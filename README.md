@@ -1,15 +1,15 @@
 # Koi — Automatic LLM Inference Placement System
 
-Koi is an intelligent orchestration layer for LLM inference jobs. Given a model, a workload description, and a map of available GPU resources, it determines the optimal placement: which GPU type, how many, and exactly how to configure tensor parallelism (TP), pipeline parallelism (PP), data parallelism (DP), and the vLLM engine — then tells the Tandem CLI where and how to launch the job.
+Koi is an intelligent orchestration layer for LLM inference jobs. Given a model, a workload description, and a map of available GPU resources, it determines the optimal placement: which GPU type, how many, and exactly how to configure tensor parallelism (TP), pipeline parallelism (PP), data parallelism (DP), and the vLLM engine — then tells the tandemn CLI where and how to launch the job.
 
-It does not launch jobs itself. It decides. The Tandem system does the launching.
+It does not launch jobs itself. It decides. The tandemn system does the launching.
 
 ---
 
 ## How It Works — End to End
 
 ```
-tandem launch Qwen/Qwen2.5-72B-Instruct dataset.jsonl --hours 8 --cheapest
+tandemn launch Qwen/Qwen2.5-72B-Instruct dataset.jsonl --hours 8 --cheapest
                           │
                           ▼
               ┌───────────────────────┐
@@ -80,7 +80,7 @@ Every interface in the system is defined here as a Pydantic model. Nothing flows
 
 | Model | Description |
 |---|---|
-| `JobRequest` | Incoming job from Tandem CLI. Has `model_name`, `task_type` (batch/online), `avg_input_tokens`, `avg_output_tokens`, `num_requests`, SLO fields (`slo_deadline_hours`, `slo_tpot_ms`, `slo_ttft_ms`), and `objective` (cheapest/fastest/balanced). |
+| `JobRequest` | Incoming job from tandemn CLI. Has `model_name`, `task_type` (batch/online), `avg_input_tokens`, `avg_output_tokens`, `num_requests`, SLO fields (`slo_deadline_hours`, `slo_tpot_ms`, `slo_ttft_ms`), and `objective` (cheapest/fastest/balanced). |
 | `ResourceMap` | Snapshot of the VPC GPU inventory. List of `GPUResource` entries, each with `gpu_type`, `instance_type`, `total_gpus`, `allocated_gpus`, `cost_per_instance_hour_usd`, `gpu_memory_gb`, `interconnect`. |
 | `GPUResource` | One GPU type in the VPC. Has `.available_gpus` and `.cost_per_gpu_hour_usd` as computed properties. |
 
@@ -243,7 +243,7 @@ The hysteresis means the state only exits GREEN when the outer threshold is cros
 
 Two concrete `MetricsSource` implementations:
 
-**`TandemMetricsAPISource`**: hits `GET {base_url}/jobs/{job_id}/metrics`. Reads `TANDEM_METRICS_API_URL` and `TANDEM_METRICS_API_KEY` from environment. Parses both flat JSON and nested JSON response formats. This is the primary source — implement the endpoint on the Tandem side and this just works.
+**`tandemnMetricsAPISource`**: hits `GET {base_url}/jobs/{job_id}/metrics`. Reads `tandemn_METRICS_API_URL` and `tandemn_METRICS_API_KEY` from environment. Parses both flat JSON and nested JSON response formats. This is the primary source — implement the endpoint on the tandemn side and this just works.
 
 **`VLLMPrometheusSource`**: reads vLLM's built-in `/metrics` Prometheus endpoint. Accepts a dict of `{job_id: endpoint_url}` so multiple jobs on different ports are handled. Parses Prometheus text format, extracts throughput, concurrent requests, GPU cache utilization. TPOT is estimated from throughput (histogram parsing is a TODO).
 
@@ -369,8 +369,8 @@ If `perfdb/` has no data, the Oracle falls back to `./results.json` in the proje
 ANTHROPIC_API_KEY=sk-ant-...
 
 # Phase 2: metrics fetching
-TANDEM_METRICS_API_URL=http://localhost:8080
-TANDEM_METRICS_API_KEY=
+tandemn_METRICS_API_URL=http://localhost:8080
+tandemn_METRICS_API_KEY=
 
 # Optional: direct vLLM Prometheus scraping
 VLLM_METRICS_URL=http://localhost:8000
@@ -390,15 +390,15 @@ Copy `.env.example` to `.env` and fill in values.
 - `demo.py`: end-to-end demo with 3 scenarios
 
 ### Phase 2 — Framework Present, Not Yet Wired
-- `monitor.py`: Kalman filter, deadband, anti-windup, per-job state — needs `TandemMetricsAPISource.fetch()` implemented
-- `metrics_api.py`: `TandemMetricsAPISource` is written — needs Tandem API endpoint on the other side; `VLLMPrometheusSource` is functional
+- `monitor.py`: Kalman filter, deadband, anti-windup, per-job state — needs `tandemnMetricsAPISource.fetch()` implemented
+- `metrics_api.py`: `tandemnMetricsAPISource` is written — needs tandemn API endpoint on the other side; `VLLMPrometheusSource` is functional
 - `refinement.py`: `DeltaStore`, `PolicyMemory`, `EfficiencyFrontier`, `PolicyLearner`, `compute_pes` — all implemented; needs to be called from `placement.py` after job completion
 - `arbiter.py`: `SwapArbiter`, `compute_nbs`, `ResourceAdder` — logic implemented; Oracle integration for new config predictions is a TODO
 - `exploration.py`: UCB scoring, budget tracking — implemented; not yet triggered from placement pipeline
 
 ### Explicitly Not In Scope (Yet)
 - GRPO fine-tuning of the LLM ensemble on policy memory
-- Actual job launching (Tandem CLI handles this)
+- Actual job launching (tandemn CLI handles this)
 - Multi-tenant auth / job ownership
 - CloudWatch GPU metrics integration (framework accepts it via custom `MetricsSource`)
 
