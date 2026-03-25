@@ -234,15 +234,73 @@ class OracleCandidate(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ThinkerProposal(BaseModel):
-    """One LLM thinker's recommendation."""
-    thinker_name: str         # "Sagan", "Turing", "Hopper"
-    thinker_persona: str      # one-line description of their priority
-    chosen_candidate_idx: int  # index into OracleCandidate list
-    config: PlacementConfig
-    metrics: PredictedMetrics
-    reasoning: str            # full chain-of-thought
-    key_concerns: List[str]   # what they're worried about
-    confidence_in_choice: float = Field(ge=0.0, le=1.0)
+    """
+    One LLM's freely-proposed config + causal hypothesis.
+    The LLM proposes a config from scratch (not picked from a list).
+    The Oracle validates and estimates metrics AFTER the proposal.
+    """
+    thinker_id: str                        # "LLM1", "LLM2", "LLM3"
+    directive: str                         # which exploration directive was given
+    proposed_config: PlacementConfig
+    oracle_estimate: Optional[PredictedMetrics] = None  # filled in post-proposal
+    hypothesis: str                        # why this config should beat the frontier
+    mechanism: str                         # physical/architectural principle supporting it
+    evidence: str                          # past runs or domain knowledge cited
+    falsification_condition: str           # what outcome would prove this hypothesis wrong
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str                         # full chain-of-thought
+    guardrail_rejections: List[str] = Field(default_factory=list)  # any failed attempts
+
+
+class ExplorationQueueEntry(BaseModel):
+    """A proposal queued for future exploration (not deployed now)."""
+    proposal: ThinkerProposal
+    priority: str                 # "high", "medium", "low"
+    reason: str                   # why it's worth testing later
+    suggested_job_constraints: str = ""  # e.g. "low-priority, SLO headroom >= 40%"
+
+
+class JudgeDecision(BaseModel):
+    """
+    Judge's synthesis of all thinker proposals.
+    Can pick one proposal OR synthesize a novel config from combined reasoning.
+    Also produces an exploration queue for future probing.
+    """
+    # Deployment config: either one of the proposals or a novel synthesis
+    decision_source: str          # "proposal_0", "proposal_1", "proposal_2", or "synthesis"
+    deployment_config: PlacementConfig
+    deployment_oracle_estimate: Optional[PredictedMetrics] = None
+
+    # If synthesis: what did the judge combine and why
+    synthesis_reasoning: str = ""
+
+    # Other proposals queued for exploration (not deployed now)
+    exploration_queue: List[ExplorationQueueEntry] = Field(default_factory=list)
+
+    # Which proposal had the most novel/interesting hypothesis worth tracking
+    most_novel_hypothesis_thinker: str = ""
+    most_novel_hypothesis_summary: str = ""
+
+    # Overall
+    reasoning: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    agreement: str = "partial"    # "full", "partial", "split"
+
+
+class DiagnosisProposal(BaseModel):
+    """
+    Re-placement proposal generated from monitoring data.
+    Includes a causal diagnosis of why the current config failed.
+    """
+    thinker_id: str
+    failure_mode: str             # what the monitoring trace shows is failing
+    causal_rule: str              # generalized rule extracted (for causal library)
+    proposed_config: PlacementConfig
+    oracle_estimate: Optional[PredictedMetrics] = None
+    repair_hypothesis: str        # why new config fixes the diagnosed failure
+    expected_improvement: str     # quantified expectation
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str
 
 
 class PlacementDecision(BaseModel):
@@ -258,19 +316,22 @@ class PlacementDecision(BaseModel):
     predicted_metrics: PredictedMetrics
 
     # Explanation
-    reasoning: str            # judge's synthesis
+    reasoning: str
     confidence: float
 
-    # All thinker proposals (for transparency / logging)
-    thinker_proposals: List[ThinkerProposal]
+    # All thinker proposals + judge decision (for transparency / logging)
+    thinker_proposals: List[ThinkerProposal] = Field(default_factory=list)
+    judge_decision: Optional[JudgeDecision] = None
 
-    # Top alternatives (for display)
-    alternatives: List[OracleCandidate] = Field(default_factory=list)
+    # Proposals queued for future exploration
+    exploration_queue: List[ExplorationQueueEntry] = Field(default_factory=list)
 
     # Metadata
     decision_timestamp: datetime = Field(default_factory=datetime.utcnow)
     oracle_candidates_evaluated: int = 0
     total_llm_calls: int = 0
+    is_reconfig: bool = False          # True if triggered by monitoring, not fresh placement
+    triggered_by: str = "initial"      # "initial", "monitoring_soft", "monitoring_hard"
 
     def display_summary(self) -> str:
         """Human-readable summary for CLI output."""

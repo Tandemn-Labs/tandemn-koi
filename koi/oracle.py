@@ -669,6 +669,27 @@ class Oracle:
             nearest_db_entry=nearest_desc,
         )
 
+    def estimate_for_config(
+        self,
+        request: JobRequest,
+        resource: Optional["GPUResource"],
+        tp: int,
+        pp: int,
+        dp: int,
+    ) -> Optional["PredictedMetrics"]:
+        """
+        Public method: get a PredictedMetrics estimate for a specific (gpu, tp, pp, dp).
+        Called by the ensemble AFTER the LLM proposes a config to get a performance prior.
+        Returns None if resource is None (GPU not found in VPC).
+        """
+        if resource is None:
+            return None
+        try:
+            return self._predict_metrics(request, resource, tp, pp, dp)
+        except Exception as e:
+            print(f"[Oracle] estimate_for_config failed for {resource.gpu_type} TP={tp} PP={pp}: {e}")
+            return None
+
     # ------------------------------------------------------------------
     # SLO checking
     # ------------------------------------------------------------------

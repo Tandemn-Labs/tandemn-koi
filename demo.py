@@ -81,9 +81,10 @@ def run_batch_demo(koi: KoiPlacement) -> None:
 
     print("\nThinker breakdown:")
     for p in decision.thinker_proposals:
-        print(f"  {p.thinker_name:6s} ({p.thinker_persona[:35]}...)")
-        print(f"    → [{p.chosen_candidate_idx}] {p.config.gpu_type} TP={p.config.tp} PP={p.config.pp} DP={p.config.dp}")
-        print(f"    → {p.reasoning[:120]}...")
+        print(f"  {p.thinker_id} (directive: {p.directive})")
+        print(f"    → {p.proposed_config.gpu_type} TP={p.proposed_config.tp} PP={p.proposed_config.pp} DP={p.proposed_config.dp} | conf={p.confidence:.0%}")
+        print(f"    Hypothesis: {p.hypothesis[:120]}...")
+        print(f"    Reasoning:  {p.reasoning[:120]}...")
 
 
 def run_online_demo(koi: KoiPlacement) -> None:
