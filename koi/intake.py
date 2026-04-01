@@ -72,7 +72,7 @@ from koi.schemas import (
 _GPU_MEMORY_GB: Dict[str, float] = {
     "H100": 80.0, "H100_SXM": 80.0,
     "H200": 141.0,
-    "A100": 80.0,
+    "A100": 80.0, "A100-80GB": 80.0, "A100-40GB": 40.0,
     "L40S": 48.0,
     "A10G": 24.0,
     "L4": 24.0,
@@ -82,7 +82,7 @@ _GPU_MEMORY_GB: Dict[str, float] = {
 _GPU_INTERCONNECT: Dict[str, str] = {
     "H100": "NVLink", "H100_SXM": "NVLink",
     "H200": "NVLink",
-    "A100": "NVLink",
+    "A100": "NVLink", "A100-80GB": "NVLink", "A100-40GB": "NVLink",
     "L40S": "PCIe",
     "A10G": "PCIe",
     "L4": "PCIe",

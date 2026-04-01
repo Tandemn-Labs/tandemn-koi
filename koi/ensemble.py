@@ -307,7 +307,7 @@ MODEL ARCHITECTURE VARIABLES (all affect placement):
   - architecture_family: llama/qwen/deepseek/mistral/phi affect hidden dim ratios
 
 HARDWARE VARIABLES:
-  - gpu_type: H100/H200/A100/L40S/A10G/L4 — each has distinct bandwidth/compute profile
+  - gpu_type: H100/H200/A100-80GB/A100-40GB/L40S/A10G/L4 — each has distinct bandwidth/compute profile
   - gpu_vram_gb: hard constraint for weight + KV cache + activations
   - gpu_bandwidth_gbps: decode bottleneck; more bandwidth = faster token generation
   - gpu_tflops_fp16: prefill bottleneck; more TFLOPS = faster TTFT
@@ -465,7 +465,7 @@ def _build_thinker_user_prompt(
         "    {\n"
         '      "rank": 1,\n'
         '      "proposed_config": {\n'
-        '        "gpu_type": "<H100|H200|A100|L40S|A10G|L4>",\n'
+        '        "gpu_type": "<H100|H200|A100-80GB|A100-40GB|L40S|A10G|L4>",\n'
         '        "tp": <int>,\n'
         '        "pp": <int>,\n'
         '        "dp": <int>,\n'

@@ -165,6 +165,8 @@ _GPU_SPECS: Dict[str, Dict[str, float]] = {
     "H100_SXM": {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 79.0},
     "H100":     {"bandwidth_gbps": 3350, "fp16_tflops": 989,  "mem_gb": 79.0},
     "H200":     {"bandwidth_gbps": 4800, "fp16_tflops": 989,  "mem_gb": 140.0},
+    "A100-80GB":{"bandwidth_gbps": 2000, "fp16_tflops": 312,  "mem_gb": 79.0},
+    "A100-40GB":{"bandwidth_gbps": 2000, "fp16_tflops": 312,  "mem_gb": 39.0},
     "A100":     {"bandwidth_gbps": 2000, "fp16_tflops": 312,  "mem_gb": 79.0},
     "L40S":     {"bandwidth_gbps":  864, "fp16_tflops": 733,  "mem_gb": 45.5},
     "A10G":     {"bandwidth_gbps":  600, "fp16_tflops": 125,  "mem_gb": 23.0},

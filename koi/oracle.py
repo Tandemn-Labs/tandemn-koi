@@ -54,7 +54,7 @@ INSTANCE_TO_GPU: Dict[str, str] = {
     "g6e.xlarge":    "L40S",  "g6e.2xlarge":   "L40S",  "g6e.4xlarge":   "L40S",
     "g6e.8xlarge":   "L40S",  "g6e.12xlarge":  "L40S",  "g6e.16xlarge":  "L40S",
     "g6e.24xlarge":  "L40S",  "g6e.48xlarge":  "L40S",
-    "p4d.24xlarge":  "A100",  "p4de.24xlarge": "A100",
+    "p4d.24xlarge":  "A100-80GB",  "p4de.24xlarge": "A100-80GB",
     "p5.48xlarge":   "H100",  "p5e.48xlarge":  "H100",
     "p5en.48xlarge": "H200",
     "g5.xlarge":     "A10G",  "g5.2xlarge":    "A10G",  "g5.4xlarge":    "A10G",
