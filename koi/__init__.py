@@ -17,6 +17,7 @@ Monitoring + refinement (Phase 2):
 """
 
 from koi.placement import KoiPlacement
+from koi.intake import koi_deploy, parse_user_request, fetch_resource_map
 from koi.oracle import Oracle
 from koi.ensemble import KoiEnsemble
 from koi.schemas import (
@@ -54,4 +55,5 @@ __all__ = [
     "SwapArbiter", "RunningJob",
     "ExplorationManager",
     "TandemMetricsAPISource", "VLLMPrometheusSource",
+    "koi_deploy", "parse_user_request", "fetch_resource_map",
 ]

@@ -37,6 +37,7 @@ from koi.refinement import KoiRefinement
 from koi.schemas import (
     DeltaRecord,
     JobRequest,
+    OracleResult,
     PlacementConfig,
     PlacementDecision,
     ResourceMap,
@@ -101,21 +102,21 @@ class KoiPlacement:
 
         # Step 1 — Oracle reference candidates
         t_oracle = time.time()
-        all_candidates = self.oracle.get_candidates(request, resource_map)
-        if not all_candidates:
+        oracle_result: OracleResult = self.oracle.get_candidates(request, resource_map)
+        if not oracle_result.candidates:
             raise RuntimeError(
                 f"[Koi] Oracle found 0 feasible candidates for {request.model_name}. "
                 "Check ResourceMap GPU availability and model memory constraints."
             )
-        slo_candidates = [c for c in all_candidates if c.meets_slo]
-        reference_candidates = slo_candidates if slo_candidates else all_candidates
+        slo_candidates = [c for c in oracle_result.candidates if c.meets_slo]
         print(
-            f"[Koi] Oracle: {len(all_candidates)} candidates, "
-            f"{len(slo_candidates)} meet SLO ({time.time() - t_oracle:.2f}s)"
+            f"[Koi] Oracle: {len(oracle_result.candidates)} candidates, "
+            f"{len(slo_candidates)} meet SLO | RAG records: {len(oracle_result.rag_records)} "
+            f"({time.time() - t_oracle:.2f}s)"
         )
 
         # Step 2 — Evolutionary context from DB
-        history_str = self._build_history(request, reference_candidates)
+        history_str = self._build_history(request, oracle_result)
         frontier_str = self._build_frontier_summary(request)
         if history_str:
             print(f"[Koi] Evolutionary context: {len(history_str)} chars from DB")
@@ -125,7 +126,7 @@ class KoiPlacement:
         # Step 3+4 — LLM proposals + judge synthesis
         t_llm = time.time()
         decision = self.ensemble.run_sync(
-            request, resource_map, reference_candidates,
+            request, resource_map, oracle_result,
             history=history_str,
             frontier_summary=frontier_str,
         )
@@ -149,18 +150,21 @@ class KoiPlacement:
         t0 = time.time()
         print(f"\n[Koi] Placement (async): {request.job_id} — {request.model_name}")
 
-        all_candidates = self.oracle.get_candidates(request, resource_map)
-        if not all_candidates:
+        oracle_result: OracleResult = self.oracle.get_candidates(request, resource_map)
+        if not oracle_result.candidates:
             raise RuntimeError("Oracle found 0 feasible candidates.")
 
-        slo_candidates = [c for c in all_candidates if c.meets_slo]
-        reference_candidates = slo_candidates if slo_candidates else all_candidates
+        slo_candidates = [c for c in oracle_result.candidates if c.meets_slo]
+        print(
+            f"[Koi] Oracle: {len(oracle_result.candidates)} candidates, "
+            f"{len(slo_candidates)} meet SLO | RAG records: {len(oracle_result.rag_records)}"
+        )
 
-        history_str = self._build_history(request, reference_candidates)
+        history_str = self._build_history(request, oracle_result)
         frontier_str = self._build_frontier_summary(request)
 
         decision = await self.ensemble.run(
-            request, resource_map, reference_candidates,
+            request, resource_map, oracle_result,
             history=history_str,
             frontier_summary=frontier_str,
         )
@@ -272,7 +276,7 @@ class KoiPlacement:
             f"current: {current_config.gpu_type} TP={current_config.tp} PP={current_config.pp} | "
             f"{len(monitoring_trace)} monitoring samples"
         )
-        history_str = self._build_history(request, [])
+        history_str = self._build_history(request, None)
         decision = self.ensemble.run_diagnosis_sync(
             request, current_config, monitoring_trace, resource_map,
             history=history_str,
@@ -291,7 +295,7 @@ class KoiPlacement:
     def _build_history(
         self,
         request: JobRequest,
-        reference_candidates: list,
+        oracle_result: Optional[OracleResult],
     ) -> Optional[str]:
         """
         Query DeltaStore + PolicyMemory for this workload class.
@@ -302,8 +306,9 @@ class KoiPlacement:
         far more relevant history than the LLM that placed job #1.
         """
         # Use the top Oracle candidate as the query anchor for delta lookup
-        if reference_candidates:
-            top = reference_candidates[0]
+        candidates = oracle_result.candidates if oracle_result else []
+        if candidates:
+            top = candidates[0]
             return self.refinement.get_context_for_ensemble(
                 request=request,
                 gpu_type=top.config.gpu_type,

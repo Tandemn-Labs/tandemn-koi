@@ -3,9 +3,9 @@ koi/schemas.py — All Pydantic data models for the Koi placement system.
 
 Data flow:
   JobRequest + ResourceMap
-      → Oracle → List[OracleCandidate]
-      → Ensemble → List[ThinkerProposal]
-      → Judge → PlacementDecision
+      → Oracle → OracleResult (candidates + rag_records + model_features)
+      → Ensemble (3 LLMs × 5 proposals each = 15 ThinkerProposals)
+      → Judge → PlacementDecision (top 5 RankedPlacements)
 
 Refinement (later):
   RuntimeMetrics → DeltaRecord → PESComponents → policy memory
@@ -229,27 +229,50 @@ class OracleCandidate(BaseModel):
     feasibility_notes: List[str] = Field(default_factory=list)
 
 
+class OracleResult(BaseModel):
+    """
+    Full output of Oracle.get_candidates().
+    Bundles feasibility-checked candidates AND the raw RAG records so the
+    ensemble LLMs can read actual observed data, not just interpolated scores.
+    """
+    candidates: List[OracleCandidate]
+    rag_records: List[Any] = Field(default_factory=list)  # raw dicts from PerfRAG
+    model_features: Optional[Any] = None                  # ModelFeatures instance
+
+
 # ---------------------------------------------------------------------------
 # Ensemble: Thinker proposals + Judge output
 # ---------------------------------------------------------------------------
 
 class ThinkerProposal(BaseModel):
     """
-    One LLM's freely-proposed config + causal hypothesis.
-    The LLM proposes a config from scratch (not picked from a list).
-    The Oracle validates and estimates metrics AFTER the proposal.
+    One of the 5 ranked proposals from a single LLM thinker.
+    Each proposal is a specific config grounded in RAG evidence + reasoning.
     """
     thinker_id: str                        # "LLM1", "LLM2", "LLM3"
     directive: str                         # which exploration directive was given
+    rank: int = 1                          # 1-5 within this thinker's output
     proposed_config: PlacementConfig
-    oracle_estimate: Optional[PredictedMetrics] = None  # filled in post-proposal
-    hypothesis: str                        # why this config should beat the frontier
-    mechanism: str                         # physical/architectural principle supporting it
-    evidence: str                          # past runs or domain knowledge cited
-    falsification_condition: str           # what outcome would prove this hypothesis wrong
+    oracle_estimate: Optional[PredictedMetrics] = None  # filled post-proposal
+    hypothesis: str                        # why this config fits the workload
+    mechanism: str                         # physical/architectural principle
+    evidence: str                          # RAG records or domain knowledge cited
+    falsification_condition: str           # what outcome would prove it wrong
     confidence: float = Field(ge=0.0, le=1.0)
-    reasoning: str                         # full chain-of-thought
-    guardrail_rejections: List[str] = Field(default_factory=list)  # any failed attempts
+    reasoning: str                         # step-by-step reasoning chain
+    guardrail_rejections: List[str] = Field(default_factory=list)
+
+
+class ThinkerResult(BaseModel):
+    """
+    All 5 proposals from one LLM thinker in a single pass.
+    The LLM returns these ranked 1-5 (1=best by its directive).
+    """
+    thinker_id: str
+    directive: str
+    proposals: List[ThinkerProposal]      # always 5 proposals
+    overall_reasoning: str                 # thinker's summary across all proposals
+    guardrail_rejections: List[str] = Field(default_factory=list)
 
 
 class ExplorationQueueEntry(BaseModel):
@@ -260,28 +283,42 @@ class ExplorationQueueEntry(BaseModel):
     suggested_job_constraints: str = ""  # e.g. "low-priority, SLO headroom >= 40%"
 
 
+class RankedPlacement(BaseModel):
+    """
+    One of the judge's top-5 ranked placement recommendations.
+    These are the final output sent to the Orca scheduler.
+    """
+    rank: int                              # 1=best, 5=5th best
+    config: PlacementConfig
+    oracle_estimate: Optional[PredictedMetrics] = None
+    source: str                            # e.g. "LLM1_rank1", "LLM3_rank2", "synthesis"
+    reasoning: str                         # judge's reasoning for this rank
+    confidence: float = Field(ge=0.0, le=1.0)
+    meets_slo: bool = True
+
+
 class JudgeDecision(BaseModel):
     """
-    Judge's synthesis of all thinker proposals.
-    Can pick one proposal OR synthesize a novel config from combined reasoning.
-    Also produces an exploration queue for future probing.
+    Judge's ranked output across all 15 proposals (5 × 3 thinkers).
+    Produces top 5 placements for Orca + exploration queue.
     """
-    # Deployment config: either one of the proposals or a novel synthesis
-    decision_source: str          # "proposal_0", "proposal_1", "proposal_2", or "synthesis"
+    # Primary deployment config (rank 1)
+    decision_source: str
     deployment_config: PlacementConfig
     deployment_oracle_estimate: Optional[PredictedMetrics] = None
 
-    # If synthesis: what did the judge combine and why
+    # Top 5 ranked placements (sent to Orca)
+    top_placements: List[RankedPlacement] = Field(default_factory=list)
+
+    # If judge synthesized novel config: explanation
     synthesis_reasoning: str = ""
 
-    # Other proposals queued for exploration (not deployed now)
+    # Proposals queued for future exploration
     exploration_queue: List[ExplorationQueueEntry] = Field(default_factory=list)
 
-    # Which proposal had the most novel/interesting hypothesis worth tracking
     most_novel_hypothesis_thinker: str = ""
     most_novel_hypothesis_summary: str = ""
 
-    # Overall
     reasoning: str
     confidence: float = Field(ge=0.0, le=1.0)
     agreement: str = "partial"    # "full", "partial", "split"
@@ -306,21 +343,28 @@ class DiagnosisProposal(BaseModel):
 class PlacementDecision(BaseModel):
     """
     Final output of the Koi placement system.
-    This is what gets returned to the Tandem CLI.
+    This is what gets returned to the Orca scheduler.
+
+    top_placements: 5 ranked options for Orca to choose from.
+    recommendation: top_placements[0].config (kept for backward compat).
     """
     job_id: str
     model_name: str
 
-    # The chosen placement
+    # Primary placement (rank 1) — backward compat
     recommendation: PlacementConfig
     predicted_metrics: PredictedMetrics
+
+    # Top 5 ranked placements for Orca
+    top_placements: List[RankedPlacement] = Field(default_factory=list)
 
     # Explanation
     reasoning: str
     confidence: float
 
-    # All thinker proposals + judge decision (for transparency / logging)
-    thinker_proposals: List[ThinkerProposal] = Field(default_factory=list)
+    # Full thinker results + judge decision (for transparency / logging)
+    thinker_results: List[ThinkerResult] = Field(default_factory=list)
+    thinker_proposals: List[ThinkerProposal] = Field(default_factory=list)  # flat list
     judge_decision: Optional[JudgeDecision] = None
 
     # Proposals queued for future exploration
@@ -329,8 +373,9 @@ class PlacementDecision(BaseModel):
     # Metadata
     decision_timestamp: datetime = Field(default_factory=datetime.utcnow)
     oracle_candidates_evaluated: int = 0
+    rag_records_retrieved: int = 0
     total_llm_calls: int = 0
-    is_reconfig: bool = False          # True if triggered by monitoring, not fresh placement
+    is_reconfig: bool = False
     triggered_by: str = "initial"      # "initial", "monitoring_soft", "monitoring_hard"
 
     def display_summary(self) -> str:
@@ -356,8 +401,23 @@ class PlacementDecision(BaseModel):
             lines.append(f"  Est. TPOT    : {met.tpot_ms:.1f} ms")
         lines += [
             f"  Confidence   : {self.confidence:.0%}  (source: {met.data_source.value})",
+            f"  RAG records  : {self.rag_records_retrieved}",
             f"",
-            f"  vLLM Args:",
+        ]
+        if self.top_placements:
+            lines.append(f"  TOP 5 PLACEMENTS FOR ORCA:")
+            for p in self.top_placements:
+                cfg = p.config
+                tps_str = f"{p.oracle_estimate.throughput_tokens_per_sec:.0f} tok/s" if p.oracle_estimate else "?"
+                slo = "✓" if p.meets_slo else "✗"
+                lines.append(
+                    f"    [{p.rank}] {cfg.gpu_type} TP={cfg.tp} PP={cfg.pp} DP={cfg.dp} "
+                    f"({cfg.num_gpus}GPUs) | {tps_str} | conf={p.confidence:.0%} "
+                    f"| SLO={slo} | src={p.source}"
+                )
+            lines.append("")
+        lines += [
+            f"  vLLM Args (rank-1):",
             f"  {rec.engine_config.to_vllm_args()}",
             f"",
             f"  Reasoning: {self.reasoning[:300]}{'...' if len(self.reasoning) > 300 else ''}",
