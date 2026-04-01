@@ -213,6 +213,49 @@ Steps:
 
 ---
 
+### Orca Integration
+
+Koi runs as an HTTP service that the [Orca](https://github.com/Tandemn-Labs/Tandemn-orca) CLI calls alongside its roofline solver.
+
+**Setup:**
+```bash
+pip install -r requirements.txt
+ANTHROPIC_API_KEY=sk-ant-... python -m koi.server
+# Koi listens on :8090 (configure with KOI_PORT)
+```
+
+**Orca side:** Set `KOI_SERVICE_URL=http://localhost:8090` and the CLI will call `POST /decide` in parallel with roofline during `orca plan` / `orca deploy`.
+
+**Data flow:**
+1. Orca's `GET /resources` returns raw AWS data: instance catalog (GPU specs, pricing, vCPUs, quota family) + quota pools (per-family/region/market vCPU limits)
+2. CLI forwards this as the `resource_map` in `POST /decide` along with the `job_request`
+3. Koi's Oracle joins instances to quota pools, computes per-instance-type availability, enumerates TP/PP/DP candidates, predicts metrics
+4. LLM ensemble picks the best config
+5. CLI shows both Koi and roofline results; user chooses which to deploy
+
+**`POST /decide` request:**
+```json
+{
+  "job_request": {
+    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+    "task_type": "batch",
+    "avg_input_tokens": 512,
+    "avg_output_tokens": 256,
+    "num_requests": 100000,
+    "slo_deadline_hours": 8.0,
+    "objective": "cheapest"
+  },
+  "resource_map": {
+    "instances": [...],
+    "quotas": [...]
+  }
+}
+```
+
+**Response:** Full `PlacementDecision` (recommendation, predicted metrics, reasoning, thinker proposals, alternatives).
+
+---
+
 ### `koi/monitor.py` — Runtime Monitoring (Phase 2)
 
 Koi does not instrument jobs itself. It fetches metrics that are already being collected. This file provides the processing layer on top of fetched data.
