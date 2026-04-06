@@ -133,6 +133,44 @@ class TestLaunchAttempts:
         assert rate["rate"] == pytest.approx(0.25)
 
 
+class TestChainSnapshots:
+    def test_record_and_query(self, memory):
+        snap_id = memory.record_chain_snapshot(
+            decision_id="dec-test", job_id="job-1",
+            throughput_tps=833.0, tokens_completed=2_000_000,
+            tokens_remaining=5_500_000, elapsed_hours=0.5,
+            slo_headroom_pct=85.0, gpu_cache_usage_pct=0.62,
+            gpu_sm_util_pct=78.0, gpu_mem_bw_util_pct=85.0,
+        )
+        assert snap_id.startswith("snap-")
+
+        snaps = memory.query_chain_snapshots("dec-test")
+        assert len(snaps) == 1
+        assert snaps[0]["throughput_tps"] == 833.0
+        assert snaps[0]["slo_headroom_pct"] == 85.0
+
+    def test_time_series(self, memory):
+        """Multiple snapshots create a time series."""
+        for i in range(5):
+            memory.record_chain_snapshot(
+                decision_id="dec-ts", job_id="job-1",
+                throughput_tps=800.0 - i * 50,  # degrading
+                tokens_completed=i * 1_000_000,
+                tokens_remaining=5_000_000 - i * 1_000_000,
+                elapsed_hours=i * 0.5,
+                slo_headroom_pct=90.0 - i * 10,
+            )
+        snaps = memory.query_chain_snapshots("dec-ts")
+        assert len(snaps) == 5
+        # Should be ordered by timestamp (ascending)
+        tps_values = [s["throughput_tps"] for s in snaps]
+        assert tps_values[0] > tps_values[-1]  # degrading over time
+
+    def test_query_nonexistent(self, memory):
+        snaps = memory.query_chain_snapshots("dec-nonexistent")
+        assert len(snaps) == 0
+
+
 class TestCounts:
     def test_initial_counts(self, memory):
         assert memory.decision_count() == 0

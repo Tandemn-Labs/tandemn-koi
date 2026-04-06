@@ -118,10 +118,28 @@ class AgenticMemory:
                 other_jobs_in_region TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS chain_snapshots (
+                snapshot_id     TEXT PRIMARY KEY,
+                decision_id     TEXT REFERENCES decisions(decision_id),
+                job_id          TEXT NOT NULL,
+                timestamp       TEXT DEFAULT (datetime('now')),
+                throughput_tps          REAL,
+                tokens_completed        INTEGER,
+                tokens_remaining        INTEGER,
+                elapsed_hours           REAL,
+                slo_headroom_pct        REAL,
+                gpu_cache_usage_pct     REAL,
+                gpu_sm_util_pct         REAL,
+                gpu_mem_bw_util_pct     REAL,
+                num_requests_waiting    INTEGER
+            );
+
             CREATE INDEX IF NOT EXISTS idx_decisions_model ON decisions(model_name);
             CREATE INDEX IF NOT EXISTS idx_outcomes_job ON outcomes(job_id);
             CREATE INDEX IF NOT EXISTS idx_outcomes_status ON outcomes(status);
             CREATE INDEX IF NOT EXISTS idx_launch_instance ON launch_attempts(instance_type, region);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_decision ON chain_snapshots(decision_id);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_job ON chain_snapshots(job_id);
         """)
         conn.commit()
         # connection kept open (persistent)
@@ -279,9 +297,56 @@ class AgenticMemory:
         # connection kept open (persistent)
         return rule_id
 
+    def record_chain_snapshot(
+        self, decision_id: str, job_id: str,
+        throughput_tps: float = 0.0,
+        tokens_completed: int = 0,
+        tokens_remaining: int = 0,
+        elapsed_hours: float = 0.0,
+        slo_headroom_pct: float = 0.0,
+        gpu_cache_usage_pct: float = 0.0,
+        gpu_sm_util_pct: float = 0.0,
+        gpu_mem_bw_util_pct: float = 0.0,
+        num_requests_waiting: int = 0,
+    ) -> str:
+        snapshot_id = f"snap-{uuid.uuid4().hex[:8]}"
+        conn = self._conn()
+        conn.execute("""
+            INSERT INTO chain_snapshots (
+                snapshot_id, decision_id, job_id,
+                throughput_tps, tokens_completed, tokens_remaining,
+                elapsed_hours, slo_headroom_pct,
+                gpu_cache_usage_pct, gpu_sm_util_pct, gpu_mem_bw_util_pct,
+                num_requests_waiting
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            snapshot_id, decision_id, job_id,
+            throughput_tps, tokens_completed, tokens_remaining,
+            elapsed_hours, slo_headroom_pct,
+            gpu_cache_usage_pct, gpu_sm_util_pct, gpu_mem_bw_util_pct,
+            num_requests_waiting,
+        ))
+        conn.commit()
+        # connection kept open (persistent)
+        return snapshot_id
+
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
+
+    def query_chain_snapshots(
+        self, decision_id: str, limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Get time series of chain snapshots for a specific chain."""
+        conn = self._conn()
+        rows = conn.execute("""
+            SELECT * FROM chain_snapshots
+            WHERE decision_id = ?
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (decision_id, limit)).fetchall()
+        # connection kept open (persistent)
+        return [dict(r) for r in rows]
 
     def query_decisions(
         self, model_name: Optional[str] = None,
