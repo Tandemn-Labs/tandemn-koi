@@ -295,6 +295,84 @@ class KoiAgent:
         return final_text
 
     # ------------------------------------------------------------------
+    # Pre-computed cost table
+    # ------------------------------------------------------------------
+
+    def _build_cost_table(self, req: JobRequest, rm: ResourceMap) -> str:
+        """Pre-compute total cost for known configs from memory + PerfDB."""
+        total_tokens = req.total_tokens or 0
+        if total_tokens == 0:
+            return "COST TABLE: Cannot compute — total tokens unknown."
+
+        lines = ["PRE-COMPUTED COST TABLE (sorted by total cost, cheapest first):"]
+        lines.append(f"  {'Source':<12} {'GPU':<12} {'Config':<18} {'TPS':>7} {'$/hr':>8} {'ETA(h)':>7} {'Total $':>9} {'SLO':>5}")
+        lines.append(f"  {'─'*12} {'─'*12} {'─'*18} {'─'*7} {'─'*8} {'─'*7} {'─'*9} {'─'*5}")
+
+        rows = []
+
+        # 1. Ground truth outcomes from memory (highest trust)
+        outcomes = self.memory.query_outcomes(model_name=req.model_name, status="succeeded", limit=10)
+        for o in outcomes:
+            tps = o.get("actual_tps")
+            cost_hr = o.get("actual_cost_per_hour")
+            if not tps or tps <= 0 or not cost_hr:
+                continue
+            eta_h = total_tokens / tps / 3600
+            total_cost = cost_hr * eta_h
+            gpu = o.get("gpu_type", "?")
+            tp, pp, dp = o.get("tp", 1), o.get("pp", 1), o.get("dp", 1)
+            meets_slo = eta_h <= (req.slo_deadline_hours or 999)
+            rows.append((total_cost, "VERIFIED", gpu, f"TP={tp} PP={pp} DP={dp}", tps, cost_hr, eta_h, meets_slo))
+
+        # 2. PerfDB records for this model
+        if self.perfdb:
+            records = self.perfdb.query(model_name=req.model_name, limit=30)
+            seen = set()
+            for r in records:
+                gpu = r.get("gpu_type", "?")
+                tp = int(r.get("tp", 1))
+                pp = int(r.get("pp", 1))
+                dp = int(r.get("dp", 1))
+                tps = r.get("throughput_tps", 0)
+                if tps <= 0:
+                    continue
+
+                # Find matching resource for cost
+                resource = rm.get_resource(gpu)
+                if not resource:
+                    continue
+
+                key = (gpu, tp, pp, dp)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                num_gpus = tp * pp * dp
+                if num_gpus > resource.available_gpus:
+                    continue
+
+                num_instances = max(1, num_gpus // resource.gpus_per_instance)
+                cost_hr = num_instances * resource.cost_per_instance_hour_usd
+                eta_h = total_tokens / tps / 3600
+                total_cost = cost_hr * eta_h
+                meets_slo = eta_h <= (req.slo_deadline_hours or 999)
+                rows.append((total_cost, "PerfDB", gpu, f"TP={tp} PP={pp} DP={dp}", tps, cost_hr, eta_h, meets_slo))
+
+        # Sort by total cost
+        rows.sort(key=lambda r: r[0])
+
+        for total_cost, source, gpu, config, tps, cost_hr, eta_h, meets_slo in rows[:15]:
+            slo_str = "✓" if meets_slo else "✗"
+            lines.append(
+                f"  {source:<12} {gpu:<12} {config:<18} {tps:>7.0f} {cost_hr:>7.2f} {eta_h:>7.2f} {total_cost:>8.2f} {slo_str:>5}"
+            )
+
+        if not rows:
+            lines.append("  (no data — use tools to query PerfDB and physics)")
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Prompt builders
     # ------------------------------------------------------------------
 
@@ -305,6 +383,9 @@ class KoiAgent:
         io_ratio = req.prefill_decode_ratio
 
         resources_text = get_resources(rm)
+
+        # Pre-compute cost table from memory outcomes + PerfDB
+        cost_table = self._build_cost_table(req, rm)
 
         sections = [
             f"PLACEMENT REQUEST:",
@@ -319,7 +400,10 @@ class KoiAgent:
             "",
             resources_text,
             "",
-            "Use your tools to query PerfDB, memory, and physics. Then decide.",
+            cost_table,
+            "",
+            "Use your tools to query PerfDB, memory, and physics to VERIFY the cost table above.",
+            "The cost table is pre-computed — pick the cheapest total_cost row that meets SLO, then verify it.",
             "",
             "Return your decision as a JSON block:",
             "```json",
