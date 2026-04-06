@@ -101,7 +101,7 @@ class KoiAgent:
     # Tools — defined as @beta_tool functions
     # ------------------------------------------------------------------
 
-    def _build_tools(self):
+    def _build_tools(self, resource_map: Optional[ResourceMap] = None):
         """Create tool functions bound to this agent's backing services."""
         perfdb = self.perfdb
         memory = self.memory
@@ -164,13 +164,32 @@ class KoiAgent:
 
         @beta_tool
         def get_resources_tool() -> str:
-            """Get available GPU resources (types, counts, VRAM, cost, regions)."""
-            # Resource map is passed via the prompt context, not fetched live here
-            # This is a fallback in case the agent wants to re-check
-            return "Resources are provided in the prompt context above."
+            """Get available GPU resources (types, counts, VRAM, cost, regions) from the cluster."""
+            if resource_map:
+                from koi.tools.resources import get_resources as _gr
+                return _gr(resource_map)
+            return "No resource map available. Resources should be in prompt context."
+
+        @beta_tool
+        def record_outcome_tool(
+            decision_id: str,
+            job_id: str,
+            status: str,
+            actual_tps: Optional[float] = None,
+            actual_cost_per_hour: Optional[float] = None,
+            failure_reason: Optional[str] = None,
+            failure_category: Optional[str] = None,
+        ) -> str:
+            """Record a job/chain outcome in Koi's memory. Call this when a chain ends or job completes."""
+            from koi.tools.memory import record_outcome_tool as _rot
+            return _rot(memory, decision_id=decision_id, job_id=job_id,
+                       status=status, actual_tps=actual_tps,
+                       actual_cost_per_hour=actual_cost_per_hour,
+                       failure_reason=failure_reason, failure_category=failure_category)
 
         return [query_perfdb, query_memory_tool, get_gpu_physics_tool,
-                get_model_arch_tool, find_similar_models_tool, get_resources_tool]
+                get_model_arch_tool, find_similar_models_tool, get_resources_tool,
+                record_outcome_tool]
 
     # ------------------------------------------------------------------
     # Main decision entry point
@@ -186,7 +205,7 @@ class KoiAgent:
 
         # Build the user prompt with all context
         prompt = self._build_decide_prompt(job_request, resource_map)
-        tools = self._build_tools()
+        tools = self._build_tools(resource_map=resource_map)
 
         logger.info(f"[Koi] Agent deciding for {job_request.model_name} ({job_request.job_id})")
 
@@ -341,15 +360,15 @@ class KoiAgent:
         import json
         import re
 
-        # Try to find JSON block
+        # Try to find JSON block in ```json ... ``` fences
         json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if not json_match:
-            # Try raw JSON
-            json_match = re.search(r"\{[^{}]*\"gpu_type\"[^{}]*\}", text, re.DOTALL)
+            # Try raw JSON (with capture group for consistency)
+            json_match = re.search(r"(\{[^{}]*\"gpu_type\"[^{}]*\})", text, re.DOTALL)
 
         if json_match:
             try:
-                data = json.loads(json_match.group(1) if json_match.lastindex else json_match.group(0))
+                data = json.loads(json_match.group(1))
             except json.JSONDecodeError:
                 data = {}
         else:
