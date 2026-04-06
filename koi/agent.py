@@ -47,7 +47,14 @@ DECISION FRAMEWORK (follow this order):
 KEY METRICS FOR BATCH:
 - throughput_tokens_per_sec is ALL THAT MATTERS for batch SLO. TPOT/TTFT are irrelevant.
 - required_tps = total_tokens / (slo_hours * 3600). Any config above this meets SLO.
-- cost_per_m_tokens = (cost_per_hour / tps) * (1e6 / 3600). Minimize this for objective=cheapest.
+
+CRITICAL — CHEAPEST MEANS LOWEST TOTAL JOB COST, NOT LOWEST $/HR:
+- total_cost = (cost_per_hour * total_tokens) / (tps * 3600)
+- A fast expensive GPU can be CHEAPER total than a slow cheap GPU:
+    L40S: 528 TPS × $20.98/hr → runs 5.2h → $109 total
+    A100: 2186 TPS × $40.96/hr → runs 1.3h → $51 total  ← CHEAPER
+- ALWAYS compute total_cost for each candidate config and pick the lowest.
+- Do NOT just pick the cheapest $/hr — that is WRONG for batch jobs.
 
 PHYSICAL CONSTRAINTS:
 - model_size_gb = params_billions * 2 (fp16). Must fit in GPU VRAM with ≥8GB headroom.
