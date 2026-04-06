@@ -181,7 +181,7 @@ class TestCounts:
 class TestToolFunctions:
     def test_query_memory_empty(self, memory):
         result = query_memory(memory, model_name="Qwen")
-        assert "No past outcomes" in result
+        assert "No memory found" in result
 
     def test_query_memory_with_data(self, memory):
         dec_id = memory.record_decision(

@@ -486,10 +486,10 @@ def query_memory(
     """Query Koi's memory for past decisions, outcomes, and rules."""
     lines = []
 
-    # Past outcomes
+    # Past outcomes (ground truth from completed jobs)
     outcomes = memory.query_outcomes(model_name=model_name, status=status, limit=limit)
     if outcomes:
-        lines.append(f"PAST OUTCOMES ({len(outcomes)} found):")
+        lines.append(f"PAST OUTCOMES ({len(outcomes)} found — ground truth from completed jobs):")
         for o in outcomes:
             slo = "SLO met" if o.get("slo_met") else "SLO missed"
             delta = f"delta={o['delta_tps_pct']:+.1f}%" if o.get("delta_tps_pct") is not None else ""
@@ -499,8 +499,28 @@ def query_memory(
                 f"TPS={o.get('actual_tps','?')} (pred={o.get('predicted_tps','?')}) {delta} | "
                 f"{slo}{fail}"
             )
-    else:
-        lines.append(f"No past outcomes found for model={model_name or 'any'}")
+
+    # Past decisions (what Koi previously chose — even if no outcome yet)
+    decisions = memory.query_decisions(model_name=model_name, gpu_type=instance_type, limit=limit)
+    if decisions:
+        lines.append(f"\nPAST DECISIONS ({len(decisions)} found — what Koi previously chose):")
+        for dec in decisions:
+            outcome_status = dec.get("status")
+            outcome_tps = dec.get("actual_tps")
+            if outcome_status and outcome_tps:
+                result = f"→ actual={outcome_tps:.0f} TPS ({outcome_status})"
+            elif outcome_status:
+                result = f"→ {outcome_status}"
+            else:
+                result = "→ no outcome yet (job may still be running)"
+            lines.append(
+                f"  {dec.get('model_name','?')} | {dec.get('gpu_type','?')} TP={dec.get('tp',1)} PP={dec.get('pp',1)} DP={dec.get('dp',1)} | "
+                f"predicted={dec.get('predicted_tps','?')} TPS @ ${dec.get('predicted_cost_per_hour','?')}/hr | "
+                f"conf={dec.get('prediction_confidence','?')} ({dec.get('prediction_source','?')}) {result}"
+            )
+
+    if not outcomes and not decisions:
+        lines.append(f"No memory found for model={model_name or 'any'}. This is the first time Koi has seen this model.")
 
     # Rules
     if include_rules:
