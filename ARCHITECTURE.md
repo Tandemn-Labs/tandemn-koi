@@ -171,13 +171,28 @@ If the agent needs more data, it queries more. If the perfdb has an exact match 
      - `"proxy:Llama-70B:dist=0.02"` — similar model, distance-scaled confidence
    - Query memory for past outcomes on this model (or similar models)
 
-2. Give the agent this packet + tools to query more if needed:
-   - Agent sees: "10 direct records for Qwen-72B + 8 proxy records from Llama-70B (dist=0.02)"
-   - If enough direct data → decides immediately (fast path, <5s)
-   - If only proxy data → agent reasons about transferability, may query more ("show me Llama-70B vs Qwen-72B scaling differences if any")
+2. **Pre-compute a cost table** (critical — LLMs are bad at arithmetic):
+   - For each config in memory outcomes + PerfDB, compute:
+     `total_cost = ($/hr × total_tokens) / (tps × 3600)`
+   - Sort by total cost, cheapest first
+   - Tag each row with source: `VERIFIED` (ground truth from memory) or `PerfDB`
+   - Inject the table into the prompt — agent reads costs instead of computing them
+   - Example table the agent sees:
+     ```
+     Source       GPU          Config             TPS     $/hr    ETA    Total$  SLO
+     VERIFIED     L40S         TP=4 PP=4 DP=1    1100    18.72   2.50   $46.74   ✓
+     PerfDB       A100-80GB    TP=8 PP=1 DP=1    2186    40.96   1.26   $51.45   ✓
+     PerfDB       L40S         TP=4 PP=2 DP=1     528    20.98   5.20  $109.11   ✓
+     ```
+   - Agent picks the cheapest ✓ row and verifies with tools
+
+3. Give the agent this packet + tools to query more if needed:
+   - Agent sees the cost table + can call tools to verify or explore alternatives
+   - If cost table has a VERIFIED row → high confidence, minimal tool calls
+   - If only PerfDB rows → agent verifies physics, may adjust
    - If no data at all → agent uses physics/roofline + explores conservatively
 
-3. For repeat workloads, **memory IS the primary context** — already vetted by real production runs. Agent checks memory first before touching PerfDB.
+4. For repeat workloads, **memory IS the primary context** — already vetted by real production runs. Agent checks memory first before touching PerfDB.
 
 ---
 
