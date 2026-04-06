@@ -972,50 +972,68 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 
 ## 10. Implementation Plan
 
-### Phase 1: Core Agent + Memory (This Rewrite)
+### Phase 1: Core Agent + Monitoring + Scale Up/Down (THIS VERSION)
 
+**Koi:**
 - [ ] `koi/agent.py` — KoiAgent built on Claude Agent SDK with tool definitions
-- [ ] `koi/tools/perfdb.py` — PerfDB query tool (SQL over CSV/SQLite)
-- [ ] `koi/tools/memory.py` — Agentic Memory (decisions, outcomes, rules tables)
+- [ ] `koi/tools/perfdb.py` — PerfDB query tool (pandas over CSV)
+- [ ] `koi/tools/memory.py` — Agentic Memory (decisions, outcomes, rules, launch_attempts tables)
 - [ ] `koi/tools/resources.py` — Live resource map from Orca
-- [ ] `koi/tools/physics.py` — GPU specs + bottleneck analysis
-- [ ] `koi/tools/orca_api.py` — Launch, scale, metrics from Orca
+- [ ] `koi/tools/physics.py` — GPU specs + bottleneck analysis + physics-vector similarity
+- [ ] `koi/tools/orca_api.py` — Launch, scale, kill, metrics from Orca
+- [ ] `koi/monitor.py` — Background polling loop (10s), SLO tracking, agent triggers
 - [ ] `koi/server.py` — HTTP endpoints: `/decide`, `/health`, `/job/complete`
 - [ ] `koi/schemas.py` — Pydantic models for all data structures
+- [ ] Scale UP: A/B test when FALLING_BEHIND (launch repair replica, compare, cull loser)
+- [ ] Scale DOWN: shed excess replicas when over-provisioned (headroom > 70%)
+- [ ] Spot preemption recovery: detect dead replica → decide whether to replace based on SLO math
+- [ ] Warm-up detection: ignore first 5 min of metrics before SLO projections
+- [ ] Verbose evolutionary trace logging (`--verbose`)
 
-### Orca Changes (new branch off Orca `main`, NOT `koi-integration`)
+**Orca (new branch `koi-compat` off `main`):**
+- [ ] `GET /resources` endpoint — instance catalog + quota pools (fix A100 40/80 VRAM)
+- [ ] Fix A100 40GB vs 80GB in `gpu_specs.py` + `config.py`
+- [ ] `call_koi` timeout to 300s (thread join + HTTP)
+- [ ] Per-replica metrics for heterogeneous replica types (verify A/B test works)
+- [ ] Final metrics fallback in `_assemble_output()` — ring buffer if summaries missing
+- [ ] `POST /job/complete` webhook to `KOI_SERVICE_URL`
+- [ ] `--quantization` flag in CLI (fp16 default)
 
-`koi-integration` was a prototype — won't be merged. Create a fresh branch (e.g., `koi-compat`) off Orca `main` with only the minimal changes Koi needs:
+### Future (NOT this version)
 
-- [ ] `GET /resources` endpoint — instance catalog + quota pools. Port from `koi-integration` but clean up (fix A100 40/80 VRAM, use SkyPilot pricing)
-- [ ] Fix A100 40GB vs 80GB in `gpu_specs.py` + `config.py` — `p4d.24xlarge` must report `gpu_memory_gb: 40`, not 80
-- [ ] Bump `call_koi` timeout to 300s (thread join + HTTP)
-- [ ] Per-replica metrics already exist (`GET /job/{id}/replicas/{rid}/metrics`) — verify they work for heterogeneous replica types (A/B test)
-- [ ] Final metrics fallback in `_assemble_output()` — read from ring buffer if replica summaries missing
-- [ ] (Optional) `POST /job/complete` webhook to `KOI_SERVICE_URL` — cleaner than polling
-
-This branch stays small and mergeable to Orca `main` independently of Koi's timeline.
-
-### Phase 2: Monitoring + A/B Testing
-
-- [ ] `koi/monitor.py` — SSE subscriber to Orca metrics, SLO tracking
-- [ ] A/B test orchestrator in agent tools (`scale_chain` + `compare_replicas`)
-- [ ] Background monitoring loop (agent watches all tracked jobs)
-- [ ] Orca webhook for job completion
-
-### Phase 3: Multi-Tenancy
-
+**Multi-tenancy:**
 - [ ] Cluster state tracker (all jobs, all resources, all SLOs)
 - [ ] Priority-based allocation in agent reasoning
 - [ ] Resource rebalancing (reassign GPUs when jobs complete)
 
+**Opportunistic exploration:**
+- [ ] SLO headroom-gated exploration on spot instances (AdaEvolve-inspired)
+- [ ] Momentum tracking in configuration space
+- [ ] Piggyback exploration (heterogeneous replica in DP≥3)
+
+**Dataset-aware chunking:**
+- [ ] Agent sets chunk_size as part of config (small for fault tolerance, large for throughput)
+
+**Budget enforcement:**
+- [ ] User specifies max spend, agent tracks cost accrual and scales down to stay under
+
+**Launch availability analytics:**
+- [ ] Orca `GET /analytics/launch_success_rate` endpoint
+- [ ] Soft availability model per (instance_type, region, time_of_day)
+
+**Agent framework swap:**
+- [ ] Evaluate LangGraph, OpenAI Agents SDK, OpenClaw for model-agnostic agent layer
+
+**PerfDB upgrade:**
+- [ ] Migrate from CSV to SQLite when >10K records
+
 ---
 
-## 11. Batch-Specific Gaps (Things We're Missing)
+## 11. Batch-Specific Details
 
-### Scale DOWN, not just up
+### Scale DOWN, not just up (Phase 1)
 
-The doc covers scaling up (FALLING_BEHIND → add replicas) and exploration (ON_TRACK + headroom → probe). But it doesn't cover **scaling down when you're over-provisioned.**
+Scaling down is as important as scaling up for `objective: cheapest`. When over-provisioned, shed excess replicas.
 
 Scenario: Agent launches DP=4 to meet an 8hr SLO. After 1 hour, 40% of tokens are done. Projected ETA: 2.5h. That's 5.5 hours of headroom — you're burning 4× GPU cost for no reason.
 
@@ -1034,9 +1052,9 @@ Record: "Learned: for 5K requests on Qwen-72B, DP=2 is sufficient for 8hr SLO"
 
 This is the **cheapest** objective in action — not just picking the cheapest config upfront, but actively shedding excess capacity mid-job.
 
-### Spot preemption recovery
+### Spot preemption recovery (Phase 1)
 
-Batch jobs on spots WILL get preempted. The doc mentions spots for exploration but doesn't address what happens when a PRIMARY replica on spot gets killed.
+Batch jobs on spots WILL get preempted. When a replica dies, agent decides whether to replace based on SLO math.
 
 ```
 Monitoring detects: replica-3 stopped reporting metrics for 30s
