@@ -1101,10 +1101,33 @@ if elapsed_minutes < 5 and throughput_variance > 0.15:
 
 1. **Claude Agent SDK for now, abstracted for swap.** Claude's tool use and retrieval quality is unmatched today — use it. But wrap the agent behind an `AgentLLM` interface so we can swap to open-source models (Llama, Qwen) or other SDKs later without rewriting the tools. The tools themselves are model-agnostic (SQL queries, HTTP calls) — only the reasoning layer cares which LLM is driving. Future: evaluate LangGraph (production-mature, model-agnostic, persistent state), OpenAI Agents SDK (supports 100+ models since v0.10), and OpenClaw (fast-growing OSS agent, but more consumer-facing — needs assessment for structured tool dispatch). Key criteria: tool use quality on structured data, latency, cost, and ability to run locally.
 
-2. **PerfDB as SQLite or keep as CSV?** SQLite gives indexing, joins, aggregates. CSV is simpler but agent would need pandas. For 300 records CSV is fine, for 10K+ we need SQLite.
+2. **PerfDB stays as CSV for now.** 300 records is fine for pandas. Agent's `query_perfdb` tool reads CSV via pandas filters. Migrate to SQLite when we hit 10K+ records or need joins across tables.
 
-3. **Memory retention policy?** How long do we keep outcomes? Do rules expire? If a GPU type gets a firmware update that changes performance, old rules become stale.
+3. **Memory retention: 30-day rolling window + monthly summary.** Raw outcomes kept for 30 days (full detail for recent decisions). Every 30 days, agent summarizes old outcomes into rules and frontier updates, then archives raw records. Rules persist indefinitely but carry a `last_confirmed` timestamp — agent weights recent confirmations higher. Stale rules (not confirmed in 90 days) get demoted, not deleted.
 
-4. **Agent cost per decision?** Claude Agent SDK calls are billed per token. A single agent decision with 5 tool calls might cost $0.05-0.10. At 1000 jobs/day that's $50-100/day. Is that acceptable vs the savings from better placement?
+4. **Agent cost per decision: acceptable.** ~$0.05-0.10 per decision, $50-100/day at 1000 jobs. Trivial compared to GPU savings from better placement (a single $40/hr → $14/hr improvement on one job pays for a day of agent costs).
 
-5. **Exploration budget?** What fraction of jobs should be exploratory (trying new configs to expand knowledge)? Too low = slow learning. Too high = SLO risk.
+5. **Observability: verbose evolutionary trace for demos.** Every decision must be traceable — not just the final config, but the full reasoning chain. `--verbose` mode prints:
+   ```
+   [Koi] Job job-abc123: Qwen/Qwen2.5-72B-Instruct, 5K reqs, SLO=8h, objective=cheapest
+   [Koi] Memory hit: 3 past outcomes for this model
+   [Koi]   outcome-1: A100-80GB TP=8 PP=1 → 1498 TPS, $45 total, SLO met ✓
+   [Koi]   outcome-2: L40S TP=4 PP=2 → 833 TPS, $33 total, SLO met ✓ ← cheapest known
+   [Koi]   outcome-3: A100-40GB TP=4 → FAILED (OOM) — rule: "TP>=8 on A100-40GB for 72B"
+   [Koi] PerfDB: 12 direct records, 8 proxy (Llama-70B, dist=0.02)
+   [Koi] Resources: 80 L40S, 32 A100-80GB, 16 H100 available
+   [Koi] Physics: io_ratio=0.93 → balanced workload, bandwidth matters
+   [Koi] Agent decision: L40S TP=4 PP=2 DP=1 — $33 total (cheapest from memory)
+   [Koi]   confidence: 92% (memory-backed, 2 prior successes)
+   [Koi]   alternative rejected: A100-80GB TP=8 ($45, 36% more expensive)
+   [Koi] Launching via Orca...
+   [Koi] Monitoring: ON_TRACK (2400 TPS, headroom=85%)
+   [Koi] Piggyback probe: launched 1× A10G TP=4 PP=4 (spot, $5.67/hr)
+   [Koi] Probe result: A10G gets 280 TPS at $5.67/hr → $5.63/M tokens (worse than L40S $4.46)
+   [Koi] Probe killed. Memory updated: "A10G too slow for 72B batch at this io_ratio"
+   [Koi] Job completed: 833 TPS actual, $33.12 total, SLO met ✓ (2.5h / 8h)
+   [Koi] Evolution: memory now has 4 outcomes for Qwen-72B. Frontier: L40S TP=4 PP=2 @ $4.46/M
+   ```
+   This trace is the demo. It shows memory recall, physics reasoning, exploration, and learning in one job. Saved to a log file per job for post-hoc analysis.
+
+6. **Exploration budget: user-configurable.** Default 10% of jobs can be exploratory. User can set `--explore-budget 0.2` (aggressive learning) or `--explore-budget 0` (no exploration, pure exploit). Exposed as a parameter in the `/decide` request, stored per-user in memory.
