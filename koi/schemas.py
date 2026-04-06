@@ -51,8 +51,10 @@ class MonitoringStatus(str, Enum):
     AT_RISK = "at_risk"                 # SLO headroom 10-30%
     FALLING_BEHIND = "falling_behind"   # SLO headroom < 10%
     OVER_PROVISIONED = "over_provisioned"  # headroom > 70% AND elapsed > 20%
-    COMPLETED = "completed"
-    FAILED = "failed"
+    CHAIN_END = "chain_end"             # chain terminated (swap/scale/kill)
+    LAUNCH_FAILED = "launch_failed"     # instance failed to start
+    COMPLETED = "completed"             # job completed (all chunks done)
+    FAILED = "failed"                   # job failed
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +295,9 @@ class AgentDecision(BaseModel):
 # ---------------------------------------------------------------------------
 
 class JobTracker(BaseModel):
-    """In-memory state for a tracked running job."""
+    """In-memory state for a tracked running job. Links to memory via decision_id."""
     job_id: str
+    decision_id: Optional[str] = None   # links to memory.decisions table (current chain)
     config: PlacementConfig
     slo_deadline_hours: float
     total_tokens: int

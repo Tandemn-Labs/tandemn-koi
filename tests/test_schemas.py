@@ -29,6 +29,8 @@ class TestEnums:
         assert MonitoringStatus.WARMING_UP.value == "warming_up"
         assert MonitoringStatus.OVER_PROVISIONED.value == "over_provisioned"
         assert MonitoringStatus.FALLING_BEHIND.value == "falling_behind"
+        assert MonitoringStatus.CHAIN_END.value == "chain_end"
+        assert MonitoringStatus.LAUNCH_FAILED.value == "launch_failed"
 
 
 class TestJobRequest:
@@ -198,6 +200,24 @@ class TestJobTracker:
         assert tracker.status == MonitoringStatus.WARMING_UP
         assert tracker.slo_headroom_pct == 100.0
         assert tracker.warmup_complete is False
+        assert tracker.decision_id is None  # not linked yet
+
+    def test_with_decision_id(self):
+        cfg = PlacementConfig(
+            gpu_type="L40S", instance_type="g6e.12xlarge",
+            num_gpus=8, num_instances=2, tp=4, pp=2, dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=2),
+        )
+        tracker = JobTracker(
+            job_id="job-abc",
+            decision_id="dec-12345678",
+            config=cfg,
+            slo_deadline_hours=8.0,
+            total_tokens=7_500_000,
+            predicted_tps=2590.0,
+        )
+        assert tracker.decision_id == "dec-12345678"
 
 
 class TestMonitoringTrigger:
