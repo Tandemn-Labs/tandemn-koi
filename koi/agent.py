@@ -11,7 +11,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from anthropic import AsyncAnthropic, beta_tool
+from anthropic import AsyncAnthropic, beta_async_tool
 
 from koi.schemas import (
     AgentDecision, DataSource, EngineConfig, JobRequest,
@@ -106,8 +106,8 @@ class KoiAgent:
         perfdb = self.perfdb
         memory = self.memory
 
-        @beta_tool
-        def query_perfdb(
+        @beta_async_tool
+        async def query_perfdb(
             model_name: Optional[str] = None,
             gpu_type: Optional[str] = None,
             tp: Optional[int] = None,
@@ -123,8 +123,8 @@ class KoiAgent:
                        tp=tp, pp=pp, io_ratio_min=io_ratio_min, io_ratio_max=io_ratio_max,
                        sort_by=sort_by, limit=limit)
 
-        @beta_tool
-        def query_memory_tool(
+        @beta_async_tool
+        async def query_memory_tool(
             model_name: Optional[str] = None,
             status: Optional[str] = None,
             limit: int = 10,
@@ -133,21 +133,21 @@ class KoiAgent:
             from koi.tools.memory import query_memory as _qm
             return _qm(memory, model_name=model_name, status=status, limit=limit)
 
-        @beta_tool
-        def get_gpu_physics_tool(
+        @beta_async_tool
+        async def get_gpu_physics_tool(
             gpu_type: str,
             model_name: Optional[str] = None,
         ) -> str:
             """Get GPU hardware specs (bandwidth, TFLOPS, VRAM). If model_name provided, shows per-TP VRAM analysis."""
             return get_gpu_physics(gpu_type, model_name=model_name)
 
-        @beta_tool
-        def get_model_arch_tool(model_name: str) -> str:
+        @beta_async_tool
+        async def get_model_arch_tool(model_name: str) -> str:
             """Get model architecture: params, layers, heads, KV heads, GQA ratio, size. Fetches from HF Hub if unknown."""
             return get_model_arch(model_name)
 
-        @beta_tool
-        def find_similar_models_tool(model_name: str) -> str:
+        @beta_async_tool
+        async def find_similar_models_tool(model_name: str) -> str:
             """Find PerfDB models with similar architecture (by physics-vector distance). Use when target model has no PerfDB data."""
             mf = get_model_features(model_name)
             perfdb_models = perfdb.get_distinct_models()
@@ -162,16 +162,16 @@ class KoiAgent:
                 )
             return "\n".join(lines)
 
-        @beta_tool
-        def get_resources_tool() -> str:
+        @beta_async_tool
+        async def get_resources_tool() -> str:
             """Get available GPU resources (types, counts, VRAM, cost, regions) from the cluster."""
             if resource_map:
                 from koi.tools.resources import get_resources as _gr
                 return _gr(resource_map)
             return "No resource map available. Resources should be in prompt context."
 
-        @beta_tool
-        def record_outcome_tool(
+        @beta_async_tool
+        async def record_outcome_tool(
             decision_id: str,
             job_id: str,
             status: str,
