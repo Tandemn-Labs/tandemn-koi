@@ -404,10 +404,29 @@ This is NOT the same as Orca's raw telemetry (1Hz, in-memory). Chain snapshots a
 
 **How the agent uses memory:**
 
-1. **Before deciding**: `query_memory(model="Qwen-72B", gpu="L40S")` → "Last time we ran this on L40S TP=4, it succeeded with 833 TPS and cost $33 total"
-2. **Before deciding**: `query_memory(status="failed", model="Qwen-72B")` → "A100-40GB TP=4 OOMed — rule: always use TP>=8 on 40GB"
-3. **After chain ends**: `record_outcome(decision_id, actual_tps=1320, delta=-11.9%)` → per-chain prediction error
-4. **Rule extraction**: After N outcomes with similar patterns, agent proposes a rule
+Memory returns TWO tiers of information, with different trust levels:
+
+**Tier 1 — Outcomes (ground truth, highest trust):**
+Completed jobs with actual measured performance. These are verified data points.
+> "Qwen-72B on L40S TP=4 PP=2: **actual** 833 TPS, $33 total, SLO met ✓ (delta from prediction: -3.9%)"
+
+**Tier 2 — Decisions without outcomes (predictions, moderate trust):**
+Past decisions Koi made but jobs haven't completed yet (or no feedback received). Better than nothing — they show what Koi previously chose and at what confidence — but unverified.
+> "Qwen-72B on L40S TP=4 PP=2: **predicted** 528 TPS @ $20.98/hr, confidence=82% — no outcome yet"
+
+The agent should:
+- If Tier 1 outcome exists → reuse that config with HIGH confidence (90%+)
+- If only Tier 2 decisions exist → consider them but still verify against PerfDB/physics (same confidence as before)
+- If no memory at all → full exploration from PerfDB + physics (lowest confidence)
+
+**Agent workflow with memory:**
+
+1. **Before deciding**: `query_memory(model="Qwen-72B")` → returns both outcomes AND decisions
+2. **If outcomes exist**: "Last time this succeeded at 833 TPS on L40S TP=4" → reuse config, skip PerfDB
+3. **If only decisions exist**: "I predicted 528 TPS but no verification yet" → check PerfDB to confirm, same confidence
+4. **If failed outcomes exist**: "A100-40GB TP=4 OOMed" → avoid that config, check rules
+5. **After chain ends**: `record_outcome(decision_id, actual_tps=...)` → promotes decision to ground truth
+6. **Rule extraction**: After N outcomes with similar patterns, agent proposes a rule
 
 **Launch outcome tracking (per-attempt, not per-job):**
 
