@@ -356,12 +356,58 @@ CREATE TABLE rules (
 );
 ```
 
+**Memory is per-CHAIN, not per-job.**
+
+A job can go through multiple GPU configurations (chains) during its lifetime. Each chain is a separate learning data point:
+
+```
+Job job-abc (SLO=8h, Qwen-72B):
+  Chain 1: L40S TP=4 PP=2 DP=2    (0h → 3h, 833 TPS, then FALLING_BEHIND)
+  Chain 2: A100-80GB TP=4 PP=2     (3h → 3.1h, A/B test probe)
+  Chain 3: A100-80GB TP=4 PP=2     (3.1h → 5.5h, won A/B, completed)
+
+Memory records:
+  decision-1 → outcome: "L40S 833 TPS, fell behind at 3h" (chain 1)
+  decision-2 → outcome: "A100-80GB 2400 TPS, A/B winner" (chain 2)
+  decision-3 → outcome: "A100-80GB finished job, SLO met" (chain 3)
+```
+
+Each decision in the `decisions` table maps to one chain. The `outcomes` table records what happened for that specific chain, not the whole job. A `job_id` can have multiple `decision_id`s.
+
+**Chain snapshots — periodic memory updates DURING execution:**
+
+In addition to recording chain outcomes at end, Koi writes periodic snapshots of how each chain is performing. This creates a time series in memory:
+
+```sql
+CREATE TABLE chain_snapshots (
+    snapshot_id     TEXT PRIMARY KEY,
+    decision_id     TEXT REFERENCES decisions(decision_id),
+    job_id          TEXT NOT NULL,
+    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+    -- Performance at this moment
+    throughput_tps          REAL,
+    tokens_completed        INTEGER,
+    tokens_remaining        INTEGER,
+    elapsed_hours           REAL,
+    slo_headroom_pct        REAL,
+
+    -- GPU health at this moment
+    gpu_cache_usage_pct     REAL,
+    gpu_sm_util_pct         REAL,
+    gpu_mem_bw_util_pct     REAL,
+    num_requests_waiting    INTEGER
+);
+```
+
+This is NOT the same as Orca's raw telemetry (1Hz, in-memory). Chain snapshots are sampled every **2-5 minutes** and written to SQLite. They persist across restarts and give the agent historical context: "L40S performance degraded from 850→600 TPS over 2 hours as KV cache filled up."
+
 **How the agent uses memory:**
 
 1. **Before deciding**: `query_memory(model="Qwen-72B", gpu="L40S")` → "Last time we ran this on L40S TP=4, it succeeded with 833 TPS and cost $33 total"
 2. **Before deciding**: `query_memory(status="failed", model="Qwen-72B")` → "A100-40GB TP=4 OOMed — rule: always use TP>=8 on 40GB"
-3. **After completion**: `record_outcome(job_id, actual_tps=1320, predicted_tps=1498, delta=-11.9%)` → Oracle was 12% optimistic, store correction
-4. **Rule extraction**: After N outcomes with similar patterns, agent proposes a rule → "For models >70B on PCIe GPUs, actual throughput is 15-20% below analytical estimate"
+3. **After chain ends**: `record_outcome(decision_id, actual_tps=1320, delta=-11.9%)` → per-chain prediction error
+4. **Rule extraction**: After N outcomes with similar patterns, agent proposes a rule
 
 **Launch outcome tracking (per-attempt, not per-job):**
 
@@ -544,15 +590,89 @@ tracked_jobs[job_id] = {
 
 Every 10 seconds, a background asyncio task polls Orca for each tracked job, updates the state, and checks the trigger rules. **No LLM calls in the loop** — just arithmetic (`remaining_tokens / smoothed_tps`). The agent only wakes up when something needs a decision.
 
-**Cost of monitoring:** Near zero. It's one HTTP GET per job every 10s. For 10 concurrent jobs: 1 req/s to Orca. No LLM cost until something goes wrong.
+**Three separate async loops with DIFFERENT periods:**
 
-**When does the agent wake up?**
+These are architecturally distinct. Do NOT conflate them.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ LOOP 1: TELEMETRY POLLING (10s)                                  │
+│   Pure code, no LLM, no DB writes.                               │
+│   Fetches raw metrics from Orca, updates in-memory JobTracker.   │
+│   Computes SLO headroom. Checks trigger thresholds.              │
+│   Cost: ~0 (one HTTP GET per job per 10s)                        │
+│                                                                   │
+│ LOOP 2: MEMORY SNAPSHOT (2-5 min)                                │
+│   Pure code, no LLM. Writes current chain performance to         │
+│   chain_snapshots table in SQLite. Creates time series per chain. │
+│   Also records launch failures immediately (not periodic).        │
+│   Cost: ~0 (SQLite write)                                        │
+│                                                                   │
+│ LOOP 3: AGENT FEEDBACK (event-driven, NOT periodic)              │
+│   LLM invocation. ONLY fires on triggers:                        │
+│   - FALLING_BEHIND → agent diagnoses + proposes scale/swap       │
+│   - OVER_PROVISIONED → agent suggests replicas to kill           │
+│   - CHAIN_END → agent records chain outcome in memory            │
+│   - JOB_COMPLETE → agent records final outcome + extracts rules  │
+│   - LAUNCH_FAILED → agent records failure + adjusts strategy     │
+│   Cost: ~$0.05 per invocation (only when needed)                 │
+│                                                                   │
+│ KEY: Loops 1 and 2 run CONTINUOUSLY at their intervals.          │
+│      Loop 3 runs ONLY on events. They do NOT share a timer.      │
+└─────────────────────────────────────────────────────────────────┘
+
+Timeline for a healthy job:
+  t=0s    [L1] poll metrics → WARMING_UP
+  t=10s   [L1] poll metrics → WARMING_UP
+  ...
+  t=300s  [L1] poll metrics → ON_TRACK (warmup complete)
+  t=300s  [L2] snapshot chain → write to chain_snapshots
+  t=310s  [L1] poll metrics → ON_TRACK
+  ...
+  t=600s  [L2] snapshot chain → write to chain_snapshots
+  ...
+  t=3600s [L1] all chunks done → COMPLETED
+  t=3600s [L3] AGENT WAKES → record_outcome, extract rules ← ONLY LLM call
+
+Timeline for a struggling job:
+  t=300s  [L1] poll → ON_TRACK
+  t=600s  [L2] snapshot → TPS=800
+  t=900s  [L2] snapshot → TPS=650 (degrading!)
+  t=1000s [L1] poll → FALLING_BEHIND (headroom < 10%)
+  t=1000s [L3] AGENT WAKES → diagnoses KV cache pressure → proposes A/B test
+  t=1000s [L2] record: chain 1 ending (agent initiated scale-up)
+  t=1020s [L1] new replica detected → track both chains
+  t=1200s [L2] snapshot chain 1 (old): 500 TPS | snapshot chain 2 (new): 2400 TPS
+  t=1300s [L3] AGENT WAKES → A/B complete → kill chain 1, keep chain 2
+  t=1300s [L2] record: chain 1 outcome (lost A/B), chain 2 promoted
+```
+
+**Chain lifecycle events that update memory (Loop 2 + immediate):**
+
+| Event | When | What's written | Loop |
+|-------|------|----------------|------|
+| Chain starts | Replica(s) running, first metrics arrive | `decisions` row (predicted config) | Immediate |
+| Chain snapshot | Every 2-5 min while chain is alive | `chain_snapshots` row (TPS, headroom, GPU health) | Loop 2 |
+| Launch failed | Instance couldn't start | `launch_attempts` row (failure_reason) | Immediate |
+| Chain ends (swap/kill) | Replicas terminated | `outcomes` row (actual TPS, delta, per-CHAIN) | Immediate |
+| Job completes | All chunks done | `outcomes` row for final chain + job-level summary | Loop 3 (agent) |
+
+**Orca needs to tell Koi about chain lifecycle events.** Specifically:
+- When replicas launch successfully → chain started (Koi gets this from first metrics ingest)
+- When replicas are killed/swapped → chain ended (Koi detects this from replica state change in telemetry)
+- When job completes → already handled via webhook `POST /job/complete`
+
+No additional Orca API needed — Koi infers chain start/end from the replica state changes it already monitors in Loop 1.
+
+**When does the agent (Loop 3) wake up?**
 
 | Trigger | What happens | Agent cost |
 |---------|-------------|------------|
 | `FALLING_BEHIND` | Agent reads metrics + physics, decides whether to scale/swap/accept | ~$0.05 per invocation |
-| `COMPLETED` | Agent records outcome, extracts rules | ~$0.02 |
-| `FAILED` | Agent diagnoses failure, stores corrective action | ~$0.03 |
+| `OVER_PROVISIONED` | Agent suggests replicas to kill | ~$0.03 |
+| `CHAIN_END` | Agent records chain outcome in memory (may not need LLM — can be rule-based) | ~$0.02 or $0 |
+| `JOB_COMPLETE` | Agent records final outcome, extracts rules | ~$0.02 |
+| `LAUNCH_FAILED` | Agent records failure, adjusts strategy for retry | ~$0.03 |
 | `ON_TRACK` | Nothing. No agent call. | $0 |
 
 For a typical 8-hour batch job that runs smoothly: 0 agent calls during monitoring. One call at completion. Total monitoring cost: $0.02.
