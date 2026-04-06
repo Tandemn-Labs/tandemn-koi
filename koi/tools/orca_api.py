@@ -234,10 +234,10 @@ class OrcaClient:
 
 
 # ---------------------------------------------------------------------------
-# Agent tool functions
+# Agent tool functions (async — safe to call from tool_runner)
 # ---------------------------------------------------------------------------
 
-def launch_chain(
+async def async_launch_chain(
     orca: OrcaClient,
     model_name: str,
     input_file: str,
@@ -250,72 +250,50 @@ def launch_chain(
     num_requests: int,
     quantization: Optional[str] = None,
 ) -> str:
-    """
-    Launch a batch job via Orca. Returns job_id and status.
-    NOTE: This is sync wrapper — called from agent tool dispatch which runs in async context.
-    The actual HTTP call uses orca.submit_batch() which is async.
-    """
-    # This will be called via asyncio from the agent
-    import asyncio
-    result = asyncio.get_event_loop().run_until_complete(
-        orca.submit_batch(
-            model_name=model_name, input_file=input_file,
-            instance_type=instance_type, gpu_type=gpu_type,
-            tp=tp, pp=pp, dp=dp,
-            slo_deadline_hours=slo_deadline_hours,
-            avg_input_tokens=avg_input_tokens,
-            avg_output_tokens=avg_output_tokens,
-            num_requests=num_requests,
-            quantization=quantization,
-        )
+    """Launch a batch job via Orca. Returns job_id and status."""
+    result = await orca.submit_batch(
+        model_name=model_name, input_file=input_file,
+        instance_type=instance_type, gpu_type=gpu_type,
+        tp=tp, pp=pp, dp=dp,
+        slo_deadline_hours=slo_deadline_hours,
+        avg_input_tokens=avg_input_tokens,
+        avg_output_tokens=avg_output_tokens,
+        num_requests=num_requests,
+        quantization=quantization,
     )
     job_id = result.get("job_id", "unknown")
     status = result.get("status", "unknown")
     return f"Job launched: {job_id} (status={status})"
 
 
-def scale_chain(
+async def async_scale_chain(
     orca: OrcaClient,
     job_id: str,
     gpu_type: str, tp: int, pp: int,
     count: int,
 ) -> str:
-    """
-    Scale a running job. Positive count = add replicas. Negative = kill excess.
-    """
-    import asyncio
+    """Scale a running job. Positive count = add replicas. Negative = kill excess."""
     if count > 0:
-        result = asyncio.get_event_loop().run_until_complete(
-            orca.scale_job(job_id, gpu_type, tp, pp, count)
-        )
+        result = await orca.scale_job(job_id, gpu_type, tp, pp, count)
         return f"Scaled up: {count} replicas added. {result}"
     elif count < 0:
-        # Need to pick which replicas to kill — get replica list first
-        replicas_data = asyncio.get_event_loop().run_until_complete(
-            orca.get_replicas(job_id)
-        )
+        replicas_data = await orca.get_replicas(job_id)
         replicas = replicas_data.get("replicas", [])
-        active = [r["replica_id"] for r in replicas if r.get("phase") not in ("dead", "killed", "completed", "failed")]
-        to_kill = active[abs(count):]  # kill the last N
+        active = [r["replica_id"] for r in replicas
+                  if r.get("phase") not in ("dead", "killed", "completed", "failed")]
+        to_kill = active[:abs(count)]  # kill the first N (oldest)
         if not to_kill:
             return "No active replicas to kill."
-        result = asyncio.get_event_loop().run_until_complete(
-            orca.kill_replicas(job_id, to_kill)
-        )
+        result = await orca.kill_replicas(job_id, to_kill)
         return f"Scaled down: killed {len(to_kill)} replicas. {result}"
     else:
         return "count=0, no action taken."
 
 
-def get_job_metrics_tool(orca: OrcaClient, job_id: str) -> str:
+async def async_get_job_metrics(orca: OrcaClient, job_id: str) -> str:
     """Get live metrics + chunk progress for a running job."""
-    import asyncio
-    metrics = asyncio.get_event_loop().run_until_complete(
-        orca.get_job_metrics(job_id)
-    )
-    progress = asyncio.get_event_loop().run_until_complete(
-        orca.get_chunk_progress(job_id)
-    )
+    metrics = await orca.get_job_metrics(job_id)
+    progress = await orca.get_chunk_progress(job_id)
 
     tps = metrics.get("avg_generation_throughput_toks_per_s", 0)
     cache = metrics.get("gpu_cache_usage_perc", 0)
