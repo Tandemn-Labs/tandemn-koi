@@ -1,10 +1,9 @@
 """
 koi/tools/memory.py — Agentic Memory backed by SQLite.
 
-Four tables:
-  decisions       — every config Koi proposes (with predictions + context)
+Three tables:
+  decisions       — every config Koi proposes (with predictions)
   outcomes        — what actually happened (ground truth)
-  rules           — learned patterns extracted from outcomes
   launch_attempts — per-attempt launch success/failure tracking
 """
 
@@ -23,7 +22,6 @@ class AgenticMemory:
         self.db_path = db_path
         if db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        # Keep a persistent connection (required for :memory: databases)
         self._persistent_conn = sqlite3.connect(db_path)
         self._persistent_conn.row_factory = sqlite3.Row
         if db_path != ":memory:":
@@ -37,112 +35,76 @@ class AgenticMemory:
         conn = self._conn()
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS decisions (
-                decision_id     TEXT PRIMARY KEY,
-                job_id          TEXT NOT NULL,
-                timestamp       TEXT DEFAULT (datetime('now')),
-                model_name      TEXT NOT NULL,
-                instance_type   TEXT NOT NULL,
-                gpu_type        TEXT NOT NULL,
-                tp              INTEGER NOT NULL,
-                pp              INTEGER NOT NULL,
-                dp              INTEGER NOT NULL,
-                num_gpus        INTEGER NOT NULL,
-                quantization    TEXT,
-                predicted_tps           REAL,
+                decision_id          TEXT PRIMARY KEY,
+                job_id               TEXT NOT NULL,
+                timestamp            TEXT DEFAULT (datetime('now')),
+                model_name           TEXT NOT NULL,
+                instance_type        TEXT NOT NULL,
+                gpu_type             TEXT NOT NULL,
+                tp                   INTEGER NOT NULL,
+                pp                   INTEGER NOT NULL,
+                dp                   INTEGER NOT NULL,
+                num_gpus             INTEGER NOT NULL,
+                quantization         TEXT,
+                predicted_tps        REAL,
                 predicted_cost_per_hour REAL,
-                predicted_total_cost    REAL,
+                predicted_total_cost REAL,
                 predicted_runtime_hours REAL,
-                prediction_confidence   REAL,
-                prediction_source       TEXT,
-                slo_deadline_hours      REAL,
-                objective               TEXT,
-                avg_input_tokens        INTEGER,
-                avg_output_tokens       INTEGER,
-                num_requests            INTEGER,
-                quota_snapshot          TEXT,
-                other_jobs_running      TEXT,
-                why_this_config         TEXT,
-                alternatives_considered TEXT
+                prediction_confidence REAL,
+                prediction_source    TEXT,
+                slo_deadline_hours   REAL,
+                objective            TEXT,
+                avg_input_tokens     INTEGER,
+                avg_output_tokens    INTEGER,
+                num_requests         INTEGER,
+                triggered_by         TEXT DEFAULT 'user',
+                parent_decision_id   TEXT,
+                market               TEXT DEFAULT 'on_demand'
             );
 
             CREATE TABLE IF NOT EXISTS outcomes (
-                outcome_id      TEXT PRIMARY KEY,
-                decision_id     TEXT REFERENCES decisions(decision_id),
-                job_id          TEXT NOT NULL,
-                timestamp       TEXT DEFAULT (datetime('now')),
-                status          TEXT NOT NULL,
-                actual_tps              REAL,
-                actual_cost_per_hour    REAL,
-                actual_total_cost       REAL,
-                actual_runtime_hours    REAL,
-                actual_tpot_ms          REAL,
-                actual_cost_per_m_tokens REAL,
-                delta_tps_pct           REAL,
-                delta_cost_pct          REAL,
-                slo_met                 INTEGER,
-                slo_headroom_pct        REAL,
-                failure_reason          TEXT,
-                failure_category        TEXT,
-                failure_detail          TEXT,
-                corrective_action       TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS rules (
-                rule_id         TEXT PRIMARY KEY,
-                created_at      TEXT DEFAULT (datetime('now')),
-                updated_at      TEXT DEFAULT (datetime('now')),
-                rule_text       TEXT NOT NULL,
-                rule_type       TEXT NOT NULL,
-                confidence      REAL,
-                evidence_count  INTEGER DEFAULT 1,
-                model_pattern   TEXT,
-                gpu_pattern     TEXT,
-                workload_pattern TEXT,
-                derived_from    TEXT
+                outcome_id           TEXT PRIMARY KEY,
+                decision_id          TEXT REFERENCES decisions(decision_id),
+                job_id               TEXT NOT NULL,
+                timestamp            TEXT DEFAULT (datetime('now')),
+                status               TEXT NOT NULL,
+                actual_tps           REAL,
+                actual_cost_per_hour REAL,
+                actual_total_cost    REAL,
+                actual_runtime_hours REAL,
+                delta_tps_pct        REAL,
+                delta_cost_pct       REAL,
+                slo_met              INTEGER,
+                slo_headroom_pct     REAL,
+                failure_category     TEXT,
+                diagnosis            TEXT,
+                bottleneck           TEXT,
+                diff_from_parent     TEXT
             );
 
             CREATE TABLE IF NOT EXISTS launch_attempts (
-                attempt_id      TEXT PRIMARY KEY,
-                decision_id     TEXT REFERENCES decisions(decision_id),
-                job_id          TEXT NOT NULL,
-                timestamp       TEXT DEFAULT (datetime('now')),
-                instance_type   TEXT NOT NULL,
-                gpu_type        TEXT NOT NULL,
-                region          TEXT NOT NULL,
-                market          TEXT NOT NULL,
-                count           INTEGER NOT NULL,
-                launched        INTEGER NOT NULL,
-                time_to_launch  REAL,
-                failure_reason  TEXT,
-                quota_available INTEGER,
+                attempt_id           TEXT PRIMARY KEY,
+                decision_id          TEXT REFERENCES decisions(decision_id),
+                job_id               TEXT NOT NULL,
+                timestamp            TEXT DEFAULT (datetime('now')),
+                instance_type        TEXT NOT NULL,
+                gpu_type             TEXT NOT NULL,
+                region               TEXT NOT NULL,
+                market               TEXT NOT NULL,
+                count                INTEGER NOT NULL,
+                launched             INTEGER NOT NULL,
+                time_to_launch       REAL,
+                failure_reason       TEXT,
+                quota_available      INTEGER,
                 other_jobs_in_region TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS chain_snapshots (
-                snapshot_id     TEXT PRIMARY KEY,
-                decision_id     TEXT REFERENCES decisions(decision_id),
-                job_id          TEXT NOT NULL,
-                timestamp       TEXT DEFAULT (datetime('now')),
-                throughput_tps          REAL,
-                tokens_completed        INTEGER,
-                tokens_remaining        INTEGER,
-                elapsed_hours           REAL,
-                slo_headroom_pct        REAL,
-                gpu_cache_usage_pct     REAL,
-                gpu_sm_util_pct         REAL,
-                gpu_mem_bw_util_pct     REAL,
-                num_requests_waiting    INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_decisions_model ON decisions(model_name);
             CREATE INDEX IF NOT EXISTS idx_outcomes_job ON outcomes(job_id);
             CREATE INDEX IF NOT EXISTS idx_outcomes_status ON outcomes(status);
             CREATE INDEX IF NOT EXISTS idx_launch_instance ON launch_attempts(instance_type, region);
-            CREATE INDEX IF NOT EXISTS idx_snapshots_decision ON chain_snapshots(decision_id);
-            CREATE INDEX IF NOT EXISTS idx_snapshots_job ON chain_snapshots(job_id);
         """)
         conn.commit()
-        # connection kept open (persistent)
 
     # ------------------------------------------------------------------
     # Write operations
@@ -160,10 +122,9 @@ class AgenticMemory:
         prediction_confidence: float = 0.5,
         prediction_source: str = "analytical",
         quantization: Optional[str] = None,
-        quota_snapshot: Optional[dict] = None,
-        other_jobs_running: Optional[list] = None,
-        why_this_config: str = "",
-        alternatives_considered: Optional[list] = None,
+        triggered_by: str = "user",
+        parent_decision_id: Optional[str] = None,
+        market: str = "on_demand",
     ) -> str:
         decision_id = f"dec-{uuid.uuid4().hex[:8]}"
         conn = self._conn()
@@ -174,23 +135,17 @@ class AgenticMemory:
                 predicted_tps, predicted_cost_per_hour, predicted_total_cost,
                 predicted_runtime_hours, prediction_confidence, prediction_source,
                 slo_deadline_hours, objective, avg_input_tokens, avg_output_tokens,
-                num_requests, quota_snapshot, other_jobs_running,
-                why_this_config, alternatives_considered
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                num_requests, triggered_by, parent_decision_id, market
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             decision_id, job_id, model_name, instance_type, gpu_type,
             tp, pp, dp, num_gpus, quantization,
             predicted_tps, predicted_cost_per_hour, predicted_total_cost,
             predicted_runtime_hours, prediction_confidence, prediction_source,
             slo_deadline_hours, objective, avg_input_tokens, avg_output_tokens,
-            num_requests,
-            json.dumps(quota_snapshot) if quota_snapshot else None,
-            json.dumps(other_jobs_running) if other_jobs_running else None,
-            why_this_config,
-            json.dumps(alternatives_considered) if alternatives_considered else None,
+            num_requests, triggered_by, parent_decision_id, market,
         ))
         conn.commit()
-        # connection kept open (persistent)
         return decision_id
 
     def record_outcome(
@@ -199,14 +154,12 @@ class AgenticMemory:
         actual_cost_per_hour: Optional[float] = None,
         actual_total_cost: Optional[float] = None,
         actual_runtime_hours: Optional[float] = None,
-        actual_tpot_ms: Optional[float] = None,
-        actual_cost_per_m_tokens: Optional[float] = None,
         slo_met: Optional[bool] = None,
         slo_headroom_pct: Optional[float] = None,
-        failure_reason: Optional[str] = None,
         failure_category: Optional[str] = None,
-        failure_detail: Optional[str] = None,
-        corrective_action: Optional[str] = None,
+        diagnosis: Optional[str] = None,
+        bottleneck: Optional[str] = None,
+        diff_from_parent: Optional[str] = None,
     ) -> str:
         outcome_id = f"out-{uuid.uuid4().hex[:8]}"
 
@@ -227,21 +180,20 @@ class AgenticMemory:
             INSERT INTO outcomes (
                 outcome_id, decision_id, job_id, status,
                 actual_tps, actual_cost_per_hour, actual_total_cost,
-                actual_runtime_hours, actual_tpot_ms, actual_cost_per_m_tokens,
+                actual_runtime_hours,
                 delta_tps_pct, delta_cost_pct, slo_met, slo_headroom_pct,
-                failure_reason, failure_category, failure_detail, corrective_action
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                failure_category, diagnosis, bottleneck, diff_from_parent
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             outcome_id, decision_id, job_id, status,
             actual_tps, actual_cost_per_hour, actual_total_cost,
-            actual_runtime_hours, actual_tpot_ms, actual_cost_per_m_tokens,
+            actual_runtime_hours,
             delta_tps_pct, delta_cost_pct,
             int(slo_met) if slo_met is not None else None,
             slo_headroom_pct,
-            failure_reason, failure_category, failure_detail, corrective_action,
+            failure_category, diagnosis, bottleneck, diff_from_parent,
         ))
         conn.commit()
-        # connection kept open (persistent)
         return outcome_id
 
     def record_launch_attempt(
@@ -270,83 +222,11 @@ class AgenticMemory:
             json.dumps(other_jobs_in_region) if other_jobs_in_region else None,
         ))
         conn.commit()
-        # connection kept open (persistent)
         return attempt_id
-
-    def add_rule(
-        self, rule_text: str, rule_type: str,
-        confidence: float = 0.5, evidence_count: int = 1,
-        model_pattern: Optional[str] = None,
-        gpu_pattern: Optional[str] = None,
-        workload_pattern: Optional[str] = None,
-        derived_from: Optional[list] = None,
-    ) -> str:
-        rule_id = f"rule-{uuid.uuid4().hex[:8]}"
-        conn = self._conn()
-        conn.execute("""
-            INSERT INTO rules (
-                rule_id, rule_text, rule_type, confidence, evidence_count,
-                model_pattern, gpu_pattern, workload_pattern, derived_from
-            ) VALUES (?,?,?,?,?,?,?,?,?)
-        """, (
-            rule_id, rule_text, rule_type, confidence, evidence_count,
-            model_pattern, gpu_pattern, workload_pattern,
-            json.dumps(derived_from) if derived_from else None,
-        ))
-        conn.commit()
-        # connection kept open (persistent)
-        return rule_id
-
-    def record_chain_snapshot(
-        self, decision_id: str, job_id: str,
-        throughput_tps: float = 0.0,
-        tokens_completed: int = 0,
-        tokens_remaining: int = 0,
-        elapsed_hours: float = 0.0,
-        slo_headroom_pct: float = 0.0,
-        gpu_cache_usage_pct: float = 0.0,
-        gpu_sm_util_pct: float = 0.0,
-        gpu_mem_bw_util_pct: float = 0.0,
-        num_requests_waiting: int = 0,
-    ) -> str:
-        snapshot_id = f"snap-{uuid.uuid4().hex[:8]}"
-        conn = self._conn()
-        conn.execute("""
-            INSERT INTO chain_snapshots (
-                snapshot_id, decision_id, job_id,
-                throughput_tps, tokens_completed, tokens_remaining,
-                elapsed_hours, slo_headroom_pct,
-                gpu_cache_usage_pct, gpu_sm_util_pct, gpu_mem_bw_util_pct,
-                num_requests_waiting
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            snapshot_id, decision_id, job_id,
-            throughput_tps, tokens_completed, tokens_remaining,
-            elapsed_hours, slo_headroom_pct,
-            gpu_cache_usage_pct, gpu_sm_util_pct, gpu_mem_bw_util_pct,
-            num_requests_waiting,
-        ))
-        conn.commit()
-        # connection kept open (persistent)
-        return snapshot_id
 
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
-
-    def query_chain_snapshots(
-        self, decision_id: str, limit: int = 50,
-    ) -> List[Dict[str, Any]]:
-        """Get time series of chain snapshots for a specific chain."""
-        conn = self._conn()
-        rows = conn.execute("""
-            SELECT * FROM chain_snapshots
-            WHERE decision_id = ?
-            ORDER BY timestamp ASC
-            LIMIT ?
-        """, (decision_id, limit)).fetchall()
-        # connection kept open (persistent)
-        return [dict(r) for r in rows]
 
     def query_decisions(
         self, model_name: Optional[str] = None,
@@ -356,7 +236,7 @@ class AgenticMemory:
         conn = self._conn()
         query = """
             SELECT d.*, o.status, o.actual_tps, o.actual_total_cost,
-                   o.delta_tps_pct, o.slo_met, o.failure_reason
+                   o.delta_tps_pct, o.slo_met, o.diagnosis
             FROM decisions d
             LEFT JOIN outcomes o ON d.decision_id = o.decision_id
             WHERE 1=1
@@ -372,7 +252,6 @@ class AgenticMemory:
         params.append(limit)
 
         rows = conn.execute(query, params).fetchall()
-        # connection kept open (persistent)
         return [dict(r) for r in rows]
 
     def query_outcomes(
@@ -399,26 +278,6 @@ class AgenticMemory:
         params.append(limit)
 
         rows = conn.execute(query, params).fetchall()
-        # connection kept open (persistent)
-        return [dict(r) for r in rows]
-
-    def query_rules(
-        self, model_pattern: Optional[str] = None,
-        gpu_pattern: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        conn = self._conn()
-        query = "SELECT * FROM rules WHERE 1=1"
-        params: list = []
-        if model_pattern:
-            query += " AND (model_pattern IS NULL OR model_pattern LIKE ?)"
-            params.append(f"%{model_pattern}%")
-        if gpu_pattern:
-            query += " AND (gpu_pattern IS NULL OR gpu_pattern LIKE ?)"
-            params.append(f"%{gpu_pattern}%")
-        query += " ORDER BY confidence DESC, evidence_count DESC"
-
-        rows = conn.execute(query, params).fetchall()
-        # connection kept open (persistent)
         return [dict(r) for r in rows]
 
     def get_launch_success_rate(
@@ -439,7 +298,6 @@ class AgenticMemory:
             params.append(region)
 
         row = conn.execute(query, params).fetchone()
-        # connection kept open (persistent)
         attempts = row["attempts"] or 0
         succeeded = row["succeeded"] or 0
         return {
@@ -455,19 +313,11 @@ class AgenticMemory:
     def decision_count(self) -> int:
         conn = self._conn()
         row = conn.execute("SELECT COUNT(*) as n FROM decisions").fetchone()
-        # connection kept open (persistent)
         return row["n"]
 
     def outcome_count(self) -> int:
         conn = self._conn()
         row = conn.execute("SELECT COUNT(*) as n FROM outcomes").fetchone()
-        # connection kept open (persistent)
-        return row["n"]
-
-    def rule_count(self) -> int:
-        conn = self._conn()
-        row = conn.execute("SELECT COUNT(*) as n FROM rules").fetchone()
-        # connection kept open (persistent)
         return row["n"]
 
 
@@ -480,10 +330,9 @@ def query_memory(
     model_name: Optional[str] = None,
     instance_type: Optional[str] = None,
     status: Optional[str] = None,
-    include_rules: bool = True,
     limit: int = 10,
 ) -> str:
-    """Query Koi's memory for past decisions, outcomes, and rules."""
+    """Query Koi's memory for past decisions and outcomes."""
     lines = []
 
     # Past outcomes (ground truth from completed jobs)
@@ -493,7 +342,11 @@ def query_memory(
         for o in outcomes:
             slo = "SLO met" if o.get("slo_met") else "SLO missed"
             delta = f"delta={o['delta_tps_pct']:+.1f}%" if o.get("delta_tps_pct") is not None else ""
-            fail = f" FAILED: {o.get('failure_reason', '?')}" if o.get("status") == "failed" else ""
+            if o.get("status") == "failed":
+                bottleneck = f"[{o.get('bottleneck', '?')}] " if o.get("bottleneck") else ""
+                fail = f" FAILED: {bottleneck}{o.get('diagnosis', '?')}"
+            else:
+                fail = ""
             lines.append(
                 f"  {o.get('model_name','?')} | {o.get('gpu_type','?')} TP={o.get('tp',1)} PP={o.get('pp',1)} | "
                 f"TPS={o.get('actual_tps','?')} (pred={o.get('predicted_tps','?')}) {delta} | "
@@ -513,25 +366,16 @@ def query_memory(
                 result = f"→ {outcome_status}"
             else:
                 result = "→ no outcome yet (job may still be running)"
+            triggered = f" [{dec.get('triggered_by', 'user')}]" if dec.get("triggered_by") != "user" else ""
+            market = f" {dec.get('market', '')}" if dec.get("market") == "spot" else ""
             lines.append(
-                f"  {dec.get('model_name','?')} | {dec.get('gpu_type','?')} TP={dec.get('tp',1)} PP={dec.get('pp',1)} DP={dec.get('dp',1)} | "
+                f"  {dec.get('model_name','?')} | {dec.get('gpu_type','?')} TP={dec.get('tp',1)} PP={dec.get('pp',1)} DP={dec.get('dp',1)}{market} | "
                 f"predicted={dec.get('predicted_tps','?')} TPS @ ${dec.get('predicted_cost_per_hour','?')}/hr | "
-                f"conf={dec.get('prediction_confidence','?')} ({dec.get('prediction_source','?')}) {result}"
+                f"conf={dec.get('prediction_confidence','?')} ({dec.get('prediction_source','?')}){triggered} {result}"
             )
 
     if not outcomes and not decisions:
         lines.append(f"No memory found for model={model_name or 'any'}. This is the first time Koi has seen this model.")
-
-    # Rules
-    if include_rules:
-        rules = memory.query_rules(model_pattern=model_name, gpu_pattern=instance_type)
-        if rules:
-            lines.append(f"\nLEARNED RULES ({len(rules)} found):")
-            for r in rules[:5]:
-                lines.append(
-                    f"  [{r['rule_type']}] {r['rule_text']} "
-                    f"(confidence={r['confidence']:.0%}, evidence={r['evidence_count']})"
-                )
 
     return "\n".join(lines)
 
@@ -545,14 +389,15 @@ def record_outcome_tool(
     actual_cost_per_hour: Optional[float] = None,
     actual_total_cost: Optional[float] = None,
     actual_runtime_hours: Optional[float] = None,
-    failure_reason: Optional[str] = None,
     failure_category: Optional[str] = None,
+    diagnosis: Optional[str] = None,
+    bottleneck: Optional[str] = None,
 ) -> str:
     """Record job outcome in Koi's memory."""
     outcome_id = memory.record_outcome(
         decision_id=decision_id, job_id=job_id, status=status,
         actual_tps=actual_tps, actual_cost_per_hour=actual_cost_per_hour,
         actual_total_cost=actual_total_cost, actual_runtime_hours=actual_runtime_hours,
-        failure_reason=failure_reason, failure_category=failure_category,
+        failure_category=failure_category, diagnosis=diagnosis, bottleneck=bottleneck,
     )
     return f"Outcome recorded: {outcome_id} (status={status})"

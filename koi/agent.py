@@ -193,15 +193,19 @@ class KoiAgent:
             status: str,
             actual_tps: Optional[float] = None,
             actual_cost_per_hour: Optional[float] = None,
-            failure_reason: Optional[str] = None,
             failure_category: Optional[str] = None,
+            diagnosis: Optional[str] = None,
+            bottleneck: Optional[str] = None,
         ) -> str:
-            """Record a job/chain outcome in Koi's memory. Call this when a chain ends or job completes."""
+            """Record a job/chain outcome in Koi's memory. Call this when a chain ends or job completes.
+            diagnosis: narrative of what happened ('KV cache hit 92%, bandwidth-bound. Try A100.')
+            bottleneck: 'memory_bound' | 'compute_bound' | 'kv_cache' | 'network' | 'unknown'"""
             from koi.tools.memory import record_outcome_tool as _rot
             return _rot(memory, decision_id=decision_id, job_id=job_id,
                        status=status, actual_tps=actual_tps,
                        actual_cost_per_hour=actual_cost_per_hour,
-                       failure_reason=failure_reason, failure_category=failure_category)
+                       failure_category=failure_category, diagnosis=diagnosis,
+                       bottleneck=bottleneck)
 
         return [query_perfdb, query_memory_tool, get_gpu_physics_tool,
                 get_model_arch_tool, find_similar_models_tool, get_resources_tool,

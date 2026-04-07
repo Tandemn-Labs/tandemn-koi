@@ -276,146 +276,121 @@ distance = (
 
 **Schema:**
 
+**Three tables** (see `koi/tools/memory.py` for full schema):
+
 ```sql
--- Every decision Koi makes (predicted)
-CREATE TABLE decisions (
-    decision_id     TEXT PRIMARY KEY,
-    job_id          TEXT NOT NULL,
-    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP,
-    model_name      TEXT NOT NULL,
-    
-    -- Config chosen
-    instance_type   TEXT NOT NULL,
-    gpu_type        TEXT NOT NULL,
-    tp              INTEGER NOT NULL,
-    pp              INTEGER NOT NULL,
-    dp              INTEGER NOT NULL,
-    num_gpus        INTEGER NOT NULL,
-    quantization    TEXT,
-    
-    -- What Koi predicted
-    predicted_tps           REAL,
+CREATE TABLE decisions (              -- what Koi proposed (one row per chain)
+    decision_id          TEXT PRIMARY KEY,
+    job_id               TEXT NOT NULL,
+    timestamp            TEXT,
+    model_name           TEXT NOT NULL,
+    instance_type        TEXT NOT NULL,
+    gpu_type             TEXT NOT NULL,
+    tp, pp, dp           INTEGER NOT NULL,
+    num_gpus             INTEGER NOT NULL,
+    quantization         TEXT,
+    predicted_tps        REAL,
     predicted_cost_per_hour REAL,
-    predicted_total_cost    REAL,
+    predicted_total_cost REAL,
     predicted_runtime_hours REAL,
-    prediction_confidence   REAL,     -- 0-1
-    prediction_source       TEXT,     -- "perfdb_exact", "perfdb_interpolated", "analytical", "memory"
-    
-    -- Context at decision time
-    slo_deadline_hours      REAL,
-    objective               TEXT,     -- "cheapest", "fastest", "balanced"
-    avg_input_tokens        INTEGER,
-    avg_output_tokens       INTEGER,
-    num_requests            INTEGER,
-    
-    -- Quota snapshot at decision time
-    quota_snapshot          JSON,     -- {"A100-80GB": {"available": 32, "region": "us-west-2"}, ...}
-    other_jobs_running      JSON,     -- [{"job_id": "x", "gpu_type": "L40S", "gpus": 16}, ...]
-    
-    -- Agent reasoning (structured, not free text)
-    why_this_config         TEXT,     -- "PerfDB record #47: L40S TP=4 PP=2 gets 833 TPS at io_ratio=2"
-    alternatives_considered JSON      -- [{"config": "A100 TP=8", "rejected_because": "2x cost for 1.8x speed"}]
+    prediction_confidence REAL,       -- 0-1
+    prediction_source    TEXT,        -- "memory", "perfdb_exact", "analytical"
+    slo_deadline_hours   REAL,
+    objective            TEXT,        -- "cheapest", "fastest", "balanced"
+    avg_input_tokens     INTEGER,
+    avg_output_tokens    INTEGER,
+    num_requests         INTEGER,
+    triggered_by         TEXT,        -- "user" | "slo_violation" | "exploration" | "auto_retry"
+    parent_decision_id   TEXT,        -- links retry chains (NULL if first attempt)
+    market               TEXT         -- "spot" | "on_demand"
 );
 
--- What actually happened (ground truth, written on job completion)
-CREATE TABLE outcomes (
-    outcome_id      TEXT PRIMARY KEY,
-    decision_id     TEXT REFERENCES decisions(decision_id),
-    job_id          TEXT NOT NULL,
-    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Status
-    status          TEXT NOT NULL,     -- "succeeded", "failed", "slo_met", "slo_missed"
-    
-    -- Actual performance
-    actual_tps              REAL,
-    actual_cost_per_hour    REAL,
-    actual_total_cost       REAL,
-    actual_runtime_hours    REAL,
-    actual_tpot_ms          REAL,
-    actual_cost_per_m_tokens REAL,
-    
-    -- Prediction error (the learning signal)
-    delta_tps_pct           REAL,     -- (actual - predicted) / predicted * 100
-    delta_cost_pct          REAL,
-    slo_met                 BOOLEAN,
-    slo_headroom_pct        REAL,     -- (slo_hours - actual_hours) / slo_hours * 100
-    
-    -- Failure analysis (CRITICAL — this is what makes the system learn)
-    failure_reason          TEXT,     -- NULL if succeeded
-    failure_category        TEXT,     -- "quota_exceeded", "oom", "throughput_below_estimate",
-                                     -- "instance_unavailable", "launch_timeout", "spot_preemption",
-                                     -- "kv_cache_pressure", "pipeline_bubble", "pcie_saturation"
-    failure_detail          TEXT,     -- "A100-40GB TP=4: 144GB/4=36GB > 40GB VRAM"
-    corrective_action       TEXT      -- "Use TP=8 or switch to A100-80GB"
+CREATE TABLE outcomes (               -- what actually happened (ground truth)
+    outcome_id           TEXT PRIMARY KEY,
+    decision_id          TEXT REFERENCES decisions(decision_id),
+    job_id               TEXT NOT NULL,
+    timestamp            TEXT,
+    status               TEXT NOT NULL,
+    actual_tps           REAL,
+    actual_cost_per_hour REAL,
+    actual_total_cost    REAL,
+    actual_runtime_hours REAL,
+    delta_tps_pct        REAL,        -- (actual - predicted) / predicted * 100
+    delta_cost_pct       REAL,
+    slo_met              INTEGER,
+    slo_headroom_pct     REAL,
+    failure_category     TEXT,         -- "oom", "quota_exceeded", "spot_preemption", ...
+    diagnosis            TEXT,         -- narrative: "KV cache hit 92%, bandwidth-bound. Try A100."
+    bottleneck           TEXT,         -- "memory_bound" | "compute_bound" | "kv_cache" | "network"
+    diff_from_parent     TEXT          -- JSON: what changed from parent decision
 );
 
--- Learned rules (extracted from patterns in outcomes)
-CREATE TABLE rules (
-    rule_id         TEXT PRIMARY KEY,
-    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-    
-    rule_text       TEXT NOT NULL,     -- "Qwen-72B on A100-40GB requires TP>=8 (OOM at TP=4)"
-    rule_type       TEXT NOT NULL,     -- "constraint", "preference", "causal"
-    confidence      REAL,              -- 0-1, increases with confirming evidence
-    evidence_count  INTEGER DEFAULT 1, -- how many outcomes support this rule
-    
-    -- Scope: when does this rule apply?
-    model_pattern   TEXT,              -- "Qwen/Qwen2.5-72B*" or NULL for all
-    gpu_pattern     TEXT,              -- "A100-40GB" or NULL for all
-    workload_pattern TEXT,             -- "batch_prefill_heavy" or NULL for all
-    
-    -- Provenance
-    derived_from    JSON               -- ["outcome_id_1", "outcome_id_2", ...]
+CREATE TABLE launch_attempts (        -- did it even start? (quota != availability)
+    attempt_id, decision_id, job_id, timestamp,
+    instance_type, gpu_type, region, market, count,
+    launched, time_to_launch, failure_reason,
+    quota_available, other_jobs_in_region
 );
 ```
 
-**Memory is per-CHAIN, not per-job.**
+Note: The `rules` and `chain_snapshots` tables were removed. The agent derives patterns directly from outcomes. Real-time chain state lives in the in-memory `JobTracker` (updated every 10s by the monitoring loop), not in SQLite.
 
-A job can go through multiple GPU configurations (chains) during its lifetime. Each chain is a separate learning data point:
+**Memory is per-CHAIN, not per-job. Chains link via `parent_decision_id`.**
+
+A job can go through multiple GPU configurations (chains) during its lifetime. Each chain is a separate learning data point. Retry chains link via `parent_decision_id`:
 
 ```
 Job job-abc (SLO=8h, Qwen-72B):
-  Chain 1: L40S TP=4 PP=2 DP=2    (0h → 3h, 833 TPS, then FALLING_BEHIND)
-  Chain 2: A100-80GB TP=4 PP=2     (3h → 3.1h, A/B test probe)
-  Chain 3: A100-80GB TP=4 PP=2     (3.1h → 5.5h, won A/B, completed)
 
-Memory records:
-  decision-1 → outcome: "L40S 833 TPS, fell behind at 3h" (chain 1)
-  decision-2 → outcome: "A100-80GB 2400 TPS, A/B winner" (chain 2)
-  decision-3 → outcome: "A100-80GB finished job, SLO met" (chain 3)
+  decisions table:
+    dec-a1 | L40S TP=4    | pred=870  | triggered_by=user          | parent=NULL
+    dec-b2 | A100 TP=8    | pred=1500 | triggered_by=slo_violation | parent=dec-a1
+    dec-c3 | A100 TP=8    | pred=1498 | triggered_by=auto_retry    | parent=dec-b2
+
+  outcomes table (one per chain, NOT one per job):
+    dec-a1 → TPS=833  | diagnosis="fell behind at 3h, KV cache 92%" | bottleneck=kv_cache
+    dec-b2 → TPS=2400 | diagnosis="A/B probe won, 2.9x faster"
+    dec-c3 → TPS=1520 | diagnosis="completed, SLO met with 60% headroom" | slo_met=1
+
+  What the agent sees (query_memory output):
+    PAST OUTCOMES (3 found — ground truth):
+      Qwen-72B | L40S TP=4  | TPS=833 (pred=870) delta=-4.3% | [kv_cache] fell behind
+      Qwen-72B | A100 TP=8  | TPS=2400 (pred=1500) delta=+60% | A/B probe won
+      Qwen-72B | A100 TP=8  | TPS=1520 (pred=1498) delta=+1.5% | SLO met ✓
 ```
 
-Each decision in the `decisions` table maps to one chain. The `outcomes` table records what happened for that specific chain, not the whole job. A `job_id` can have multiple `decision_id`s.
+Each decision maps to one chain. The `outcomes` table records what happened for that specific chain. A `job_id` can have multiple `decision_id`s.
 
-**Chain snapshots — periodic memory updates DURING execution:**
+**Chunked jobs — parallel replicas with heterogeneous GPUs:**
 
-In addition to recording chain outcomes at end, Koi writes periodic snapshots of how each chain is performing. This creates a time series in memory:
+Chunked jobs launch N replicas pulling from the same Redis queue. Each replica tries the primary config; if capacity isn't available, it falls back to alternatives. Different replicas may end up on **different GPUs**. Chains share a `group_id` (parent job ID):
 
-```sql
-CREATE TABLE chain_snapshots (
-    snapshot_id     TEXT PRIMARY KEY,
-    decision_id     TEXT REFERENCES decisions(decision_id),
-    job_id          TEXT NOT NULL,
-    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP,
+```
+Job mo-qwen7b (chunked, 3 replicas):
 
-    -- Performance at this moment
-    throughput_tps          REAL,
-    tokens_completed        INTEGER,
-    tokens_remaining        INTEGER,
-    elapsed_hours           REAL,
-    slo_headroom_pct        REAL,
+  chain mo-qwen7b-r0: L40S TP=4  → 800 TPS  (got primary)    group_id=mo-qwen7b
+  chain mo-qwen7b-r1: A100 TP=8  → 1498 TPS (L40S full, fell back to A100)
+  chain mo-qwen7b-r2: L40S TP=4  → 833 TPS  (got L40S in different region)
 
-    -- GPU health at this moment
-    gpu_cache_usage_pct     REAL,
-    gpu_sm_util_pct         REAL,
-    gpu_mem_bw_util_pct     REAL,
-    num_requests_waiting    INTEGER
-);
+  Aggregate: 3131 TPS → SLO easily met
 ```
 
-This is NOT the same as Orca's raw telemetry (1Hz, in-memory). Chain snapshots are sampled every **2-5 minutes** and written to SQLite. They persist across restarts and give the agent historical context: "L40S performance degraded from 850→600 TPS over 2 hours as KV cache filled up."
+**Critical distinction — SLO is per-JOB, outcomes are per-CHAIN:**
+
+SLO headroom is computed using the **aggregate TPS across all chains** in the group. A slow individual chain does NOT trigger FALLING_BEHIND if the job-level aggregate meets the SLO:
+
+```
+  chain-r0: L40S  300 TPS (degraded, KV cache pressure)
+  chain-r1: A100  1498 TPS
+  chain-r2: L40S  800 TPS
+
+  Per-chain SLO check (WRONG): r0 triggers FALLING_BEHIND (300 < 347 required)
+  Group SLO check (CORRECT):   aggregate=2598 TPS, SLO needs 347 → headroom 87%, ON_TRACK
+```
+
+But **outcomes** are recorded per-chain when the job completes. Each chain gets its own outcome row so memory learns per-config: "L40S TP=4 → 800 TPS" and "A100 TP=8 → 1498 TPS" as separate data points. The cost table next time will have both as VERIFIED rows.
+
+**Current limitation:** The agent picks ONE config; fallback to different GPUs is mechanical (Orca tries alternatives in order). The agent can't proactively design heterogeneous replica mixes ("launch 2 cheap L40S + 1 fast A100"). Blended cost for mixed groups isn't computed. This is future work (piggyback exploration).
 
 **How the agent uses memory:**
 
@@ -624,81 +599,59 @@ tracked_jobs[job_id] = {
 
 Every 10 seconds, a background asyncio task polls Orca for each tracked job, updates the state, and checks the trigger rules. **No LLM calls in the loop** — just arithmetic (`remaining_tokens / smoothed_tps`). The agent only wakes up when something needs a decision.
 
-**Three separate async loops with DIFFERENT periods:**
-
-These are architecturally distinct. Do NOT conflate them.
+**Two async loops** (architecturally distinct, do NOT conflate):
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ LOOP 1: TELEMETRY POLLING (10s)                                  │
-│   Pure code, no LLM, no DB writes.                               │
-│   Fetches raw metrics from Orca, updates in-memory JobTracker.   │
-│   Computes SLO headroom. Checks trigger thresholds.              │
-│   Cost: ~0 (one HTTP GET per job per 10s)                        │
-│                                                                   │
-│ LOOP 2: MEMORY SNAPSHOT (2-5 min)                                │
-│   Pure code, no LLM. Writes current chain performance to         │
-│   chain_snapshots table in SQLite. Creates time series per chain. │
-│   Also records launch failures immediately (not periodic).        │
-│   Cost: ~0 (SQLite write)                                        │
-│                                                                   │
-│ LOOP 3: AGENT FEEDBACK (event-driven, NOT periodic)              │
-│   LLM invocation. ONLY fires on triggers:                        │
-│   - FALLING_BEHIND → agent diagnoses + proposes scale/swap       │
-│   - OVER_PROVISIONED → agent suggests replicas to kill           │
-│   - CHAIN_END → agent records chain outcome in memory            │
-│   - JOB_COMPLETE → agent records final outcome + extracts rules  │
-│   - LAUNCH_FAILED → agent records failure + adjusts strategy     │
-│   Cost: ~$0.05 per invocation (only when needed)                 │
-│                                                                   │
-│ KEY: Loops 1 and 2 run CONTINUOUSLY at their intervals.          │
-│      Loop 3 runs ONLY on events. They do NOT share a timer.      │
-└─────────────────────────────────────────────────────────────────┘
+LOOP 1: TELEMETRY POLLING (10s, no LLM)
+  Per tracked chain: GET /job/{parent}/replicas/{chain}/metrics → per-chain TPS.
+  Job-level: GET /job/{parent}/chunks/progress → completion fraction.
+  Computes SLO headroom (using GROUP AGGREGATE TPS for chunked jobs).
+  Classifies status: WARMING_UP → ON_TRACK → AT_RISK → FALLING_BEHIND.
+  Emits triggers on state transitions.
 
-Timeline for a healthy job:
-  t=0s    [L1] poll metrics → WARMING_UP
-  t=10s   [L1] poll metrics → WARMING_UP
-  ...
-  t=300s  [L1] poll metrics → ON_TRACK (warmup complete)
-  t=300s  [L2] snapshot chain → write to chain_snapshots
-  t=310s  [L1] poll metrics → ON_TRACK
-  ...
-  t=600s  [L2] snapshot chain → write to chain_snapshots
-  ...
+LOOP 2: TRIGGER DISPATCHER (event-driven, LLM)
+  ONLY fires when Loop 1 emits a trigger:
+  - FALLING_BEHIND → agent diagnoses + proposes scale/swap
+  - OVER_PROVISIONED → agent suggests replicas to kill
+  - COMPLETED → agent records per-chain outcomes with diagnosis + bottleneck
+  - FAILED → agent records failure analysis
+  Cost: ~$0.05 per invocation. Healthy job: 0 calls during run, 1 at completion.
+```
+
+Timeline (healthy job):
+```
+  t=0s    [L1] poll → WARMING_UP
+  t=300s  [L1] poll → ON_TRACK (warmup complete)
   t=3600s [L1] all chunks done → COMPLETED
-  t=3600s [L3] AGENT WAKES → record_outcome, extract rules ← ONLY LLM call
-
-Timeline for a struggling job:
-  t=300s  [L1] poll → ON_TRACK
-  t=600s  [L2] snapshot → TPS=800
-  t=900s  [L2] snapshot → TPS=650 (degrading!)
-  t=1000s [L1] poll → FALLING_BEHIND (headroom < 10%)
-  t=1000s [L3] AGENT WAKES → diagnoses KV cache pressure → proposes A/B test
-  t=1000s [L2] record: chain 1 ending (agent initiated scale-up)
-  t=1020s [L1] new replica detected → track both chains
-  t=1200s [L2] snapshot chain 1 (old): 500 TPS | snapshot chain 2 (new): 2400 TPS
-  t=1300s [L3] AGENT WAKES → A/B complete → kill chain 1, keep chain 2
-  t=1300s [L2] record: chain 1 outcome (lost A/B), chain 2 promoted
+  t=3600s [L2] AGENT WAKES → record_outcome ← only LLM call
 ```
 
-**Chain lifecycle events that update memory (Loop 2 + immediate):**
+Timeline (struggling job):
+```
+  t=1000s [L1] poll → FALLING_BEHIND (group aggregate headroom < 10%)
+  t=1000s [L2] AGENT WAKES → diagnoses KV cache pressure → proposes A/B test
+  t=1020s [L1] new replica detected → track both chains
+  t=1300s [L2] AGENT WAKES → A/B complete → kill loser, keep winner
+```
 
-| Event | When | What's written | Loop |
-|-------|------|----------------|------|
-| Chain starts | Replica(s) running, first metrics arrive | `decisions` row (predicted config) | Immediate |
-| Chain snapshot | Every 2-5 min while chain is alive | `chain_snapshots` row (TPS, headroom, GPU health) | Loop 2 |
-| Launch failed | Instance couldn't start | `launch_attempts` row (failure_reason) | Immediate |
-| Chain ends (swap/kill) | Replicas terminated | `outcomes` row (actual TPS, delta, per-CHAIN) | Immediate |
-| Job completes | All chunks done | `outcomes` row for final chain + job-level summary | Loop 3 (agent) |
+**Orca↔Koi webhook flow (explicit, not inferred from polling):**
 
-**Orca needs to tell Koi about chain lifecycle events.** Specifically:
-- When replicas launch successfully → chain started (Koi gets this from first metrics ingest)
-- When replicas are killed/swapped → chain ended (Koi detects this from replica state change in telemetry)
-- When job completes → already handled via webhook `POST /job/complete`
+```
+Orca launches replica  →  POST /job/started {job_id, group_id, gpu_type, tp, pp, decision_id}
+                          → Koi registers chain in monitor, starts polling
+Orca assembly done     →  POST /job/complete {job_id, status, metrics}
+                          → Koi records per-chain outcomes, unregisters group
+Orca all configs fail  →  POST /job/launch-failed {job_id, configs_tried, failure_reasons}
+                          → Koi records in launch_attempts
+```
 
-No additional Orca API needed — Koi infers chain start/end from the replica state changes it already monitors in Loop 1.
+| Event | What's written | When |
+|-------|----------------|------|
+| Chain starts | `decisions` row (via /decide, before launch) | Immediate |
+| Launch failed | `launch_attempts` row (via /job/launch-failed) | Immediate |
+| Job completes | `outcomes` row per chain (via /job/complete) | Immediate |
 
-**When does the agent (Loop 3) wake up?**
+**When does the agent (Loop 2) wake up?**
 
 | Trigger | What happens | Agent cost |
 |---------|-------------|------------|
@@ -1150,32 +1103,36 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 
 ## 10. Implementation Plan
 
-### Phase 1: Core Agent + Monitoring + Scale Up/Down (THIS VERSION)
+### Phase 1: Core Agent + Monitoring (THIS VERSION)
 
-**Koi:**
-- [ ] `koi/agent.py` — KoiAgent built on Claude Agent SDK with tool definitions
-- [ ] `koi/tools/perfdb.py` — PerfDB query tool (pandas over CSV)
-- [ ] `koi/tools/memory.py` — Agentic Memory (decisions, outcomes, rules, launch_attempts tables)
-- [ ] `koi/tools/resources.py` — Live resource map from Orca
-- [ ] `koi/tools/physics.py` — GPU specs + bottleneck analysis + physics-vector similarity
-- [ ] `koi/tools/orca_api.py` — Launch, scale, kill, metrics from Orca
-- [ ] `koi/monitor.py` — Background polling loop (10s), SLO tracking, agent triggers
-- [ ] `koi/server.py` — HTTP endpoints: `/decide`, `/health`, `/job/complete`
-- [ ] `koi/schemas.py` — Pydantic models for all data structures
-- [ ] Scale UP: A/B test when FALLING_BEHIND (launch repair replica, compare, cull loser)
-- [ ] Scale DOWN: shed excess replicas when over-provisioned (headroom > 70%)
-- [ ] Spot preemption recovery: detect dead replica → decide whether to replace based on SLO math
-- [ ] Warm-up detection: ignore first 5 min of metrics before SLO projections
-- [ ] Verbose evolutionary trace logging (`--verbose`)
+**Koi — done:**
+- [x] `koi/agent.py` — KoiAgent with 7 tools, pre-computed cost table, tool_runner loop
+- [x] `koi/tools/perfdb.py` — PerfDB query tool (pandas over CSV, 687 columns → 20 key columns)
+- [x] `koi/tools/memory.py` — 3 tables: decisions (with lineage), outcomes (with diagnosis), launch_attempts
+- [x] `koi/tools/resources.py` — Live resource map from Orca (Shape A/B/C parsing, A100 normalization)
+- [x] `koi/tools/physics.py` — GPU specs + physics-vector similarity + HF Hub model fetch
+- [x] `koi/tools/orca_api.py` — Submit, scale, kill, per-replica metrics, chunk progress
+- [x] `koi/monitor.py` — 2 async loops (telemetry 10s + trigger dispatcher), group-level SLO
+- [x] `koi/server.py` — `/decide`, `/health`, `/jobs`, `/job/started`, `/job/complete`, `/job/launch-failed`
+- [x] `koi/schemas.py` — Pydantic models with group_id for job groups
+- [x] Warm-up detection (5 min warmup period, no triggers during warmup)
+- [x] Per-chain outcomes for heterogeneous groups (separate learning signals per GPU config)
 
-**Orca (new branch `koi-compat` off `main`):**
-- [ ] `GET /resources` endpoint — instance catalog + quota pools (fix A100 40/80 VRAM)
-- [ ] Fix A100 40GB vs 80GB in `gpu_specs.py` + `config.py`
-- [ ] `call_koi` timeout to 300s (thread join + HTTP)
-- [ ] Per-replica metrics for heterogeneous replica types (verify A/B test works)
-- [ ] Final metrics fallback in `_assemble_output()` — ring buffer if summaries missing
-- [ ] `POST /job/complete` webhook to `KOI_SERVICE_URL`
-- [ ] `--quantization` flag in CLI (fp16 default)
+**Orca (`koi-v2` branch) — done:**
+- [x] `GET /resources` endpoint + A100 40GB/80GB normalization
+- [x] `POST /job/started` webhook per replica (with group_id + decision_id)
+- [x] `POST /job/complete` webhook on assembly (parent job_id)
+- [x] `koi_decision_id` field on BatchedRequest (flows CLI → server → webhook → Koi)
+- [x] Per-replica fallback in chunked path (each replica tries configs in order)
+- [x] `call_koi` timeout 600s
+- [x] `koi_alternatives` passed from CLI to server
+
+**Not done yet:**
+- [ ] Scale UP: A/B test when FALLING_BEHIND
+- [ ] Scale DOWN: shed excess replicas when over-provisioned
+- [ ] Spot preemption recovery
+- [ ] Fast-path: skip LLM when memory has high-confidence answer for repeat workloads
+- [ ] Heterogeneous replica design: agent proactively designs mixed-GPU mixes (not just fallback)
 
 ### Future (NOT this version)
 

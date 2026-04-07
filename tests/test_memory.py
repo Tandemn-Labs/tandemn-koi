@@ -40,6 +40,23 @@ class TestDecisions:
         results = memory.query_decisions(model_name="Qwen")
         assert len(results) == 3
 
+    def test_new_fields(self, memory):
+        dec_id = memory.record_decision(
+            job_id="job-retry", model_name="test-model",
+            instance_type="g6e.12xlarge", gpu_type="L40S",
+            tp=4, pp=2, dp=1, num_gpus=8,
+            predicted_tps=833.0, predicted_cost_per_hour=13.35,
+            slo_deadline_hours=8.0, objective="cheapest",
+            avg_input_tokens=500, avg_output_tokens=200,
+            triggered_by="slo_violation",
+            parent_decision_id="dec-original",
+            market="spot",
+        )
+        results = memory.query_decisions(model_name="test-model")
+        assert results[0]["triggered_by"] == "slo_violation"
+        assert results[0]["parent_decision_id"] == "dec-original"
+        assert results[0]["market"] == "spot"
+
 
 class TestOutcomes:
     def test_record_outcome_with_delta(self, memory):
@@ -73,32 +90,56 @@ class TestOutcomes:
         )
         memory.record_outcome(
             decision_id=dec_id, job_id="job-fail", status="failed",
-            failure_reason="OOM", failure_category="oom",
+            diagnosis="OOM at batch_size=256, KV cache exceeded 40GB VRAM",
+            failure_category="oom",
+            bottleneck="memory_bound",
         )
 
         failed = memory.query_outcomes(status="failed")
         assert len(failed) == 1
-        assert failed[0]["failure_reason"] == "OOM"
+        assert failed[0]["diagnosis"] == "OOM at batch_size=256, KV cache exceeded 40GB VRAM"
+        assert failed[0]["failure_category"] == "oom"
+        assert failed[0]["bottleneck"] == "memory_bound"
 
-
-class TestRules:
-    def test_add_and_query(self, memory):
-        rule_id = memory.add_rule(
-            rule_text="Qwen-72B on A100-40GB requires TP>=8 (OOM at TP=4)",
-            rule_type="constraint",
-            confidence=0.9, evidence_count=3,
-            model_pattern="Qwen*72B*", gpu_pattern="A100-40GB",
+    def test_outcome_with_diagnosis_and_bottleneck(self, memory):
+        dec_id = memory.record_decision(
+            job_id="job-diag", model_name="test",
+            instance_type="g6e", gpu_type="L40S",
+            tp=4, pp=2, dp=1, num_gpus=8,
+            predicted_tps=800.0, predicted_cost_per_hour=13.35,
+            slo_deadline_hours=8.0, objective="cheapest",
+            avg_input_tokens=500, avg_output_tokens=200,
         )
-        assert rule_id.startswith("rule-")
+        memory.record_outcome(
+            decision_id=dec_id, job_id="job-diag", status="succeeded",
+            actual_tps=833.0, actual_cost_per_hour=13.35,
+            diagnosis="Ran smoothly, slight overperformance vs prediction",
+            bottleneck="memory_bound",
+            diff_from_parent='{"tp": {"old": 2, "new": 4}}',
+        )
+        outcomes = memory.query_outcomes(model_name="test")
+        assert outcomes[0]["diagnosis"] is not None
+        assert outcomes[0]["bottleneck"] == "memory_bound"
+        assert "tp" in outcomes[0]["diff_from_parent"]
 
-        rules = memory.query_rules(model_pattern="Qwen")
-        assert len(rules) == 1
-        assert "TP>=8" in rules[0]["rule_text"]
-
-    def test_rule_count(self, memory):
-        assert memory.rule_count() == 0
-        memory.add_rule("test rule", "preference", 0.5)
-        assert memory.rule_count() == 1
+    def test_query_memory_shows_diagnosis(self, memory):
+        dec_id = memory.record_decision(
+            job_id="job-fail2", model_name="Qwen-72B",
+            instance_type="p4d.24xlarge", gpu_type="A100-40GB",
+            tp=4, pp=1, dp=1, num_gpus=8,
+            predicted_tps=900.0, predicted_cost_per_hour=32.0,
+            slo_deadline_hours=8.0, objective="cheapest",
+            avg_input_tokens=500, avg_output_tokens=200,
+        )
+        memory.record_outcome(
+            decision_id=dec_id, job_id="job-fail2", status="failed",
+            diagnosis="A100-40GB TP=4: 144GB/4=36GB > 40GB VRAM, OOM",
+            failure_category="oom",
+            bottleneck="memory_bound",
+        )
+        result = query_memory(memory, model_name="Qwen-72B")
+        assert "memory_bound" in result
+        assert "OOM" in result
 
 
 class TestLaunchAttempts:
@@ -133,49 +174,10 @@ class TestLaunchAttempts:
         assert rate["rate"] == pytest.approx(0.25)
 
 
-class TestChainSnapshots:
-    def test_record_and_query(self, memory):
-        snap_id = memory.record_chain_snapshot(
-            decision_id="dec-test", job_id="job-1",
-            throughput_tps=833.0, tokens_completed=2_000_000,
-            tokens_remaining=5_500_000, elapsed_hours=0.5,
-            slo_headroom_pct=85.0, gpu_cache_usage_pct=0.62,
-            gpu_sm_util_pct=78.0, gpu_mem_bw_util_pct=85.0,
-        )
-        assert snap_id.startswith("snap-")
-
-        snaps = memory.query_chain_snapshots("dec-test")
-        assert len(snaps) == 1
-        assert snaps[0]["throughput_tps"] == 833.0
-        assert snaps[0]["slo_headroom_pct"] == 85.0
-
-    def test_time_series(self, memory):
-        """Multiple snapshots create a time series."""
-        for i in range(5):
-            memory.record_chain_snapshot(
-                decision_id="dec-ts", job_id="job-1",
-                throughput_tps=800.0 - i * 50,  # degrading
-                tokens_completed=i * 1_000_000,
-                tokens_remaining=5_000_000 - i * 1_000_000,
-                elapsed_hours=i * 0.5,
-                slo_headroom_pct=90.0 - i * 10,
-            )
-        snaps = memory.query_chain_snapshots("dec-ts")
-        assert len(snaps) == 5
-        # Should be ordered by timestamp (ascending)
-        tps_values = [s["throughput_tps"] for s in snaps]
-        assert tps_values[0] > tps_values[-1]  # degrading over time
-
-    def test_query_nonexistent(self, memory):
-        snaps = memory.query_chain_snapshots("dec-nonexistent")
-        assert len(snaps) == 0
-
-
 class TestCounts:
     def test_initial_counts(self, memory):
         assert memory.decision_count() == 0
         assert memory.outcome_count() == 0
-        assert memory.rule_count() == 0
 
 
 class TestToolFunctions:
@@ -214,3 +216,30 @@ class TestToolFunctions:
             status="succeeded", actual_tps=950.0,
         )
         assert "Outcome recorded" in result
+
+    def test_decision_lineage(self, memory):
+        """Parent→child decision linking for retry chains."""
+        dec1 = memory.record_decision(
+            job_id="job-abc", model_name="Qwen-72B",
+            instance_type="g6e.12xlarge", gpu_type="L40S",
+            tp=4, pp=2, dp=1, num_gpus=8,
+            predicted_tps=870.0, predicted_cost_per_hour=13.35,
+            slo_deadline_hours=8.0, objective="cheapest",
+            avg_input_tokens=500, avg_output_tokens=200,
+            triggered_by="user",
+        )
+        dec2 = memory.record_decision(
+            job_id="job-abc", model_name="Qwen-72B",
+            instance_type="p4de.24xlarge", gpu_type="A100-80GB",
+            tp=8, pp=1, dp=1, num_gpus=8,
+            predicted_tps=1500.0, predicted_cost_per_hour=40.96,
+            slo_deadline_hours=8.0, objective="cheapest",
+            avg_input_tokens=500, avg_output_tokens=200,
+            triggered_by="slo_violation",
+            parent_decision_id=dec1,
+        )
+        results = memory.query_decisions(model_name="Qwen-72B")
+        assert len(results) == 2
+        child = [r for r in results if r["parent_decision_id"] is not None][0]
+        assert child["parent_decision_id"] == dec1
+        assert child["triggered_by"] == "slo_violation"

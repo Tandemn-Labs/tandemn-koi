@@ -1,9 +1,8 @@
 """
-koi/monitor.py — Three separate async loops for job monitoring.
+koi/monitor.py — Two async loops for job monitoring.
 
 Loop 1 (TelemetryLoop): 10s polling, pure code, updates JobTracker, checks thresholds
-Loop 2 (SnapshotLoop):  2-5 min, writes chain_snapshots to SQLite
-Loop 3 (TriggerDispatcher): event-driven, fires agent on triggers
+Loop 2 (TriggerDispatcher): event-driven, fires agent on triggers
 
 These are independent asyncio.Tasks. They do NOT share a timer.
 """
@@ -16,7 +15,6 @@ from typing import Callable, Coroutine, Dict, List, Optional
 from koi.schemas import (
     JobTracker, MonitoringStatus, MonitoringTrigger, PlacementConfig,
 )
-from koi.tools.memory import AgenticMemory
 from koi.tools.orca_api import OrcaClient
 
 logger = logging.getLogger("koi.monitor")
@@ -44,16 +42,12 @@ class MonitoringLoop:
     def __init__(
         self,
         orca: OrcaClient,
-        memory: AgenticMemory,
         on_trigger: Optional[Callable[[MonitoringTrigger], Coroutine]] = None,
         telemetry_interval: float = 10.0,
-        snapshot_interval: float = 180.0,  # 3 minutes
     ):
         self.orca = orca
-        self.memory = memory
-        self.on_trigger = on_trigger  # async callback for Loop 3
+        self.on_trigger = on_trigger
         self.telemetry_interval = telemetry_interval
-        self.snapshot_interval = snapshot_interval
 
         self.tracked_jobs: Dict[str, JobTracker] = {}
         self._trigger_queue: asyncio.Queue = asyncio.Queue()
@@ -72,10 +66,12 @@ class MonitoringLoop:
         total_tokens: int,
         predicted_tps: float,
         decision_id: Optional[str] = None,
+        group_id: Optional[str] = None,
     ):
         tracker = JobTracker(
             job_id=job_id,
             decision_id=decision_id,
+            group_id=group_id,
             config=config,
             slo_deadline_hours=slo_deadline_hours,
             total_tokens=total_tokens,
@@ -83,11 +79,24 @@ class MonitoringLoop:
             tokens_remaining=total_tokens,
         )
         self.tracked_jobs[job_id] = tracker
-        logger.info(f"[Monitor] Registered job {job_id} (SLO={slo_deadline_hours}h, {total_tokens:,} tokens)")
+        group_str = f", group={group_id}" if group_id else ""
+        logger.info(f"[Monitor] Registered job {job_id} (SLO={slo_deadline_hours}h, {total_tokens:,} tokens{group_str})")
 
     def unregister_job(self, job_id: str):
         self.tracked_jobs.pop(job_id, None)
         logger.info(f"[Monitor] Unregistered job {job_id}")
+
+    def get_group_chains(self, group_id: str) -> Dict[str, JobTracker]:
+        """Get all tracked chains that belong to a job group."""
+        return {jid: t for jid, t in self.tracked_jobs.items() if t.group_id == group_id}
+
+    def unregister_group(self, group_id: str) -> List[JobTracker]:
+        """Unregister all chains in a group. Returns the trackers for aggregation."""
+        chains = self.get_group_chains(group_id)
+        for jid in chains:
+            self.tracked_jobs.pop(jid, None)
+        logger.info(f"[Monitor] Unregistered group {group_id} ({len(chains)} chains)")
+        return list(chains.values())
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -99,10 +108,9 @@ class MonitoringLoop:
         self._trigger_queue = asyncio.Queue()
         self._tasks = [
             asyncio.create_task(self._telemetry_loop(), name="telemetry"),
-            asyncio.create_task(self._snapshot_loop(), name="snapshot"),
             asyncio.create_task(self._trigger_dispatcher(), name="triggers"),
         ]
-        logger.info(f"[Monitor] Started 3 async loops (telemetry={self.telemetry_interval}s, snapshot={self.snapshot_interval}s, triggers=event-driven)")
+        logger.info(f"[Monitor] Started 2 async loops (telemetry={self.telemetry_interval}s, triggers=event-driven)")
 
     async def stop(self):
         """Cancel all loops."""
@@ -136,10 +144,17 @@ class MonitoringLoop:
         if not tracker:
             return
 
+        # For grouped chains, Orca indexes by parent job_id — not replica_id
+        orca_job_id = tracker.group_id or job_id
+
         # Fetch metrics from Orca
         try:
-            metrics = await self.orca.get_job_metrics(job_id)
-            progress = await self.orca.get_chunk_progress(job_id)
+            # Per-replica throughput (individual chain), job-level chunk progress
+            if tracker.group_id:
+                metrics = await self.orca.get_replica_metrics(tracker.group_id, job_id)
+            else:
+                metrics = await self.orca.get_job_metrics(orca_job_id)
+            progress = await self.orca.get_chunk_progress(orca_job_id)
         except Exception as e:
             logger.warning(f"[Monitor/L1] Failed to fetch metrics for {job_id}: {e}")
             return
@@ -184,9 +199,9 @@ class MonitoringLoop:
             await self._emit_trigger(job_id, MonitoringStatus.COMPLETED, "All chunks completed")
             return
 
-        # Check Orca job status
+        # Check Orca job status (use parent job_id for grouped chains)
         try:
-            job_status = await self.orca.get_job_status(job_id)
+            job_status = await self.orca.get_job_status(orca_job_id)
             if job_status.get("status") in ("failed", "cancelled"):
                 tracker.status = MonitoringStatus.FAILED
                 await self._emit_trigger(job_id, MonitoringStatus.FAILED,
@@ -195,7 +210,20 @@ class MonitoringLoop:
         except Exception:
             pass
 
-        # Classify status
+        # Classify status — for grouped chains, use aggregate TPS for SLO check
+        if tracker.group_id:
+            group_chains = self.get_group_chains(tracker.group_id)
+            aggregate_tps = sum(t.smoothed_tps for t in group_chains.values())
+            # Recompute headroom using aggregate throughput and full job tokens
+            total_job_tokens = sum(t.total_tokens for t in group_chains.values())
+            total_remaining = max(0, total_job_tokens - int(
+                total_job_tokens * ((completed_chunks + failed_chunks) / max(total_chunks, 1))
+            )) if total_chunks > 0 else total_job_tokens
+            tracker.slo_headroom_pct = compute_slo_headroom(
+                tracker.slo_deadline_hours, tracker.elapsed_hours,
+                total_remaining, aggregate_tps,
+            )
+
         prev_status = tracker.status
         new_status = _classify_status(tracker)
         tracker.status = new_status
@@ -229,39 +257,7 @@ class MonitoringLoop:
         logger.info(f"[Monitor/L1] Trigger: {status.value} for {job_id} — {hint}")
 
     # ------------------------------------------------------------------
-    # Loop 2: Snapshot loop (2-5 min, writes to SQLite)
-    # ------------------------------------------------------------------
-
-    async def _snapshot_loop(self):
-        """Periodically write chain snapshots to memory."""
-        while self._running:
-            try:
-                for job_id, tracker in list(self.tracked_jobs.items()):
-                    if tracker.status in (MonitoringStatus.WARMING_UP, MonitoringStatus.COMPLETED, MonitoringStatus.FAILED):
-                        continue
-                    if not tracker.decision_id:
-                        continue
-
-                    self.memory.record_chain_snapshot(
-                        decision_id=tracker.decision_id,
-                        job_id=job_id,
-                        throughput_tps=tracker.smoothed_tps,
-                        tokens_completed=tracker.tokens_completed,
-                        tokens_remaining=tracker.tokens_remaining,
-                        elapsed_hours=tracker.elapsed_hours,
-                        slo_headroom_pct=tracker.slo_headroom_pct,
-                        gpu_cache_usage_pct=tracker.gpu_cache_usage,
-                        gpu_sm_util_pct=tracker.gpu_sm_util,
-                        gpu_mem_bw_util_pct=tracker.gpu_mem_bw_util,
-                    )
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[Monitor/L2] Snapshot error: {e}")
-            await asyncio.sleep(self.snapshot_interval)
-
-    # ------------------------------------------------------------------
-    # Loop 3: Trigger dispatcher (event-driven, fires agent)
+    # Loop 2: Trigger dispatcher (event-driven, fires agent)
     # ------------------------------------------------------------------
 
     async def _trigger_dispatcher(self):

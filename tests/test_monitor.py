@@ -1,4 +1,4 @@
-"""Tests for koi/monitor.py — three async loops, SLO computation, thresholds."""
+"""Tests for koi/monitor.py — two async loops, SLO computation, thresholds."""
 
 import pytest
 from datetime import datetime, timedelta
@@ -10,7 +10,6 @@ from koi.monitor import (
     _ema, _classify_status, compute_slo_headroom,
     MonitoringLoop, WARMUP_MINUTES,
 )
-from koi.tools.memory import AgenticMemory
 
 
 def _make_config():
@@ -101,9 +100,8 @@ class TestClassifyStatus:
 
 class TestMonitoringLoopRegistration:
     def test_register_job(self):
-        memory = AgenticMemory(db_path=":memory:")
         from unittest.mock import MagicMock
-        monitor = MonitoringLoop(orca=MagicMock(), memory=memory)
+        monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
             job_id="job-1", config=_make_config(),
             slo_deadline_hours=8.0, total_tokens=7_500_000,
@@ -113,9 +111,8 @@ class TestMonitoringLoopRegistration:
         assert monitor.tracked_jobs["job-1"].decision_id == "dec-abc"
 
     def test_unregister_job(self):
-        memory = AgenticMemory(db_path=":memory:")
         from unittest.mock import MagicMock
-        monitor = MonitoringLoop(orca=MagicMock(), memory=memory)
+        monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
             job_id="job-1", config=_make_config(),
             slo_deadline_hours=8.0, total_tokens=7_500_000,
@@ -123,25 +120,3 @@ class TestMonitoringLoopRegistration:
         )
         monitor.unregister_job("job-1")
         assert "job-1" not in monitor.tracked_jobs
-
-
-class TestSnapshotWriting:
-    def test_snapshot_writes_to_memory(self):
-        memory = AgenticMemory(db_path=":memory:")
-        # Record a decision first so the FK is valid
-        dec_id = memory.record_decision(
-            job_id="job-1", model_name="test",
-            instance_type="g6e.12xlarge", gpu_type="L40S",
-            tp=4, pp=2, dp=1, num_gpus=8,
-            predicted_tps=833.0, predicted_cost_per_hour=13.35,
-            slo_deadline_hours=8.0, objective="cheapest",
-            avg_input_tokens=1200, avg_output_tokens=300,
-        )
-        snap_id = memory.record_chain_snapshot(
-            decision_id=dec_id, job_id="job-1",
-            throughput_tps=800.0, tokens_completed=2_000_000,
-            elapsed_hours=0.5, slo_headroom_pct=85.0,
-        )
-        snaps = memory.query_chain_snapshots(dec_id)
-        assert len(snaps) == 1
-        assert snaps[0]["throughput_tps"] == 800.0

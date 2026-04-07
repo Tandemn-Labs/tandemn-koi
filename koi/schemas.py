@@ -298,6 +298,7 @@ class JobTracker(BaseModel):
     """In-memory state for a tracked running job. Links to memory via decision_id."""
     job_id: str
     decision_id: Optional[str] = None   # links to memory.decisions table (current chain)
+    group_id: Optional[str] = None      # parent job ID — chains in a group share this
     config: PlacementConfig
     slo_deadline_hours: float
     total_tokens: int

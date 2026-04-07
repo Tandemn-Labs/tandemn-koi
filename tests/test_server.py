@@ -46,6 +46,8 @@ async def client():
     app.state.monitor = MagicMock()
     app.state.monitor.tracked_jobs = {}
     app.state.monitor.register_job = MagicMock()
+    app.state.monitor.get_group_chains = MagicMock(return_value={})
+    app.state.monitor.unregister_group = MagicMock(return_value=[])
 
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
@@ -112,6 +114,7 @@ class TestJobComplete:
         app.state.monitor.tracked_jobs = {
             "job-done": MagicMock(
                 decision_id="dec-123",
+                group_id=None,
                 elapsed_hours=2.5,
                 slo_headroom_pct=80.0,
             ),

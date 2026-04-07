@@ -74,8 +74,7 @@ async def lifespan(app: FastAPI):
     # Memory
     app.state.memory = AgenticMemory(db_path=memory_path)
     logger.info(f"[Koi] Memory: {app.state.memory.decision_count()} decisions, "
-                f"{app.state.memory.outcome_count()} outcomes, "
-                f"{app.state.memory.rule_count()} rules")
+                f"{app.state.memory.outcome_count()} outcomes")
 
     # Orca client
     app.state.session = aiohttp.ClientSession()
@@ -98,7 +97,6 @@ async def lifespan(app: FastAPI):
     # Monitor
     app.state.monitor = MonitoringLoop(
         orca=app.state.orca,
-        memory=app.state.memory,
         on_trigger=app.state.agent.handle_trigger,
     )
     if app.state.orca:
@@ -143,7 +141,6 @@ async def health():
         "perfdb_records": app.state.perfdb.record_count if app.state.perfdb else 0,
         "memory_decisions": app.state.memory.decision_count(),
         "memory_outcomes": app.state.memory.outcome_count(),
-        "memory_rules": app.state.memory.rule_count(),
         "tracked_jobs": len(app.state.monitor.tracked_jobs),
         "agent_model": app.state.agent.model,
         "orca_connected": app.state.orca is not None,
@@ -205,7 +202,7 @@ async def decide(req: DecideRequest):
         avg_input_tokens=job_request.avg_input_tokens,
         avg_output_tokens=job_request.avg_output_tokens,
         num_requests=job_request.num_requests,
-        why_this_config=decision.reasoning[:500],
+        triggered_by="user",
     )
 
     # NOTE: Do NOT register in monitor here. The job hasn't launched yet.
@@ -220,6 +217,7 @@ async def decide(req: DecideRequest):
 class JobStartedRequest(BaseModel):
     job_id: str
     decision_id: Optional[str] = None
+    group_id: Optional[str] = None      # parent job ID for chunked replicas
     gpu_type: str
     instance_type: str
     tp: int
@@ -255,45 +253,87 @@ async def job_started(req: JobStartedRequest):
         total_tokens=req.total_tokens,
         predicted_tps=req.predicted_tps,
         decision_id=req.decision_id,
+        group_id=req.group_id,
     )
 
-    logger.info(f"[Koi] Job started: {req.job_id} on {req.gpu_type} TP={req.tp} PP={req.pp}")
-    return {"status": "registered", "job_id": req.job_id}
+    group_str = f" (group={req.group_id})" if req.group_id else ""
+    logger.info(f"[Koi] Job started: {req.job_id} on {req.gpu_type} TP={req.tp} PP={req.pp}{group_str}")
+    return {"status": "registered", "job_id": req.job_id, "group_id": req.group_id}
 
 
 @app.post("/job/complete")
 async def job_complete(req: JobCompleteRequest):
-    """Webhook from Orca when a job completes."""
+    """Webhook from Orca when a job completes.
+
+    Two modes:
+      1. Single-chain job: req.job_id matches a tracked chain directly
+      2. Job group (chunked): req.job_id matches the group_id of multiple chains
+         → aggregates metrics across all chains, records ONE outcome
+    """
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
 
+    # Mode 1: direct chain match (single-cluster job)
     tracker = monitor.tracked_jobs.get(req.job_id)
-    if not tracker:
-        logger.warning(f"[Koi] Job complete webhook for unknown job: {req.job_id}")
-        # Still record what we can
-        return {"status": "unknown_job", "job_id": req.job_id}
+    if tracker and not tracker.group_id:
+        actual_tps = req.metrics.get("avg_generation_throughput_toks_per_s")
+        actual_cost_per_hour = req.metrics.get("cost_per_hour")
 
-    # Record outcome
-    actual_tps = req.metrics.get("avg_generation_throughput_toks_per_s")
-    actual_cost_per_hour = req.metrics.get("cost_per_hour")
+        if tracker.decision_id:
+            outcome_id = memory.record_outcome(
+                decision_id=tracker.decision_id,
+                job_id=req.job_id,
+                status=req.status,
+                actual_tps=actual_tps,
+                actual_cost_per_hour=actual_cost_per_hour,
+                actual_runtime_hours=tracker.elapsed_hours,
+                slo_met=req.status == "succeeded",
+                slo_headroom_pct=tracker.slo_headroom_pct,
+            )
+            logger.info(f"[Koi] Outcome recorded: {outcome_id} for {req.job_id} ({req.status})")
 
-    if tracker.decision_id:
-        outcome_id = memory.record_outcome(
-            decision_id=tracker.decision_id,
-            job_id=req.job_id,
-            status=req.status,
-            actual_tps=actual_tps,
-            actual_cost_per_hour=actual_cost_per_hour,
-            actual_runtime_hours=tracker.elapsed_hours,
-            slo_met=req.status == "succeeded",
-            slo_headroom_pct=tracker.slo_headroom_pct,
-        )
-        logger.info(f"[Koi] Outcome recorded: {outcome_id} for {req.job_id} ({req.status})")
+        monitor.unregister_job(req.job_id)
+        return {"status": "recorded", "job_id": req.job_id}
 
-    # Unregister from monitor
-    monitor.unregister_job(req.job_id)
+    # Mode 2: job group completion (chunked job)
+    group_chains = monitor.get_group_chains(req.job_id)
+    if group_chains:
+        total_tps = sum(t.smoothed_tps for t in group_chains.values())
+        max_elapsed = max(t.elapsed_hours for t in group_chains.values()) if group_chains else 0
 
-    return {"status": "recorded", "job_id": req.job_id}
+        # Record PER-CHAIN outcomes so the learning signal stays clean.
+        # Heterogeneous replicas (L40S + A100 fallback) need separate outcomes
+        # so memory can say "L40S gets 800 TPS" and "A100 gets 1498 TPS" independently.
+        outcomes_recorded = 0
+        for chain_id, tracker in group_chains.items():
+            if not tracker.decision_id:
+                continue
+            memory.record_outcome(
+                decision_id=tracker.decision_id,
+                job_id=req.job_id,
+                status=req.status,
+                actual_tps=tracker.smoothed_tps,
+                actual_runtime_hours=tracker.elapsed_hours,
+                slo_met=req.status == "succeeded",
+                slo_headroom_pct=tracker.slo_headroom_pct,
+            )
+            outcomes_recorded += 1
+
+        logger.info(f"[Koi] Group completed: {req.job_id} — {outcomes_recorded} chain outcomes, "
+                    f"aggregate TPS={total_tps:.0f}, {req.status}")
+
+        # Unregister all chains in the group
+        monitor.unregister_group(req.job_id)
+        return {
+            "status": "recorded",
+            "job_id": req.job_id,
+            "chains_closed": len(group_chains),
+            "outcomes_recorded": outcomes_recorded,
+            "aggregate_tps": round(total_tps, 1),
+        }
+
+    logger.warning(f"[Koi] Job complete webhook for unknown job: {req.job_id}")
+    return {"status": "unknown_job", "job_id": req.job_id}
 
 
 class LaunchFailedRequest(BaseModel):
