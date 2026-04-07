@@ -99,7 +99,7 @@ class TestPromptBuilding:
         )
         prompt = agent._build_trigger_prompt(trigger)
         assert "falling_behind" in prompt
-        assert "Scale up" in prompt
+        assert "scale_chain_tool" in prompt
         assert "Throughput dropped" in prompt
 
     def test_trigger_prompt_completed(self, agent):

@@ -26,6 +26,7 @@ SLO_YELLOW_THRESHOLD = 10.0      # headroom 10-30% → AT_RISK
 OVER_PROVISIONED_THRESHOLD = 70.0 # headroom > 70% AND elapsed > 20% → shed
 OVER_PROVISIONED_MIN_ELAPSED = 0.20  # 20% of SLO elapsed before considering scale-down
 EMA_ALPHA = 0.3                   # exponential moving average smoothing
+TRIGGER_COOLDOWN_SECONDS = 300    # 5 min between triggers for same job
 
 
 class MonitoringLoop:
@@ -233,12 +234,19 @@ class MonitoringLoop:
             tracker.warmup_complete = True
             logger.info(f"[Monitor/L1] {job_id}: warmup complete, TPS={tracker.smoothed_tps:.0f}")
 
-        # Emit triggers on state transitions
+        # Emit triggers on state transitions (with cooldown)
         if new_status != prev_status:
-            if new_status == MonitoringStatus.FALLING_BEHIND:
+            now = datetime.utcnow()
+            cooldown_ok = (
+                not tracker.last_trigger_at or
+                (now - tracker.last_trigger_at).total_seconds() >= TRIGGER_COOLDOWN_SECONDS
+            )
+            if new_status == MonitoringStatus.FALLING_BEHIND and cooldown_ok:
+                tracker.last_trigger_at = now
                 await self._emit_trigger(job_id, MonitoringStatus.FALLING_BEHIND,
                                          f"Headroom={tracker.slo_headroom_pct:.1f}%, TPS={tracker.smoothed_tps:.0f}")
-            elif new_status == MonitoringStatus.OVER_PROVISIONED:
+            elif new_status == MonitoringStatus.OVER_PROVISIONED and cooldown_ok:
+                tracker.last_trigger_at = now
                 await self._emit_trigger(job_id, MonitoringStatus.OVER_PROVISIONED,
                                          f"Headroom={tracker.slo_headroom_pct:.0f}%, can shed replicas")
 

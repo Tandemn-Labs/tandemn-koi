@@ -231,6 +231,7 @@ class AgenticMemory:
     def query_decisions(
         self, model_name: Optional[str] = None,
         gpu_type: Optional[str] = None,
+        job_id: Optional[str] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         conn = self._conn()
@@ -248,6 +249,9 @@ class AgenticMemory:
         if gpu_type:
             query += " AND d.gpu_type LIKE ?"
             params.append(f"%{gpu_type}%")
+        if job_id:
+            query += " AND d.job_id LIKE ?"
+            params.append(f"%{job_id}%")
         query += " ORDER BY d.timestamp DESC LIMIT ?"
         params.append(limit)
 
@@ -257,6 +261,7 @@ class AgenticMemory:
     def query_outcomes(
         self, model_name: Optional[str] = None,
         status: Optional[str] = None,
+        job_id: Optional[str] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         conn = self._conn()
@@ -274,6 +279,9 @@ class AgenticMemory:
         if status:
             query += " AND o.status = ?"
             params.append(status)
+        if job_id:
+            query += " AND o.job_id LIKE ?"
+            params.append(f"%{job_id}%")
         query += " ORDER BY o.timestamp DESC LIMIT ?"
         params.append(limit)
 
@@ -329,6 +337,7 @@ def query_memory(
     memory: AgenticMemory,
     model_name: Optional[str] = None,
     instance_type: Optional[str] = None,
+    job_id: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = 10,
 ) -> str:
@@ -336,7 +345,7 @@ def query_memory(
     lines = []
 
     # Past outcomes (ground truth from completed jobs)
-    outcomes = memory.query_outcomes(model_name=model_name, status=status, limit=limit)
+    outcomes = memory.query_outcomes(model_name=model_name, status=status, job_id=job_id, limit=limit)
     if outcomes:
         lines.append(f"PAST OUTCOMES ({len(outcomes)} found — ground truth from completed jobs):")
         for o in outcomes:
@@ -354,7 +363,7 @@ def query_memory(
             )
 
     # Past decisions (what Koi previously chose — even if no outcome yet)
-    decisions = memory.query_decisions(model_name=model_name, gpu_type=instance_type, limit=limit)
+    decisions = memory.query_decisions(model_name=model_name, gpu_type=instance_type, job_id=job_id, limit=limit)
     if decisions:
         lines.append(f"\nPAST DECISIONS ({len(decisions)} found — what Koi previously chose):")
         for dec in decisions:

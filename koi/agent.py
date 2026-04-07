@@ -121,6 +121,7 @@ class KoiAgent:
         """Create tool functions bound to this agent's backing services."""
         perfdb = self.perfdb
         memory = self.memory
+        orca = self.orca
 
         @beta_async_tool
         async def query_perfdb(
@@ -142,12 +143,13 @@ class KoiAgent:
         @beta_async_tool
         async def query_memory_tool(
             model_name: Optional[str] = None,
+            job_id: Optional[str] = None,
             status: Optional[str] = None,
             limit: int = 10,
         ) -> str:
             """Query Koi's memory for past job decisions, outcomes, and learned rules. Check this FIRST before PerfDB."""
             from koi.tools.memory import query_memory as _qm
-            return _qm(memory, model_name=model_name, status=status, limit=limit)
+            return _qm(memory, model_name=model_name, job_id=job_id, status=status, limit=limit)
 
         @beta_async_tool
         async def get_gpu_physics_tool(
@@ -207,9 +209,32 @@ class KoiAgent:
                        failure_category=failure_category, diagnosis=diagnosis,
                        bottleneck=bottleneck)
 
+        # Action tools — only when Orca is connected
+        action_tools = []
+        if orca:
+            @beta_async_tool
+            async def scale_chain_tool(
+                job_id: str,
+                gpu_type: str,
+                tp: int,
+                pp: int,
+                count: int,
+            ) -> str:
+                """Scale a running job. count>0 adds replicas with the specified GPU config. count<0 kills the oldest active replicas."""
+                from koi.tools.orca_api import async_scale_chain
+                return await async_scale_chain(orca, job_id, gpu_type, tp, pp, count)
+
+            @beta_async_tool
+            async def get_job_metrics_tool(job_id: str) -> str:
+                """Get live throughput, GPU utilization, KV cache usage, and chunk progress for a running job."""
+                from koi.tools.orca_api import async_get_job_metrics
+                return await async_get_job_metrics(orca, job_id)
+
+            action_tools = [scale_chain_tool, get_job_metrics_tool]
+
         return [query_perfdb, query_memory_tool, get_gpu_physics_tool,
                 get_model_arch_tool, find_similar_models_tool, get_resources_tool,
-                record_outcome_tool]
+                record_outcome_tool] + action_tools
 
     # ------------------------------------------------------------------
     # Main decision entry point
@@ -330,6 +355,9 @@ class KoiAgent:
 
         rows = []
 
+        # Debug: exclude GPUs via env var (e.g. KOI_EXCLUDE_GPUS=A100-40GB,A100-80GB)
+        exclude_gpus = set(g.strip() for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",") if g.strip())
+
         # 1. Ground truth outcomes from memory (highest trust)
         outcomes = self.memory.query_outcomes(model_name=req.model_name, status="succeeded", limit=10)
         for o in outcomes:
@@ -337,9 +365,11 @@ class KoiAgent:
             cost_hr = o.get("actual_cost_per_hour")
             if not tps or tps <= 0 or not cost_hr:
                 continue
+            gpu = o.get("gpu_type", "?")
+            if gpu in exclude_gpus:
+                continue
             eta_h = total_tokens / tps / 3600
             total_cost = cost_hr * eta_h
-            gpu = o.get("gpu_type", "?")
             tp, pp, dp = o.get("tp", 1), o.get("pp", 1), o.get("dp", 1)
             meets_slo = eta_h <= (req.slo_deadline_hours or 999)
             resource = rm.get_resource(gpu)
@@ -363,6 +393,8 @@ class KoiAgent:
             seen = set()
             for r in records:
                 gpu = r.get("gpu_type", "?")
+                if gpu in exclude_gpus:
+                    continue
                 tp = int(r.get("tp", 1))
                 pp = int(r.get("pp", 1))
                 dp = int(r.get("dp", 1))
@@ -485,13 +517,16 @@ class KoiAgent:
             sections.append(f"\nDiagnosis: {trigger.diagnosis_hint}")
 
         if trigger.trigger_type == MonitoringStatus.FALLING_BEHIND:
-            sections.append("\nWhat should we do? Scale up? A/B test a different GPU? Accept the miss?")
+            sections.append("\nWhat should we do? Use get_job_metrics_tool to check live state, then scale_chain_tool to add replicas if needed.")
+            sections.append("\nIMPORTANT: Do NOT use record_outcome_tool. This job is still RUNNING. "
+                           "Outcomes are recorded automatically when the job completes.")
         elif trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
-            sections.append("\nWe're over-provisioned. Which replicas should we kill to save cost?")
+            sections.append("\nWe're over-provisioned. Use scale_chain_tool with negative count to kill excess replicas.")
+            sections.append("\nIMPORTANT: Do NOT use record_outcome_tool. This job is still RUNNING.")
         elif trigger.trigger_type == MonitoringStatus.COMPLETED:
             sections.append("\nJob completed. Record the outcome using record_outcome tool.")
         elif trigger.trigger_type == MonitoringStatus.FAILED:
-            sections.append("\nJob failed. Diagnose why and record corrective action.")
+            sections.append("\nJob failed. Diagnose why and record corrective action with record_outcome tool.")
 
         return "\n".join(sections)
 
