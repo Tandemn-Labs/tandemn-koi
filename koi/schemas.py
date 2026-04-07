@@ -320,8 +320,9 @@ class JobTracker(BaseModel):
     gpu_sm_util: float = 0.0
     gpu_mem_bw_util: float = 0.0
 
-    # Trigger cooldown
-    last_trigger_at: Optional[datetime] = None
+    # Anti-windup: suppress triggers while a scaling action is in progress
+    action_in_progress: bool = False
+    action_freeze_until: Optional[float] = None  # unix timestamp
 
     # Replicas
     replica_ids: List[str] = Field(default_factory=list)

@@ -9,6 +9,7 @@ These are independent asyncio.Tasks. They do NOT share a timer.
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Callable, Coroutine, Dict, List, Optional
 
@@ -21,12 +22,15 @@ logger = logging.getLogger("koi.monitor")
 
 # Thresholds
 WARMUP_MINUTES = 5.0
-SLO_GREEN_THRESHOLD = 30.0       # headroom > 30% → ON_TRACK
-SLO_YELLOW_THRESHOLD = 10.0      # headroom 10-30% → AT_RISK
-OVER_PROVISIONED_THRESHOLD = 70.0 # headroom > 70% AND elapsed > 20% → shed
-OVER_PROVISIONED_MIN_ELAPSED = 0.20  # 20% of SLO elapsed before considering scale-down
 EMA_ALPHA = 0.3                   # exponential moving average smoothing
-TRIGGER_COOLDOWN_SECONDS = 300    # 5 min between triggers for same job
+
+# Hysteresis thresholds (enter/exit pairs prevent oscillation)
+FALLING_BEHIND_ENTER = 10.0       # headroom < 10% → enter FALLING_BEHIND
+FALLING_BEHIND_EXIT = 20.0        # headroom > 20% → exit FALLING_BEHIND
+ON_TRACK_THRESHOLD = 30.0         # headroom > 30% → ON_TRACK
+OVER_PROVISIONED_ENTER = 70.0     # headroom > 70% → enter OVER_PROVISIONED
+OVER_PROVISIONED_EXIT = 50.0      # headroom < 50% → exit OVER_PROVISIONED
+OVER_PROVISIONED_MIN_ELAPSED = 0.20  # 20% of SLO elapsed before considering scale-down
 
 
 class MonitoringLoop:
@@ -193,11 +197,11 @@ class MonitoringLoop:
         else:
             tracker.projected_eta_hours = float("inf")
 
-        # Check for completion
+        # Check for completion — don't emit trigger, /job/complete webhook handles outcome recording
         all_done = progress.get("all_done", False)
         if all_done or (total_chunks > 0 and (completed_chunks + failed_chunks) >= total_chunks):
             tracker.status = MonitoringStatus.COMPLETED
-            await self._emit_trigger(job_id, MonitoringStatus.COMPLETED, "All chunks completed")
+            logger.info(f"[Monitor/L1] {job_id}: all chunks completed, awaiting /job/complete webhook")
             return
 
         # Check Orca job status (use parent job_id for grouped chains)
@@ -234,19 +238,17 @@ class MonitoringLoop:
             tracker.warmup_complete = True
             logger.info(f"[Monitor/L1] {job_id}: warmup complete, TPS={tracker.smoothed_tps:.0f}")
 
-        # Emit triggers on state transitions (with cooldown)
+        # Emit triggers on state transitions (anti-windup: skip if action in progress)
         if new_status != prev_status:
-            now = datetime.utcnow()
-            cooldown_ok = (
-                not tracker.last_trigger_at or
-                (now - tracker.last_trigger_at).total_seconds() >= TRIGGER_COOLDOWN_SECONDS
-            )
-            if new_status == MonitoringStatus.FALLING_BEHIND and cooldown_ok:
-                tracker.last_trigger_at = now
+            frozen = (tracker.action_in_progress and
+                      tracker.action_freeze_until and
+                      time.time() < tracker.action_freeze_until)
+            if frozen:
+                logger.debug(f"[Monitor/L1] {job_id}: anti-windup active, skipping trigger")
+            elif new_status == MonitoringStatus.FALLING_BEHIND:
                 await self._emit_trigger(job_id, MonitoringStatus.FALLING_BEHIND,
                                          f"Headroom={tracker.slo_headroom_pct:.1f}%, TPS={tracker.smoothed_tps:.0f}")
-            elif new_status == MonitoringStatus.OVER_PROVISIONED and cooldown_ok:
-                tracker.last_trigger_at = now
+            elif new_status == MonitoringStatus.OVER_PROVISIONED:
                 await self._emit_trigger(job_id, MonitoringStatus.OVER_PROVISIONED,
                                          f"Headroom={tracker.slo_headroom_pct:.0f}%, can shed replicas")
 
@@ -304,21 +306,42 @@ def _ema(prev: float, new: float, alpha: float) -> float:
 
 
 def _classify_status(tracker: JobTracker) -> MonitoringStatus:
-    """Classify job status from tracker state. Pure function."""
+    """Classify job status with hysteresis to prevent oscillation.
+
+    Enter/exit thresholds differ: entering FALLING_BEHIND requires headroom < 10%,
+    but exiting requires headroom > 20%. This dead band prevents rapid flipping
+    when headroom hovers near a boundary.
+    """
     if tracker.elapsed_hours < (WARMUP_MINUTES / 60) and not tracker.warmup_complete:
         return MonitoringStatus.WARMING_UP
 
-    if (tracker.slo_headroom_pct > OVER_PROVISIONED_THRESHOLD and
-            tracker.elapsed_hours > tracker.slo_deadline_hours * OVER_PROVISIONED_MIN_ELAPSED):
+    prev = tracker.status
+    h = tracker.slo_headroom_pct
+
+    # OVER_PROVISIONED: enter at 70%, exit at 50%
+    if prev == MonitoringStatus.OVER_PROVISIONED:
+        if h < OVER_PROVISIONED_EXIT:
+            pass  # fall through to normal classification
+        else:
+            return MonitoringStatus.OVER_PROVISIONED
+    elif (h > OVER_PROVISIONED_ENTER and
+          tracker.elapsed_hours > tracker.slo_deadline_hours * OVER_PROVISIONED_MIN_ELAPSED):
         return MonitoringStatus.OVER_PROVISIONED
 
-    if tracker.slo_headroom_pct > SLO_GREEN_THRESHOLD:
+    # FALLING_BEHIND: enter at 10%, exit at 20%
+    if prev == MonitoringStatus.FALLING_BEHIND:
+        if h > FALLING_BEHIND_EXIT:
+            pass  # fall through to normal classification
+        else:
+            return MonitoringStatus.FALLING_BEHIND
+    elif h < FALLING_BEHIND_ENTER:
+        return MonitoringStatus.FALLING_BEHIND
+
+    # Normal classification (no hysteresis needed)
+    if h > ON_TRACK_THRESHOLD:
         return MonitoringStatus.ON_TRACK
 
-    if tracker.slo_headroom_pct > SLO_YELLOW_THRESHOLD:
-        return MonitoringStatus.AT_RISK
-
-    return MonitoringStatus.FALLING_BEHIND
+    return MonitoringStatus.AT_RISK
 
 
 def compute_slo_headroom(

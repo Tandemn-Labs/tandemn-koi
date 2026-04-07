@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from koi.agent import KoiAgent
 from koi.monitor import MonitoringLoop
-from koi.schemas import EngineConfig, JobRequest, MonitoringStatus, PlacementConfig
+from koi.schemas import EngineConfig, JobRequest, MonitoringStatus, MonitoringTrigger, PlacementConfig
 from koi.tools.memory import AgenticMemory
 from koi.tools.orca_api import OrcaClient
 from koi.tools.perfdb import PerfDB
@@ -99,9 +99,10 @@ async def lifespan(app: FastAPI):
         orca=app.state.orca,
         on_trigger=app.state.agent.handle_trigger,
     )
+    app.state.agent.monitor = app.state.monitor  # for anti-windup in scale_chain_tool
     if app.state.orca:
         await app.state.monitor.start()
-        logger.info("[Koi] Monitor started (3 async loops)")
+        logger.info("[Koi] Monitor started (2 async loops)")
     else:
         logger.info("[Koi] Monitor not started — no Orca connection")
 
@@ -302,17 +303,21 @@ async def job_complete(req: JobCompleteRequest):
         max_elapsed = max(t.elapsed_hours for t in group_chains.values()) if group_chains else 0
 
         # Record PER-CHAIN outcomes so the learning signal stays clean.
-        # Heterogeneous replicas (L40S + A100 fallback) need separate outcomes
-        # so memory can say "L40S gets 800 TPS" and "A100 gets 1498 TPS" independently.
+        # For single-chain groups, use Orca's aggregate TPS (true average over whole run).
+        # For multi-chain groups, use per-chain EMA (best we have per-replica).
+        orca_aggregate_tps = req.metrics.get("throughput_tokens_per_sec")
+        use_orca_tps = orca_aggregate_tps and len(group_chains) == 1
+
         outcomes_recorded = 0
         for chain_id, tracker in group_chains.items():
             if not tracker.decision_id:
                 continue
+            chain_tps = orca_aggregate_tps if use_orca_tps else tracker.smoothed_tps
             memory.record_outcome(
                 decision_id=tracker.decision_id,
                 job_id=req.job_id,
                 status=req.status,
-                actual_tps=tracker.smoothed_tps,
+                actual_tps=chain_tps,
                 actual_runtime_hours=tracker.elapsed_hours,
                 slo_met=req.status == "succeeded",
                 slo_headroom_pct=tracker.slo_headroom_pct,
@@ -334,6 +339,35 @@ async def job_complete(req: JobCompleteRequest):
 
     logger.warning(f"[Koi] Job complete webhook for unknown job: {req.job_id}")
     return {"status": "unknown_job", "job_id": req.job_id}
+
+
+class ReplicaFailedRequest(BaseModel):
+    job_id: str          # replica chain ID
+    group_id: str        # parent job ID
+    status: str = "failed"
+    reason: str = ""
+
+
+@app.post("/job/replica-failed")
+async def replica_failed(req: ReplicaFailedRequest):
+    """Called by Orca when a replica dies mid-job. Triggers agent for diagnosis."""
+    monitor: MonitoringLoop = app.state.monitor
+    tracker = monitor.tracked_jobs.get(req.job_id)
+    if not tracker:
+        logger.warning(f"[Koi] Replica-failed for unknown chain: {req.job_id}")
+        return {"status": "unknown", "job_id": req.job_id}
+
+    tracker.status = MonitoringStatus.FAILED
+    # Emit FAILED trigger to agent
+    trigger = MonitoringTrigger(
+        trigger_type=MonitoringStatus.FAILED,
+        job_id=req.job_id,
+        job_tracker=tracker.model_dump(),
+        diagnosis_hint=f"Replica died: {req.reason[:200]}",
+    )
+    await monitor._trigger_queue.put(trigger)
+    logger.info(f"[Koi] Replica failed: {req.job_id} — {req.reason[:100]}")
+    return {"status": "trigger_emitted", "job_id": req.job_id}
 
 
 class LaunchFailedRequest(BaseModel):

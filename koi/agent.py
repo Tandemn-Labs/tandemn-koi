@@ -109,6 +109,7 @@ class KoiAgent:
         self.memory = memory
         self.orca = orca
         self.model = model
+        self.monitor = None  # set by server.py after monitor is created
         self._client = AsyncAnthropic(
             api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", ""),
         )
@@ -117,7 +118,7 @@ class KoiAgent:
     # Tools — defined as @beta_tool functions
     # ------------------------------------------------------------------
 
-    def _build_tools(self, resource_map: Optional[ResourceMap] = None):
+    def _build_tools(self, resource_map: Optional[ResourceMap] = None, monitor=None):
         """Create tool functions bound to this agent's backing services."""
         perfdb = self.perfdb
         memory = self.memory
@@ -222,7 +223,14 @@ class KoiAgent:
             ) -> str:
                 """Scale a running job. count>0 adds replicas with the specified GPU config. count<0 kills the oldest active replicas."""
                 from koi.tools.orca_api import async_scale_chain
-                return await async_scale_chain(orca, job_id, gpu_type, tp, pp, count)
+                result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count)
+                # Anti-windup: freeze triggers for this job while scaling action takes effect
+                if monitor:
+                    for tracker in monitor.tracked_jobs.values():
+                        if tracker.group_id == job_id or tracker.job_id == job_id:
+                            tracker.action_in_progress = True
+                            tracker.action_freeze_until = time.time() + 300  # 5 min freeze
+                return result
 
             @beta_async_tool
             async def get_job_metrics_tool(job_id: str) -> str:
@@ -311,7 +319,7 @@ class KoiAgent:
     async def handle_trigger(self, trigger: MonitoringTrigger) -> str:
         """Called by the monitor when a job needs attention."""
         prompt = self._build_trigger_prompt(trigger)
-        tools = self._build_tools()
+        tools = self._build_tools(monitor=self.monitor)
 
         logger.info(f"[Koi] Agent handling {trigger.trigger_type.value} for {trigger.job_id}")
 
@@ -499,12 +507,25 @@ class KoiAgent:
     def _build_trigger_prompt(self, trigger: MonitoringTrigger) -> str:
         """Build the user message for a monitoring trigger."""
         tracker = trigger.job_tracker
+        config = tracker.get('config', {})
+        group_id = tracker.get('group_id') or trigger.job_id
+        predicted_tps = tracker.get('predicted_tps', 0)
+        actual_tps = tracker.get('smoothed_tps', 0)
+        delta_pct = ((actual_tps - predicted_tps) / predicted_tps * 100) if predicted_tps > 0 else 0
+
         sections = [
             f"MONITORING TRIGGER: {trigger.trigger_type.value}",
             f"Job: {trigger.job_id}",
+            f"Group (parent job ID): {group_id}",
+            f"",
+            f"Config:",
+            f"  GPU: {config.get('gpu_type', '?')} TP={config.get('tp', '?')} PP={config.get('pp', '?')} DP={config.get('dp', '?')}",
+            f"  Instance: {config.get('instance_type', '?')}",
+            f"  SLO: {tracker.get('slo_deadline_hours', '?')}h",
+            f"  Total tokens: {tracker.get('total_tokens', 0):,}",
             f"",
             f"Current state:",
-            f"  Smoothed TPS: {tracker.get('smoothed_tps', 0):.0f}",
+            f"  Actual TPS: {actual_tps:.0f} (predicted {predicted_tps:.0f}, delta={delta_pct:+.1f}%)",
             f"  SLO headroom: {tracker.get('slo_headroom_pct', 0):.1f}%",
             f"  Elapsed: {tracker.get('elapsed_hours', 0):.2f}h",
             f"  Tokens remaining: {tracker.get('tokens_remaining', 0):,}",
@@ -516,15 +537,20 @@ class KoiAgent:
         if trigger.diagnosis_hint:
             sections.append(f"\nDiagnosis: {trigger.diagnosis_hint}")
 
+        # Tool usage instructions — always use group_id for Orca API calls
+        sections.append(f"\nIMPORTANT: When calling scale_chain_tool or get_job_metrics_tool, "
+                       f"use job_id='{group_id}' (the parent/group ID), NOT the chain ID.")
+
         if trigger.trigger_type == MonitoringStatus.FALLING_BEHIND:
-            sections.append("\nWhat should we do? Use get_job_metrics_tool to check live state, then scale_chain_tool to add replicas if needed.")
-            sections.append("\nIMPORTANT: Do NOT use record_outcome_tool. This job is still RUNNING. "
-                           "Outcomes are recorded automatically when the job completes.")
+            sections.append("\nAction: Use get_job_metrics_tool to check live state, then scale_chain_tool to add replicas if needed.")
+            sections.append("Do NOT use record_outcome_tool — this job is still RUNNING. "
+                           "Outcomes are recorded automatically on completion.")
         elif trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
-            sections.append("\nWe're over-provisioned. Use scale_chain_tool with negative count to kill excess replicas.")
-            sections.append("\nIMPORTANT: Do NOT use record_outcome_tool. This job is still RUNNING.")
+            sections.append("\nAction: Use scale_chain_tool with negative count to kill excess replicas.")
+            sections.append("Do NOT use record_outcome_tool — this job is still RUNNING.")
         elif trigger.trigger_type == MonitoringStatus.COMPLETED:
-            sections.append("\nJob completed. Record the outcome using record_outcome tool.")
+            sections.append("\nJob completed. Outcome has been recorded automatically by the webhook. "
+                           "Do NOT call record_outcome_tool.")
         elif trigger.trigger_type == MonitoringStatus.FAILED:
             sections.append("\nJob failed. Diagnose why and record corrective action with record_outcome tool.")
 
