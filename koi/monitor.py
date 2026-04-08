@@ -9,6 +9,7 @@ These are independent asyncio.Tasks. They do NOT share a timer.
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Callable, Coroutine, Dict, List, Optional
@@ -21,7 +22,7 @@ from koi.tools.orca_api import OrcaClient
 logger = logging.getLogger("koi.monitor")
 
 # Thresholds
-WARMUP_MINUTES = 5.0
+WARMUP_MINUTES = float(os.environ.get("KOI_WARMUP_MINUTES", "5.0"))
 EMA_ALPHA = 0.3                   # exponential moving average smoothing
 
 # Hysteresis thresholds (enter/exit pairs prevent oscillation)
@@ -58,6 +59,7 @@ class MonitoringLoop:
         self._trigger_queue: asyncio.Queue = asyncio.Queue()
         self._tasks: List[asyncio.Task] = []
         self._running = False
+        self._group_trigger_cooldown: Dict[str, float] = {}  # "group_id:status" → last_emit_time
 
     # ------------------------------------------------------------------
     # Job registration
@@ -141,6 +143,15 @@ class MonitoringLoop:
                 break
             except Exception as e:
                 logger.error(f"[Monitor/L1] Telemetry error: {e}")
+            # Clean up dead/completed trackers after grace period
+            now = time.time()
+            for jid in list(self.tracked_jobs.keys()):
+                t = self.tracked_jobs[jid]
+                if t.status in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED):
+                    dead_since = t.last_positive_tps_at or (now - 120)
+                    if now - dead_since > 60:
+                        self.tracked_jobs.pop(jid, None)
+                        logger.info(f"[Monitor/L1] Cleaned up dead tracker: {jid}")
             await asyncio.sleep(self.telemetry_interval)
 
     async def _poll_job(self, job_id: str):
@@ -149,8 +160,28 @@ class MonitoringLoop:
         if not tracker:
             return
 
+        # Skip dead/completed replicas — no point polling them
+        if tracker.status in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED):
+            return
+
         # For grouped chains, Orca indexes by parent job_id — not replica_id
         orca_job_id = tracker.group_id or job_id
+
+        # Check replica liveness from Orca (detect dead/failed/killed replicas)
+        if tracker.group_id and job_id not in tracker.dead_replicas:
+            try:
+                replicas_resp = await self.orca.get_replicas(tracker.group_id)
+                for r in replicas_resp.get("replicas", []):
+                    if r["replica_id"] == job_id and r.get("phase") in ("dead", "failed", "killed"):
+                        logger.warning(f"[Monitor/L1] {job_id}: Orca reports phase={r['phase']}, zeroing TPS")
+                        tracker.smoothed_tps = 0
+                        tracker.status = MonitoringStatus.FAILED
+                        tracker.dead_replicas.append(job_id)
+                        await self._emit_trigger(job_id, MonitoringStatus.FAILED,
+                                                 f"Orca reports replica {r['phase']}")
+                        return
+            except Exception:
+                pass  # fallback to EMA decay below
 
         # Fetch metrics from Orca
         try:
@@ -168,6 +199,12 @@ class MonitoringLoop:
         tps = metrics.get("avg_generation_throughput_toks_per_s", 0)
         if tps > 0:
             tracker.smoothed_tps = _ema(tracker.smoothed_tps, tps, EMA_ALPHA)
+            tracker.last_positive_tps_at = time.time()
+        elif tracker.last_positive_tps_at and tracker.smoothed_tps > 0:
+            stale_seconds = time.time() - tracker.last_positive_tps_at
+            if stale_seconds > 60:
+                decay_factor = 0.5 ** (stale_seconds / 60)
+                tracker.smoothed_tps *= decay_factor
 
         # Estimate tokens from chunk progress
         total_chunks = progress.get("total", 0)
@@ -220,7 +257,8 @@ class MonitoringLoop:
             group_chains = self.get_group_chains(tracker.group_id)
             aggregate_tps = sum(t.smoothed_tps for t in group_chains.values())
             # Recompute headroom using aggregate throughput and full job tokens
-            total_job_tokens = sum(t.total_tokens for t in group_chains.values())
+            # All replicas share the same chunk pool — use max, not sum
+            total_job_tokens = max(t.total_tokens for t in group_chains.values())
             total_remaining = max(0, total_job_tokens - int(
                 total_job_tokens * ((completed_chunks + failed_chunks) / max(total_chunks, 1))
             )) if total_chunks > 0 else total_job_tokens
@@ -257,6 +295,14 @@ class MonitoringLoop:
         tracker = self.tracked_jobs.get(job_id)
         if not tracker:
             return
+        # Group-level dedup: at most one trigger per group per status per 30s
+        if tracker.group_id:
+            key = f"{tracker.group_id}:{status.value}"
+            last = self._group_trigger_cooldown.get(key, 0)
+            if time.time() - last < 30:
+                logger.debug(f"[Monitor/L1] Dedup: skipping {status.value} for {job_id} (group cooldown)")
+                return
+            self._group_trigger_cooldown[key] = time.time()
         trigger = MonitoringTrigger(
             trigger_type=status,
             job_id=job_id,
@@ -312,6 +358,10 @@ def _classify_status(tracker: JobTracker) -> MonitoringStatus:
     but exiting requires headroom > 20%. This dead band prevents rapid flipping
     when headroom hovers near a boundary.
     """
+    # Respect terminal states — don't reclassify dead/completed replicas
+    if tracker.status in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED):
+        return tracker.status
+
     if tracker.elapsed_hours < (WARMUP_MINUTES / 60) and not tracker.warmup_complete:
         return MonitoringStatus.WARMING_UP
 

@@ -1146,8 +1146,12 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 - [x] `koi_alternatives` passed from CLI to server
 
 **Not done yet:**
-- [ ] Scale-up replicas tracked in Koi (need koi_webhook_info propagation in Orca scale endpoint)
-- [ ] Spot preemption recovery
+- [x] Scale-up replicas tracked in Koi (koi_webhook_info propagation in Orca scale endpoint — fixed 2026-04-08)
+- [x] Trigger deduplication for grouped jobs (30s cooldown per group per status — fixed 2026-04-08)
+- [x] Failure outcomes recorded in memory (auto-record in /job/replica-failed webhook — fixed 2026-04-08)
+- [x] Scale-up/down decisions recorded in memory (triggered_by=scale_up/scale_down — fixed 2026-04-08)
+- [ ] Adaptive replacement: agent queries failure history before choosing replacement config (same GPU keeps dying → try different GPU/region/market)
+- [ ] Spot preemption recovery (on-demand fallback when spot repeatedly fails)
 - [ ] Fast-path: skip LLM when memory has high-confidence answer for repeat workloads
 - [ ] Heterogeneous replica design: agent proactively designs mixed-GPU mixes (not just fallback)
 - [ ] `launch_chain` as agent tool (agent-initiated launches, not just CLI-driven)
@@ -1228,6 +1232,15 @@ Agent decides:
 ```
 
 The Orca watchdog already handles replica death and chunk reclamation. Koi's role is deciding WHETHER to replace (based on SLO math) and WHAT to replace with (same GPU? different? on-demand fallback?).
+
+**Observed in simulation (2026-04-08):** Killed 2 of 4 L40S replicas → Koi detected failures via `/job/replica-failed`, zeroed their TPS, aggregate headroom dropped from +13% to -75%, FALLING_BEHIND triggered, agent called `scale_chain_tool` and launched 3 replacement replicas (r4, r5, r6). System recovered to 5 alive replicas, headroom back to +24%. Then killed ALL 5 → Koi launched 4 more replacements (r7-r10), recovered again.
+
+**Gap exposed:** All replacement replicas used the **same config** (L40S TP=2 PP=4). The agent never considered "L40S keeps dying, should I try a different GPU or region?" The FAILED prompt tells the agent to diagnose and scale, but doesn't instruct it to query memory for repeated failure patterns or try alternative configs. This is the **adaptive replacement** gap — the agent should:
+1. Query memory: "has this config failed before? how many times?"
+2. If repeated failures on same GPU/region → try alternative from PerfDB (different instance, different region, on-demand instead of spot)
+3. Use the ranked alternatives list from the original `/decide` response as fallback options
+
+This connects to the A/B testing + AlphaEvolve exploration vision: a failure is not just something to recover from, it's signal to explore the config space.
 
 ### Cost tracking and budget enforcement
 

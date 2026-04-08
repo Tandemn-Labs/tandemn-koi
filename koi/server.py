@@ -236,6 +236,12 @@ async def job_started(req: JobStartedRequest):
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
 
+    # Link scale-up replicas to their pending decision
+    if not req.decision_id and hasattr(monitor, '_pending_scale_decision'):
+        pending = getattr(monitor, '_pending_scale_decision', None)
+        if pending and pending.get("group_id") == req.group_id:
+            req.decision_id = pending["decision_id"]
+
     # Detect fallback: if Orca used a different config than Koi's primary decision,
     # create a child decision so the outcome links to the ACTUAL config, not the intended one.
     actual_decision_id = req.decision_id
@@ -388,6 +394,19 @@ async def replica_failed(req: ReplicaFailedRequest):
         return {"status": "unknown", "job_id": req.job_id}
 
     tracker.status = MonitoringStatus.FAILED
+    tracker.smoothed_tps = 0
+    if req.job_id not in tracker.dead_replicas:
+        tracker.dead_replicas.append(req.job_id)
+    # Record failure outcome in memory for learning
+    memory: AgenticMemory = app.state.memory
+    if tracker.decision_id:
+        memory.record_outcome(
+            decision_id=tracker.decision_id,
+            job_id=req.group_id,
+            status="replica_failed",
+            failure_category="infrastructure",
+            diagnosis=req.reason[:200],
+        )
     # Emit FAILED trigger to agent
     trigger = MonitoringTrigger(
         trigger_type=MonitoringStatus.FAILED,

@@ -123,6 +123,7 @@ class KoiAgent:
         perfdb = self.perfdb
         memory = self.memory
         orca = self.orca
+        exclude_gpus = set(g.strip() for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",") if g.strip())
 
         @beta_async_tool
         async def query_perfdb(
@@ -226,6 +227,36 @@ class KoiAgent:
                 count: int,
             ) -> str:
                 """Scale a running job. count>0 adds replicas with the specified GPU config. count<0 kills the oldest active replicas."""
+                # Record scaling decision in memory before calling Orca
+                if count != 0 and memory:
+                    parent_dec = None
+                    if monitor:
+                        for t in monitor.tracked_jobs.values():
+                            if t.group_id == job_id and t.decision_id:
+                                parent_dec = t.decision_id
+                                break
+                    parent = memory.get_decision(parent_dec) if parent_dec else None
+                    scale_dec_id = memory.record_decision(
+                        job_id=job_id,
+                        model_name=parent["model_name"] if parent else "unknown",
+                        instance_type=parent["instance_type"] if parent else "unknown",
+                        gpu_type=gpu_type, tp=tp, pp=pp, dp=count,
+                        num_gpus=tp * pp * count,
+                        predicted_tps=0,
+                        predicted_cost_per_hour=parent["predicted_cost_per_hour"] if parent else 0,
+                        slo_deadline_hours=parent["slo_deadline_hours"] if parent else 0,
+                        objective=parent["objective"] if parent else "cheapest",
+                        avg_input_tokens=parent["avg_input_tokens"] if parent else 0,
+                        avg_output_tokens=parent["avg_output_tokens"] if parent else 0,
+                        triggered_by="scale_up" if count > 0 else "scale_down",
+                        parent_decision_id=parent_dec,
+                    )
+                    # Store so /job/started can link new replicas to this decision
+                    if monitor and count > 0:
+                        monitor._pending_scale_decision = {
+                            "group_id": job_id, "decision_id": scale_dec_id,
+                        }
+
                 from koi.tools.orca_api import async_scale_chain
                 result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count)
                 # Anti-windup: freeze triggers for this job while scaling action takes effect
@@ -558,7 +589,11 @@ class KoiAgent:
             sections.append("\nJob completed. Outcome has been recorded automatically by the webhook. "
                            "Do NOT call record_outcome_tool.")
         elif trigger.trigger_type == MonitoringStatus.FAILED:
-            sections.append("\nJob failed. Diagnose why and record corrective action with record_outcome tool.")
+            sections.append("\nA replica FAILED (not the whole job). Other replicas may still be running.")
+            sections.append("1. Diagnose why the replica failed (spot preemption? OOM? infra issue?).")
+            sections.append("2. Use get_job_metrics_tool to check if remaining replicas can still meet SLO.")
+            sections.append("3. If SLO is at risk, use scale_chain_tool to add replacement replicas.")
+            sections.append("4. Do NOT call record_outcome_tool — the job is still running.")
 
         return "\n".join(sections)
 

@@ -320,6 +320,9 @@ class JobTracker(BaseModel):
     gpu_sm_util: float = 0.0
     gpu_mem_bw_util: float = 0.0
 
+    # Telemetry staleness
+    last_positive_tps_at: Optional[float] = None  # unix timestamp
+
     # Anti-windup: suppress triggers while a scaling action is in progress
     action_in_progress: bool = False
     action_freeze_until: Optional[float] = None  # unix timestamp
