@@ -571,6 +571,17 @@ class KoiAgent:
             f"  GPU mem BW: {tracker.get('gpu_mem_bw_util', 0):.0f}%",
         ]
 
+        # Per-replica TPS breakdown (so agent can identify sick/dead replicas)
+        if self.monitor and tracker.get('group_id'):
+            group_chains = self.monitor.get_group_chains(tracker['group_id'])
+            if len(group_chains) > 1:
+                sections.append(f"\nPer-replica TPS:")
+                for rid, t in group_chains.items():
+                    status_icon = "💀" if t.status.value == "failed" else "⚠" if t.smoothed_tps < 100 else "✓"
+                    sections.append(f"  {status_icon} {rid}: TPS={t.smoothed_tps:.0f} ({t.status.value})")
+                agg = sum(t.smoothed_tps for t in group_chains.values())
+                sections.append(f"  Aggregate: {agg:.0f} TPS ({len(group_chains)} replicas)")
+
         if trigger.diagnosis_hint:
             sections.append(f"\nDiagnosis: {trigger.diagnosis_hint}")
 

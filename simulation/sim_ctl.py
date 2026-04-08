@@ -9,6 +9,7 @@ Commands:
     state                          — show simulator + Koi state
     kill <replica_id>              — kill a replica (simulates EC2 death)
     tps <replica_id> <value>       — set replica base TPS
+    degrade <replica_id> [tps] [s] — gradually reduce TPS (default: 50 TPS over 60s)
     add                            — add a new replica (instant)
     complete                       — force job completion
     koi                            — show Koi /health + /jobs
@@ -136,6 +137,10 @@ def main():
             print(post(f"{ORCA}/sim/kill-replica/{parts[1]}"))
         elif cmd == "tps" and len(parts) >= 3:
             print(post(f"{ORCA}/sim/set-tps/{parts[1]}", {"tps": float(parts[2])}))
+        elif cmd == "degrade" and len(parts) >= 2:
+            target = float(parts[2]) if len(parts) > 2 else 50
+            secs = float(parts[3]) if len(parts) > 3 else 60
+            print(post(f"{ORCA}/sim/degrade/{parts[1]}", {"target_tps": target, "over_seconds": secs}))
         elif cmd == "add":
             print(post(f"{ORCA}/sim/add-replica"))
         elif cmd == "complete":

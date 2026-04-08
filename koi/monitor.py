@@ -31,7 +31,7 @@ FALLING_BEHIND_EXIT = 20.0        # headroom > 20% → exit FALLING_BEHIND
 ON_TRACK_THRESHOLD = 30.0         # headroom > 30% → ON_TRACK
 OVER_PROVISIONED_ENTER = 70.0     # headroom > 70% → enter OVER_PROVISIONED
 OVER_PROVISIONED_EXIT = 50.0      # headroom < 50% → exit OVER_PROVISIONED
-OVER_PROVISIONED_MIN_ELAPSED = 0.20  # 20% of SLO elapsed before considering scale-down
+OVER_PROVISIONED_MIN_ELAPSED = float(os.environ.get("KOI_OVERPROV_MIN_ELAPSED", "0.20"))  # fraction of SLO
 
 
 class MonitoringLoop:

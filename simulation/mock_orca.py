@@ -488,6 +488,35 @@ async def sim_force_complete():
     return {"status": "completed", "job_id": job.job_id}
 
 
+class DegradeRequest(BaseModel):
+    target_tps: float = 50
+    over_seconds: float = 60
+
+
+@app.post("/sim/degrade/{replica_id}")
+async def sim_degrade_replica(replica_id: str, req: DegradeRequest):
+    """Gradually reduce a replica's TPS over time (simulates KV cache thrashing, mem pressure)."""
+    for job in SIM.jobs.values():
+        replica = job.replicas.get(replica_id)
+        if replica:
+            start_tps = replica.base_tps
+            logger.info(f"[Sim] Degrading {replica_id}: {start_tps:.0f} → {req.target_tps:.0f} over {req.over_seconds}s")
+            asyncio.create_task(_gradual_degrade(replica, start_tps, req.target_tps, req.over_seconds))
+            return {"status": "degrading", "replica_id": replica_id,
+                    "from_tps": start_tps, "to_tps": req.target_tps, "seconds": req.over_seconds}
+    raise HTTPException(404, f"Replica {replica_id} not found")
+
+
+async def _gradual_degrade(replica: SimReplica, start_tps: float, target_tps: float, seconds: float):
+    """Linearly ramp TPS from start to target over N seconds."""
+    steps = int(seconds / 2)  # update every 2s
+    for i in range(steps + 1):
+        frac = i / max(steps, 1)
+        replica.base_tps = start_tps + (target_tps - start_tps) * frac
+        await asyncio.sleep(2)
+    replica.base_tps = target_tps
+
+
 @app.post("/sim/add-replica")
 async def sim_add_replica():
     """Manually add a replica that's immediately running (no launch delay)."""
@@ -496,7 +525,7 @@ async def sim_add_replica():
         raise HTTPException(404, "No job running")
     idx = len(job.replicas)
     rid = f"{job.job_id}-r{idx}"
-    replica = SimReplica(replica_id=rid, phase="running", tps=1200.0)
+    replica = SimReplica(replica_id=rid, phase="running", base_tps=1200.0)
     job.replicas[rid] = replica
     await _notify_koi_replica_started(job, replica)
     return {"status": "added", "replica_id": rid}
