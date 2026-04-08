@@ -393,6 +393,16 @@ async def replica_failed(req: ReplicaFailedRequest):
         logger.warning(f"[Koi] Replica-failed for unknown chain: {req.job_id}")
         return {"status": "unknown", "job_id": req.job_id}
 
+    # Check if this was an intentional kill (from scale_chain_tool)
+    if req.job_id in monitor._koi_initiated_kills:
+        monitor._koi_initiated_kills.discard(req.job_id)
+        tracker.status = MonitoringStatus.COMPLETED
+        tracker.smoothed_tps = 0
+        if req.job_id not in tracker.dead_replicas:
+            tracker.dead_replicas.append(req.job_id)
+        logger.info(f"[Koi] Intentional kill acknowledged: {req.job_id}")
+        return {"status": "intentional_kill", "job_id": req.job_id}
+
     tracker.status = MonitoringStatus.FAILED
     tracker.smoothed_tps = 0
     if req.job_id not in tracker.dead_replicas:

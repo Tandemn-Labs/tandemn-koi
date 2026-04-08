@@ -60,6 +60,7 @@ class MonitoringLoop:
         self._tasks: List[asyncio.Task] = []
         self._running = False
         self._group_trigger_cooldown: Dict[str, float] = {}  # "group_id:status" → last_emit_time
+        self._koi_initiated_kills: set = set()  # replica IDs killed by scale_chain_tool
 
     # ------------------------------------------------------------------
     # Job registration
@@ -173,12 +174,18 @@ class MonitoringLoop:
                 replicas_resp = await self.orca.get_replicas(tracker.group_id)
                 for r in replicas_resp.get("replicas", []):
                     if r["replica_id"] == job_id and r.get("phase") in ("dead", "failed", "killed"):
-                        logger.warning(f"[Monitor/L1] {job_id}: Orca reports phase={r['phase']}, zeroing TPS")
                         tracker.smoothed_tps = 0
-                        tracker.status = MonitoringStatus.FAILED
                         tracker.dead_replicas.append(job_id)
-                        await self._emit_trigger(job_id, MonitoringStatus.FAILED,
-                                                 f"Orca reports replica {r['phase']}")
+                        # Intentional kills (from scale_chain_tool) don't trigger FAILED
+                        if job_id in self._koi_initiated_kills:
+                            tracker.status = MonitoringStatus.COMPLETED  # clean exit
+                            self._koi_initiated_kills.discard(job_id)
+                            logger.info(f"[Monitor/L1] {job_id}: intentional kill, cleaning up")
+                        else:
+                            tracker.status = MonitoringStatus.FAILED
+                            logger.warning(f"[Monitor/L1] {job_id}: Orca reports phase={r['phase']}, zeroing TPS")
+                            await self._emit_trigger(job_id, MonitoringStatus.FAILED,
+                                                     f"Orca reports replica {r['phase']}")
                         return
             except Exception:
                 pass  # fallback to EMA decay below

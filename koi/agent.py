@@ -257,6 +257,17 @@ class KoiAgent:
                             "group_id": job_id, "decision_id": scale_dec_id,
                         }
 
+                # For scale-down: mark replicas as intentionally killed so FAILED doesn't fire
+                if count < 0 and monitor:
+                    try:
+                        replicas_data = await orca.get_replicas(job_id)
+                        active = [r["replica_id"] for r in replicas_data.get("replicas", [])
+                                  if r.get("phase") not in ("dead", "killed", "completed", "failed")]
+                        to_kill = active[:abs(count)]
+                        monitor._koi_initiated_kills.update(to_kill)
+                    except Exception:
+                        pass
+
                 from koi.tools.orca_api import async_scale_chain
                 result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count)
                 # Anti-windup: freeze triggers for this job while scaling action takes effect
@@ -268,12 +279,26 @@ class KoiAgent:
                 return result
 
             @beta_async_tool
+            async def kill_replica_tool(job_id: str, replica_ids: list[str]) -> str:
+                """Kill specific replicas by ID. Use when you identify degraded/sick replicas that should be removed."""
+                if monitor:
+                    monitor._koi_initiated_kills.update(replica_ids)
+                result = await orca.kill_replicas(job_id, replica_ids)
+                # Anti-windup
+                if monitor:
+                    for tracker in monitor.tracked_jobs.values():
+                        if tracker.group_id == job_id or tracker.job_id == job_id:
+                            tracker.action_in_progress = True
+                            tracker.action_freeze_until = time.time() + 300
+                return f"Killed {len(replica_ids)} replicas: {replica_ids}. {result}"
+
+            @beta_async_tool
             async def get_job_metrics_tool(job_id: str) -> str:
                 """Get live throughput, GPU utilization, KV cache usage, and chunk progress for a running job."""
                 from koi.tools.orca_api import async_get_job_metrics
                 return await async_get_job_metrics(orca, job_id)
 
-            action_tools = [scale_chain_tool, get_job_metrics_tool]
+            action_tools = [scale_chain_tool, kill_replica_tool, get_job_metrics_tool]
 
         return [query_perfdb, query_memory_tool, get_gpu_physics_tool,
                 get_model_arch_tool, find_similar_models_tool, get_resources_tool,
@@ -586,13 +611,15 @@ class KoiAgent:
             sections.append(f"\nDiagnosis: {trigger.diagnosis_hint}")
 
         # Tool usage instructions — always use group_id for Orca API calls
-        sections.append(f"\nIMPORTANT: When calling scale_chain_tool or get_job_metrics_tool, "
+        sections.append(f"\nIMPORTANT: When calling scale_chain_tool, kill_replica_tool, or get_job_metrics_tool, "
                        f"use job_id='{group_id}' (the parent/group ID), NOT the chain ID.")
 
         if trigger.trigger_type == MonitoringStatus.FALLING_BEHIND:
-            sections.append("\nAction: Use get_job_metrics_tool to check live state, then scale_chain_tool to add replicas if needed.")
-            sections.append("Do NOT use record_outcome_tool — this job is still RUNNING. "
-                           "Outcomes are recorded automatically on completion.")
+            sections.append("\nAction:")
+            sections.append("1. Check per-replica TPS above. If any replica is producing <10% of the group average, it's degraded — kill it with kill_replica_tool(job_id, [replica_id]) to free resources.")
+            sections.append("2. Use get_job_metrics_tool to check live state.")
+            sections.append("3. If SLO is at risk after removing sick replicas, use scale_chain_tool to add replacements.")
+            sections.append("Do NOT use record_outcome_tool — this job is still RUNNING.")
         elif trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
             sections.append("\nAction: Use scale_chain_tool with negative count to kill excess replicas.")
             sections.append("Do NOT use record_outcome_tool — this job is still RUNNING.")
