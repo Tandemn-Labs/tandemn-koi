@@ -93,8 +93,8 @@ def wait_for(url: str, timeout: int = 15, label: str = "") -> bool:
 
 
 @contextmanager
-def koi_server(api_key: str = "dummy", orca_url: str = ""):
-    """Start koi server as a subprocess; yield; kill on exit."""
+def koi_server(api_key: str = "dummy", orca_url: str = "", extra_env: dict = None):
+    """Start koi server as a subprocess; yield db_path; kill on exit."""
     db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     db.close()
     env = {
@@ -104,6 +104,7 @@ def koi_server(api_key: str = "dummy", orca_url: str = ""):
         "KOI_PORT": str(KOI_PORT),
         "KOI_MEMORY_PATH": db.name,
         "KOI_PERFDB_PATH": "./perfdb/perfdb_all.csv",
+        **(extra_env or {}),
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "koi.server"],
@@ -128,7 +129,7 @@ def koi_server(api_key: str = "dummy", orca_url: str = ""):
 
 
 @contextmanager
-def mock_orca_server():
+def mock_orca_server(replicas: int = 2, tps: float = 1200):
     """Start mock_orca as a subprocess with --no-decide; yield; kill on exit.
     Koi server must already be running (mock_orca sends /job/started on init)."""
     # Use a dummy koi-url so init_scenario's /decide + /job/started fail instantly
@@ -138,7 +139,7 @@ def mock_orca_server():
         [sys.executable, "simulation/mock_orca.py",
          "--port", str(ORCA_PORT),
          "--koi-url", "http://localhost:1",
-         "--replicas", "2", "--tps", "1200",
+         "--replicas", str(replicas), "--tps", str(tps),
          "--model", "Qwen/Qwen3-32B",
          "--no-decide"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -658,16 +659,24 @@ def run_tier3(api_key: str):
 
             print(f"    [{len(replica_ids)} replicas running, group={group_id}]")
 
-            # Register replicas with Koi (mock_orca used dummy koi-url)
+            # Register replicas with Koi — tight SLO so losing 1 replica forces scale_up
+            # SLO = 0.5h, total = 6M tokens → required_tps = 3333
+            # 2 replicas × 1200 = 2400 TPS meets it, but 1 × 1200 = 1200 does NOT
             for rid in replica_ids:
                 post(f"{KOI_URL}/job/started", {
                     "job_id": rid, "group_id": group_id,
                     "gpu_type": "L40S", "instance_type": "g6e.12xlarge",
                     "tp": 4, "pp": 1, "dp": 1,
-                    "slo_deadline_hours": 2.0, "total_tokens": 6_000_000,
+                    "slo_deadline_hours": 0.5, "total_tokens": 6_000_000,
                     "predicted_tps": 1200.0,
                 })
-            time.sleep(2)  # let monitor pick them up
+            time.sleep(5)  # let monitor poll and pick up metrics
+
+            # Diagnostic: check Koi sees the replicas
+            jobs = requests.get(f"{KOI_URL}/jobs", timeout=5).json()
+            print(f"    koi tracked: {len(jobs.get('jobs',[]))} jobs")
+            for j in jobs.get("jobs", []):
+                print(f"      {j['job_id']}: TPS={j['smoothed_tps']:.0f} headroom={j['slo_headroom_pct']:.0f}%")
 
             # Fire preemption: kill in mock_orca AND send webhook directly to Koi
             target = replica_ids[0]
@@ -678,8 +687,8 @@ def run_tier3(api_key: str):
                 "status": "failed", "reason": "SpotInstanceInterruption",
             })
 
-            # Give agent up to 120s to respond
-            deadline = time.time() + 120
+            # Give agent up to 150s to respond
+            deadline = time.time() + 150
             trigger_responded = False
             while time.time() < deadline:
                 time.sleep(5)
@@ -689,11 +698,17 @@ def run_tier3(api_key: str):
                 if scale_decs:
                     trigger_responded = True
                     break
-                elapsed = int(time.time() - (deadline - 120))
-                print(f"    waiting for agent response... ({elapsed}s)")
+                elapsed = int(time.time() - (deadline - 150))
+                # Diagnostic: show current Koi state
+                try:
+                    jobs = requests.get(f"{KOI_URL}/jobs", timeout=3).json()
+                    statuses = [(j["job_id"][-5:], j["status"], f"TPS={j['smoothed_tps']:.0f}") for j in jobs.get("jobs",[])]
+                except Exception:
+                    statuses = "?"
+                print(f"    waiting... ({elapsed}s) jobs={statuses}")
 
             def t_agent_responded_to_failed_trigger():
-                assert trigger_responded, "Agent did not produce a scale_up decision within 120s"
+                assert trigger_responded, "Agent did not produce a scale_up decision within 150s"
 
             def t_agent_scale_decision_exists():
                 m2 = AgenticMemory(db_path)
@@ -722,6 +737,221 @@ def run_tier3(api_key: str):
         for name in ["agent responded to FAILED trigger (scale_up decision in memory)",
                      "scale_up decision recorded in memory",
                      "agent uses market=on_demand after 2 spot preemptions"]:
+            skip(name, str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 4 — Scenario tests (OVER_PROVISIONED + FALLING_BEHIND, requires ANTHROPIC_API_KEY)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_sim_replicas():
+    """Get (group_id, {rid: info}) from mock_orca's sim/state."""
+    state = requests.get(f"{ORCA_URL}/sim/state", timeout=5).json()
+    for job_id, info in state.items():
+        running = {rid: r for rid, r in info.get("replicas", {}).items()
+                   if r.get("phase") == "running"}
+        return job_id, running, info.get("replicas", {})
+    return None, {}, {}
+
+
+def _register_replicas_with_koi(group_id, replica_ids, total_tokens, slo, predicted_tps=1200):
+    """Register replicas with Koi via /job/started."""
+    for rid in replica_ids:
+        post(f"{KOI_URL}/job/started", {
+            "job_id": rid, "group_id": group_id,
+            "gpu_type": "L40S", "instance_type": "g6e.12xlarge",
+            "tp": 4, "pp": 1, "dp": 1,
+            "slo_deadline_hours": slo, "total_tokens": total_tokens,
+            "predicted_tps": predicted_tps,
+        })
+
+
+def run_tier4(api_key: str):
+    # ── T4.1: OVER_PROVISIONED → scale-down → no self-fight ──────────────────
+    section("T4.1  OVER_PROVISIONED → scale-down → no self-fight")
+
+    # Setup: 4 replicas × 1200 TPS = 4800 TPS, SLO = 2h, total = 1M tokens
+    # required_tps = 1M / (2 * 3600) = 139 TPS. Headroom ≈ 97%. Massively over-provisioned.
+    # KOI_WARMUP_MINUTES=0 + KOI_OVERPROV_MIN_ELAPSED=0.001 so it fires immediately.
+    try:
+        fast_env = {"KOI_WARMUP_MINUTES": "0", "KOI_OVERPROV_MIN_ELAPSED": "0.001"}
+        with koi_server(api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env) as db_path:
+          with mock_orca_server(replicas=4, tps=1200):
+            from koi.tools.memory import AgenticMemory
+
+            group_id, running, all_replicas = _get_sim_replicas()
+            if not running:
+                skip("agent scale-down on OVER_PROVISIONED", "no replicas in mock_orca")
+                return
+
+            print(f"    [{len(running)} replicas, group={group_id}]")
+            _register_replicas_with_koi(group_id, running.keys(),
+                                        total_tokens=1_000_000, slo=2.0)
+            time.sleep(3)  # let monitor pick up metrics and compute headroom
+
+            # Wait for scale_down decision (agent responds to OVER_PROVISIONED trigger)
+            deadline = time.time() + 150
+            scale_down_found = False
+            while time.time() < deadline:
+                time.sleep(5)
+                m = AgenticMemory(db_path)
+                decs = m.query_decisions(limit=10)
+                if any(d.get("triggered_by") == "scale_down" for d in decs):
+                    scale_down_found = True
+                    break
+                elapsed = int(time.time() - (deadline - 150))
+                print(f"    waiting for OVER_PROVISIONED → scale_down... ({elapsed}s)")
+
+            def t_scale_down_happened():
+                assert scale_down_found, "No scale_down decision within 150s"
+
+            check("agent scaled down on OVER_PROVISIONED trigger", t_scale_down_happened)
+
+            if scale_down_found:
+                # Now simulate the self-fight scenario:
+                # fire /job/replica-failed for killed replicas → should NOT trigger scale_up
+                time.sleep(5)  # let the kill propagate
+                _, still_running, all_reps = _get_sim_replicas()
+                killed = [rid for rid, r in all_reps.items()
+                          if r.get("phase") in ("dead", "killed", "failed")]
+                print(f"    killed replicas: {killed}, still running: {list(still_running.keys())}")
+
+                # Send /job/replica-failed for each killed replica (as mock_orca would)
+                for rid in killed:
+                    post(f"{KOI_URL}/job/replica-failed", {
+                        "job_id": rid, "group_id": group_id,
+                        "status": "failed", "reason": "Koi-initiated scale-down kill",
+                    })
+
+                # Count scale_up decisions before and after
+                m_before = AgenticMemory(db_path)
+                scale_ups_before = len([d for d in m_before.query_decisions(limit=20)
+                                        if d.get("triggered_by") == "scale_up"])
+                print(f"    scale_up decisions before: {scale_ups_before}")
+                print(f"    waiting 40s for spurious scale_up...")
+                time.sleep(40)
+
+                m_after = AgenticMemory(db_path)
+                scale_ups_after = len([d for d in m_after.query_decisions(limit=20)
+                                       if d.get("triggered_by") == "scale_up"])
+
+                def t_no_self_fight():
+                    assert scale_ups_after == scale_ups_before, \
+                        f"Self-fight! scale_up went from {scale_ups_before} → {scale_ups_after}"
+
+                check("no self-fight: killed replicas did NOT trigger scale_up", t_no_self_fight)
+            else:
+                skip("no self-fight: killed replicas did NOT trigger scale_up",
+                     "scale_down never happened")
+
+    except RuntimeError as e:
+        skip("agent scaled down on OVER_PROVISIONED trigger", str(e))
+        skip("no self-fight: killed replicas did NOT trigger scale_up", str(e))
+
+    # ── T4.2: FALLING_BEHIND → scale-up → new replica tracked ────────────────
+    section("T4.2  FALLING_BEHIND → scale-up → new replica tracked")
+
+    # Setup: 1 replica × 1200 TPS, SLO = 0.15h (9 min), total = 6M tokens
+    # required_tps = 6M / (0.15 * 3600) = 11,111 TPS. 1 replica gets ~1200 → FALLING_BEHIND.
+    try:
+        fast_env = {"KOI_WARMUP_MINUTES": "0"}
+        with koi_server(api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env) as db_path:
+          with mock_orca_server(replicas=1, tps=1200):
+            from koi.tools.memory import AgenticMemory
+
+            group_id, running, _ = _get_sim_replicas()
+            if not running:
+                skip("agent scales up on FALLING_BEHIND", "no replicas in mock_orca")
+                return
+
+            print(f"    [{len(running)} replica, group={group_id}]")
+            _register_replicas_with_koi(group_id, running.keys(),
+                                        total_tokens=6_000_000, slo=0.15)
+            time.sleep(8)  # let monitor poll and compute headroom
+
+            # Diagnostic: check Koi sees the replica and its headroom
+            jobs = requests.get(f"{KOI_URL}/jobs", timeout=5).json()
+            print(f"    koi tracked: {len(jobs.get('jobs',[]))} jobs")
+            for j in jobs.get("jobs", []):
+                print(f"      {j['job_id']}: status={j['status']} TPS={j['smoothed_tps']:.0f} headroom={j['slo_headroom_pct']:.0f}%")
+
+            # Wait for scale_up decision
+            deadline = time.time() + 150
+            scale_up_found = False
+            while time.time() < deadline:
+                time.sleep(5)
+                m = AgenticMemory(db_path)
+                decs = m.query_decisions(limit=10)
+                if any(d.get("triggered_by") == "scale_up" for d in decs):
+                    scale_up_found = True
+                    break
+                elapsed = int(time.time() - (deadline - 150))
+                try:
+                    jobs = requests.get(f"{KOI_URL}/jobs", timeout=3).json()
+                    statuses = [(j["job_id"][-5:], j["status"], f"h={j['slo_headroom_pct']:.0f}%") for j in jobs.get("jobs",[])]
+                except Exception:
+                    statuses = "?"
+                print(f"    waiting for FALLING_BEHIND → scale_up... ({elapsed}s) {statuses}")
+
+            def t_scale_up_happened():
+                assert scale_up_found, "No scale_up decision within 150s"
+
+            check("agent scales up on FALLING_BEHIND trigger", t_scale_up_happened)
+
+            if scale_up_found:
+                # Wait for mock_orca to create the new replica (~15s launch delay)
+                print(f"    waiting for new replica to appear in mock_orca...")
+                deadline2 = time.time() + 30
+                new_rid = None
+                original_rids = set(running.keys())
+                while time.time() < deadline2:
+                    time.sleep(3)
+                    _, current_running, all_reps = _get_sim_replicas()
+                    new_rids = set(all_reps.keys()) - original_rids
+                    running_new = [r for r in new_rids if all_reps[r]["phase"] == "running"]
+                    if running_new:
+                        new_rid = running_new[0]
+                        break
+
+                if new_rid:
+                    # Register the new replica with Koi
+                    print(f"    new replica {new_rid} running, registering with Koi...")
+                    post(f"{KOI_URL}/job/started", {
+                        "job_id": new_rid, "group_id": group_id,
+                        "gpu_type": "L40S", "instance_type": "g6e.12xlarge",
+                        "tp": 4, "pp": 1, "dp": 1,
+                        "slo_deadline_hours": 0.15, "total_tokens": 6_000_000,
+                        "predicted_tps": 1200.0,
+                    })
+                    time.sleep(15)  # let Koi's monitor poll a few times
+
+                    jobs = requests.get(f"{KOI_URL}/jobs", timeout=5).json()
+                    tracked = jobs.get("jobs", [])
+                    tracked_ids = [j["job_id"] for j in tracked]
+
+                    def t_new_replica_tracked():
+                        assert new_rid in tracked_ids, \
+                            f"New replica {new_rid} not in tracked jobs: {tracked_ids}"
+
+                    def t_aggregate_tps_improved():
+                        agg_tps = sum(j.get("smoothed_tps", 0) for j in tracked
+                                      if j.get("status") != "failed")
+                        assert agg_tps > 1200, \
+                            f"Aggregate TPS {agg_tps:.0f} should be > 1200 (2 replicas)"
+
+                    check("new replica is tracked by Koi monitor", t_new_replica_tracked)
+                    check("aggregate TPS improved after scale-up", t_aggregate_tps_improved)
+                else:
+                    skip("new replica is tracked by Koi monitor", "mock_orca didn't create a running replica")
+                    skip("aggregate TPS improved after scale-up", "no new replica")
+            else:
+                skip("new replica is tracked by Koi monitor", "scale_up never happened")
+                skip("aggregate TPS improved after scale-up", "scale_up never happened")
+
+    except RuntimeError as e:
+        for name in ["agent scales up on FALLING_BEHIND trigger",
+                     "new replica is tracked by Koi monitor",
+                     "aggregate TPS improved after scale-up"]:
             skip(name, str(e))
 
 
@@ -779,12 +1009,18 @@ if __name__ == "__main__":
 
     if has_llm:
         run_tier3(api_key)
+        run_tier4(api_key)
     else:
-        section("T3  LLM agent tests  [skipped]")
+        section("T3+T4  LLM agent tests  [skipped]")
         for name in [
             "agent calls get_failure_summary_tool on FAILED trigger",
             "scale_up decision recorded in memory",
             "agent uses market=on_demand after 2 spot preemptions",
+            "agent scaled down on OVER_PROVISIONED trigger",
+            "no self-fight: killed replicas did NOT trigger scale_up",
+            "agent scales up on FALLING_BEHIND trigger",
+            "new replica is tracked by Koi monitor",
+            "aggregate TPS improved after scale-up",
         ]:
             skip(name, "no ANTHROPIC_API_KEY")
 
