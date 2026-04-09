@@ -78,57 +78,8 @@ class ModelFeatures:
         self.gqa_ratio = self.num_attention_heads / max(self.num_kv_heads, 1)
 
 
-# ---------------------------------------------------------------------------
-# Known models registry
-# ---------------------------------------------------------------------------
-
-_KNOWN_MODELS: Dict[str, Dict] = {
-    "Qwen/Qwen2.5-72B-Instruct": dict(
-        num_params_billions=72, num_layers=80, hidden_dim=8192,
-        num_attention_heads=64, num_kv_heads=8, vocab_size=152064,
-        architecture_family="qwen",
-    ),
-    "Qwen/Qwen3-32B": dict(
-        num_params_billions=32, num_layers=64, hidden_dim=5120,
-        num_attention_heads=64, num_kv_heads=8, vocab_size=151936,
-        architecture_family="qwen",
-    ),
-    "Qwen/Qwen3-235B-A22B": dict(
-        num_params_billions=235, num_layers=94, hidden_dim=4096,
-        num_attention_heads=64, num_kv_heads=4, vocab_size=151936,
-        is_moe=True, num_experts=128, active_experts=8, architecture_family="qwen",
-    ),
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-70B": dict(
-        num_params_billions=70, num_layers=80, hidden_dim=8192,
-        num_attention_heads=64, num_kv_heads=8, vocab_size=128256,
-        architecture_family="llama",
-    ),
-    "meta-llama/Llama-3-70B": dict(
-        num_params_billions=70, num_layers=80, hidden_dim=8192,
-        num_attention_heads=64, num_kv_heads=8, vocab_size=128256,
-        architecture_family="llama",
-    ),
-    "meta-llama/Llama-3-8B": dict(
-        num_params_billions=8, num_layers=32, hidden_dim=4096,
-        num_attention_heads=32, num_kv_heads=8, vocab_size=128256,
-        architecture_family="llama",
-    ),
-    "meta-llama/Llama-3.1-70B-Instruct": dict(
-        num_params_billions=70, num_layers=80, hidden_dim=8192,
-        num_attention_heads=64, num_kv_heads=8, vocab_size=128256,
-        architecture_family="llama",
-    ),
-    "meta-llama/Llama-3.1-405B-Instruct": dict(
-        num_params_billions=405, num_layers=126, hidden_dim=16384,
-        num_attention_heads=128, num_kv_heads=8, vocab_size=128256,
-        architecture_family="llama",
-    ),
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": dict(
-        num_params_billions=46.7, num_layers=32, hidden_dim=4096,
-        num_attention_heads=32, num_kv_heads=8, vocab_size=32000,
-        is_moe=True, num_experts=8, active_experts=2, architecture_family="mistral",
-    ),
-}
+# Known models — imported from model_features.py (single source of truth)
+from koi.model_features import _KNOWN_MODELS
 
 
 # ---------------------------------------------------------------------------

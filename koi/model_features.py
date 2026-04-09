@@ -194,7 +194,9 @@ def compute_config_features(
     flops_per_param = aggregate_tflops / max(model.num_params_billions, 0.1)
 
     # Roofline decode estimate: tokens/sec ≈ bandwidth / bytes_to_load_weights
-    roofline_decode = (aggregate_bw / max(model.model_size_gb, 0.1)) * 0.65  # 65% efficiency
+    # For MoE, only active experts are loaded per token
+    effective_size_gb = model.model_size_gb * getattr(model, 'active_expert_ratio', 1.0)
+    roofline_decode = (aggregate_bw / max(effective_size_gb, 0.1)) * 0.65  # 65% efficiency
 
     io_ratio = input_len / max(output_len, 1)
     total_context = input_len + output_len
@@ -205,7 +207,7 @@ def compute_config_features(
         "dp": dp,
         "num_gpus_total": num_gpus_total,
         "gpu_type": gpu_type,
-        "params_per_gpu_b": model.num_params_billions / max(tp, 1),
+        "params_per_gpu_b": model.num_params_billions / max(tp * pp, 1),
         "weight_gb_per_gpu": weight_gb_per_gpu,
         "vram_headroom": vram_headroom,
         "vram_headroom_gb": vram_headroom_gb,

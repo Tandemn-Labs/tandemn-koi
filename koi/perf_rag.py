@@ -321,7 +321,13 @@ class PerfRAG:
         rec["_total_context"] = input_len + output_len
         rec["_is_decode_heavy"] = int(rec["_io_ratio"] < 0.5)
         rec["_is_prefill_heavy"] = int(rec["_io_ratio"] > 2.0)
-        rec["_roofline_tps"] = (gpu_spec["bandwidth_gbps"] * tp / max(model_size_gb, 0.1)) * 0.65
+        # For MoE, only active experts are loaded per token
+        is_moe = int(rec.get("is_moe", 0) or 0)
+        num_experts = float(rec.get("num_experts", 0) or 0)
+        active_experts = float(rec.get("active_experts", 0) or 0)
+        expert_ratio = (active_experts / num_experts) if (is_moe and num_experts > 0) else 1.0
+        effective_size_gb = model_size_gb * expert_ratio
+        rec["_roofline_tps"] = (gpu_spec["bandwidth_gbps"] * tp / max(effective_size_gb, 0.1)) * 0.65
 
     def _row_to_embedding_text(self, rec: Dict) -> str:
         """
@@ -443,7 +449,9 @@ class PerfRAG:
             else "prefill-heavy" if io_ratio > 2.0
             else "balanced"
         )
-        roofline = (gpu_spec["bandwidth_gbps"] * tp / max(model_size_gb, 0.1)) * 0.65
+        # MoE: rough estimate — typical active ratio ~6-25% of total params
+        effective_size = model_size_gb * (0.1 if is_moe else 1.0)
+        roofline = (gpu_spec["bandwidth_gbps"] * tp / max(effective_size, 0.1)) * 0.65
 
         return (
             f"model={model_name} params={num_params_billions:.1f}B size={model_size_gb:.0f}GB "
