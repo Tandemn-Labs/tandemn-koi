@@ -445,18 +445,30 @@ async def swap_replicas(job_id: str, req: SwapRequest):
 # Control endpoints (/sim/*)
 # ---------------------------------------------------------------------------
 
+class KillReplicaRequest(BaseModel):
+    reason: str = "Simulated EC2 termination"
+
+
 @app.post("/sim/kill-replica/{replica_id}")
-async def sim_kill_replica(replica_id: str):
-    """Simulate a replica dying (EC2 termination, spot preemption, OOM, etc.)."""
+async def sim_kill_replica(replica_id: str, req: KillReplicaRequest = KillReplicaRequest()):
+    """Simulate a replica dying. Pass reason to control failure category."""
     for job in SIM.jobs.values():
         replica = job.replicas.get(replica_id)
         if replica:
             replica.phase = "dead"
             replica.base_tps = 0
-            logger.info(f"[Sim] Killed replica {replica_id} (simulated death)")
-            await _notify_koi_replica_failed(job, replica, "Simulated EC2 termination")
-            return {"status": "killed", "replica_id": replica_id}
+            logger.info(f"[Sim] Killed replica {replica_id} ({req.reason})")
+            await _notify_koi_replica_failed(job, replica, req.reason)
+            return {"status": "killed", "replica_id": replica_id, "reason": req.reason}
     raise HTTPException(404, f"Replica {replica_id} not found")
+
+
+@app.post("/sim/spot-preempt/{replica_id}")
+async def sim_spot_preempt(replica_id: str):
+    """Convenience: simulate a spot instance preemption."""
+    return await sim_kill_replica(
+        replica_id, KillReplicaRequest(reason="SpotInstanceInterruption")
+    )
 
 
 class SetTpsRequest(BaseModel):

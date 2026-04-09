@@ -134,7 +134,10 @@ def main():
         elif cmd == "koi":
             show_koi()
         elif cmd == "kill" and len(parts) >= 2:
-            print(post(f"{ORCA}/sim/kill-replica/{parts[1]}"))
+            reason = " ".join(parts[2:]) if len(parts) > 2 else "Simulated EC2 termination"
+            print(post(f"{ORCA}/sim/kill-replica/{parts[1]}", {"reason": reason}))
+        elif cmd == "preempt" and len(parts) >= 2:
+            print(post(f"{ORCA}/sim/spot-preempt/{parts[1]}"))
         elif cmd == "tps" and len(parts) >= 3:
             print(post(f"{ORCA}/sim/set-tps/{parts[1]}", {"tps": float(parts[2])}))
         elif cmd == "degrade" and len(parts) >= 2:

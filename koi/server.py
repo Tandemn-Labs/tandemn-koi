@@ -13,6 +13,7 @@ Usage:
 
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -128,6 +129,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Failure classification
+# ---------------------------------------------------------------------------
+
+_FAILURE_PATTERNS = [
+    (re.compile(r"spot|preempt", re.I), "spot_preemption"),
+    (re.compile(r"insufficient.?capacity|no.?capacity", re.I), "no_capacity"),
+    (re.compile(r"oom|out.?of.?memory|cuda.?oom", re.I), "oom"),
+    (re.compile(r"quota", re.I), "quota"),
+]
+
+
+def _classify_failure(reason: str) -> str:
+    """Map Orca's raw failure reason to a structured category."""
+    for pattern, category in _FAILURE_PATTERNS:
+        if pattern.search(reason):
+            return category
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +320,10 @@ async def job_started(req: JobStartedRequest):
                 tracker.action_freeze_until = None
                 logger.info(f"[Koi] Anti-windup unfrozen for {tracker.job_id} (new replica {req.job_id} ready)")
 
+    # Update availability prior (success observation)
+    market = "on_demand" if req.is_fallback else "spot"
+    memory.update_availability(gpu_type=req.gpu_type, region="unknown", market=market, launched=True)
+
     group_str = f" (group={req.group_id})" if req.group_id else ""
     fallback_str = " [FALLBACK]" if req.is_fallback else ""
     logger.info(f"[Koi] Job started: {req.job_id} on {req.gpu_type} TP={req.tp} PP={req.pp}{group_str}{fallback_str}")
@@ -422,9 +447,16 @@ async def replica_failed(req: ReplicaFailedRequest):
             decision_id=tracker.decision_id,
             job_id=req.group_id,
             status="replica_failed",
-            failure_category="infrastructure",
+            failure_category=_classify_failure(req.reason),
             diagnosis=req.reason[:200],
         )
+    # Update availability prior (failure observation)
+    memory.update_availability(
+        gpu_type=tracker.config.gpu_type,
+        region=tracker.config.region,
+        market="spot" if _classify_failure(req.reason) == "spot_preemption" else "on_demand",
+        launched=False,
+    )
     # Emit FAILED trigger to agent
     trigger = MonitoringTrigger(
         trigger_type=MonitoringStatus.FAILED,
@@ -435,6 +467,44 @@ async def replica_failed(req: ReplicaFailedRequest):
     await monitor._trigger_queue.put(trigger)
     logger.info(f"[Koi] Replica failed: {req.job_id} — {req.reason[:100]}")
     return {"status": "trigger_emitted", "job_id": req.job_id}
+
+
+class ConfigAttemptRequest(BaseModel):
+    job_id: str
+    decision_id: Optional[str] = None
+    instance_type: str
+    gpu_type: str
+    region: str
+    market: str = "on_demand"
+    launched: bool
+    failure_reason: str = ""
+    time_to_launch: float = 0
+    attempt_index: int = 0
+
+
+@app.post("/job/config-attempted")
+async def config_attempted(req: ConfigAttemptRequest):
+    """Called by Orca for EACH allocation attempt (success or failure)."""
+    memory: AgenticMemory = app.state.memory
+    memory.record_launch_attempt(
+        decision_id=req.decision_id or f"unknown-{req.job_id}",
+        job_id=req.job_id,
+        instance_type=req.instance_type,
+        gpu_type=req.gpu_type,
+        region=req.region,
+        market=req.market,
+        count=1,
+        launched=req.launched,
+        time_to_launch=req.time_to_launch if req.launched else None,
+        failure_reason=req.failure_reason if not req.launched else None,
+        failure_category=_classify_failure(req.failure_reason) if not req.launched else None,
+    )
+    memory.update_availability(
+        gpu_type=req.gpu_type, region=req.region, market=req.market, launched=req.launched,
+    )
+    status = "success" if req.launched else "failed"
+    logger.info(f"[Koi] Config attempt: {req.gpu_type} {req.market} in {req.region} → {status}")
+    return {"status": "recorded", "job_id": req.job_id, "launched": req.launched}
 
 
 class LaunchFailedRequest(BaseModel):
@@ -456,17 +526,20 @@ async def job_launch_failed(req: LaunchFailedRequest):
 
     for i, config in enumerate(req.configs_tried):
         reason = req.failure_reasons[i] if i < len(req.failure_reasons) else "unknown"
+        gpu = config.get("gpu_type", "unknown")
+        rgn = config.get("region", "unknown")
+        mkt = config.get("market", "on_demand")
         memory.record_launch_attempt(
             decision_id=decision_id or f"unknown-{req.job_id}",
             job_id=req.job_id,
             instance_type=config.get("instance_type", "unknown"),
-            gpu_type=config.get("gpu_type", "unknown"),
-            region=config.get("region", "unknown"),
-            market=config.get("market", "on_demand"),
+            gpu_type=gpu, region=rgn, market=mkt,
             count=1,
             launched=False,
             failure_reason=reason,
+            failure_category=_classify_failure(reason),
         )
+        memory.update_availability(gpu_type=gpu, region=rgn, market=mkt, launched=False)
 
     logger.info(
         f"[Koi] Launch failed for {req.job_id}: "

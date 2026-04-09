@@ -160,18 +160,62 @@ class TestLaunchAttempts:
             launched=False, failure_reason="InsufficientCapacity",
         )
 
-    def test_success_rate(self, memory):
-        for i in range(4):
-            memory.record_launch_attempt(
-                decision_id=f"dec-{i}", job_id=f"job-{i}",
-                instance_type="p5.48xlarge", gpu_type="H100",
-                region="us-west-2", market="on_demand", count=1,
-                launched=(i < 1),  # 1 success, 3 failures
-            )
-        rate = memory.get_launch_success_rate("p5.48xlarge", region="us-west-2")
-        assert rate["attempts"] == 4
-        assert rate["succeeded"] == 1
-        assert rate["rate"] == pytest.approx(0.25)
+    def test_failure_category(self, memory):
+        memory.record_launch_attempt(
+            decision_id="dec-test", job_id="job-1",
+            instance_type="p5.48xlarge", gpu_type="H100",
+            region="us-west-2", market="spot", count=1,
+            launched=False,
+            failure_reason="SpotInstanceInterruption",
+            failure_category="spot_preemption",
+        )
+
+
+class TestAvailabilityPriors:
+    def test_uninformative_prior(self, memory):
+        """With no observations, availability should be 50% ± high uncertainty."""
+        summary = memory.get_failure_summary("H100")
+        assert summary["availability_pct"] == pytest.approx(50.0)
+        assert summary["effective_observations"] == 0
+
+    def test_update_success(self, memory):
+        memory.update_availability("L40S", "us-east-1", "spot", launched=True)
+        summary = memory.get_failure_summary("L40S", region="us-east-1", market="spot")
+        assert summary["availability_pct"] > 50.0  # shifted toward success
+        assert summary["effective_observations"] == 1
+
+    def test_update_failure(self, memory):
+        memory.update_availability("L40S", "us-east-1", "spot", launched=False)
+        summary = memory.get_failure_summary("L40S", region="us-east-1", market="spot")
+        assert summary["availability_pct"] < 50.0  # shifted toward failure
+
+    def test_repeated_failures_lower_availability(self, memory):
+        for _ in range(5):
+            memory.update_availability("L40S", "us-east-1", "spot", launched=False)
+        memory.update_availability("L40S", "us-east-1", "spot", launched=True)
+        summary = memory.get_failure_summary("L40S", region="us-east-1", market="spot")
+        # 5 failures + 1 success → ~33% availability
+        assert summary["availability_pct"] < 40.0
+        assert summary["effective_observations"] == 6
+
+    def test_spot_preemption_count(self, memory):
+        """Recent spot preemptions should appear in summary."""
+        # Record a decision so the outcome join works
+        dec_id = memory.record_decision(
+            job_id="job-spot", model_name="test-model",
+            instance_type="g6e.12xlarge", gpu_type="L40S",
+            tp=4, pp=1, dp=1, num_gpus=4, predicted_tps=1000,
+            predicted_cost_per_hour=13.35, slo_deadline_hours=8.0,
+            objective="cheapest", avg_input_tokens=512, avg_output_tokens=256,
+        )
+        memory.record_outcome(
+            decision_id=dec_id, job_id="job-spot",
+            status="replica_failed",
+            failure_category="spot_preemption",
+            diagnosis="SpotInstanceInterruption",
+        )
+        summary = memory.get_failure_summary("L40S")
+        assert summary["spot_preemptions_6h"] == 1
 
 
 class TestCounts:

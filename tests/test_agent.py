@@ -65,11 +65,11 @@ class TestSystemPrompt:
 class TestToolWiring:
     def test_build_tools_count(self, agent, resource_map):
         tools = agent._build_tools(resource_map=resource_map)
-        assert len(tools) == 7  # query_perfdb, query_memory, gpu_physics, model_arch, similar_models, resources, record_outcome
+        assert len(tools) == 8  # query_perfdb, query_memory, gpu_physics, model_arch, similar_models, resources, record_outcome
 
     def test_build_tools_without_resource_map(self, agent):
         tools = agent._build_tools()
-        assert len(tools) == 7
+        assert len(tools) == 8
 
 
 class TestPromptBuilding:

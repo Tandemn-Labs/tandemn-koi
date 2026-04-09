@@ -1,13 +1,15 @@
 """
 koi/tools/memory.py — Agentic Memory backed by SQLite.
 
-Three tables:
-  decisions       — every config Koi proposes (with predictions)
-  outcomes        — what actually happened (ground truth)
-  launch_attempts — per-attempt launch success/failure tracking
+Four tables:
+  decisions            — every config Koi proposes (with predictions)
+  outcomes             — what actually happened (ground truth)
+  launch_attempts      — per-attempt launch success/failure tracking
+  availability_priors  — Beta(α,β) conjugate priors for GPU availability
 """
 
 import json
+import math
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
@@ -95,14 +97,27 @@ class AgenticMemory:
                 launched             INTEGER NOT NULL,
                 time_to_launch       REAL,
                 failure_reason       TEXT,
+                failure_category     TEXT,
                 quota_available      INTEGER,
                 other_jobs_in_region TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS availability_priors (
+                key              TEXT PRIMARY KEY,
+                gpu_type         TEXT NOT NULL,
+                region           TEXT,
+                market           TEXT,
+                alpha            REAL DEFAULT 1.0,
+                beta             REAL DEFAULT 1.0,
+                last_updated     TEXT DEFAULT (datetime('now')),
+                last_decay       TEXT DEFAULT (datetime('now'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_decisions_model ON decisions(model_name);
             CREATE INDEX IF NOT EXISTS idx_outcomes_job ON outcomes(job_id);
             CREATE INDEX IF NOT EXISTS idx_outcomes_status ON outcomes(status);
             CREATE INDEX IF NOT EXISTS idx_launch_instance ON launch_attempts(instance_type, region);
+            CREATE INDEX IF NOT EXISTS idx_avail_gpu ON availability_priors(gpu_type);
         """)
         conn.commit()
 
@@ -202,6 +217,7 @@ class AgenticMemory:
         count: int, launched: bool,
         time_to_launch: Optional[float] = None,
         failure_reason: Optional[str] = None,
+        failure_category: Optional[str] = None,
         quota_available: Optional[int] = None,
         other_jobs_in_region: Optional[list] = None,
     ) -> str:
@@ -211,13 +227,13 @@ class AgenticMemory:
             INSERT INTO launch_attempts (
                 attempt_id, decision_id, job_id,
                 instance_type, gpu_type, region, market, count,
-                launched, time_to_launch, failure_reason,
+                launched, time_to_launch, failure_reason, failure_category,
                 quota_available, other_jobs_in_region
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             attempt_id, decision_id, job_id,
             instance_type, gpu_type, region, market, count,
-            int(launched), time_to_launch, failure_reason,
+            int(launched), time_to_launch, failure_reason, failure_category,
             quota_available,
             json.dumps(other_jobs_in_region) if other_jobs_in_region else None,
         ))
@@ -294,34 +310,125 @@ class AgenticMemory:
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
-    def get_launch_success_rate(
-        self, instance_type: str, region: Optional[str] = None, hours: int = 24,
-    ) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Availability Beta priors
+    # ------------------------------------------------------------------
+
+    _DECAY_RATE = 0.95  # per-hour decay → ~30% weight after 24h
+
+    def update_availability(
+        self, gpu_type: str, region: str, market: str, launched: bool,
+    ) -> None:
+        """Bayesian update: success → α+=1, failure → β+=1 (with time decay)."""
+        key = f"{gpu_type}|{region}|{market}"
         conn = self._conn()
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-        query = """
-            SELECT COUNT(*) as attempts,
-                   SUM(launched) as succeeded,
-                   AVG(CASE WHEN launched = 1 THEN time_to_launch END) as avg_time
-            FROM launch_attempts
-            WHERE instance_type = ? AND timestamp > ?
-        """
-        params: list = [instance_type, cutoff]
+        row = conn.execute(
+            "SELECT alpha, beta, last_decay FROM availability_priors WHERE key = ?",
+            (key,),
+        ).fetchone()
+
+        now = datetime.utcnow()
+        if row:
+            last_decay = datetime.fromisoformat(row["last_decay"])
+            hours = (now - last_decay).total_seconds() / 3600
+            decay = self._DECAY_RATE ** hours
+            alpha = row["alpha"] * decay
+            beta_val = row["beta"] * decay
+        else:
+            alpha, beta_val = 1.0, 1.0  # uninformative prior
+
+        if launched:
+            alpha += 1
+        else:
+            beta_val += 1
+
+        conn.execute("""
+            INSERT INTO availability_priors (key, gpu_type, region, market, alpha, beta, last_updated, last_decay)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                alpha=excluded.alpha, beta=excluded.beta,
+                last_updated=excluded.last_updated, last_decay=excluded.last_decay
+        """, (key, gpu_type, region, market, alpha, beta_val, now.isoformat(), now.isoformat()))
+        conn.commit()
+
+    def get_failure_summary(
+        self, gpu_type: str, region: Optional[str] = None, market: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return availability posterior + recent failure context."""
+        conn = self._conn()
+        now = datetime.utcnow()
+
+        # 1. Beta posterior (apply decay at read time)
+        query = "SELECT alpha, beta, last_decay FROM availability_priors WHERE gpu_type = ?"
+        params: list = [gpu_type]
         if region:
             query += " AND region = ?"
             params.append(region)
+        if market:
+            query += " AND market = ?"
+            params.append(market)
 
-        row = conn.execute(query, params).fetchone()
-        attempts = row["attempts"] or 0
-        succeeded = row["succeeded"] or 0
+        rows = conn.execute(query, params).fetchall()
+        # Aggregate across matching priors (sum α,β if multiple regions/markets)
+        total_alpha, total_beta = 1.0, 1.0  # base prior
+        for r in rows:
+            last_decay = datetime.fromisoformat(r["last_decay"])
+            hours = (now - last_decay).total_seconds() / 3600
+            decay = self._DECAY_RATE ** hours
+            total_alpha += (r["alpha"] - 1.0) * decay  # subtract base prior, add decayed
+            total_beta += (r["beta"] - 1.0) * decay
+
+        total_alpha = max(total_alpha, 1.0)
+        total_beta = max(total_beta, 1.0)
+        mean = total_alpha / (total_alpha + total_beta)
+        n = total_alpha + total_beta - 2  # effective observations
+        variance = (total_alpha * total_beta) / ((total_alpha + total_beta) ** 2 * (total_alpha + total_beta + 1))
+        uncertainty = math.sqrt(variance)
+
+        # 2. Recent failures (last 6h) for context
+        cutoff = (now - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
+        recent_q = """
+            SELECT failure_category, failure_reason, timestamp
+            FROM launch_attempts
+            WHERE gpu_type = ? AND timestamp > ? AND launched = 0
+        """
+        recent_params: list = [gpu_type, cutoff]
+        if region:
+            recent_q += " AND region = ?"
+            recent_params.append(region)
+        if market:
+            recent_q += " AND market = ?"
+            recent_params.append(market)
+        recent_q += " ORDER BY timestamp DESC LIMIT 20"
+        recent_launches = conn.execute(recent_q, recent_params).fetchall()
+
+        # Also check outcome failures (replica deaths)
+        outcome_q = """
+            SELECT o.failure_category, o.diagnosis, o.timestamp
+            FROM outcomes o JOIN decisions d ON o.decision_id = d.decision_id
+            WHERE d.gpu_type = ? AND o.timestamp > ?
+              AND o.status = 'replica_failed'
+        """
+        outcome_params: list = [gpu_type, cutoff]
+        outcome_failures = conn.execute(outcome_q, outcome_params).fetchall()
+
+        all_recent = [dict(r) for r in recent_launches] + [dict(r) for r in outcome_failures]
+        spot_preemptions = sum(1 for r in all_recent if r.get("failure_category") == "spot_preemption")
+        no_capacity = sum(1 for r in all_recent if r.get("failure_category") == "no_capacity")
+        last_failure = max((r.get("timestamp", "") for r in all_recent), default=None)
+
         return {
-            "instance_type": instance_type,
+            "gpu_type": gpu_type,
             "region": region,
-            "window_hours": hours,
-            "attempts": attempts,
-            "succeeded": succeeded,
-            "rate": succeeded / max(attempts, 1),
-            "avg_time_to_launch": row["avg_time"],
+            "market": market,
+            "availability_pct": round(mean * 100, 1),
+            "uncertainty_pct": round(uncertainty * 100, 1),
+            "effective_observations": round(n),
+            "spot_preemptions_6h": spot_preemptions,
+            "no_capacity_6h": no_capacity,
+            "last_failure_at": last_failure,
+            "alpha": round(total_alpha, 2),
+            "beta": round(total_beta, 2),
         }
 
     def decision_count(self) -> int:

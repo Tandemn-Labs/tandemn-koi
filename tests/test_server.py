@@ -159,6 +159,31 @@ class TestLaunchFailed:
         assert body["attempts_recorded"] == 2
 
 
+class TestClassifyFailure:
+    def test_spot_preemption(self):
+        from koi.server import _classify_failure
+        assert _classify_failure("SpotInstanceInterruption") == "spot_preemption"
+        assert _classify_failure("spot preempted by EC2") == "spot_preemption"
+
+    def test_no_capacity(self):
+        from koi.server import _classify_failure
+        assert _classify_failure("InsufficientCapacity in us-east-1") == "no_capacity"
+
+    def test_oom(self):
+        from koi.server import _classify_failure
+        assert _classify_failure("CUDA OOM: tried to allocate 40GB") == "oom"
+        assert _classify_failure("OutOfMemoryError") == "oom"
+
+    def test_quota(self):
+        from koi.server import _classify_failure
+        assert _classify_failure("QuotaExceeded for p5.48xlarge") == "quota"
+
+    def test_unknown(self):
+        from koi.server import _classify_failure
+        assert _classify_failure("some random error") == "unknown"
+        assert _classify_failure("") == "unknown"
+
+
 class TestListJobs:
     @pytest.mark.asyncio
     async def test_empty(self, client):

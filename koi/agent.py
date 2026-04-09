@@ -215,6 +215,18 @@ class KoiAgent:
                        failure_category=failure_category, diagnosis=diagnosis,
                        bottleneck=bottleneck)
 
+        @beta_async_tool
+        async def get_failure_summary_tool(
+            gpu_type: str,
+            region: Optional[str] = None,
+            market: Optional[str] = None,
+        ) -> str:
+            """Check GPU availability and failure history. Returns Beta-prior availability (%) with uncertainty,
+            recent spot preemptions, and capacity failures. Call BEFORE replacing failed replicas."""
+            import json as _json
+            result = memory.get_failure_summary(gpu_type, region=region, market=market)
+            return _json.dumps(result, indent=2)
+
         # Action tools — only when Orca is connected
         action_tools = []
         if orca:
@@ -225,17 +237,28 @@ class KoiAgent:
                 tp: int,
                 pp: int,
                 count: int,
+                on_demand: Optional[bool] = None,
             ) -> str:
-                """Scale a running job. count>0 adds replicas with the specified GPU config. count<0 kills the oldest active replicas."""
+                """Scale a running job. count>0 adds replicas with the specified GPU config. count<0 kills the oldest active replicas.
+                on_demand: True=force on-demand, False=force spot, None=inherit from parent decision."""
+                # Resolve parent decision and market preference
+                parent_dec = None
+                if count != 0 and monitor:
+                    for t in monitor.tracked_jobs.values():
+                        if t.group_id == job_id and t.decision_id:
+                            parent_dec = t.decision_id
+                            break
+                parent = memory.get_decision(parent_dec) if parent_dec else None
+
+                # Market: explicit override > inherit from parent > default on-demand
+                if on_demand is not None:
+                    use_on_demand = on_demand
+                else:
+                    use_on_demand = parent.get("market", "on_demand") == "on_demand" if parent else False
+                market_str = "on_demand" if use_on_demand else "spot"
+
                 # Record scaling decision in memory before calling Orca
                 if count != 0 and memory:
-                    parent_dec = None
-                    if monitor:
-                        for t in monitor.tracked_jobs.values():
-                            if t.group_id == job_id and t.decision_id:
-                                parent_dec = t.decision_id
-                                break
-                    parent = memory.get_decision(parent_dec) if parent_dec else None
                     scale_dec_id = memory.record_decision(
                         job_id=job_id,
                         model_name=parent["model_name"] if parent else "unknown",
@@ -250,7 +273,7 @@ class KoiAgent:
                         avg_output_tokens=parent["avg_output_tokens"] if parent else 0,
                         triggered_by="scale_up" if count > 0 else "scale_down",
                         parent_decision_id=parent_dec,
-                        market=parent.get("market", "on_demand") if parent else "on_demand",
+                        market=market_str,
                     )
                     # Store so /job/started can link new replicas to this decision
                     if monitor and count > 0:
@@ -268,9 +291,6 @@ class KoiAgent:
                         monitor._koi_initiated_kills.update(to_kill)
                     except Exception:
                         pass
-
-                # Inherit market preference from parent decision
-                use_on_demand = parent.get("market", "on_demand") == "on_demand" if parent else False
 
                 from koi.tools.orca_api import async_scale_chain
                 result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count,
@@ -307,7 +327,7 @@ class KoiAgent:
 
         return [query_perfdb, query_memory_tool, get_gpu_physics_tool,
                 get_model_arch_tool, find_similar_models_tool, get_resources_tool,
-                record_outcome_tool] + action_tools
+                record_outcome_tool, get_failure_summary_tool] + action_tools
 
     # ------------------------------------------------------------------
     # Main decision entry point
@@ -423,8 +443,8 @@ class KoiAgent:
             return "COST TABLE: Cannot compute — total tokens unknown.", []
 
         lines = ["PRE-COMPUTED COST TABLE (sorted by total cost, cheapest first):"]
-        lines.append(f"  {'Source':<12} {'GPU':<12} {'Config':<18} {'TPS':>7} {'$/hr':>8} {'ETA(h)':>7} {'Total $':>9} {'SLO':>5}")
-        lines.append(f"  {'─'*12} {'─'*12} {'─'*18} {'─'*7} {'─'*8} {'─'*7} {'─'*9} {'─'*5}")
+        lines.append(f"  {'Source':<12} {'GPU':<12} {'Config':<18} {'TPS':>7} {'$/hr':>8} {'ETA(h)':>7} {'Total $':>9} {'SLO':>5} {'Avail':>10}")
+        lines.append(f"  {'─'*12} {'─'*12} {'─'*18} {'─'*7} {'─'*8} {'─'*7} {'─'*9} {'─'*5} {'─'*10}")
 
         rows = []
 
@@ -502,13 +522,24 @@ class KoiAgent:
         # Sort by total cost
         rows.sort(key=lambda r: r["total_cost"])
 
+        # Annotate with availability from Beta priors
+        _avail_cache: Dict[str, Dict] = {}
+        for row in rows:
+            gpu = row["gpu_type"]
+            if gpu not in _avail_cache:
+                _avail_cache[gpu] = self.memory.get_failure_summary(gpu)
+            s = _avail_cache[gpu]
+            row["avail_pct"] = s["availability_pct"]
+            row["avail_unc"] = s["uncertainty_pct"]
+
         for row in rows[:15]:
             slo_str = "✓" if row["meets_slo"] else "✗"
             config_str = f"TP={row['tp']} PP={row['pp']} DP={row['dp']}"
+            avail_str = f"{row['avail_pct']:.0f}%±{row['avail_unc']:.0f}%"
             lines.append(
                 f"  {row['source']:<12} {row['gpu_type']:<12} {config_str:<18} "
                 f"{row['predicted_tps']:>7.0f} {row['cost_per_hour']:>7.2f} "
-                f"{row['eta_h']:>7.2f} {row['total_cost']:>8.2f} {slo_str:>5}"
+                f"{row['eta_h']:>7.2f} {row['total_cost']:>8.2f} {slo_str:>5} {avail_str:>10}"
             )
 
         if not rows:
@@ -632,11 +663,30 @@ class KoiAgent:
             sections.append("\nJob completed. Outcome has been recorded automatically by the webhook. "
                            "Do NOT call record_outcome_tool.")
         elif trigger.trigger_type == MonitoringStatus.FAILED:
+            # Pre-inject failure context so agent sees it immediately
+            gpu_type = config.get("gpu_type")
+            if gpu_type and self.memory:
+                summary = self.memory.get_failure_summary(gpu_type)
+                sections.append(f"\nFAILURE CONTEXT:")
+                sections.append(f"  Availability for {gpu_type}: {summary['availability_pct']}% ± {summary['uncertainty_pct']}% "
+                               f"(n={summary['effective_observations']})")
+                if summary["spot_preemptions_6h"]:
+                    sections.append(f"  Spot preemptions (last 6h): {summary['spot_preemptions_6h']}")
+                if summary["no_capacity_6h"]:
+                    sections.append(f"  No-capacity failures (last 6h): {summary['no_capacity_6h']}")
+                if summary["last_failure_at"]:
+                    sections.append(f"  Last failure: {summary['last_failure_at']}")
             sections.append("\nA replica FAILED (not the whole job). Other replicas may still be running.")
-            sections.append("1. Diagnose why the replica failed (spot preemption? OOM? infra issue?).")
-            sections.append("2. Use get_job_metrics_tool to check if remaining replicas can still meet SLO.")
-            sections.append("3. If SLO is at risk, use scale_chain_tool to add replacement replicas.")
-            sections.append("4. Do NOT call record_outcome_tool — the job is still running.")
+            sections.append("1. Diagnose why: check the diagnosis_hint for failure category.")
+            sections.append("2. BEFORE replacing, call get_failure_summary_tool for this GPU type to check "
+                           "recent failure patterns. Look at availability_pct and uncertainty.")
+            sections.append("3. If same (gpu_type, market) has failed ≥2 times recently:")
+            sections.append("   - spot_preemption: retry with on_demand=True in scale_chain_tool")
+            sections.append("   - no_capacity: try a DIFFERENT gpu_type")
+            sections.append("   - oom: try higher TP (more VRAM per shard)")
+            sections.append("4. Use get_job_metrics_tool to check if remaining replicas can still meet SLO.")
+            sections.append("5. If SLO at risk, use scale_chain_tool to add replacement replicas.")
+            sections.append("6. Do NOT call record_outcome_tool — the job is still running.")
 
         return "\n".join(sections)
 

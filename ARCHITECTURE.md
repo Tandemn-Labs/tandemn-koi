@@ -1234,8 +1234,13 @@ But if B takes 8 H100 GPUs, they're all gone. And A and C compete for A100s.
 - [ ] User specifies max spend, agent tracks cost accrual and scales down to stay under
 
 **Launch availability analytics:**
-- [ ] Orca `GET /analytics/launch_success_rate` endpoint
-- [ ] Soft availability model per (instance_type, region, time_of_day)
+- [x] Soft availability model per (gpu_type, region, market) — Beta(α,β) prior with time decay (`availability_priors` table)
+- [x] Failure reason classification (`_classify_failure()` in server.py) + `failure_category` on `launch_attempts`
+- [x] Agent tool: `get_failure_summary_tool` — returns availability % ± uncertainty, recent preemptions/failures
+- [x] Adaptive replacement: FAILED prompt instructs agent to query failure history before replacing
+- [x] Spot→on-demand fallback: `scale_chain_tool` accepts explicit `on_demand` parameter
+- [x] `/job/config-attempted` webhook — Orca reports each allocation attempt (success or failure)
+- [ ] Orca `GET /analytics/launch_success_rate` endpoint (aggregate across all users)
 - [ ] Orca streams launch analytics to Koi — Orca sees ALL launches across all users. Expose: `GET /analytics/launch_success_rate?instance_type=p5.48xlarge&region=us-west-2&window=24h` → `{"attempts": 14, "succeeded": 5, "rate": 0.36, "avg_time_to_launch": 180}`. Turns Orca into a real-time availability oracle.
 
 **Agent framework swap:**
@@ -1330,8 +1335,8 @@ Layer 3: Hierarchical prior (transfer learning) [FUTURE]
 | Process noise (Q) | How much TPS varies within a job (Orca metrics variance) | (0.08 × μ)² |
 | Measurement noise (R) | Prometheus poll jitter (~5-10% of steady state) | (0.05 × μ)² |
 | Warmup rate prior | Physics: model_size_gb / GPU_bandwidth → load time | 0→1200 over 30s |
-| Launch success rate | Beta(α, β) conjugate prior, updated per attempt | Beta(47, 6) = 89% ± 4% |
-| Failure rate by market | Beta prior, updated per replica lifetime | spot: Beta(12, 88) = 12%/hr |
+| Launch success rate | Beta(α, β) conjugate prior, updated per attempt — **IMPLEMENTED** (`availability_priors` table) | Beta(47, 6) = 89% ± 4% |
+| Failure rate by market | Beta prior, updated per replica failure — **IMPLEMENTED** (0.95^hour decay) | spot: Beta(12, 88) = 12%/hr |
 
 ### What Changes for the Agent
 
@@ -1372,9 +1377,29 @@ CREATE TABLE posteriors (
 
 The raw outcomes table stays (audit trail). The posteriors table is the agent's view.
 
+### Availability Prior (Implemented)
+
+The availability model uses Beta-Binomial conjugate priors — the first piece of the
+Bayesian memory layer to ship. Each (gpu_type, region, market) tuple has its own
+Beta(α, β) distribution stored in `availability_priors` table:
+
+- Prior: Beta(1, 1) — uninformative ("no idea")
+- Each successful launch: α += 1
+- Each failed launch/preemption: β += 1
+- Time decay: α,β *= 0.95^(hours_since_last_update) — observations >24h old contribute <30% weight
+- Agent receives: `availability_pct ± uncertainty_pct` via `get_failure_summary_tool`
+
+Updated from three ingest paths:
+- `POST /job/config-attempted` — each individual allocation attempt (success or failure)
+- `POST /job/replica-failed` — mid-job death (spot preemption = failure for that market)
+- `POST /job/started` — successful launch
+
+This model naturally handles sparse data (Beta(1,1) is honest), time-of-day patterns (decay
+makes recent observations dominate), and different markets (separate priors for spot vs on-demand).
+
 ### Implementation Path
 
-1. **Phase 2a**: Conjugate per-config posteriors (Normal-Inverse-Gamma). Seed from PerfDB. Update on every outcome. Agent's `query_memory` tool returns posteriors instead of raw outcomes. ~200 lines.
+1. **Phase 2a (PARTIAL)**: Availability Beta priors implemented. Remaining: Normal-Inverse-Gamma posteriors for TPS/cost per config. Seed from PerfDB. Update on every outcome. Agent's `query_memory` tool returns posteriors instead of raw outcomes. ~200 lines.
 2. **Phase 2b**: Kalman filter replaces EMA + static warmup. Within-job tracking seeded from Layer 1. Anomaly detection replaces hardcoded thresholds. ~300 lines.
 3. **Phase 2c**: Thompson sampling for exploration — when choosing between configs, sample from posteriors and pick the sample-best. Natural exploration-exploitation balance. ~50 lines.
 4. **Phase 3**: Hierarchical model with MCMC/VI for cross-config transfer learning. Only needed at scale.
