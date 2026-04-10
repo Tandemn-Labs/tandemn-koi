@@ -126,6 +126,7 @@ class GPUResource(BaseModel):
     gpu_memory_gb: float
     region: str
     interconnect: str                    # "NVLink" or "PCIe"
+    cloud: str = "aws"                   # forward-compat: "gcp", "azure"
 
     @property
     def available_gpus(self) -> int:
@@ -325,7 +326,9 @@ class JobTracker(BaseModel):
 
     # Anti-windup: suppress triggers while a scaling action is in progress
     action_in_progress: bool = False
-    action_freeze_until: Optional[float] = None  # unix timestamp
+    action_freeze_until: Optional[float] = None
+    consecutive_fetch_failures: int = 0
+    last_metrics_update: Optional[float] = None  # unix timestamp
 
     # Replicas
     replica_ids: List[str] = Field(default_factory=list)

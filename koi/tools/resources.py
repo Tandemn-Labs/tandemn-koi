@@ -88,6 +88,9 @@ def _parse_shape_c(
     quotas = data.get("quotas", [])
     resolved_vpc = vpc_id or data.get("vpc_id", "vpc-unknown")
 
+    # Orca may include live allocation counts from ClusterManager
+    orca_allocated = data.get("allocated_gpus", {})  # {"H100": 16, "L40S": 4}
+
     resources: List[GPUResource] = []
     for inst in instances:
         family = inst.get("quota_family", "")
@@ -133,7 +136,7 @@ def _parse_shape_c(
             instance_type=instance_type,
             gpus_per_instance=gpus_per_instance,
             total_gpus=total_gpus,
-            allocated_gpus=0,
+            allocated_gpus=orca_allocated.get(gpu_type, 0),
             cost_per_instance_hour_usd=cost,
             gpu_memory_gb=gpu_memory_gb,
             region=best_region,

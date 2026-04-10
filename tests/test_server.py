@@ -9,6 +9,7 @@ from koi.schemas import (
     AgentDecision, PlacementConfig, EngineConfig, DataSource, MonitoringStatus,
 )
 from koi.server import app
+from koi.resource_ledger import ResourceLedger
 from koi.tools.memory import AgenticMemory
 from koi.tools.perfdb import PerfDB
 
@@ -38,6 +39,7 @@ async def client():
     app.state.perfdb = MagicMock()
     app.state.perfdb.record_count = 307
     app.state.memory = memory
+    app.state.ledger = ResourceLedger()
     app.state.orca = None
     app.state.agent = MagicMock()
     app.state.agent.model = "claude-sonnet-4-6"
