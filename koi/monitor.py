@@ -8,6 +8,7 @@ These are independent asyncio.Tasks. They do NOT share a timer.
 """
 
 import asyncio
+import math
 import os
 import time
 from datetime import datetime
@@ -76,6 +77,9 @@ class MonitoringLoop:
         decision_id: Optional[str] = None,
         group_id: Optional[str] = None,
     ):
+        if job_id in self.tracked_jobs:
+            logger.info("job_already_registered", job_id=job_id)
+            return
         tracker = JobTracker(
             job_id=job_id,
             decision_id=decision_id,
@@ -219,7 +223,7 @@ class MonitoringLoop:
 
         # Update throughput with EMA
         tps = metrics.get("avg_generation_throughput_toks_per_s", 0)
-        if tps > 0:
+        if tps > 0 and math.isfinite(tps):
             tracker.smoothed_tps = _ema(tracker.smoothed_tps, tps, EMA_ALPHA)
             tracker.last_positive_tps_at = time.time()
         elif tracker.last_positive_tps_at and tracker.smoothed_tps > 0:
@@ -234,7 +238,8 @@ class MonitoringLoop:
         failed_chunks = progress.get("failed", 0)
         if total_chunks > 0:
             completion_frac = (completed_chunks + failed_chunks) / total_chunks
-            tracker.tokens_completed = int(tracker.total_tokens * completion_frac)
+            new_completed = int(tracker.total_tokens * completion_frac)
+            tracker.tokens_completed = max(tracker.tokens_completed, new_completed)
             tracker.tokens_remaining = tracker.total_tokens - tracker.tokens_completed
 
         # Time tracking
@@ -279,6 +284,9 @@ class MonitoringLoop:
         # Classify status — for grouped chains, use aggregate TPS for SLO check
         if tracker.group_id:
             group_chains = self.get_group_chains(tracker.group_id)
+            if not group_chains:
+                # Race: all trackers removed mid-poll (e.g., /job/complete webhook)
+                return
             aggregate_tps = sum(t.smoothed_tps for t in group_chains.values())
             # Recompute headroom using aggregate throughput and full job tokens
             # All replicas share the same chunk pool — use max, not sum
@@ -428,7 +436,7 @@ def compute_slo_headroom(
 ) -> float:
     """Compute SLO headroom percentage. >0 means on track, <0 means behind."""
     if smoothed_tps <= 0:
-        return 0.0
+        return -100.0 if tokens_remaining > 0 else 0.0
     remaining_hours = tokens_remaining / smoothed_tps / 3600
     time_left = slo_deadline_hours - elapsed_hours
     return ((time_left - remaining_hours) / max(slo_deadline_hours, 0.01)) * 100

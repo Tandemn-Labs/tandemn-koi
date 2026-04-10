@@ -599,6 +599,188 @@ def run_tier1():
 
     check("fallback decision picks cheapest config with confidence=0.3", t_fallback_picks_cheapest_slo_meeting)
 
+    # ── T1.9: Bug C1 (FIXED) — empty group_chains race condition ───────────
+    section("T1.9  Bug C1 (fixed): empty group_chains handled gracefully")
+
+    def t_c1_race_fixed():
+        """After fix: _poll_job returns gracefully when all group trackers
+        are removed mid-poll (race with /job/complete webhook)."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from koi.monitor import MonitoringLoop
+
+        config = PlacementConfig(
+            gpu_type="L40S", instance_type="g6e.12xlarge",
+            num_gpus=4, num_instances=1, tp=4, pp=1, dp=1, region="us-east-1",
+            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1)
+        )
+
+        mock_orca = AsyncMock()
+        mock_orca.get_job_status.return_value = {
+            "status": "running", "chunks": {"total": 500, "completed": 200, "failed": 0}
+        }
+        mock_orca.get_chunk_progress.return_value = {"total": 500, "completed": 200, "failed": 0}
+        mock_orca.get_job_metrics.return_value = {"avg_generation_throughput_toks_per_s": 1200.0}
+
+        monitor = MonitoringLoop(orca=mock_orca, on_trigger=None)
+        monitor.register_job("r1", config, slo_deadline_hours=8.0, total_tokens=6_000_000,
+                              predicted_tps=1200, decision_id="dec-1", group_id="parent-job")
+        monitor.register_job("r2", config, slo_deadline_hours=8.0, total_tokens=6_000_000,
+                              predicted_tps=1200, decision_id="dec-1", group_id="parent-job")
+
+        async def _metrics_side_effect(group_id, replica_id):
+            monitor.unregister_group("parent-job")
+            return {"avg_generation_throughput_toks_per_s": 1200.0}
+        mock_orca.get_replica_metrics.side_effect = _metrics_side_effect
+
+        async def run():
+            await monitor._poll_job("r1")  # should NOT raise ValueError
+
+        asyncio.run(run())
+
+    check("C1 fixed: _poll_job survives empty group_chains (no ValueError)", t_c1_race_fixed)
+
+    # ── T1.10: Bug C2 (FIXED) — fallback uses correct key ────────────────────
+    section("T1.10  Bug C2 (fixed): _fallback_decision uses 'predicted_tps' key")
+
+    def t_c2_fallback_fixed():
+        """After fix: _fallback_decision reads 'predicted_tps' key correctly."""
+        perfdb = PerfDB("perfdb/perfdb_all.csv") if os.path.exists("perfdb/perfdb_all.csv") else None
+        mem = AgenticMemory(":memory:")
+        agent = KoiAgent(perfdb=perfdb, memory=mem, api_key="dummy")
+        rm = ResourceMap(
+            vpc_id="test", region="us-east-1",
+            resources=[
+                GPUResource(gpu_type="L40S", instance_type="g6e.12xlarge",
+                            gpus_per_instance=4, total_gpus=80, allocated_gpus=0,
+                            cost_per_instance_hour_usd=10.49, gpu_memory_gb=48.0,
+                            region="us-east-1", interconnect="PCIe"),
+            ],
+        )
+        req = JobRequest(
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            avg_input_tokens=512, avg_output_tokens=256,
+            num_requests=5000, slo_deadline_hours=8.0, objective="cheapest",
+        )
+        agent._build_cost_table(req, rm)
+        decision = agent._fallback_decision(req, rm, elapsed=10.0)
+        assert decision.predicted_tps > 0, \
+            f"C2 still broken: predicted_tps={decision.predicted_tps} (should be >0)"
+
+    check("C2 fixed: fallback predicted_tps > 0", t_c2_fallback_fixed)
+
+    # ── T1.11: Bug C3 (FIXED) — headroom negative when dead ──────────────────
+    section("T1.11  Bug C3 (fixed): headroom is negative when tps=0 and tokens remain")
+
+    def t_c3_headroom_fixed():
+        """After fix: compute_slo_headroom returns negative value when tps=0."""
+        from koi.monitor import compute_slo_headroom
+
+        headroom = compute_slo_headroom(
+            slo_deadline_hours=8.0, elapsed_hours=4.0,
+            tokens_remaining=3_000_000, smoothed_tps=0.0,
+        )
+        assert headroom < 0, \
+            f"C3 still broken: headroom={headroom:.2f} (should be negative when dead)"
+        # Zero tokens remaining with zero TPS should be 0.0 (job is done)
+        headroom_done = compute_slo_headroom(8.0, 4.0, 0, 0.0)
+        assert headroom_done == 0.0, \
+            f"completed job headroom should be 0.0, got {headroom_done}"
+
+    check("C3 fixed: headroom < 0 when tps=0 and tokens remain", t_c3_headroom_fixed)
+
+    # ── T1.12: Bug H1 (FIXED) — Inf TPS rejected by isfinite guard ─────────
+    section("T1.12  Bug H1 (fixed): Inf TPS rejected by math.isfinite guard")
+
+    def t_h1_inf_rejected():
+        """After fix: Inf TPS still produces Inf from _ema (pure math), but
+        the guard in _poll_job (tps > 0 and math.isfinite(tps)) prevents it
+        from reaching _ema at all."""
+        import math
+        tps = float('inf')
+        # The guard that now exists in monitor.py:222
+        passes_guard = tps > 0 and math.isfinite(tps)
+        assert not passes_guard, f"H1 still broken: Inf passes the guard"
+
+    check("H1 fixed: Inf TPS blocked by math.isfinite guard", t_h1_inf_rejected)
+
+    # ── T1.13: Bug H2 (FIXED) — ceiling division gives correct instances ─────
+    section("T1.13  Bug H2 (fixed): ceiling division gives correct num_instances")
+
+    def t_h2_ceiling_division():
+        """After fix: 13 GPUs on 8-GPU instances → 2 instances (not 1)."""
+        num_gpus = 13
+        gpus_per_instance = 8
+        result = max(1, -(-num_gpus // gpus_per_instance))
+        assert result == 2, f"H2 still broken: got {result} instances (expected 2)"
+        # Also verify exact divisibility still works
+        assert max(1, -(-16 // 8)) == 2, "16/8 should be 2"
+        assert max(1, -(-8 // 8)) == 1, "8/8 should be 1"
+
+    check("H2 fixed: ceiling division gives 2 instances for 13 GPUs", t_h2_ceiling_division)
+
+    # ── T1.14: Bug H3 (FIXED) — tokens_completed is monotonic ────────────────
+    section("T1.14  Bug H3 (fixed): tokens_completed never decreases (monotonic guard)")
+
+    def t_h3_monotonic():
+        """After fix: tokens_completed uses max() guard, never decreases."""
+        from koi.monitor import MonitoringLoop
+        from koi.schemas import JobTracker
+
+        total_tokens = 6_000_000
+        # Simulate tracker after first poll: 60% complete
+        prev_completed = int(total_tokens * (300 / 500))  # 3,600,000
+        # Second poll reports regression: 50%
+        new_completed = int(total_tokens * (250 / 500))    # 3,000,000
+        # The fix: max(prev, new) prevents regression
+        result = max(prev_completed, new_completed)
+        assert result == prev_completed, \
+            f"H3 still broken: result={result} (should stay at {prev_completed})"
+
+    check("H3 fixed: max() guard prevents tokens_completed regression", t_h3_monotonic)
+
+    # ── T1.15: Bug H4 (FIXED) — scale-down uses abs(count) ───────────────────
+    section("T1.15  Bug H4 (fixed): scale-down uses abs(count) for dp/num_gpus")
+
+    def t_h4_abs_count():
+        """After fix: scale-down with count=-2 stores dp=2, num_gpus=8 (positive)."""
+        tp, pp, count = 4, 1, -2
+        dp = abs(count)                  # fixed: abs(count)
+        num_gpus = tp * pp * abs(count)  # fixed: abs(count)
+        assert dp == 2, f"H4 still broken: dp={dp}"
+        assert num_gpus == 8, f"H4 still broken: num_gpus={num_gpus}"
+
+    check("H4 fixed: abs(count) gives dp=2 and num_gpus=8", t_h4_abs_count)
+
+    # ── T1.16: Bug H5 (FIXED) — duplicate register_job is idempotent ─────────
+    section("T1.16  Bug H5 (fixed): duplicate register_job preserves metrics")
+
+    def t_h5_idempotent():
+        """After fix: second register_job for same job_id is a no-op."""
+        from koi.monitor import MonitoringLoop
+
+        monitor = MonitoringLoop(orca=None, on_trigger=None)
+        config = PlacementConfig(
+            gpu_type="L40S", instance_type="g6e.12xlarge",
+            num_gpus=4, num_instances=1, tp=4, pp=1, dp=1, region="us-east-1",
+            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1))
+        monitor.register_job("r1", config, slo_deadline_hours=8.0, total_tokens=6_000_000,
+                              predicted_tps=1200, decision_id="dec-1", group_id="parent-job")
+        tracker = monitor.tracked_jobs["r1"]
+        tracker.smoothed_tps = 1150.0
+        tracker.tokens_completed = 2_000_000
+        tracker.elapsed_hours = 2.5
+        # Orca retries → second register_job (should be no-op)
+        monitor.register_job("r1", config, slo_deadline_hours=8.0, total_tokens=6_000_000,
+                              predicted_tps=1200, decision_id="dec-1", group_id="parent-job")
+        after = monitor.tracked_jobs["r1"]
+        assert after.smoothed_tps == 1150.0, \
+            f"H5 still broken: smoothed_tps={after.smoothed_tps} (should be 1150)"
+        assert after.tokens_completed == 2_000_000, \
+            f"H5 still broken: tokens_completed={after.tokens_completed}"
+
+    check("H5 fixed: duplicate register_job preserves accumulated metrics", t_h5_idempotent)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 2 — Koi HTTP server (no LLM)

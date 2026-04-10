@@ -270,8 +270,8 @@ class KoiAgent:
                         job_id=job_id,
                         model_name=parent["model_name"] if parent else "unknown",
                         instance_type=parent["instance_type"] if parent else "unknown",
-                        gpu_type=gpu_type, tp=tp, pp=pp, dp=count,
-                        num_gpus=tp * pp * count,
+                        gpu_type=gpu_type, tp=tp, pp=pp, dp=abs(count),
+                        num_gpus=tp * pp * abs(count),
                         predicted_tps=0,
                         predicted_cost_per_hour=parent["predicted_cost_per_hour"] if parent else 0,
                         slo_deadline_hours=parent["slo_deadline_hours"] if parent else 0,
@@ -469,7 +469,7 @@ class KoiAgent:
                 job_id=req.job_id or "unknown",
                 model_name=req.model_name,
                 config=config,
-                predicted_tps=best.get("tps", 0),
+                predicted_tps=best.get("predicted_tps", 0),
                 predicted_cost_per_hour=best.get("cost_per_hour", 0),
                 predicted_total_cost=best.get("total_cost", 0),
                 reasoning=f"[TIMEOUT FALLBACK] Agent timed out after {elapsed:.0f}s. "
@@ -568,7 +568,7 @@ class KoiAgent:
                 if num_gpus > resource.available_gpus:
                     continue
 
-                num_instances = max(1, num_gpus // resource.gpus_per_instance)
+                num_instances = max(1, -(-num_gpus // resource.gpus_per_instance))
                 cost_hr = num_instances * resource.cost_per_instance_hour_usd
                 eta_h = total_tokens / tps / 3600
                 total_cost = cost_hr * eta_h
@@ -786,7 +786,7 @@ class KoiAgent:
         resource = rm.get_resource(gpu_type)
         cost_per_hour = data.get("predicted_cost_per_hour", 0.0)
         if not cost_per_hour and resource:
-            num_instances = max(1, num_gpus // resource.gpus_per_instance)
+            num_instances = max(1, -(-num_gpus // resource.gpus_per_instance))
             cost_per_hour = num_instances * resource.cost_per_instance_hour_usd
 
         predicted_tps = float(data.get("predicted_tps", 0.0))
@@ -804,7 +804,7 @@ class KoiAgent:
         }
         data_source = ds_map.get(data.get("data_source", "analytical"), DataSource.ANALYTICAL)
 
-        num_instances = max(1, num_gpus // (resource.gpus_per_instance if resource else 8))
+        num_instances = max(1, -(-num_gpus // (resource.gpus_per_instance if resource else 8)))
 
         config = PlacementConfig(
             gpu_type=gpu_type,

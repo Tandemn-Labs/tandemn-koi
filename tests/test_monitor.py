@@ -57,7 +57,9 @@ class TestSLOHeadroom:
 
     def test_zero_tps(self):
         h = compute_slo_headroom(8.0, 1.0, 5_000_000, 0.0)
-        assert h == 0.0
+        assert h == -100.0  # tokens remaining + zero TPS = deeply behind
+        h2 = compute_slo_headroom(8.0, 1.0, 0, 0.0)
+        assert h2 == 0.0  # no tokens remaining = done
 
     def test_just_met(self):
         # Exactly enough TPS to finish in remaining time
