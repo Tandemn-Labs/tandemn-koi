@@ -75,6 +75,24 @@ def show_koi():
     print()
 
 
+def show_resources():
+    print("\n=== Koi Resource Ledger ===")
+    data = get(f"{KOI}/resources")
+    pending = data.get("pending_gpus", {})
+    reservations = data.get("pending_reservations", [])
+    if not pending:
+        print("  No pending reservations (all GPUs available)")
+    else:
+        for gpu, count in pending.items():
+            print(f"  {gpu}: {count} GPUs pending launch")
+    if reservations:
+        print(f"\n  Active reservations ({len(reservations)}):")
+        for r in reservations:
+            print(f"    {r['decision_id'][:12]}.. → {r['gpu_type']} ×{r['num_gpus']}  "
+                  f"(age: {r['age_seconds']}s)")
+    print()
+
+
 def poll(interval=10):
     print(f"Polling every {interval}s (Ctrl+C to stop)\n")
     try:
@@ -133,6 +151,8 @@ def main():
             show_state()
         elif cmd == "koi":
             show_koi()
+        elif cmd == "resources":
+            show_resources()
         elif cmd == "kill" and len(parts) >= 2:
             reason = " ".join(parts[2:]) if len(parts) > 2 else "Simulated EC2 termination"
             print(post(f"{ORCA}/sim/kill-replica/{parts[1]}", {"reason": reason}))
