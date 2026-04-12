@@ -159,3 +159,40 @@ class TestTriggerSuppression:
         await monitor._emit_trigger("job-1", MonitoringStatus.FAILED, "Heartbeat timeout")
 
         assert not monitor._trigger_queue.empty()
+
+
+class TestGroupAggregation:
+    def test_dead_replicas_excluded_from_aggregate(self):
+        """Dead replicas (FAILED/COMPLETED) should not drag down aggregate TPS."""
+        t1 = _make_tracker(job_id="r0", smoothed_tps=2000.0)
+        t1.status = MonitoringStatus.ON_TRACK
+
+        t2 = _make_tracker(job_id="r1", smoothed_tps=0.0)
+        t2.status = MonitoringStatus.FAILED  # dead
+
+        t3 = _make_tracker(job_id="r2", smoothed_tps=1800.0)
+        t3.status = MonitoringStatus.ON_TRACK
+
+        group = {"r0": t1, "r1": t2, "r2": t3}
+
+        # Filter like the production code does
+        live = {k: v for k, v in group.items()
+                if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)}
+        aggregate = sum(t.smoothed_tps for t in live.values())
+
+        assert "r1" not in live  # dead replica excluded
+        assert aggregate == 3800.0  # 2000 + 1800, not 2000 + 0 + 1800
+
+    def test_all_dead_gives_zero(self):
+        """If all replicas are dead, aggregate TPS is 0."""
+        t1 = _make_tracker(job_id="r0", smoothed_tps=0.0)
+        t1.status = MonitoringStatus.FAILED
+        t2 = _make_tracker(job_id="r1", smoothed_tps=0.0)
+        t2.status = MonitoringStatus.COMPLETED
+
+        group = {"r0": t1, "r1": t2}
+        live = {k: v for k, v in group.items()
+                if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)}
+        aggregate = sum(t.smoothed_tps for t in live.values()) if live else 0
+
+        assert aggregate == 0

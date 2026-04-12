@@ -288,7 +288,11 @@ class MonitoringLoop:
             if not group_chains:
                 # Race: all trackers removed mid-poll (e.g., /job/complete webhook)
                 return
-            aggregate_tps = sum(t.smoothed_tps for t in group_chains.values())
+            # Exclude dead/completed replicas from aggregate — they contribute 0 TPS
+            # and drag down headroom calculation unnecessarily
+            live_chains = {k: v for k, v in group_chains.items()
+                          if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)}
+            aggregate_tps = sum(t.smoothed_tps for t in live_chains.values()) if live_chains else 0
             # Recompute headroom using aggregate throughput and full job tokens
             # All replicas share the same chunk pool — use max, not sum
             total_job_tokens = max(t.total_tokens for t in group_chains.values())
