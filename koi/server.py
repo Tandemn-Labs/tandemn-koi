@@ -494,6 +494,11 @@ async def replica_failed(req: ReplicaFailedRequest):
         logger.warning("replica_failed_unknown", job_id=req.job_id)
         return {"status": "unknown", "job_id": req.job_id}
 
+    # Dedup: if already FAILED, don't re-process (watchdog + launcher can both fire)
+    if tracker.status == MonitoringStatus.FAILED:
+        logger.info("replica_failed_dedup", job_id=req.job_id)
+        return {"status": "already_failed", "job_id": req.job_id}
+
     # Check if this was an intentional kill (from scale_chain_tool)
     if req.job_id in monitor._koi_initiated_kills:
         monitor._koi_initiated_kills.discard(req.job_id)
@@ -504,17 +509,21 @@ async def replica_failed(req: ReplicaFailedRequest):
         logger.info("intentional_kill_ack", job_id=req.job_id)
         return {"status": "intentional_kill", "job_id": req.job_id}
 
+    # Capture TPS before zeroing — valuable ground truth for learning
+    actual_tps_before_death = tracker.smoothed_tps
+
     tracker.status = MonitoringStatus.FAILED
     tracker.smoothed_tps = 0
     if req.job_id not in tracker.dead_replicas:
         tracker.dead_replicas.append(req.job_id)
-    # Record failure outcome in memory for learning
+    # Record failure outcome in memory for learning (with actual TPS if available)
     memory: AgenticMemory = app.state.memory
     if tracker.decision_id:
         memory.record_outcome(
             decision_id=tracker.decision_id,
             job_id=req.group_id,
             status="replica_failed",
+            actual_tps=actual_tps_before_death if actual_tps_before_death > 0 else None,
             failure_category=_classify_failure(req.reason),
             diagnosis=req.reason[:200],
         )

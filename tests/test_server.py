@@ -162,6 +162,94 @@ class TestLaunchFailed:
         assert body["attempts_recorded"] == 2
 
 
+class TestReplicaFailed:
+    @pytest.mark.asyncio
+    async def test_captures_tps_before_zeroing(self, client):
+        """actual_tps should be recorded from smoothed_tps BEFORE it's set to 0."""
+        import asyncio
+        from koi.schemas import JobTracker, MonitoringStatus
+
+        config = PlacementConfig(
+            gpu_type="L40S", instance_type="g6e.12xlarge",
+            num_gpus=4, num_instances=1, tp=4, pp=1, dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1),
+        )
+        tracker = JobTracker(
+            job_id="r0", config=config,
+            slo_deadline_hours=8.0, total_tokens=6_000_000,
+            predicted_tps=1200.0, tokens_remaining=5_000_000,
+        )
+        tracker.smoothed_tps = 1850.0  # was running at 1850 TPS before death
+        # Record a decision so the outcome JOIN works
+        dec_id = app.state.memory.record_decision(
+            job_id="parent-job", model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge", gpu_type="L40S",
+            tp=4, pp=1, dp=1, num_gpus=4,
+            predicted_tps=1200.0, predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0, objective="cheapest",
+            avg_input_tokens=953, avg_output_tokens=1024,
+        )
+        tracker.decision_id = dec_id
+
+        app.state.monitor.tracked_jobs = {"r0": tracker}
+        app.state.monitor._koi_initiated_kills = set()
+        app.state.monitor._trigger_queue = asyncio.Queue()
+        app.state.monitor._pending_launches = {}
+
+        resp = await client.post("/job/replica-failed", json={
+            "job_id": "r0",
+            "group_id": "parent-job",
+            "status": "failed",
+            "reason": "Heartbeat timeout (45s)",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "trigger_emitted"
+
+        # Verify tracker is zeroed
+        assert tracker.smoothed_tps == 0
+        assert tracker.status == MonitoringStatus.FAILED
+
+        # Verify outcome was recorded with actual_tps=1850
+        outcomes = app.state.memory.query_outcomes(status="replica_failed")
+        assert len(outcomes) >= 1
+        last = outcomes[0]
+        assert last["actual_tps"] == 1850.0
+
+    @pytest.mark.asyncio
+    async def test_dedup_already_failed(self, client):
+        """Second /job/replica-failed for same ID returns already_failed."""
+        import asyncio
+        from koi.schemas import JobTracker, MonitoringStatus
+
+        config = PlacementConfig(
+            gpu_type="L40S", instance_type="g6e.12xlarge",
+            num_gpus=4, num_instances=1, tp=4, pp=1, dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1),
+        )
+        tracker = JobTracker(
+            job_id="r0", config=config,
+            slo_deadline_hours=8.0, total_tokens=6_000_000,
+            predicted_tps=1200.0,
+        )
+        tracker.status = MonitoringStatus.FAILED  # already dead
+
+        app.state.monitor.tracked_jobs = {"r0": tracker}
+        app.state.monitor._koi_initiated_kills = set()
+        app.state.monitor._trigger_queue = asyncio.Queue()
+        app.state.monitor._pending_launches = {}
+
+        resp = await client.post("/job/replica-failed", json={
+            "job_id": "r0",
+            "group_id": "parent-job",
+            "status": "failed",
+            "reason": "Heartbeat timeout (45s)",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "already_failed"
+
+
 class TestClassifyFailure:
     def test_spot_preemption(self):
         from koi.server import _classify_failure
