@@ -328,6 +328,10 @@ class MonitoringLoop:
         tracker = self.tracked_jobs.get(job_id)
         if not tracker:
             return
+        # Don't emit non-FAILED triggers for replicas already marked FAILED
+        # (prevents FALLING_BEHIND racing ahead of FAILED webhook)
+        if tracker.status == MonitoringStatus.FAILED and status != MonitoringStatus.FAILED:
+            return
         # Group-level dedup: at most one trigger per group per status per 30s
         if tracker.group_id:
             key = f"{tracker.group_id}:{status.value}"

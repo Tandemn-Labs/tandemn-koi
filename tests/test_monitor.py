@@ -122,3 +122,40 @@ class TestMonitoringLoopRegistration:
         )
         monitor.unregister_job("job-1")
         assert "job-1" not in monitor.tracked_jobs
+
+
+class TestTriggerSuppression:
+    @pytest.mark.asyncio
+    async def test_falling_behind_suppressed_for_failed_replica(self):
+        """FALLING_BEHIND trigger should NOT emit for a replica already marked FAILED."""
+        from unittest.mock import MagicMock
+        monitor = MonitoringLoop(orca=MagicMock())
+        monitor.register_job(
+            job_id="job-1", config=_make_config(),
+            slo_deadline_hours=8.0, total_tokens=7_500_000,
+            predicted_tps=2590.0,
+        )
+        tracker = monitor.tracked_jobs["job-1"]
+        tracker.status = MonitoringStatus.FAILED  # already dead
+
+        await monitor._emit_trigger("job-1", MonitoringStatus.FALLING_BEHIND, "TPS low")
+
+        # Queue should be empty — trigger suppressed
+        assert monitor._trigger_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_failed_trigger_still_emits_for_failed_replica(self):
+        """FAILED trigger should still emit even if status is already FAILED (idempotent)."""
+        from unittest.mock import MagicMock
+        monitor = MonitoringLoop(orca=MagicMock())
+        monitor.register_job(
+            job_id="job-1", config=_make_config(),
+            slo_deadline_hours=8.0, total_tokens=7_500_000,
+            predicted_tps=2590.0,
+        )
+        tracker = monitor.tracked_jobs["job-1"]
+        tracker.status = MonitoringStatus.FAILED
+
+        await monitor._emit_trigger("job-1", MonitoringStatus.FAILED, "Heartbeat timeout")
+
+        assert not monitor._trigger_queue.empty()
