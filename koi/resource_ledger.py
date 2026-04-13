@@ -11,10 +11,12 @@ Carries tenant_id for multi-tenant readiness.
 
 import threading
 import time
+from dataclasses import asdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from koi.logging_config import get_logger
+from koi.runtime_state import RuntimeStateStore
 
 logger = get_logger("koi.resource_ledger")
 
@@ -43,10 +45,15 @@ class ResourceLedger:
         ledger.release("dec-123")  # on /job/started or /job/launch-failed
     """
 
-    def __init__(self, pending_ttl: float = PENDING_TTL_SECONDS):
+    def __init__(
+        self,
+        pending_ttl: float = PENDING_TTL_SECONDS,
+        runtime_state: Optional[RuntimeStateStore] = None,
+    ):
         self._pending: Dict[str, GPUAllocation] = {}
         self._lock = threading.Lock()
         self._ttl = pending_ttl
+        self._runtime_state = runtime_state
 
     def reserve(self, decision_id: str, gpu_type: str, num_gpus: int,
                 cloud: str = "aws", region: str = "unknown",
@@ -55,13 +62,20 @@ class ResourceLedger:
         """Reserve GPUs after /decide or scale_chain_tool."""
         with self._lock:
             self._expire_stale()
-            self._pending[decision_id] = GPUAllocation(
+            alloc = GPUAllocation(
                 gpu_type=gpu_type, num_gpus=num_gpus,
                 cloud=cloud, region=region,
                 instance_type=instance_type,
                 tenant_id=tenant_id,
                 decision_id=decision_id,
             )
+            self._pending[decision_id] = alloc
+            if self._runtime_state:
+                self._runtime_state.upsert_ledger_reservation(
+                    decision_id=decision_id,
+                    reservation=asdict(alloc),
+                    expires_at=alloc.created_at + self._ttl,
+                )
         logger.info("gpu_reserved", decision_id=decision_id, gpu_type=gpu_type,
                      num_gpus=num_gpus, region=region)
 
@@ -69,10 +83,34 @@ class ResourceLedger:
         """Release a pending reservation (on /job/started or /job/launch-failed)."""
         with self._lock:
             alloc = self._pending.pop(decision_id, None)
+            if alloc and self._runtime_state:
+                self._runtime_state.delete_ledger_reservation(decision_id)
         if alloc:
             logger.info("gpu_released", decision_id=decision_id, gpu_type=alloc.gpu_type,
                          num_gpus=alloc.num_gpus)
         return alloc
+
+    def restore(self) -> int:
+        """Rebuild pending reservations from persistent runtime state."""
+        if not self._runtime_state:
+            return 0
+
+        restored = 0
+        now = time.time()
+        persisted = self._runtime_state.load_ledger_reservations()
+        with self._lock:
+            self._expire_stale()
+            for decision_id, entry in persisted.items():
+                expires_at = entry.get("expires_at")
+                if expires_at is not None and expires_at <= now:
+                    self._runtime_state.delete_ledger_reservation(decision_id)
+                    continue
+                reservation = entry["reservation"]
+                self._pending[decision_id] = GPUAllocation(**reservation)
+                restored += 1
+        if restored:
+            logger.info("ledger_restored", count=restored)
+        return restored
 
     def get_pending_by_type(self, cloud: str = None, region: str = None,
                             gpu_type: str = None,
@@ -144,5 +182,7 @@ class ResourceLedger:
         expired = [k for k, v in self._pending.items() if v.created_at < cutoff]
         for k in expired:
             alloc = self._pending.pop(k)
+            if self._runtime_state:
+                self._runtime_state.delete_ledger_reservation(k)
             logger.warning("pending_expired", decision_id=k, gpu_type=alloc.gpu_type,
                            num_gpus=alloc.num_gpus, age_seconds=round(time.time() - alloc.created_at))
