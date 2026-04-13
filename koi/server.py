@@ -28,6 +28,7 @@ from koi.agent import KoiAgent
 from koi.logging_config import setup_logging, get_logger, bind_context, clear_context
 from koi.monitor import MonitoringLoop
 from koi.resource_ledger import ResourceLedger
+from koi.runtime_state import RuntimeStateStore
 from koi.schemas import (
     AgentDecision,
     DataSource,
@@ -154,7 +155,8 @@ async def lifespan(app: FastAPI):
                 outcomes=app.state.memory.outcome_count())
 
     # Resource ledger (pending GPU reservations)
-    app.state.ledger = ResourceLedger()
+    app.state.runtime_state = RuntimeStateStore()
+    app.state.ledger = ResourceLedger(runtime_state=app.state.runtime_state)
     app.state.decide_lock = asyncio.Lock()
 
     # Orca client
@@ -185,6 +187,7 @@ async def lifespan(app: FastAPI):
     app.state.monitor = MonitoringLoop(
         orca=app.state.orca,
         on_trigger=app.state.agent.handle_trigger,
+        runtime_state=app.state.runtime_state,
     )
     app.state.agent.monitor = app.state.monitor
     if app.state.orca:
@@ -387,14 +390,14 @@ async def job_launching(req: JobLaunchingRequest):
     Gives Koi early visibility into GPU spend before model_ready.
     """
     monitor: MonitoringLoop = app.state.monitor
-    monitor._pending_launches[req.job_id] = {
+    monitor.track_pending_launch(req.job_id, {
         "group_id": req.group_id,
         "gpu_type": req.gpu_type,
         "instance_type": req.instance_type,
         "tp": req.tp, "pp": req.pp,
         "region": req.region, "market": req.market,
         "launched_at": time.time(),
-    }
+    })
     logger.info("job_launching", job_id=req.job_id, group_id=req.group_id,
                 gpu_type=req.gpu_type, instance_type=req.instance_type)
     return {"status": "tracked", "job_id": req.job_id}
@@ -406,12 +409,12 @@ async def job_started(req: JobStartedRequest):
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
 
-    pending_launch = monitor._pending_launches.get(req.job_id, {})
+    pending_launch = monitor.get_pending_launch(req.job_id)
     resolved_region = req.region if req.region != "unknown" else pending_launch.get("region", "unknown")
     resolved_market = req.market if req.market != "unknown" else pending_launch.get("market", "unknown")
 
     # Clear pending launch tracking — replica reached model_ready
-    monitor._pending_launches.pop(req.job_id, None)
+    monitor.clear_pending_launch(req.job_id)
 
     # Release pending reservation — Orca confirmed, its next GET /resources reflects it
     if req.decision_id:
@@ -420,15 +423,9 @@ async def job_started(req: JobStartedRequest):
     # Link scale-up replicas to pending scale decisions queued per group.
     pending_scale_decisions = getattr(monitor, "_pending_scale_decisions", None)
     if req.group_id and isinstance(pending_scale_decisions, dict):
-        queue = pending_scale_decisions.get(req.group_id, [])
-        if queue:
-            pending = queue[0]
+        pending = monitor.consume_pending_scale_decision(req.group_id)
+        if pending:
             req.decision_id = pending["decision_id"]
-            pending["remaining"] -= 1
-            if pending["remaining"] <= 0:
-                queue.pop(0)
-            if not queue:
-                pending_scale_decisions.pop(req.group_id, None)
     elif isinstance(getattr(monitor, "_pending_scale_decision", None), dict):
         pending = getattr(monitor, "_pending_scale_decision", None)
         if pending and pending.get("group_id") == req.group_id:
@@ -492,6 +489,7 @@ async def job_started(req: JobStartedRequest):
             if tracker.group_id == req.group_id and tracker.action_in_progress:
                 tracker.action_in_progress = False
                 tracker.action_freeze_until = None
+                monitor.persist_job(tracker.job_id)
                 logger.info("anti_windup_unfrozen", tracker_job=tracker.job_id, new_replica=req.job_id)
 
     # Update availability prior (success observation)
@@ -619,6 +617,7 @@ async def replica_failed(req: ReplicaFailedRequest):
         tracker.smoothed_tps = 0
         if req.job_id not in tracker.dead_replicas:
             tracker.dead_replicas.append(req.job_id)
+        monitor.persist_job(req.job_id)
         logger.info("intentional_kill_ack", job_id=req.job_id)
         return {"status": "intentional_kill", "job_id": req.job_id}
 
@@ -629,6 +628,7 @@ async def replica_failed(req: ReplicaFailedRequest):
     tracker.smoothed_tps = 0
     if req.job_id not in tracker.dead_replicas:
         tracker.dead_replicas.append(req.job_id)
+    monitor.persist_job(req.job_id)
     failure_category = _classify_failure(req.reason)
     market = tracker.config.market
     if market == "unknown":

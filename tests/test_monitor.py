@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
 
 from koi.schemas import (
     JobTracker, MonitoringStatus, PlacementConfig, EngineConfig, MonitoringTrigger,
@@ -10,6 +11,7 @@ from koi.monitor import (
     _ema, _classify_status, compute_slo_headroom,
     MonitoringLoop, WARMUP_MINUTES,
 )
+from koi.runtime_state import RuntimeStateStore
 
 
 def _make_config():
@@ -102,7 +104,6 @@ class TestClassifyStatus:
 
 class TestMonitoringLoopRegistration:
     def test_register_job(self):
-        from unittest.mock import MagicMock
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
             job_id="job-1", config=_make_config(),
@@ -113,7 +114,6 @@ class TestMonitoringLoopRegistration:
         assert monitor.tracked_jobs["job-1"].decision_id == "dec-abc"
 
     def test_unregister_job(self):
-        from unittest.mock import MagicMock
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
             job_id="job-1", config=_make_config(),
@@ -128,7 +128,6 @@ class TestTriggerSuppression:
     @pytest.mark.asyncio
     async def test_falling_behind_suppressed_for_failed_replica(self):
         """FALLING_BEHIND trigger should NOT emit for a replica already marked FAILED."""
-        from unittest.mock import MagicMock
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
             job_id="job-1", config=_make_config(),
@@ -146,7 +145,6 @@ class TestTriggerSuppression:
     @pytest.mark.asyncio
     async def test_failed_trigger_still_emits_for_failed_replica(self):
         """FAILED trigger should still emit even if status is already FAILED (idempotent)."""
-        from unittest.mock import MagicMock
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
             job_id="job-1", config=_make_config(),
@@ -196,3 +194,91 @@ class TestGroupAggregation:
         aggregate = sum(t.smoothed_tps for t in live.values()) if live else 0
 
         assert aggregate == 0
+
+
+class TestMonitoringLoopPersistence:
+    def test_register_and_unregister_job_persist_runtime_state(self, tmp_path):
+        store = RuntimeStateStore(str(tmp_path / "runtime.sqlite"))
+        monitor = MonitoringLoop(orca=MagicMock(), runtime_state=store)
+
+        monitor.register_job(
+            job_id="job-1",
+            config=_make_config(),
+            slo_deadline_hours=8.0,
+            total_tokens=7_500_000,
+            predicted_tps=2590.0,
+            decision_id="dec-abc",
+            group_id="grp-1",
+        )
+
+        persisted = store.load_tracked_jobs()
+        assert persisted["job-1"]["decision_id"] == "dec-abc"
+        assert persisted["job-1"]["tracker"]["group_id"] == "grp-1"
+
+        monitor.unregister_job("job-1")
+        assert store.load_tracked_jobs() == {}
+
+    def test_pending_launch_and_scale_queue_persist(self, tmp_path):
+        store = RuntimeStateStore(str(tmp_path / "runtime.sqlite"))
+        monitor = MonitoringLoop(orca=MagicMock(), runtime_state=store)
+
+        monitor.track_pending_launch("replica-1", {
+            "group_id": "grp-1",
+            "gpu_type": "L40S",
+            "instance_type": "g6e.12xlarge",
+            "region": "us-west-2",
+            "market": "spot",
+        })
+        assert store.load_pending_launches()["replica-1"]["launch"]["market"] == "spot"
+
+        monitor.enqueue_pending_scale_decision("grp-1", {"decision_id": "dec-a", "remaining": 2})
+        monitor.enqueue_pending_scale_decision("grp-1", {"decision_id": "dec-b", "remaining": 1})
+        assert store.load_pending_scale_decisions()["grp-1"] == [
+            {"decision_id": "dec-a", "remaining": 2},
+            {"decision_id": "dec-b", "remaining": 1},
+        ]
+
+        first = monitor.consume_pending_scale_decision("grp-1")
+        assert first["decision_id"] == "dec-a"
+        assert store.load_pending_scale_decisions()["grp-1"] == [
+            {"decision_id": "dec-a", "remaining": 1},
+            {"decision_id": "dec-b", "remaining": 1},
+        ]
+
+        monitor.clear_pending_launch("replica-1")
+        assert store.load_pending_launches() == {}
+
+    @pytest.mark.asyncio
+    async def test_poll_job_persists_updated_tracker_state(self, tmp_path):
+        store = RuntimeStateStore(str(tmp_path / "runtime.sqlite"))
+        orca = MagicMock()
+        orca.get_job_metrics = AsyncMock(return_value={
+            "avg_generation_throughput_toks_per_s": 1000.0,
+            "gpu_cache_usage_perc": 25.0,
+            "gpu_sm_util_pct": 50.0,
+            "gpu_mem_bw_util_pct": 60.0,
+        })
+        orca.get_chunk_progress = AsyncMock(return_value={
+            "total": 10,
+            "completed": 5,
+            "failed": 0,
+            "all_done": False,
+        })
+        orca.get_job_status = AsyncMock(return_value={"status": "running"})
+
+        monitor = MonitoringLoop(orca=orca, runtime_state=store)
+        monitor.register_job(
+            job_id="job-1",
+            config=_make_config(),
+            slo_deadline_hours=8.0,
+            total_tokens=10_000,
+            predicted_tps=1200.0,
+            decision_id="dec-1",
+        )
+
+        await monitor._poll_job("job-1")
+
+        persisted = store.load_tracked_jobs()["job-1"]["tracker"]
+        assert persisted["smoothed_tps"] == pytest.approx(1000.0)
+        assert persisted["tokens_completed"] == 5000
+        assert persisted["gpu_cache_usage"] == 25.0

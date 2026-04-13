@@ -48,12 +48,42 @@ async def client():
     app.state.agent.model = "claude-sonnet-4-6"
     app.state.agent.decide = AsyncMock(return_value=_mock_decision())
     app.state.agent.handle_trigger = AsyncMock(return_value="ok")
-    app.state.monitor = MagicMock()
-    app.state.monitor.tracked_jobs = {}
-    app.state.monitor._pending_launches = {}
-    app.state.monitor.register_job = MagicMock()
-    app.state.monitor.get_group_chains = MagicMock(return_value={})
-    app.state.monitor.unregister_group = MagicMock(return_value=[])
+    monitor = MagicMock()
+    monitor.tracked_jobs = {}
+    monitor._pending_launches = {}
+    monitor._pending_scale_decisions = {}
+
+    def _track_pending_launch(job_id, launch_info):
+        monitor._pending_launches[job_id] = launch_info
+
+    def _get_pending_launch(job_id):
+        return monitor._pending_launches.get(job_id, {})
+
+    def _clear_pending_launch(job_id):
+        return monitor._pending_launches.pop(job_id, None)
+
+    def _consume_pending_scale_decision(group_id):
+        queue = monitor._pending_scale_decisions.get(group_id, [])
+        if not queue:
+            return None
+        pending = queue[0]
+        pending["remaining"] -= 1
+        if pending["remaining"] <= 0:
+            queue.pop(0)
+        if not queue:
+            monitor._pending_scale_decisions.pop(group_id, None)
+        return pending
+
+    monitor.track_pending_launch = MagicMock(side_effect=_track_pending_launch)
+    monitor.get_pending_launch = MagicMock(side_effect=_get_pending_launch)
+    monitor.clear_pending_launch = MagicMock(side_effect=_clear_pending_launch)
+    monitor.consume_pending_scale_decision = MagicMock(side_effect=_consume_pending_scale_decision)
+    monitor.persist_job = MagicMock()
+    monitor.register_job = MagicMock()
+    monitor.unregister_job = MagicMock(side_effect=lambda job_id: monitor.tracked_jobs.pop(job_id, None))
+    monitor.get_group_chains = MagicMock(return_value={})
+    monitor.unregister_group = MagicMock(return_value=[])
+    app.state.monitor = monitor
 
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as c:

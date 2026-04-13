@@ -332,11 +332,7 @@ class KoiAgent:
                         market=market_str,
                     )
                     if monitor and count > 0:
-                        pending = getattr(monitor, "_pending_scale_decisions", None)
-                        if not isinstance(pending, dict):
-                            pending = {}
-                            monitor._pending_scale_decisions = pending
-                        pending.setdefault(job_id, []).append({
+                        monitor.enqueue_pending_scale_decision(job_id, {
                             "decision_id": scale_dec_id,
                             "remaining": abs(count),
                             "region": resolved_region,
@@ -348,6 +344,7 @@ class KoiAgent:
                         if tracker.group_id == job_id or tracker.job_id == job_id:
                             tracker.action_in_progress = True
                             tracker.action_freeze_until = time.time() + 1200  # 20 min max, /job/started unfreezes early
+                            monitor.persist_job(tracker.job_id)
                 if scale_dec_id and count > 0:
                     return f"{result} decision_id={scale_dec_id}"
                 return result
@@ -364,6 +361,7 @@ class KoiAgent:
                         if tracker.group_id == job_id or tracker.job_id == job_id:
                             tracker.action_in_progress = True
                             tracker.action_freeze_until = time.time() + 300
+                            monitor.persist_job(tracker.job_id)
                 return f"Killed {len(replica_ids)} replicas: {replica_ids}. {result}"
 
             @beta_async_tool

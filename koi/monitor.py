@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Callable, Coroutine, Dict, List, Optional
 
 from koi.logging_config import get_logger, bind_context, clear_context
+from koi.runtime_state import RuntimeStateStore
 from koi.schemas import (
     JobTracker, MonitoringStatus, MonitoringTrigger, PlacementConfig,
 )
@@ -51,10 +52,12 @@ class MonitoringLoop:
         orca: OrcaClient,
         on_trigger: Optional[Callable[[MonitoringTrigger], Coroutine]] = None,
         telemetry_interval: float = 10.0,
+        runtime_state: Optional[RuntimeStateStore] = None,
     ):
         self.orca = orca
         self.on_trigger = on_trigger
         self.telemetry_interval = telemetry_interval
+        self.runtime_state = runtime_state
 
         self.tracked_jobs: Dict[str, JobTracker] = {}
         self._trigger_queue: asyncio.Queue = asyncio.Queue()
@@ -63,6 +66,7 @@ class MonitoringLoop:
         self._group_trigger_cooldown: Dict[str, float] = {}  # "group_id:status" → last_emit_time
         self._koi_initiated_kills: set = set()  # replica IDs killed by scale_chain_tool
         self._pending_launches: Dict[str, dict] = {}  # replica_id → launch info (pre-model_ready)
+        self._pending_scale_decisions: Dict[str, List[dict]] = {}  # group_id -> FIFO queue
 
     # ------------------------------------------------------------------
     # Job registration
@@ -92,11 +96,14 @@ class MonitoringLoop:
             tokens_remaining=total_tokens,
         )
         self.tracked_jobs[job_id] = tracker
+        self.persist_job(job_id)
         logger.info("job_registered", job_id=job_id, slo_hours=slo_deadline_hours,
                      total_tokens=total_tokens, group_id=group_id)
 
     def unregister_job(self, job_id: str):
         self.tracked_jobs.pop(job_id, None)
+        if self.runtime_state:
+            self.runtime_state.delete_tracked_job(job_id)
         logger.info("job_unregistered", job_id=job_id)
 
     def get_group_chains(self, group_id: str) -> Dict[str, JobTracker]:
@@ -108,8 +115,60 @@ class MonitoringLoop:
         chains = self.get_group_chains(group_id)
         for jid in chains:
             self.tracked_jobs.pop(jid, None)
+            if self.runtime_state:
+                self.runtime_state.delete_tracked_job(jid)
         logger.info("group_unregistered", group_id=group_id, chains=len(chains))
         return list(chains.values())
+
+    def persist_job(self, job_id: str) -> None:
+        tracker = self.tracked_jobs.get(job_id)
+        if tracker and self.runtime_state:
+            self.runtime_state.upsert_tracked_job(
+                job_id=job_id,
+                tracker=tracker.model_dump(mode="json"),
+            )
+
+    def persist_group(self, group_id: str) -> None:
+        for tracker_job_id, tracker in self.tracked_jobs.items():
+            if tracker.group_id == group_id:
+                self.persist_job(tracker_job_id)
+
+    def track_pending_launch(self, job_id: str, launch_info: dict) -> None:
+        self._pending_launches[job_id] = launch_info
+        if self.runtime_state:
+            self.runtime_state.upsert_pending_launch(job_id, launch_info)
+
+    def get_pending_launch(self, job_id: str) -> dict:
+        return self._pending_launches.get(job_id, {})
+
+    def clear_pending_launch(self, job_id: str) -> Optional[dict]:
+        launch = self._pending_launches.pop(job_id, None)
+        if launch and self.runtime_state:
+            self.runtime_state.delete_pending_launch(job_id)
+        return launch
+
+    def enqueue_pending_scale_decision(self, group_id: str, decision: dict) -> None:
+        queue = self._pending_scale_decisions.setdefault(group_id, [])
+        queue.append(decision)
+        if self.runtime_state:
+            self.runtime_state.replace_pending_scale_group(group_id, queue)
+
+    def consume_pending_scale_decision(self, group_id: str) -> Optional[dict]:
+        queue = self._pending_scale_decisions.get(group_id, [])
+        if not queue:
+            return None
+        decision = queue[0]
+        decision["remaining"] -= 1
+        if decision["remaining"] <= 0:
+            queue.pop(0)
+        if queue:
+            if self.runtime_state:
+                self.runtime_state.replace_pending_scale_group(group_id, queue)
+        else:
+            self._pending_scale_decisions.pop(group_id, None)
+            if self.runtime_state:
+                self.runtime_state.delete_pending_scale_group(group_id)
+        return decision
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -173,159 +232,163 @@ class MonitoringLoop:
         if not tracker:
             return
 
-        # Skip dead/completed replicas — no point polling them
-        if tracker.status in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED):
-            return
+        try:
+            # Skip dead/completed replicas — no point polling them
+            if tracker.status in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED):
+                return
 
-        # For grouped chains, Orca indexes by parent job_id — not replica_id
-        orca_job_id = tracker.group_id or job_id
+            # For grouped chains, Orca indexes by parent job_id — not replica_id
+            orca_job_id = tracker.group_id or job_id
 
-        # Check replica liveness from Orca (detect dead/failed/killed replicas)
-        if tracker.group_id and job_id not in tracker.dead_replicas:
+            # Check replica liveness from Orca (detect dead/failed/killed replicas)
+            if tracker.group_id and job_id not in tracker.dead_replicas:
+                try:
+                    replicas_resp = await self.orca.get_replicas(tracker.group_id)
+                    for r in replicas_resp.get("replicas", []):
+                        if r["replica_id"] == job_id and r.get("phase") in ("dead", "failed", "killed"):
+                            tracker.smoothed_tps = 0
+                            tracker.dead_replicas.append(job_id)
+                            # Intentional kills (from scale_chain_tool) don't trigger FAILED
+                            if job_id in self._koi_initiated_kills:
+                                tracker.status = MonitoringStatus.COMPLETED  # clean exit
+                                self._koi_initiated_kills.discard(job_id)
+                                logger.info("intentional_kill_cleanup", job_id=job_id)
+                            else:
+                                tracker.status = MonitoringStatus.FAILED
+                                logger.warning("replica_dead", job_id=job_id, phase=r["phase"])
+                                await self._emit_trigger(job_id, MonitoringStatus.FAILED,
+                                                         f"Orca reports replica {r['phase']}")
+                            return
+                except Exception as e:
+                    tracker.consecutive_fetch_failures += 1
+                    logger.warning("replica_check_failed", job_id=job_id, error=str(e),
+                                   failures=tracker.consecutive_fetch_failures)
+
+            # Fetch metrics from Orca
             try:
-                replicas_resp = await self.orca.get_replicas(tracker.group_id)
-                for r in replicas_resp.get("replicas", []):
-                    if r["replica_id"] == job_id and r.get("phase") in ("dead", "failed", "killed"):
-                        tracker.smoothed_tps = 0
-                        tracker.dead_replicas.append(job_id)
-                        # Intentional kills (from scale_chain_tool) don't trigger FAILED
-                        if job_id in self._koi_initiated_kills:
-                            tracker.status = MonitoringStatus.COMPLETED  # clean exit
-                            self._koi_initiated_kills.discard(job_id)
-                            logger.info("intentional_kill_cleanup", job_id=job_id)
-                        else:
-                            tracker.status = MonitoringStatus.FAILED
-                            logger.warning("replica_dead", job_id=job_id, phase=r["phase"])
-                            await self._emit_trigger(job_id, MonitoringStatus.FAILED,
-                                                     f"Orca reports replica {r['phase']}")
-                        return
+                # Per-replica throughput (individual chain), job-level chunk progress
+                if tracker.group_id:
+                    metrics = await self.orca.get_replica_metrics(tracker.group_id, job_id)
+                else:
+                    metrics = await self.orca.get_job_metrics(orca_job_id)
+                progress = await self.orca.get_chunk_progress(orca_job_id)
             except Exception as e:
                 tracker.consecutive_fetch_failures += 1
-                logger.warning("replica_check_failed", job_id=job_id, error=str(e),
+                logger.warning("metrics_fetch_failed", job_id=job_id, error=str(e),
                                failures=tracker.consecutive_fetch_failures)
-
-        # Fetch metrics from Orca
-        try:
-            # Per-replica throughput (individual chain), job-level chunk progress
-            if tracker.group_id:
-                metrics = await self.orca.get_replica_metrics(tracker.group_id, job_id)
-            else:
-                metrics = await self.orca.get_job_metrics(orca_job_id)
-            progress = await self.orca.get_chunk_progress(orca_job_id)
-        except Exception as e:
-            tracker.consecutive_fetch_failures += 1
-            logger.warning("metrics_fetch_failed", job_id=job_id, error=str(e),
-                           failures=tracker.consecutive_fetch_failures)
-            return
-
-        # Metrics fetched successfully — reset failure counter
-        tracker.consecutive_fetch_failures = 0
-        tracker.last_metrics_update = time.time()
-
-        # Update throughput with EMA
-        tps = metrics.get("avg_generation_throughput_toks_per_s", 0)
-        if tps > 0 and math.isfinite(tps):
-            tracker.smoothed_tps = _ema(tracker.smoothed_tps, tps, EMA_ALPHA)
-            tracker.last_positive_tps_at = time.time()
-        elif tracker.last_positive_tps_at and tracker.smoothed_tps > 0:
-            stale_seconds = time.time() - tracker.last_positive_tps_at
-            if stale_seconds > 60:
-                decay_factor = 0.5 ** (stale_seconds / 60)
-                tracker.smoothed_tps *= decay_factor
-
-        # Estimate tokens from chunk progress
-        total_chunks = progress.get("total", 0)
-        completed_chunks = progress.get("completed", 0)
-        failed_chunks = progress.get("failed", 0)
-        if total_chunks > 0:
-            completion_frac = (completed_chunks + failed_chunks) / total_chunks
-            new_completed = int(tracker.total_tokens * completion_frac)
-            tracker.tokens_completed = max(tracker.tokens_completed, new_completed)
-            tracker.tokens_remaining = tracker.total_tokens - tracker.tokens_completed
-
-        # Time tracking
-        elapsed_s = (datetime.utcnow() - tracker.started_at).total_seconds()
-        tracker.elapsed_hours = elapsed_s / 3600
-
-        # GPU health
-        tracker.gpu_cache_usage = metrics.get("gpu_cache_usage_perc", 0)
-        tracker.gpu_sm_util = metrics.get("gpu_sm_util_pct", 0)
-        tracker.gpu_mem_bw_util = metrics.get("gpu_mem_bw_util_pct", 0)
-
-        # SLO projection
-        tracker.slo_headroom_pct = compute_slo_headroom(
-            tracker.slo_deadline_hours, tracker.elapsed_hours,
-            tracker.tokens_remaining, tracker.smoothed_tps,
-        )
-        if tracker.smoothed_tps > 0:
-            tracker.projected_eta_hours = tracker.tokens_remaining / tracker.smoothed_tps / 3600
-        else:
-            tracker.projected_eta_hours = float("inf")
-
-        # Check for completion — don't emit trigger, /job/complete webhook handles outcome recording
-        all_done = progress.get("all_done", False)
-        if all_done or (total_chunks > 0 and (completed_chunks + failed_chunks) >= total_chunks):
-            tracker.status = MonitoringStatus.COMPLETED
-            logger.info("chunks_completed", job_id=job_id)
-            return
-
-        # Check Orca job status (use parent job_id for grouped chains)
-        try:
-            job_status = await self.orca.get_job_status(orca_job_id)
-            if job_status.get("status") in ("failed", "cancelled"):
-                tracker.status = MonitoringStatus.FAILED
-                await self._emit_trigger(job_id, MonitoringStatus.FAILED,
-                                         f"Orca reports status={job_status.get('status')}")
                 return
-        except Exception as e:
-            tracker.consecutive_fetch_failures += 1
-            logger.warning("job_status_check_failed", job_id=job_id, error=str(e),
-                           failures=tracker.consecutive_fetch_failures)
 
-        # Classify status — for grouped chains, use aggregate TPS for SLO check
-        if tracker.group_id:
-            group_chains = self.get_group_chains(tracker.group_id)
-            if not group_chains:
-                # Race: all trackers removed mid-poll (e.g., /job/complete webhook)
-                return
-            # Exclude dead/completed replicas from aggregate — they contribute 0 TPS
-            # and drag down headroom calculation unnecessarily
-            live_chains = {k: v for k, v in group_chains.items()
-                          if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)}
-            aggregate_tps = sum(t.smoothed_tps for t in live_chains.values()) if live_chains else 0
-            # Recompute headroom using aggregate throughput and full job tokens
-            # All replicas share the same chunk pool — use max, not sum
-            total_job_tokens = max(t.total_tokens for t in group_chains.values())
-            total_remaining = max(0, total_job_tokens - int(
-                total_job_tokens * ((completed_chunks + failed_chunks) / max(total_chunks, 1))
-            )) if total_chunks > 0 else total_job_tokens
+            # Metrics fetched successfully — reset failure counter
+            tracker.consecutive_fetch_failures = 0
+            tracker.last_metrics_update = time.time()
+
+            # Update throughput with EMA
+            tps = metrics.get("avg_generation_throughput_toks_per_s", 0)
+            if tps > 0 and math.isfinite(tps):
+                tracker.smoothed_tps = _ema(tracker.smoothed_tps, tps, EMA_ALPHA)
+                tracker.last_positive_tps_at = time.time()
+            elif tracker.last_positive_tps_at and tracker.smoothed_tps > 0:
+                stale_seconds = time.time() - tracker.last_positive_tps_at
+                if stale_seconds > 60:
+                    decay_factor = 0.5 ** (stale_seconds / 60)
+                    tracker.smoothed_tps *= decay_factor
+
+            # Estimate tokens from chunk progress
+            total_chunks = progress.get("total", 0)
+            completed_chunks = progress.get("completed", 0)
+            failed_chunks = progress.get("failed", 0)
+            if total_chunks > 0:
+                completion_frac = (completed_chunks + failed_chunks) / total_chunks
+                new_completed = int(tracker.total_tokens * completion_frac)
+                tracker.tokens_completed = max(tracker.tokens_completed, new_completed)
+                tracker.tokens_remaining = tracker.total_tokens - tracker.tokens_completed
+
+            # Time tracking
+            elapsed_s = (datetime.utcnow() - tracker.started_at).total_seconds()
+            tracker.elapsed_hours = elapsed_s / 3600
+
+            # GPU health
+            tracker.gpu_cache_usage = metrics.get("gpu_cache_usage_perc", 0)
+            tracker.gpu_sm_util = metrics.get("gpu_sm_util_pct", 0)
+            tracker.gpu_mem_bw_util = metrics.get("gpu_mem_bw_util_pct", 0)
+
+            # SLO projection
             tracker.slo_headroom_pct = compute_slo_headroom(
                 tracker.slo_deadline_hours, tracker.elapsed_hours,
-                total_remaining, aggregate_tps,
+                tracker.tokens_remaining, tracker.smoothed_tps,
             )
+            if tracker.smoothed_tps > 0:
+                tracker.projected_eta_hours = tracker.tokens_remaining / tracker.smoothed_tps / 3600
+            else:
+                tracker.projected_eta_hours = float("inf")
 
-        prev_status = tracker.status
-        new_status = _classify_status(tracker)
-        tracker.status = new_status
+            # Check for completion — don't emit trigger, /job/complete webhook handles outcome recording
+            all_done = progress.get("all_done", False)
+            if all_done or (total_chunks > 0 and (completed_chunks + failed_chunks) >= total_chunks):
+                tracker.status = MonitoringStatus.COMPLETED
+                logger.info("chunks_completed", job_id=job_id)
+                return
 
-        # Handle warmup transition
-        if not tracker.warmup_complete and new_status != MonitoringStatus.WARMING_UP:
-            tracker.warmup_complete = True
-            logger.info("warmup_complete", job_id=job_id, tps=round(tracker.smoothed_tps))
+            # Check Orca job status (use parent job_id for grouped chains)
+            try:
+                job_status = await self.orca.get_job_status(orca_job_id)
+                if job_status.get("status") in ("failed", "cancelled"):
+                    tracker.status = MonitoringStatus.FAILED
+                    await self._emit_trigger(job_id, MonitoringStatus.FAILED,
+                                             f"Orca reports status={job_status.get('status')}")
+                    return
+            except Exception as e:
+                tracker.consecutive_fetch_failures += 1
+                logger.warning("job_status_check_failed", job_id=job_id, error=str(e),
+                               failures=tracker.consecutive_fetch_failures)
 
-        # Emit triggers on state transitions (anti-windup: skip if action in progress)
-        if new_status != prev_status:
-            frozen = (tracker.action_in_progress and
-                      tracker.action_freeze_until and
-                      time.time() < tracker.action_freeze_until)
-            if frozen:
-                logger.debug("anti_windup_skip", job_id=job_id)
-            elif new_status == MonitoringStatus.FALLING_BEHIND:
-                await self._emit_trigger(job_id, MonitoringStatus.FALLING_BEHIND,
-                                         f"Headroom={tracker.slo_headroom_pct:.1f}%, TPS={tracker.smoothed_tps:.0f}")
-            elif new_status == MonitoringStatus.OVER_PROVISIONED:
-                await self._emit_trigger(job_id, MonitoringStatus.OVER_PROVISIONED,
-                                         f"Headroom={tracker.slo_headroom_pct:.0f}%, can shed replicas")
+            # Classify status — for grouped chains, use aggregate TPS for SLO check
+            if tracker.group_id:
+                group_chains = self.get_group_chains(tracker.group_id)
+                if not group_chains:
+                    # Race: all trackers removed mid-poll (e.g., /job/complete webhook)
+                    return
+                # Exclude dead/completed replicas from aggregate — they contribute 0 TPS
+                # and drag down headroom calculation unnecessarily
+                live_chains = {k: v for k, v in group_chains.items()
+                              if v.status not in (MonitoringStatus.FAILED, MonitoringStatus.COMPLETED)}
+                aggregate_tps = sum(t.smoothed_tps for t in live_chains.values()) if live_chains else 0
+                # Recompute headroom using aggregate throughput and full job tokens
+                # All replicas share the same chunk pool — use max, not sum
+                total_job_tokens = max(t.total_tokens for t in group_chains.values())
+                total_remaining = max(0, total_job_tokens - int(
+                    total_job_tokens * ((completed_chunks + failed_chunks) / max(total_chunks, 1))
+                )) if total_chunks > 0 else total_job_tokens
+                tracker.slo_headroom_pct = compute_slo_headroom(
+                    tracker.slo_deadline_hours, tracker.elapsed_hours,
+                    total_remaining, aggregate_tps,
+                )
+
+            prev_status = tracker.status
+            new_status = _classify_status(tracker)
+            tracker.status = new_status
+
+            # Handle warmup transition
+            if not tracker.warmup_complete and new_status != MonitoringStatus.WARMING_UP:
+                tracker.warmup_complete = True
+                logger.info("warmup_complete", job_id=job_id, tps=round(tracker.smoothed_tps))
+
+            # Emit triggers on state transitions (anti-windup: skip if action in progress)
+            if new_status != prev_status:
+                frozen = (tracker.action_in_progress and
+                          tracker.action_freeze_until and
+                          time.time() < tracker.action_freeze_until)
+                if frozen:
+                    logger.debug("anti_windup_skip", job_id=job_id)
+                elif new_status == MonitoringStatus.FALLING_BEHIND:
+                    await self._emit_trigger(job_id, MonitoringStatus.FALLING_BEHIND,
+                                             f"Headroom={tracker.slo_headroom_pct:.1f}%, TPS={tracker.smoothed_tps:.0f}")
+                elif new_status == MonitoringStatus.OVER_PROVISIONED:
+                    await self._emit_trigger(job_id, MonitoringStatus.OVER_PROVISIONED,
+                                             f"Headroom={tracker.slo_headroom_pct:.0f}%, can shed replicas")
+        finally:
+            if job_id in self.tracked_jobs:
+                self.persist_job(job_id)
 
     async def _emit_trigger(self, job_id: str, status: MonitoringStatus, hint: str):
         """Push a trigger event to Loop 3's queue."""
