@@ -1101,6 +1101,103 @@ def run_tier2():
         skip("JSON log lines emitted", str(e))
         skip("log lines contain event field", str(e))
 
+    # ── T2.6: primary failure → fallback start ──────────────────────────────
+    section("T2.6  Primary failure followed by fallback start")
+
+    try:
+        with koi_server() as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            def t_primary_failure_recorded():
+                m = AgenticMemory(db_path)
+                dec_id = m.record_decision(
+                    job_id="job-fallback-1",
+                    model_name="Qwen/Qwen2.5-72B-Instruct",
+                    instance_type="g6e.12xlarge",
+                    gpu_type="L40S",
+                    tp=4, pp=1, dp=1, num_gpus=4,
+                    predicted_tps=1200.0, predicted_cost_per_hour=6.85,
+                    slo_deadline_hours=8.0, objective="cheapest",
+                    avg_input_tokens=953, avg_output_tokens=1024,
+                    num_requests=5000, market="spot",
+                )
+
+                r = post(f"{KOI_URL}/job/config-attempted", {
+                    "job_id": "job-fallback-1",
+                    "decision_id": dec_id,
+                    "instance_type": "g6e.12xlarge",
+                    "gpu_type": "L40S",
+                    "region": "us-east-1",
+                    "market": "spot",
+                    "launched": False,
+                    "failure_reason": "InsufficientCapacity",
+                    "attempt_index": 0,
+                })
+                assert r.get("status") == "recorded", f"unexpected response: {r}"
+
+                conn = m._conn()
+                rows = conn.execute(
+                    "SELECT gpu_type, market, launched, failure_category FROM launch_attempts"
+                ).fetchall()
+                assert len(rows) == 1, f"expected 1 launch attempt, got {len(rows)}"
+                row = rows[0]
+                assert row["gpu_type"] == "L40S"
+                assert row["market"] == "spot"
+                assert row["launched"] == 0
+                assert row["failure_category"] == "no_capacity"
+
+            def t_fallback_start_creates_child_decision():
+                m = AgenticMemory(db_path)
+                parent = m.query_decisions(job_id="job-fallback-1", limit=5)[0]
+                parent_id = parent["decision_id"]
+
+                r = post(f"{KOI_URL}/job/started", {
+                    "job_id": "replica-fallback-1",
+                    "decision_id": parent_id,
+                    "group_id": "job-fallback-1",
+                    "gpu_type": "A100-80GB",
+                    "instance_type": "p4de.24xlarge",
+                    "tp": 8, "pp": 1, "dp": 1,
+                    "slo_deadline_hours": 8.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 0.0,
+                    "is_fallback": True,
+                })
+                assert r.get("status") == "registered", f"unexpected response: {r}"
+                assert r.get("decision_id") != parent_id, \
+                    "fallback start should return a child decision id"
+
+                child = m.get_decision(r["decision_id"])
+                assert child is not None, "child decision missing from memory"
+                assert child["parent_decision_id"] == parent_id, \
+                    f"expected parent {parent_id}, got {child['parent_decision_id']}"
+                assert child["triggered_by"] == "fallback", \
+                    f"expected fallback trigger, got {child['triggered_by']}"
+                assert child["gpu_type"] == "A100-80GB"
+                assert child["instance_type"] == "p4de.24xlarge"
+                assert child["market"] == "on_demand"
+
+            def t_fallback_updates_distinct_priors():
+                m = AgenticMemory(db_path)
+                s_primary = m.get_failure_summary("L40S", region="us-east-1", market="spot")
+                s_fallback = m.get_failure_summary("A100-80GB", region="unknown", market="on_demand")
+                assert s_primary["availability_pct"] < 50.0, \
+                    f"primary spot should be <50%, got {s_primary['availability_pct']}"
+                assert s_fallback["availability_pct"] > 50.0, \
+                    f"fallback on_demand should be >50%, got {s_fallback['availability_pct']}"
+
+            check("primary config failure is recorded before fallback", t_primary_failure_recorded)
+            check("fallback /job/started creates a child decision", t_fallback_start_creates_child_decision)
+            check("primary failure and fallback success update distinct priors", t_fallback_updates_distinct_priors)
+
+    except RuntimeError as e:
+        for name in [
+            "primary config failure is recorded before fallback",
+            "fallback /job/started creates a child decision",
+            "primary failure and fallback success update distinct priors",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 3 — Full agent loop (requires ANTHROPIC_API_KEY)
