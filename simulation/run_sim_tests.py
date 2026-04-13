@@ -97,12 +97,15 @@ def koi_server(api_key: str = "dummy", orca_url: str = "", extra_env: dict = Non
     """Start koi server as a subprocess; yield db_path; kill on exit."""
     db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     db.close()
+    runtime_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    runtime_db.close()
     env = {
         **os.environ,
         "ANTHROPIC_API_KEY": api_key,
         "ORCA_URL": orca_url,
         "KOI_PORT": str(KOI_PORT),
         "KOI_MEMORY_PATH": db.name,
+        "KOI_RUNTIME_STATE_PATH": runtime_db.name,
         "KOI_PERFDB_PATH": "./perfdb/perfdb_all.csv",
         **(extra_env or {}),
     }
@@ -124,6 +127,10 @@ def koi_server(api_key: str = "dummy", orca_url: str = "", extra_env: dict = Non
             proc.kill()
         try:
             os.unlink(db.name)
+        except OSError:
+            pass
+        try:
+            os.unlink(runtime_db.name)
         except OSError:
             pass
 
@@ -574,6 +581,17 @@ def run_tier1():
         pending = ledger.get_pending_by_type()
         assert pending.get("H100", 0) == 0, f"expected expired, got {pending}"
 
+    def t_touch_extends_pending_lease():
+        ledger = ResourceLedger(pending_ttl=0.10)
+        ledger.reserve("dec-refresh", "L40S", 4, region="us-east-1")
+        time.sleep(0.06)
+        refreshed = ledger.touch("dec-refresh")
+        time.sleep(0.06)
+        assert refreshed is True, "touch() should refresh a live reservation"
+        assert ledger.pending_count == 1, "reservation should still be pending after refresh"
+        time.sleep(0.11)
+        assert ledger.pending_count == 0, "reservation should expire once heartbeats stop"
+
     def t_summary_has_fields():
         ledger = ResourceLedger()
         ledger.reserve("dec-1", "H100", 8, region="us-east-1")
@@ -582,6 +600,7 @@ def run_tier1():
         assert s[0]["gpu_type"] == "H100"
         assert s[0]["num_gpus"] == 8
         assert "age_seconds" in s[0]
+        assert "last_refresh_age_seconds" in s[0]
 
     check("reserve shows pending GPUs", t_reserve_shows_pending)
     check("release clears pending", t_release_clears_pending)
@@ -589,6 +608,7 @@ def run_tier1():
     check("apply_to_resource_map subtracts pending", t_apply_subtracts_from_resource_map)
     check("apply_to_resource_map only subtracts from matching region", t_apply_only_hits_matching_region)
     check("pending TTL expires stale reservations", t_pending_ttl_expires)
+    check("touch refreshes the pending lease", t_touch_extends_pending_lease)
     check("summary returns structured data", t_summary_has_fields)
 
     # ── T1.8: Agent fallback decision ────────────────────────────────────────
@@ -1319,6 +1339,114 @@ def run_tier2():
             "/decide creates a pending reservation",
             "/job/launch-failed clears the pending reservation",
             "/job/launch-failed updates the real region/market prior",
+        ]:
+            skip(name, str(e))
+
+    # ── T2.9: launch heartbeat refreshes pending lease ────────────────────
+    section("T2.9  /job/launch-heartbeat refreshes the pending lease")
+
+    try:
+        fake_env = {
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_TEST_GPU_TYPE": "L40S",
+            "KOI_TEST_REQUIRED_GPUS": "8",
+            "KOI_TEST_DECIDE_DELAY_SEC": "0.01",
+            "KOI_PENDING_TTL_SECONDS": "0.20",
+        }
+        with koi_server(extra_env=fake_env):
+            payload = {
+                "job_request": {
+                    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "region": "us-east-1",
+                            "interconnect": "PCIe",
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                },
+            }
+            decide_resp = requests.post(f"{KOI_URL}/decide", json=payload, timeout=30)
+            decide_resp.raise_for_status()
+            decide_body = decide_resp.json()
+            decision_id = decide_body["_decision_id"]
+            group_id = decide_body["job_id"]
+            replica_id = f"{group_id}-r0"
+
+            time.sleep(0.12)
+            heartbeat = post(f"{KOI_URL}/job/launch-heartbeat", {
+                "job_id": replica_id,
+                "decision_id": decision_id,
+                "group_id": group_id,
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "tp": 4,
+                "pp": 2,
+                "region": "us-east-1",
+                "market": "on_demand",
+                "attempt_index": 1,
+                "phase": "provisioning",
+                "message": "still provisioning",
+            })
+
+            time.sleep(0.12)
+            resources_after_refresh = requests.get(f"{KOI_URL}/resources", timeout=5).json()
+            jobs_after_refresh = requests.get(f"{KOI_URL}/jobs", timeout=5).json()
+
+            time.sleep(0.24)
+            resources_after_expiry = requests.get(f"{KOI_URL}/resources", timeout=5).json()
+
+            def t_heartbeat_tracks_launch_progress():
+                assert heartbeat.get("status") == "tracked", f"unexpected heartbeat response: {heartbeat}"
+                pending_jobs = [j for j in jobs_after_refresh.get("jobs", []) if j.get("job_id") == replica_id]
+                assert len(pending_jobs) == 1, f"expected pending launch for {replica_id}, got {jobs_after_refresh}"
+                job = pending_jobs[0]
+                assert job.get("status") == "launching", f"expected launching status, got {job}"
+                assert job.get("launch_phase") == "provisioning", f"unexpected phase: {job}"
+                assert job.get("launch_message") == "still provisioning", f"unexpected launch message: {job}"
+
+            def t_heartbeat_keeps_reservation_alive():
+                pending_ids = [p["decision_id"] for p in resources_after_refresh.get("pending_reservations", [])]
+                assert decision_id in pending_ids, \
+                    f"decision {decision_id} should still be pending after heartbeat, pending={pending_ids}"
+
+            def t_reservation_expires_without_follow_up_heartbeat():
+                pending_ids = [p["decision_id"] for p in resources_after_expiry.get("pending_reservations", [])]
+                assert decision_id not in pending_ids, \
+                    f"decision {decision_id} should expire once heartbeats stop, pending={pending_ids}"
+
+            check("/job/launch-heartbeat records pending launch progress", t_heartbeat_tracks_launch_progress)
+            check("/job/launch-heartbeat keeps the reservation alive", t_heartbeat_keeps_reservation_alive)
+            check("pending reservation expires after heartbeats stop", t_reservation_expires_without_follow_up_heartbeat)
+
+    except RuntimeError as e:
+        for name in [
+            "/job/launch-heartbeat records pending launch progress",
+            "/job/launch-heartbeat keeps the reservation alive",
+            "pending reservation expires after heartbeats stop",
         ]:
             skip(name, str(e))
 
