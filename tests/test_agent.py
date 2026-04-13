@@ -1,6 +1,7 @@
 """Tests for koi/agent.py — prompt building, tool wiring, response parsing."""
 
 import pytest
+from types import SimpleNamespace
 from koi.agent import KoiAgent, KOI_SYSTEM_PROMPT
 from koi.schemas import (
     JobRequest, ResourceMap, GPUResource, EngineConfig, PlacementConfig,
@@ -70,6 +71,80 @@ class TestToolWiring:
     def test_build_tools_without_resource_map(self, agent):
         tools = agent._build_tools()
         assert len(tools) == 8
+
+
+class TestActionTools:
+    @pytest.mark.asyncio
+    async def test_scale_chain_tool_does_not_freeze_or_record_on_confirm(self, perfdb, memory, resource_map):
+        class FakeOrca:
+            async def get_resources(self):
+                return {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "interconnect": "PCIe",
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                }
+
+            async def scale_job(self, *args, **kwargs):
+                return {"status": "confirm", "message": "Config may not be feasible"}
+
+        agent = KoiAgent(perfdb=perfdb, memory=memory, orca=FakeOrca(), api_key="test-key")
+        parent_decision = memory.record_decision(
+            job_id="parent-job",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            market="on_demand",
+        )
+        tracker = SimpleNamespace(
+            group_id="parent-job",
+            job_id="parent-job-r0",
+            decision_id=parent_decision,
+            action_in_progress=False,
+            action_freeze_until=None,
+        )
+        monitor = SimpleNamespace(
+            tracked_jobs={"parent-job-r0": tracker},
+            _koi_initiated_kills=set(),
+        )
+        tools = agent._build_tools(resource_map=resource_map, monitor=monitor)
+        scale_tool = next(t for t in tools if t.name == "scale_chain_tool")
+
+        result = await scale_tool(job_id="parent-job", gpu_type="L40S", tp=4, pp=1, count=1)
+
+        assert "Scale not started" in result
+        assert memory.decision_count() == 1
+        assert tracker.action_in_progress is False
+        assert tracker.action_freeze_until is None
+        assert not hasattr(monitor, "_pending_scale_decisions")
 
 
 class TestPromptBuilding:

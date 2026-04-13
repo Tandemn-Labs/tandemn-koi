@@ -292,8 +292,27 @@ class KoiAgent:
                                        job_id=job_id, error=str(e))
 
                 from koi.tools.orca_api import async_scale_chain
-                result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count,
-                                                  on_demand=use_on_demand)
+                if count > 0:
+                    scale_response = await orca.scale_job(
+                        job_id, gpu_type, tp, pp, count, on_demand=use_on_demand,
+                    )
+                    if scale_response.get("status") != "scaling":
+                        logger.warning(
+                            "scale_not_started",
+                            job_id=job_id,
+                            gpu_type=gpu_type,
+                            tp=tp,
+                            pp=pp,
+                            requested=count,
+                            response=scale_response,
+                        )
+                        return f"Scale not started: {scale_response}"
+                    result = f"Scaled up: {count} replicas added. {scale_response}"
+                else:
+                    result = await async_scale_chain(
+                        orca, job_id, gpu_type, tp, pp, count,
+                        on_demand=use_on_demand,
+                    )
                 scale_dec_id = None
                 if count != 0 and memory:
                     scale_dec_id = memory.record_decision(
@@ -516,12 +535,13 @@ class KoiAgent:
     # Pre-computed cost table
     # ------------------------------------------------------------------
 
-    def _build_cost_table(self, req: JobRequest, rm: ResourceMap) -> tuple:
+    def _build_cost_table(self, req: JobRequest, rm: ResourceMap) -> str:
         """Pre-compute total cost for known configs from memory + PerfDB.
-        Returns (formatted_text, structured_rows) where rows are sorted by total cost."""
+        Returns formatted text string sorted by total cost."""
         total_tokens = req.total_tokens or 0
         if total_tokens == 0:
-            return "COST TABLE: Cannot compute — total tokens unknown.", []
+            self._last_cost_rows = []
+            return "COST TABLE: Cannot compute — total tokens unknown (num_requests not set)."
 
         lines = ["PRE-COMPUTED COST TABLE (sorted by total cost, cheapest first):"]
         lines.append(f"  {'Source':<12} {'GPU':<12} {'Config':<18} {'TPS':>7} {'$/hr':>8} {'ETA(h)':>7} {'Total $':>9} {'SLO':>5} {'Avail':>10}")
