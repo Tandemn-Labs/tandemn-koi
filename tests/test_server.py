@@ -101,6 +101,9 @@ class TestDecide:
         body = resp.json()
         assert body["job_id"] == "job-test123"
         assert body["config"]["gpu_type"] == "L40S"
+        pending = app.state.ledger.summary()
+        assert len(pending) == 1
+        assert pending[0]["region"] == "us-east-1"
 
     @pytest.mark.asyncio
     async def test_empty_resources_422(self, client):
@@ -273,6 +276,31 @@ class TestLaunchFailed:
         assert spot["availability_pct"] < 50.0
         assert on_demand["effective_observations"] == 1
         assert on_demand["availability_pct"] < 50.0
+
+    @pytest.mark.asyncio
+    async def test_releases_ledger_without_tracked_job_when_decision_id_provided(self, client):
+        """decision_id should release pending GPUs before the job is registered."""
+        app.state.ledger.reserve("dec-launchfail-direct", "L40S", 8, region="us-east-1")
+        app.state.monitor.tracked_jobs = {}
+
+        resp = await client.post("/job/launch-failed", json={
+            "job_id": "job-fail3",
+            "decision_id": "dec-launchfail-direct",
+            "configs_tried": [
+                {
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                },
+            ],
+            "failure_reasons": ["InsufficientCapacity"],
+            "total_time_seconds": 45.0,
+        })
+
+        assert resp.status_code == 200
+        assert resp.json()["attempts_recorded"] == 1
+        assert app.state.ledger.pending_count == 0
 
 
 class TestReplicaFailed:
@@ -581,12 +609,14 @@ class TestJobStarted:
         assert kwargs["predicted_tps"] == 1200.0
         assert kwargs["config"].gpu_type == "L40S"
         assert kwargs["config"].instance_type == "g6e.12xlarge"
+        assert kwargs["config"].region == "us-east-1"
+        assert kwargs["config"].market == "spot"
 
         assert existing.action_in_progress is False
         assert existing.action_freeze_until is None
 
         summary = app.state.memory.get_failure_summary(
-            "L40S", region="unknown", market="spot",
+            "L40S", region="us-east-1", market="spot",
         )
         assert summary["effective_observations"] == 1
         assert summary["availability_pct"] > 50.0
@@ -620,6 +650,8 @@ class TestJobStarted:
             "group_id": "parent-job",
             "gpu_type": "A100-80GB",
             "instance_type": "p4de.24xlarge",
+            "region": "us-west-2",
+            "market": "on_demand",
             "tp": 8,
             "pp": 1,
             "dp": 1,
@@ -641,6 +673,8 @@ class TestJobStarted:
         assert kwargs["config"].gpu_type == "A100-80GB"
         assert kwargs["config"].instance_type == "p4de.24xlarge"
         assert kwargs["config"].tp == 8
+        assert kwargs["config"].region == "us-west-2"
+        assert kwargs["config"].market == "on_demand"
 
         decisions = app.state.memory.query_decisions(model_name="Qwen/Qwen2.5-72B-Instruct")
         child = next(d for d in decisions if d["decision_id"] == body["decision_id"])
@@ -651,15 +685,45 @@ class TestJobStarted:
         assert child["market"] == "on_demand"
 
         on_demand = app.state.memory.get_failure_summary(
-            "A100-80GB", region="unknown", market="on_demand",
+            "A100-80GB", region="us-west-2", market="on_demand",
         )
         spot = app.state.memory.get_failure_summary(
-            "A100-80GB", region="unknown", market="spot",
+            "A100-80GB", region="us-west-2", market="spot",
         )
         assert on_demand["effective_observations"] == 1
         assert on_demand["availability_pct"] > 50.0
         assert spot["effective_observations"] == 0
         assert spot["availability_pct"] == pytest.approx(50.0)
+
+    @pytest.mark.asyncio
+    async def test_started_consumes_pending_scale_decisions_by_group(self, client):
+        """New replicas should consume queued scale decisions for their group only."""
+        app.state.monitor._pending_scale_decisions = {
+            "parent-job": [{"decision_id": "dec-scale", "remaining": 2}],
+            "other-job": [{"decision_id": "dec-other", "remaining": 1}],
+        }
+
+        for replica_id in ("r-scale-0", "r-scale-1"):
+            resp = await client.post("/job/started", json={
+                "job_id": replica_id,
+                "decision_id": "dec-parent",
+                "group_id": "parent-job",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "region": "us-east-1",
+                "market": "on_demand",
+                "tp": 4,
+                "pp": 1,
+                "dp": 1,
+                "slo_deadline_hours": 8.0,
+                "total_tokens": 6_000_000,
+                "predicted_tps": 1200.0,
+            })
+            assert resp.status_code == 200
+            assert resp.json()["decision_id"] == "dec-scale"
+
+        assert "parent-job" not in app.state.monitor._pending_scale_decisions
+        assert app.state.monitor._pending_scale_decisions["other-job"][0]["decision_id"] == "dec-other"
 
 
 class TestHappyPath:

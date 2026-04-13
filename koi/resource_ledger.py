@@ -99,13 +99,13 @@ class ResourceLedger:
         Accepts and returns a koi.schemas.ResourceMap. Import deferred to avoid
         circular imports.
         """
-        pending = self.get_pending_by_type()
-        if not pending:
-            return base_map
-
         adjusted = []
         for res in base_map.resources:
-            extra = pending.get(res.gpu_type, 0)
+            extra = self.get_pending_by_type(
+                cloud=getattr(res, "cloud", None),
+                region=getattr(res, "region", None),
+                gpu_type=res.gpu_type,
+            ).get(res.gpu_type, 0)
             if extra > 0:
                 new_res = res.model_copy(update={
                     "allocated_gpus": res.allocated_gpus + extra,

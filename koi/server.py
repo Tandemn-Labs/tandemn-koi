@@ -339,7 +339,8 @@ async def decide(req: DecideRequest):
             decision_id=decision_id,
             gpu_type=decision.config.gpu_type,
             num_gpus=decision.config.num_gpus,
-            region=resource_map.region,
+            region=decision.config.region,
+            instance_type=decision.config.instance_type,
         )
 
     # NOTE: Do NOT register in monitor here. The job hasn't launched yet.
@@ -357,6 +358,8 @@ class JobStartedRequest(BaseModel):
     group_id: Optional[str] = None      # parent job ID for chunked replicas
     gpu_type: str
     instance_type: str
+    region: str = "unknown"
+    market: str = "unknown"
     tp: int
     pp: int
     dp: int = 1
@@ -403,6 +406,10 @@ async def job_started(req: JobStartedRequest):
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
 
+    pending_launch = monitor._pending_launches.get(req.job_id, {})
+    resolved_region = req.region if req.region != "unknown" else pending_launch.get("region", "unknown")
+    resolved_market = req.market if req.market != "unknown" else pending_launch.get("market", "unknown")
+
     # Clear pending launch tracking — replica reached model_ready
     monitor._pending_launches.pop(req.job_id, None)
 
@@ -410,9 +417,20 @@ async def job_started(req: JobStartedRequest):
     if req.decision_id:
         app.state.ledger.release(req.decision_id)
 
-    # Link scale-up replicas to their pending decision (overrides Orca's original decision_id)
-    if hasattr(monitor, '_pending_scale_decision'):
-        pending = getattr(monitor, '_pending_scale_decision', None)
+    # Link scale-up replicas to pending scale decisions queued per group.
+    pending_scale_decisions = getattr(monitor, "_pending_scale_decisions", None)
+    if req.group_id and isinstance(pending_scale_decisions, dict):
+        queue = pending_scale_decisions.get(req.group_id, [])
+        if queue:
+            pending = queue[0]
+            req.decision_id = pending["decision_id"]
+            pending["remaining"] -= 1
+            if pending["remaining"] <= 0:
+                queue.pop(0)
+            if not queue:
+                pending_scale_decisions.pop(req.group_id, None)
+    elif isinstance(getattr(monitor, "_pending_scale_decision", None), dict):
+        pending = getattr(monitor, "_pending_scale_decision", None)
         if pending and pending.get("group_id") == req.group_id:
             req.decision_id = pending["decision_id"]
 
@@ -429,7 +447,7 @@ async def job_started(req: JobStartedRequest):
                 gpu_type=req.gpu_type,
                 tp=req.tp, pp=req.pp, dp=req.dp,
                 num_gpus=req.tp * req.pp * req.dp,
-                predicted_tps=0,
+                predicted_tps=req.predicted_tps or 0,
                 predicted_cost_per_hour=original.get("predicted_cost_per_hour", 0.0) or 0.0,
                 slo_deadline_hours=req.slo_deadline_hours,
                 objective=original.get("objective", "cheapest"),
@@ -438,7 +456,7 @@ async def job_started(req: JobStartedRequest):
                 num_requests=original.get("num_requests"),
                 triggered_by="fallback",
                 parent_decision_id=req.decision_id,
-                market="on_demand",
+                market=resolved_market if resolved_market != "unknown" else "on_demand",
             )
             logger.info("fallback_detected", original_decision=req.decision_id,
                        actual_decision=actual_decision_id, gpu_type=req.gpu_type,
@@ -450,11 +468,12 @@ async def job_started(req: JobStartedRequest):
         num_gpus=req.tp * req.pp * req.dp,
         num_instances=max(1, (req.tp * req.pp * req.dp) // 8),
         tp=req.tp, pp=req.pp, dp=req.dp,
-        region="unknown",
+        region=resolved_region,
         engine_config=EngineConfig(
             tensor_parallel_size=req.tp,
             pipeline_parallel_size=req.pp,
         ),
+        market=resolved_market,
     )
 
     monitor.register_job(
@@ -476,11 +495,19 @@ async def job_started(req: JobStartedRequest):
                 logger.info("anti_windup_unfrozen", tracker_job=tracker.job_id, new_replica=req.job_id)
 
     # Update availability prior (success observation)
-    market = "on_demand" if req.is_fallback else "spot"
-    memory.update_availability(gpu_type=req.gpu_type, region="unknown", market=market, launched=True)
+    success_market = resolved_market
+    if success_market == "unknown":
+        success_market = "on_demand" if req.is_fallback else "spot"
+    memory.update_availability(
+        gpu_type=req.gpu_type,
+        region=resolved_region,
+        market=success_market,
+        launched=True,
+    )
 
     logger.info("job_started", job_id=req.job_id, gpu_type=req.gpu_type,
-                tp=req.tp, pp=req.pp, group_id=req.group_id, is_fallback=req.is_fallback)
+                tp=req.tp, pp=req.pp, group_id=req.group_id, is_fallback=req.is_fallback,
+                region=resolved_region, market=resolved_market)
     return {"status": "registered", "job_id": req.job_id, "group_id": req.group_id,
             "decision_id": actual_decision_id}
 
@@ -602,6 +629,10 @@ async def replica_failed(req: ReplicaFailedRequest):
     tracker.smoothed_tps = 0
     if req.job_id not in tracker.dead_replicas:
         tracker.dead_replicas.append(req.job_id)
+    failure_category = _classify_failure(req.reason)
+    market = tracker.config.market
+    if market == "unknown":
+        market = "spot" if failure_category == "spot_preemption" else "on_demand"
     # Record failure outcome in memory for learning (with actual TPS if available)
     memory: AgenticMemory = app.state.memory
     if tracker.decision_id:
@@ -610,14 +641,14 @@ async def replica_failed(req: ReplicaFailedRequest):
             job_id=req.group_id,
             status="replica_failed",
             actual_tps=actual_tps_before_death if actual_tps_before_death > 0 else None,
-            failure_category=_classify_failure(req.reason),
+            failure_category=failure_category,
             diagnosis=req.reason[:200],
         )
     # Update availability prior (failure observation)
     memory.update_availability(
         gpu_type=tracker.config.gpu_type,
         region=tracker.config.region,
-        market="spot" if _classify_failure(req.reason) == "spot_preemption" else "on_demand",
+        market=market,
         launched=False,
     )
     # Emit FAILED trigger to agent
@@ -674,6 +705,7 @@ async def config_attempted(req: ConfigAttemptRequest):
 
 class LaunchFailedRequest(BaseModel):
     job_id: str
+    decision_id: Optional[str] = None
     configs_tried: List[Dict[str, Any]] = []
     failure_reasons: List[str] = []
     total_time_seconds: float = 0.0
@@ -687,7 +719,7 @@ async def job_launch_failed(req: LaunchFailedRequest):
 
     # Record each failed config in launch_attempts table
     tracker = monitor.tracked_jobs.get(req.job_id)
-    decision_id = tracker.decision_id if tracker else None
+    decision_id = req.decision_id or (tracker.decision_id if tracker else None)
 
     for i, config in enumerate(req.configs_tried):
         reason = req.failure_reasons[i] if i < len(req.failure_reasons) else "unknown"

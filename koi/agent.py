@@ -264,29 +264,20 @@ class KoiAgent:
                     use_on_demand = parent.get("market", "on_demand") == "on_demand" if parent else False
                 market_str = "on_demand" if use_on_demand else "spot"
 
-                # Record scaling decision in memory before calling Orca
-                if count != 0 and memory:
-                    scale_dec_id = memory.record_decision(
-                        job_id=job_id,
-                        model_name=parent["model_name"] if parent else "unknown",
-                        instance_type=parent["instance_type"] if parent else "unknown",
-                        gpu_type=gpu_type, tp=tp, pp=pp, dp=abs(count),
-                        num_gpus=tp * pp * abs(count),
-                        predicted_tps=0,
-                        predicted_cost_per_hour=parent["predicted_cost_per_hour"] if parent else 0,
-                        slo_deadline_hours=parent["slo_deadline_hours"] if parent else 0,
-                        objective=parent["objective"] if parent else "cheapest",
-                        avg_input_tokens=parent["avg_input_tokens"] if parent else 0,
-                        avg_output_tokens=parent["avg_output_tokens"] if parent else 0,
-                        triggered_by="scale_up" if count > 0 else "scale_down",
-                        parent_decision_id=parent_dec,
-                        market=market_str,
-                    )
-                    # Store so /job/started can link new replicas to this decision
-                    if monitor and count > 0:
-                        monitor._pending_scale_decision = {
-                            "group_id": job_id, "decision_id": scale_dec_id,
-                        }
+                resolved_instance_type = parent["instance_type"] if parent else "unknown"
+                resolved_cost_per_hour = parent["predicted_cost_per_hour"] if parent else 0
+                resolved_region = "unknown"
+                try:
+                    rm = parse_orca_resources(await orca.get_resources())
+                    resource = rm.get_resource(gpu_type)
+                    if resource:
+                        resolved_instance_type = resource.instance_type
+                        resolved_region = resource.region
+                        num_instances = max(1, -(-tp * pp * abs(count) // resource.gpus_per_instance))
+                        resolved_cost_per_hour = num_instances * resource.cost_per_instance_hour_usd
+                except Exception as e:
+                    logger.warning("scale_resource_lookup_failed", job_id=job_id,
+                                   gpu_type=gpu_type, error=str(e))
 
                 # For scale-down: mark replicas as intentionally killed so FAILED doesn't fire
                 if count < 0 and monitor:
@@ -303,12 +294,43 @@ class KoiAgent:
                 from koi.tools.orca_api import async_scale_chain
                 result = await async_scale_chain(orca, job_id, gpu_type, tp, pp, count,
                                                   on_demand=use_on_demand)
+                scale_dec_id = None
+                if count != 0 and memory:
+                    scale_dec_id = memory.record_decision(
+                        job_id=job_id,
+                        model_name=parent["model_name"] if parent else "unknown",
+                        instance_type=resolved_instance_type,
+                        gpu_type=gpu_type, tp=tp, pp=pp, dp=abs(count),
+                        num_gpus=tp * pp * abs(count),
+                        predicted_tps=0,
+                        predicted_cost_per_hour=resolved_cost_per_hour,
+                        slo_deadline_hours=parent["slo_deadline_hours"] if parent else 0,
+                        objective=parent["objective"] if parent else "cheapest",
+                        avg_input_tokens=parent["avg_input_tokens"] if parent else 0,
+                        avg_output_tokens=parent["avg_output_tokens"] if parent else 0,
+                        triggered_by="scale_up" if count > 0 else "scale_down",
+                        parent_decision_id=parent_dec,
+                        market=market_str,
+                    )
+                    if monitor and count > 0:
+                        pending = getattr(monitor, "_pending_scale_decisions", None)
+                        if not isinstance(pending, dict):
+                            pending = {}
+                            monitor._pending_scale_decisions = pending
+                        pending.setdefault(job_id, []).append({
+                            "decision_id": scale_dec_id,
+                            "remaining": abs(count),
+                            "region": resolved_region,
+                            "gpu_type": gpu_type,
+                        })
                 # Anti-windup: freeze triggers for this job while scaling action takes effect
                 if monitor:
                     for tracker in monitor.tracked_jobs.values():
                         if tracker.group_id == job_id or tracker.job_id == job_id:
                             tracker.action_in_progress = True
                             tracker.action_freeze_until = time.time() + 1200  # 20 min max, /job/started unfreezes early
+                if scale_dec_id and count > 0:
+                    return f"{result} decision_id={scale_dec_id}"
                 return result
 
             @beta_async_tool

@@ -200,6 +200,7 @@ class PlacementConfig(BaseModel):
     dp: int
     region: str
     engine_config: EngineConfig
+    market: str = "unknown"
 
     @property
     def gpus_per_replica(self) -> int:

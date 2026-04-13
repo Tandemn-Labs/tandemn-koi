@@ -111,6 +111,15 @@ class TestScale:
         assert result["status"] == "scaling"
         assert len(result["new_replicas"]) == 2
 
+    @pytest.mark.asyncio
+    async def test_scale_job_raises_on_http_error(self, orca, mock_session):
+        mock_session.set_response("post", "/job/job-123/scale", {
+            "status": "error",
+            "detail": "no capacity",
+        }, status=409)
+        with pytest.raises(Exception, match="HTTP 409"):
+            await orca.scale_job("job-123", "A100-80GB", 4, 2, 2)
+
 
 class TestKill:
     @pytest.mark.asyncio
@@ -122,6 +131,15 @@ class TestKill:
         })
         result = await orca.kill_replicas("job-123", ["job-123-v0-r2", "job-123-v0-r3"])
         assert result["reclaimed"] == 8
+
+    @pytest.mark.asyncio
+    async def test_kill_replicas_raises_on_http_error(self, orca, mock_session):
+        mock_session.set_response("post", "/job/job-123/kill", {
+            "status": "error",
+            "detail": "cannot kill",
+        }, status=500)
+        with pytest.raises(Exception, match="HTTP 500"):
+            await orca.kill_replicas("job-123", ["job-123-v0-r2"])
 
 
 class TestSubmitBatch:
@@ -152,3 +170,12 @@ class TestSwap:
         })
         result = await orca.swap_replicas("job-123", "H100", 8, 1)
         assert result["status"] == "swapping"
+
+    @pytest.mark.asyncio
+    async def test_swap_replicas_raises_on_http_error(self, orca, mock_session):
+        mock_session.set_response("post", "/job/job-123/swap", {
+            "status": "error",
+            "detail": "swap rejected",
+        }, status=400)
+        with pytest.raises(Exception, match="HTTP 400"):
+            await orca.swap_replicas("job-123", "H100", 8, 1)

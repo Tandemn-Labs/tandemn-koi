@@ -188,6 +188,7 @@ class OrcaClient:
             data = await resp.json()
             if resp.status >= 400:
                 logger.error("scale_failed", status=resp.status, response=str(data)[:200])
+                resp.raise_for_status()
             return data
 
     async def kill_replicas(self, job_id: str, replica_ids: List[str]) -> Dict[str, Any]:
@@ -202,6 +203,7 @@ class OrcaClient:
             data = await resp.json()
             if resp.status >= 400:
                 logger.error("kill_failed", status=resp.status, response=str(data)[:200])
+                resp.raise_for_status()
             return data
 
     async def swap_replicas(
@@ -231,6 +233,7 @@ class OrcaClient:
             data = await resp.json()
             if resp.status >= 400:
                 logger.error("swap_failed", status=resp.status, response=str(data)[:200])
+                resp.raise_for_status()
             return data
 
 
