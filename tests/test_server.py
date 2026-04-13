@@ -311,6 +311,69 @@ class TestJobLaunching:
         assert launching[0]["gpu_type"] == "L40S"
 
 
+class TestJobStarted:
+    @pytest.mark.asyncio
+    async def test_started_clears_pending_and_registers_job(self, client):
+        """POST /job/started should clear pending state and register the job."""
+        app.state.ledger.reserve("dec-started", "L40S", 4, region="unknown")
+        app.state.monitor._pending_launches = {
+            "r0": {
+                "group_id": "parent-job",
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "tp": 4,
+                "pp": 1,
+                "region": "us-east-1",
+                "market": "spot",
+                "launched_at": 0,
+            },
+        }
+        existing = MagicMock(
+            group_id="parent-job",
+            action_in_progress=True,
+            action_freeze_until=123.0,
+        )
+        app.state.monitor.tracked_jobs = {"existing-r1": existing}
+
+        resp = await client.post("/job/started", json={
+            "job_id": "r0",
+            "decision_id": "dec-started",
+            "group_id": "parent-job",
+            "gpu_type": "L40S",
+            "instance_type": "g6e.12xlarge",
+            "tp": 4,
+            "pp": 1,
+            "dp": 1,
+            "slo_deadline_hours": 8.0,
+            "total_tokens": 6_000_000,
+            "predicted_tps": 1200.0,
+        })
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "registered"
+        assert body["decision_id"] == "dec-started"
+        assert "r0" not in app.state.monitor._pending_launches
+        assert app.state.ledger.pending_count == 0
+
+        kwargs = app.state.monitor.register_job.call_args.kwargs
+        assert kwargs["job_id"] == "r0"
+        assert kwargs["decision_id"] == "dec-started"
+        assert kwargs["group_id"] == "parent-job"
+        assert kwargs["predicted_tps"] == 1200.0
+        assert kwargs["config"].gpu_type == "L40S"
+        assert kwargs["config"].instance_type == "g6e.12xlarge"
+
+        assert existing.action_in_progress is False
+        assert existing.action_freeze_until is None
+
+        summary = app.state.memory.get_failure_summary(
+            "L40S", region="unknown", market="spot",
+        )
+        assert summary["effective_observations"] == 1
+        assert summary["availability_pct"] > 50.0
+
+
 class TestListJobs:
     @pytest.mark.asyncio
     async def test_empty(self, client):
