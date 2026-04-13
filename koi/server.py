@@ -28,7 +28,15 @@ from koi.agent import KoiAgent
 from koi.logging_config import setup_logging, get_logger, bind_context, clear_context
 from koi.monitor import MonitoringLoop
 from koi.resource_ledger import ResourceLedger
-from koi.schemas import EngineConfig, JobRequest, MonitoringStatus, MonitoringTrigger, PlacementConfig
+from koi.schemas import (
+    AgentDecision,
+    DataSource,
+    EngineConfig,
+    JobRequest,
+    MonitoringStatus,
+    MonitoringTrigger,
+    PlacementConfig,
+)
 from koi.tools.memory import AgenticMemory
 from koi.tools.orca_api import OrcaClient
 from koi.tools.perfdb import PerfDB
@@ -52,6 +60,69 @@ class JobCompleteRequest(BaseModel):
     job_id: str
     status: str
     metrics: Dict[str, Any] = {}
+
+
+class _FixedTestAgent:
+    """Deterministic test-only agent for server-backed sim scenarios."""
+
+    def __init__(self, model: str):
+        self.model = f"{model}-test-fake"
+        self.monitor = None
+        self.required_gpus = int(os.environ.get("KOI_TEST_REQUIRED_GPUS", "8"))
+        self.preferred_gpu = os.environ.get("KOI_TEST_GPU_TYPE", "L40S")
+        self.decide_delay = float(os.environ.get("KOI_TEST_DECIDE_DELAY_SEC", "0.05"))
+
+    async def decide(self, job_request: JobRequest, resource_map) -> AgentDecision:
+        await asyncio.sleep(self.decide_delay)
+
+        resource = resource_map.get_resource(self.preferred_gpu)
+        if resource is None:
+            resource = next(
+                (r for r in resource_map.resources if r.available_gpus >= self.required_gpus),
+                None,
+            )
+
+        if not resource or resource.available_gpus < self.required_gpus:
+            raise RuntimeError("insufficient adjusted resources")
+
+        tp = min(resource.gpus_per_instance, self.required_gpus)
+        pp = max(1, self.required_gpus // max(tp, 1))
+        num_instances = max(1, self.required_gpus // max(resource.gpus_per_instance, 1))
+        cost_per_hour = resource.cost_per_instance_hour_usd * num_instances
+        total_tokens = job_request.total_tokens or 0
+        predicted_tps = float(os.environ.get("KOI_TEST_PREDICTED_TPS", "1200"))
+        runtime_hours = (total_tokens / predicted_tps / 3600) if total_tokens and predicted_tps > 0 else None
+        total_cost = cost_per_hour * runtime_hours if runtime_hours is not None else None
+
+        return AgentDecision(
+            job_id=job_request.job_id or f"test-job-{uuid.uuid4().hex[:8]}",
+            model_name=job_request.model_name,
+            config=PlacementConfig(
+                gpu_type=resource.gpu_type,
+                instance_type=resource.instance_type,
+                num_gpus=self.required_gpus,
+                num_instances=num_instances,
+                tp=tp,
+                pp=pp,
+                dp=1,
+                region=resource.region,
+                engine_config=EngineConfig(
+                    tensor_parallel_size=tp,
+                    pipeline_parallel_size=pp,
+                ),
+            ),
+            predicted_tps=predicted_tps,
+            predicted_cost_per_hour=cost_per_hour,
+            predicted_total_cost=total_cost,
+            predicted_runtime_hours=runtime_hours,
+            reasoning=f"[TEST FAKE DECIDE] available_gpus={resource.available_gpus}",
+            confidence=0.99,
+            data_source=DataSource.ANALYTICAL,
+            agent_model=self.model,
+        )
+
+    async def handle_trigger(self, trigger: MonitoringTrigger) -> str:
+        return f"[TEST FAKE TRIGGER] {trigger.trigger_type.value}"
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +166,20 @@ async def lifespan(app: FastAPI):
         logger.info("orca_not_configured")
 
     # Agent
-    app.state.agent = KoiAgent(
-        perfdb=app.state.perfdb,
-        memory=app.state.memory,
-        orca=app.state.orca,
-        api_key=api_key,
-        model=model,
-    )
-    logger.info("agent_ready", model=model)
+    if os.environ.get("KOI_TEST_FAKE_DECIDE") == "1":
+        app.state.agent = _FixedTestAgent(model=model)
+        logger.warning("agent_ready_test_mode", model=app.state.agent.model,
+                       required_gpus=app.state.agent.required_gpus,
+                       preferred_gpu=app.state.agent.preferred_gpu)
+    else:
+        app.state.agent = KoiAgent(
+            perfdb=app.state.perfdb,
+            memory=app.state.memory,
+            orca=app.state.orca,
+            api_key=api_key,
+            model=model,
+        )
+        logger.info("agent_ready", model=model)
 
     # Monitor
     app.state.monitor = MonitoringLoop(

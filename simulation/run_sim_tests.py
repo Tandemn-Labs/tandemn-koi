@@ -1198,6 +1198,103 @@ def run_tier2():
         ]:
             skip(name, str(e))
 
+    # ── T2.7: concurrent /decide calls do not double-book ─────────────────
+    section("T2.7  Concurrent /decide calls reserve GPUs only once")
+
+    try:
+        fake_env = {
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_TEST_GPU_TYPE": "L40S",
+            "KOI_TEST_REQUIRED_GPUS": "8",
+            "KOI_TEST_DECIDE_DELAY_SEC": "0.05",
+        }
+        with koi_server(api_key="dummy", extra_env=fake_env):
+            import concurrent.futures
+            import threading
+
+            payload = {
+                "job_request": {
+                    "model_name": "Qwen/Qwen2.5-72B-Instruct",
+                    "task_type": "batch",
+                    "avg_input_tokens": 953,
+                    "avg_output_tokens": 1024,
+                    "num_requests": 5000,
+                    "slo_deadline_hours": 8.0,
+                    "objective": "cheapest",
+                },
+                "resource_map": {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                },
+            }
+
+            barrier = threading.Barrier(2)
+
+            def post_decide():
+                barrier.wait()
+                resp = requests.post(f"{KOI_URL}/decide", json=payload, timeout=30)
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {"detail": resp.text}
+                return resp.status_code, body
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _: post_decide(), range(2)))
+
+            status_codes = sorted(code for code, _ in results)
+            success_bodies = [body for code, body in results if code == 200]
+            error_bodies = [body for code, body in results if code != 200]
+            resources = requests.get(f"{KOI_URL}/resources", timeout=5).json()
+
+            def t_only_one_decide_succeeds():
+                assert status_codes == [200, 500], \
+                    f"expected [200, 500], got {status_codes}"
+
+            def t_one_pending_reservation_exists():
+                assert resources.get("pending_count") == 1, \
+                    f"expected 1 pending reservation, got {resources.get('pending_count')}"
+                assert resources.get("pending_gpus", {}).get("L40S") == 8, \
+                    f"expected 8 pending L40S GPUs, got {resources.get('pending_gpus')}"
+                assert len(resources.get("pending_reservations", [])) == 1, \
+                    f"expected exactly 1 reservation, got {resources.get('pending_reservations')}"
+
+            def t_failure_is_adjusted_resource_shortage():
+                assert success_bodies and "[TEST FAKE DECIDE]" in success_bodies[0].get("reasoning", ""), \
+                    f"unexpected success body: {success_bodies}"
+                assert error_bodies and "insufficient adjusted resources" in error_bodies[0].get("detail", ""), \
+                    f"unexpected error body: {error_bodies}"
+
+            check("concurrent /decide returns one success and one failure", t_only_one_decide_succeeds)
+            check("only one pending reservation remains after concurrent /decide", t_one_pending_reservation_exists)
+            check("failed concurrent /decide sees adjusted resource shortage", t_failure_is_adjusted_resource_shortage)
+
+    except RuntimeError as e:
+        for name in [
+            "concurrent /decide returns one success and one failure",
+            "only one pending reservation remains after concurrent /decide",
+            "failed concurrent /decide sees adjusted resource shortage",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 3 — Full agent loop (requires ANTHROPIC_API_KEY)
