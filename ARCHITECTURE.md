@@ -1,8 +1,29 @@
 # Koi v2 — Evolutionary Agentic Cluster Management
 
-**Automated, data-driven GPU placement for batched LLM inference.**
+**Automated, data-driven GPU placement and runtime control for batched LLM inference.**
 
-Koi abstracts the GPU/MLOps/deployment layer from the user. User provides a model, a dataset, and an SLO — Koi figures out the rest.
+Koi is an **optional** intelligence layer for Tandemn Orca. Orca can still run standalone without Koi. When enabled, Koi helps choose placements, tracks launch/runtime state for chunked jobs, and learns from real outcomes.
+
+---
+
+## 0. Current Reality Check (2026-04-13)
+
+Read this first before the rest of the document:
+
+- **Orca is still the launcher and data plane.** Initial job launch is still CLI-driven through Orca.
+- **Koi is optional.** If `KOI_SERVICE_URL` is unset, Orca runs standalone.
+- **Current live Koi↔Orca lifecycle for chunked jobs** is:
+  - `/decide`
+  - `/job/config-attempted`
+  - `/job/launching`
+  - `/job/launch-heartbeat`
+  - `/job/started`
+  - `/job/launch-failed`
+  - `/job/replica-failed`
+  - `/job/complete`
+- **Runtime control state is now persisted** in `RuntimeStateStore`, which is separate from `AgenticMemory`.
+- **Pending GPU reservations are lease-based.** `/job/launch-heartbeat` refreshes the reservation while Orca is still launching.
+- **Startup restore exists, but startup reconciliation does not.** Koi can restore its last known state from disk, but it does not yet ask Orca for the ground truth on boot.
 
 ---
 
@@ -14,14 +35,14 @@ User: "Run Qwen/Qwen2.5-72B-Instruct on this 5000-request dataset, finish in 8 h
 Koi:  1. Queries PerfDB → finds that A100-80GB TP=8 PP=1 gets 1498 tok/s for this model
       2. Checks live quota → 4× p4de.24xlarge available in us-west-2
       3. Proposes config: p4de TP=4 PP=2, ETA=0.35h, cost=$14.34
-      4. Tells Orca to launch it
-      5. Monitors throughput via Orca telemetry
+      4. Returns that config to Orca, which launches it
+      5. Monitors throughput via Orca telemetry + webhooks
       6. If falling behind SLO → adds replicas (A/B tests new GPU chain)
       7. When done → records outcome in memory (prediction error, what worked, what didn't)
       8. Next similar job → Koi already knows the answer
 ```
 
-**Koi is the brain, Orca is the muscle.** Orca never needs to know Koi exists — it just receives API calls to launch, scale, and monitor jobs.
+**Koi is the optional brain, Orca is the launcher/data plane.** Orca can run by itself, or it can be wired to Koi through `KOI_SERVICE_URL`.
 
 ---
 
@@ -56,7 +77,7 @@ Koi draws from the evolutionary AI systems literature:
 │  │    query_memory()     → Agentic Memory                        │  │
 │  │    get_resources()    → Live GPU Quota (from Orca)            │  │
 │  │    get_gpu_physics()  → GPU Specs + Bottleneck Analysis       │  │
-│  │    launch_chain()     → Deploy via Orca API                   │  │
+│  │    launch_chain()     → Planned; not current new-job path     │  │
 │  │    scale_chain()      → Add/remove replicas via Orca API      │  │
 │  │    get_job_metrics()  → Live telemetry from Orca              │  │
 │  │    record_outcome()   → Write to Agentic Memory               │  │
@@ -68,7 +89,7 @@ Koi draws from the evolutionary AI systems literature:
 │  ┌──────▼──┐ ┌─────▼────┐ ┌───▼───┐ ┌───▼────────────┐           │
 │  │ PerfDB  │ │ Agentic  │ │  SLO  │ │  Orca REST API │           │
 │  │         │ │ Memory   │ │Monitor│ │                 │           │
-│  │ 687 col │ │          │ │       │ │ POST /deploy    │           │
+│  │ 687 col │ │          │ │       │ │ CLI-driven launch│           │
 │  │ bench-  │ │ outcomes │ │ good/ │ │ POST /scale     │           │
 │  │ marks   │ │ failures │ │ bad   │ │ GET  /resources │           │
 │  │ physics │ │ rules    │ │ live  │ │ GET  /metrics   │           │
@@ -127,9 +148,11 @@ The agent then:
 2. Calls `get_resources()` to see what GPUs are available
 3. Calls `get_gpu_physics("A100-80GB")` to understand bottlenecks
 4. Reasons about the options and picks a config
-5. Calls `launch_chain(config)` to deploy
+5. Returns the chosen config to the Orca launch path
 
 If the agent needs more data, it queries more. If the perfdb has an exact match with high confidence, it decides in one tool call. If it's a novel model with no data, it does more exploration. **The agent adapts its strategy to the situation**, unlike the fixed pipeline.
+
+For current production usage, that decision is returned to Orca and the Orca CLI/server path performs the launch. Koi does not yet originate new launches autonomously.
 
 ### Agent Tools
 
@@ -580,7 +603,7 @@ ChromaDB is fine as an optional secondary store for natural-language lessons (e.
 
 **How it tracks multiple jobs:**
 
-The monitoring infrastructure is a simple Python process (part of the Koi server) that maintains an in-memory dict of tracked jobs. When `/decide` returns a config and Orca launches it, the job gets registered:
+The monitoring infrastructure is a Python process inside the Koi server that maintains working state in memory **backed by `RuntimeStateStore` on disk**. When `/decide` returns a config and Orca launches it, the job gets registered:
 
 ```python
 # In Koi server, after /decide
@@ -595,6 +618,15 @@ tracked_jobs[job_id] = {
 ```
 
 Every 10 seconds, a background asyncio task polls Orca for each tracked job, updates the state, and checks the trigger rules. **No LLM calls in the loop** — just arithmetic (`remaining_tokens / smoothed_tps`). The agent only wakes up when something needs a decision.
+
+Pending launches and pending scale decisions are also persisted. On Koi restart, the server restores:
+
+- tracked jobs
+- pending launches
+- pending scale queues
+- pending GPU reservations
+
+This restore is last-known-state restore, not full Orca reconciliation.
 
 **Two async loops** (architecturally distinct, do NOT conflate):
 
@@ -634,6 +666,11 @@ Timeline (struggling job):
 **Orca↔Koi webhook flow (explicit, not inferred from polling):**
 
 ```
+Replica launch active   →  POST /job/launch-heartbeat {job_id, decision_id, group_id,
+                          gpu_type, instance_type, tp, pp, region, market,
+                          attempt_index, phase, message}
+                          → Koi refreshes the pending GPU lease and stores launch phase
+
 vLLM model_ready phase →  POST /job/started {job_id, group_id, gpu_type, tp, pp, decision_id, adjusted_slo}
                           → Koi registers chain in monitor, starts polling
                           NOTE: fires on model_ready, NOT on sky.launch. SLO is adjusted
