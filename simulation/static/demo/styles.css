@@ -206,6 +206,37 @@ button:hover {
   box-shadow: 0 14px 30px rgba(74, 215, 183, 0.18);
 }
 
+.secondary-button {
+  padding: 10px 14px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(114, 154, 196, 0.18);
+  box-shadow: none;
+}
+
+.secondary-button:hover {
+  box-shadow: none;
+  background: rgba(110, 231, 249, 0.08);
+}
+
+.danger-button {
+  border-color: rgba(239, 106, 98, 0.25);
+  color: #ffd5d1;
+}
+
+.danger-button:hover {
+  background: rgba(239, 106, 98, 0.12);
+}
+
+.warning-button {
+  border-color: rgba(246, 183, 86, 0.25);
+  color: #ffe2b3;
+}
+
+.warning-button:hover {
+  background: rgba(246, 183, 86, 0.12);
+}
+
 .launch-status {
   color: var(--muted);
   font-size: 14px;
@@ -286,6 +317,12 @@ button:hover {
   margin-top: 14px;
 }
 
+.control-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .timing-chip {
   padding: 12px 14px;
   border-radius: 14px;
@@ -322,6 +359,64 @@ button:hover {
 .detail-list dd {
   text-align: right;
   font-family: "IBM Plex Mono", "JetBrains Mono", monospace;
+}
+
+.replica-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.replica-card {
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(114, 154, 196, 0.12);
+}
+
+.replica-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.replica-title {
+  margin: 0;
+  font-size: 15px;
+}
+
+.replica-phase {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--cyan);
+}
+
+.replica-meta {
+  margin: 12px 0 0;
+  display: grid;
+  gap: 8px;
+}
+
+.replica-meta-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.replica-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.replica-actions .secondary-button {
+  padding: 8px 10px;
+  font-size: 13px;
 }
 
 .quota-list,

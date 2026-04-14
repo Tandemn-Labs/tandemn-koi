@@ -110,6 +110,10 @@
             <span class="metric-label">Progress</span>
             <strong id="progress-percent" class="metric-value">-</strong>
           </article>
+          <article class="metric-card">
+            <span class="metric-label">SLO Headroom</span>
+            <strong id="slo-headroom" class="metric-value">-</strong>
+          </article>
         </div>
 
         <div class="progress-panel">
@@ -125,6 +129,24 @@
         <div class="launch-timing-card">
           <h3>Launch Timing Preview</h3>
           <div id="launch-timing-grid" class="timing-grid"></div>
+        </div>
+
+        <div class="detail-block">
+          <h3>Live Controls</h3>
+          <div class="control-strip">
+            <button id="add-replica-button" type="button" class="secondary-button">Add Replica</button>
+            <button id="kill-oldest-button" type="button" class="secondary-button danger-button">Kill Oldest</button>
+            <button id="throttle-button" type="button" class="secondary-button warning-button">Throttle Oldest</button>
+            <button id="restore-button" type="button" class="secondary-button">Restore TPS</button>
+          </div>
+          <p class="quota-meta">These controls call the demo Orca API directly so Koi can react to the changed world.</p>
+        </div>
+
+        <div class="detail-block">
+          <h3>Replica Fleet</h3>
+          <div id="replica-grid" class="replica-grid">
+            <div class="timeline-empty">Launch a session to inspect live replicas.</div>
+          </div>
         </div>
       </section>
 

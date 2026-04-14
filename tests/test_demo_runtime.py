@@ -46,6 +46,7 @@ class TestDemoRuntime:
         assert running["runtime"]["status"] == "running"
         assert running["runtime"]["aggregate_tps"] == 2000.0
         assert running["runtime"]["tokens_completed"] > 0
+        assert running["runtime"]["slo_headroom_pct"] is not None
 
     def test_kill_event_reduces_active_replicas(self):
         mgr = DemoSessionManager()
