@@ -436,16 +436,101 @@ def list_quota_presets() -> list[QuotaPreset]:
     return list(_QUOTA_PRESETS.values())
 
 
-def get_quota_preset(slug: str) -> QuotaPreset:
-    return _QUOTA_PRESETS[slug]
+def get_quota_preset(
+    slug: str,
+    *,
+    overrides: Optional[Mapping[str, float]] = None,
+) -> QuotaPreset:
+    """Return the quota preset, optionally overlaying per-row baseline_vcpus overrides.
+
+    ``overrides`` maps quota row keys (``"FAMILY|region|market"``) to their new
+    ``baseline_vcpus`` value. Unknown keys are ignored. None means "use defaults".
+    """
+
+    preset = _QUOTA_PRESETS[slug]
+    if not overrides:
+        return preset
+    normalized = {str(k): float(v) for k, v in overrides.items()}
+    if not normalized:
+        return preset
+    patched_quotas: list[dict[str, Any]] = []
+    changed = False
+    for quota in preset.quotas:
+        entry = dict(quota)
+        key = quota_row_key(entry)
+        if key in normalized:
+            new_value = max(0, int(round(normalized[key])))
+            if new_value != int(entry.get("baseline_vcpus", 0) or 0):
+                changed = True
+            entry["baseline_vcpus"] = new_value
+        patched_quotas.append(entry)
+    if not changed:
+        return preset
+    return QuotaPreset(
+        slug=preset.slug,
+        title=preset.title,
+        cloud=preset.cloud,
+        notes=preset.notes,
+        instances=preset.instances,
+        quotas=tuple(patched_quotas),
+    )
 
 
-def quota_preset_to_resource_map(slug: str) -> dict[str, Any]:
-    preset = get_quota_preset(slug)
+def quota_row_key(row: Mapping[str, Any]) -> str:
+    """Stable key for a quota row (family / region / market)."""
+
+    family = str(row.get("family") or "").upper()
+    region = str(row.get("region") or "")
+    market = str(row.get("market") or "")
+    return f"{family}|{region}|{market}"
+
+
+def quota_preset_to_resource_map(
+    slug: str,
+    *,
+    overrides: Optional[Mapping[str, float]] = None,
+) -> dict[str, Any]:
+    preset = get_quota_preset(slug, overrides=overrides)
     return {
         "instances": [asdict(instance) for instance in preset.instances],
         "quotas": list(preset.quotas),
     }
+
+
+def default_quota_overrides(slug: str) -> dict[str, int]:
+    """Baseline vCPU values keyed by quota_row_key for the given preset."""
+
+    preset = _QUOTA_PRESETS[slug]
+    return {
+        quota_row_key(row): int(row.get("baseline_vcpus", 0) or 0)
+        for row in preset.quotas
+    }
+
+
+def quota_preset_editable_rows(slug: str) -> list[dict[str, Any]]:
+    """Serialize the preset's quota rows with slider metadata for the UI."""
+
+    preset = _QUOTA_PRESETS[slug]
+    rows: list[dict[str, Any]] = []
+    for row in preset.quotas:
+        baseline = int(row.get("baseline_vcpus", 0) or 0)
+        # Upper bound: give headroom to 4× default or 1024, whichever is larger,
+        # rounded to the nearest 16 vCPUs for tidy slider snapping.
+        upper = max(baseline * 4, 1024)
+        upper = int(round(upper / 16.0)) * 16
+        rows.append(
+            {
+                "key": quota_row_key(row),
+                "family": str(row.get("family") or "").upper(),
+                "region": str(row.get("region") or ""),
+                "market": str(row.get("market") or ""),
+                "default_vcpus": baseline,
+                "min_vcpus": 0,
+                "max_vcpus": max(upper, 16),
+                "step_vcpus": 16,
+            }
+        )
+    return rows
 
 
 def list_scenarios() -> list[ScenarioPreset]:

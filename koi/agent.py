@@ -530,11 +530,81 @@ class KoiAgent:
                 return f"{result}{market_note}"
 
             @beta_async_tool
-            async def kill_replica_tool(job_id: str, replica_ids: list[str]) -> str:
-                """Kill specific replicas by ID. Use when you identify degraded/sick replicas that should be removed."""
+            async def kill_replica_tool(
+                job_id: str,
+                replica_ids: list[str],
+                force: bool = False,
+            ) -> str:
+                """Kill specific replicas by ID.
+
+                Safety guards (unless ``force=True``):
+                  1. Refuse to kill a replica whose TPS is >= the fleet median.
+                     That prevents accidentally killing the fastest/healthy replica.
+                  2. Refuse to kill if it would take active_replicas to zero.
+
+                Use ``force=True`` only when you are explicitly tearing the whole
+                job down.
+                """
+                if not replica_ids:
+                    return "No replica_ids provided; nothing killed."
+
+                try:
+                    replicas_data = await orca.get_replicas(job_id)
+                except Exception as e:
+                    logger.warning(
+                        "kill_replica_fleet_lookup_failed",
+                        job_id=job_id,
+                        error=str(e),
+                    )
+                    replicas_data = {"replicas": []}
+
+                active_replicas = [
+                    r
+                    for r in (replicas_data.get("replicas") or [])
+                    if str(r.get("phase", "")).lower()
+                    not in ("dead", "killed", "completed", "failed")
+                ]
+                fleet_tps = sorted(float(r.get("tps", 0) or 0) for r in active_replicas)
+                median_tps = fleet_tps[len(fleet_tps) // 2] if fleet_tps else 0.0
+                by_id = {r["replica_id"]: r for r in active_replicas}
+                rejected: list[str] = []
+                refusal_reasons: list[str] = []
+
+                if not force:
+                    # Guard 2: refuse if we would kill every remaining replica.
+                    active_ids = {r["replica_id"] for r in active_replicas}
+                    candidate = set(replica_ids) & active_ids
+                    if candidate and candidate >= active_ids:
+                        return (
+                            "kill_refused: would remove all active replicas for "
+                            f"{job_id}. Pass force=True only when tearing the job "
+                            "down intentionally."
+                        )
+                    # Guard 1: refuse any replica that is at/above fleet median TPS.
+                    for rid in replica_ids:
+                        info = by_id.get(rid)
+                        if not info:
+                            continue
+                        rep_tps = float(info.get("tps", 0) or 0)
+                        if rep_tps >= median_tps and rep_tps > 0:
+                            rejected.append(rid)
+                            refusal_reasons.append(
+                                f"{rid} (tps={rep_tps:.0f} >= fleet_median={median_tps:.0f})"
+                            )
+
+                allowed = [rid for rid in replica_ids if rid not in rejected]
+                if not allowed:
+                    return (
+                        "kill_refused: all targets are at or above the fleet "
+                        f"median TPS ({median_tps:.0f}). Refused: {refusal_reasons}. "
+                        "Target a genuinely degraded replica or pass force=True "
+                        "if you really intend to."
+                    )
+
                 if monitor:
-                    monitor._koi_initiated_kills.update(replica_ids)
-                result = await orca.kill_replicas(job_id, replica_ids)
+                    monitor._koi_initiated_kills.update(allowed)
+                result = await orca.kill_replicas(job_id, allowed)
+
                 # Anti-windup
                 if monitor:
                     for tracker in monitor.tracked_jobs.values():
@@ -542,7 +612,14 @@ class KoiAgent:
                             tracker.action_in_progress = True
                             tracker.action_freeze_until = time.time() + 300
                             monitor.persist_job(tracker.job_id)
-                return f"Killed {len(replica_ids)} replicas: {replica_ids}. {result}"
+
+                suffix = ""
+                if rejected:
+                    suffix = (
+                        f" Refused to kill {len(rejected)} healthy replica(s): "
+                        f"{refusal_reasons}."
+                    )
+                return f"Killed {len(allowed)} replica(s): {allowed}.{suffix} {result}"
 
             @beta_async_tool
             async def get_job_metrics_tool(job_id: str) -> str:

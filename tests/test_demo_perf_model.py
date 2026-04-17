@@ -120,19 +120,22 @@ class TestDemoPerfModel:
         assert (a100_tp8 / a100_tp4) > (l40s_tp8 / l40s_tp4)
 
     def test_pipeline_parallelism_has_overhead(self):
+        # Pick a model + GPU config where the weights already fit with headroom to
+        # spare, so PP2 no longer unlocks extra KV-cache batching and its bubble
+        # overhead becomes the dominant effect (realistic small-model behaviour).
         model = DemoPerfModel(prefer_perfdb=False)
         pp1 = model.estimate_replica_tps(
-            model_name="Qwen/Qwen3-32B",
-            gpu_type="L40S",
-            tp=4,
+            model_name="meta-llama/Llama-3.1-8B-Instruct",
+            gpu_type="A100-80GB",
+            tp=2,
             pp=1,
             input_tokens=512,
             output_tokens=256,
         )
         pp2 = model.estimate_replica_tps(
-            model_name="Qwen/Qwen3-32B",
-            gpu_type="L40S",
-            tp=4,
+            model_name="meta-llama/Llama-3.1-8B-Instruct",
+            gpu_type="A100-80GB",
+            tp=2,
             pp=2,
             input_tokens=512,
             output_tokens=256,

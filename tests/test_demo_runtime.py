@@ -1,6 +1,20 @@
 """Tests for demo session runtime progression."""
 
+import pytest
+
 from simulation.demo_runtime import DemoSessionManager
+from simulation import demo_runtime as _demo_runtime
+
+
+@pytest.fixture(autouse=True)
+def _disable_tps_noise():
+    """Run every test in this file with deterministic TPS (no display jitter)."""
+    original = _demo_runtime.TPS_NOISE_SIGMA
+    _demo_runtime.set_tps_noise_sigma(0.0)
+    try:
+        yield
+    finally:
+        _demo_runtime.set_tps_noise_sigma(original)
 
 
 def _session_payload():

@@ -11,257 +11,207 @@
 </head>
 <body>
   <div class="page">
-    <div class="top-actions">
-      <button id="theme-toggle" type="button" class="secondary-button theme-toggle">Night Mode</button>
-    </div>
-
     <main class="dashboard">
-      <aside class="panel intelligence-rail">
-        <div class="panel-header">
-          <h2>Tandemn Intelligence Loop</h2>
-          <p>Control decisions, trigger handling, and live job context.</p>
-        </div>
+      <section class="workspace">
+        <section class="panel launch-panel">
+          <div class="launch-panel-body">
+            <div class="launch-copy">
+              <h1>Tandemn Intelligence</h1>
+            </div>
 
-        <div class="rail-stack">
-          <section class="surface compact-surface">
-            <div class="section-heading">
-              <h3>Koi Decision</h3>
+            <form id="launch-form" class="launch-form">
+              <div class="launch-primary-grid">
+                <label class="hero-field hero-field-model">
+                  <span class="hero-field-title">Model</span>
+                  <input id="model-input" name="model_name" list="model-options" placeholder="meta-llama/Llama-3.1-70B-Instruct">
+                  <datalist id="model-options"></datalist>
+                </label>
+
+                <label class="hero-field">
+                  <span class="hero-field-title">SLO</span>
+                  <input id="slo-hours" name="slo_deadline_hours" type="number" min="0.1" step="0.1" value="8.0">
+                </label>
+
+                <label class="hero-field">
+                  <span class="hero-field-title">Output</span>
+                  <input id="output-tokens" name="avg_output_tokens" type="number" min="1" value="200">
+                </label>
+
+                <label class="hero-field">
+                  <span class="hero-field-title">Chunks</span>
+                  <input id="total-chunks" name="total_chunks" type="number" min="1" value="500">
+                </label>
+
+                <label class="hero-field">
+                  <span class="hero-field-title">Input</span>
+                  <input id="input-tokens" name="avg_input_tokens" type="number" min="1" value="800">
+                </label>
+              </div>
+
+              <details class="launch-secondary-row">
+                <summary class="section-toggle">Show Advanced</summary>
+                <div class="launch-secondary-grid">
+                  <label class="hero-field hero-field-secondary hero-field-select">
+                    <span class="hero-field-title">Quota Preset</span>
+                    <select id="quota-select" name="quota_preset"></select>
+                  </label>
+
+                  <label class="hero-field hero-field-secondary hero-field-select" hidden>
+                    <span class="hero-field-title">Scenario</span>
+                    <select id="scenario-select" name="scenario"></select>
+                  </label>
+
+                  <label class="hero-field hero-field-secondary">
+                    <span class="hero-field-title">Cost Cap</span>
+                    <input id="cost-cap" name="cost_cap_usd" type="number" min="1" step="1" value="120">
+                  </label>
+                </div>
+              </details>
+
+              <div class="form-actions form-actions-hero">
+                <button id="launch-button" type="submit" class="launch-cta">Launch Demo</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <section id="koi-reasoning-panel" class="panel reasoning-panel">
+          <div class="reasoning-header">
+            <h2>Koi Reasoning</h2>
+          </div>
+          <div id="koi-reasoning-text" class="reasoning-copy is-empty">No Koi reasoning yet. Launch a session to inspect Koi's decision narrative here.</div>
+        </section>
+
+        <section class="controls-quota-split">
+          <section class="panel logs-panel">
+            <h2>Logs</h2>
+            <div id="activity-console" class="logs-feed">
+              <div class="console-empty">Launch a session to start the console.</div>
             </div>
-            <div id="koi-thinking-banner" class="thinking-banner" hidden>
-              <span class="thinking-dot" aria-hidden="true"></span>
-              <span>Koi Thinking...</span>
-            </div>
-            <div id="koi-details" class="scenario-copy">No live Koi decision attached yet.</div>
           </section>
 
-          <section class="surface compact-surface">
-            <div class="section-heading">
-              <h3>Jobs</h3>
-            </div>
-            <div class="job-list">
-              <div class="job-row">
-                <span class="job-key">Active Session</span>
-                <strong id="session-label">No demo session active yet.</strong>
-              </div>
-              <div class="job-row">
-                <span class="job-key">Launch State</span>
-                <span id="launch-status" class="status-pill">Idle</span>
-              </div>
+          <section class="panel chains-panel">
+            <h2>Running Chains</h2>
+            <div id="replica-grid" class="replica-list">
+              <div class="console-empty">Launch a session to inspect live chains.</div>
             </div>
           </section>
+        </section>
 
-          <section class="surface compact-surface">
-            <div class="section-heading">
-              <h3>Quota + Region</h3>
+        <section class="controls-quota-split controls-quota-split-lower">
+          <section class="panel quota-region-panel">
+            <div class="quota-region-header">
+              <h2>Quota + Region</h2>
+              <button id="edit-quota-button" type="button" class="inline-link-button">Edit Quota</button>
             </div>
             <div id="quota-details" class="quota-list"></div>
           </section>
 
-          <section class="surface compact-surface">
-            <div class="section-heading">
-              <h3>Model Facts</h3>
-            </div>
-            <dl id="model-details" class="detail-list"></dl>
-          </section>
-        </div>
-      </aside>
-
-      <section class="workspace">
-        <section class="panel launch-panel">
-          <div class="panel-header">
-            <h2>Job Characteristics</h2>
-            <p>Set model, prompt shape, batch size, quota, and constraints before launching.</p>
-          </div>
-
-          <form id="launch-form" class="control-grid">
-            <label>
-              <span>Model</span>
-              <input id="model-input" name="model_name" list="model-options" placeholder="meta-llama/Llama-3.1-70B-Instruct">
-              <datalist id="model-options"></datalist>
-              <small class="field-hint">Type any Hugging Face model ID. The list is just suggestions.</small>
-            </label>
-
-            <label>
-              <span>Quota Preset</span>
-              <select id="quota-select" name="quota_preset"></select>
-            </label>
-
-            <label>
-              <span>Scenario</span>
-              <select id="scenario-select" name="scenario"></select>
-            </label>
-
-            <label>
-              <span>SLO (hours)</span>
-              <input id="slo-hours" name="slo_deadline_hours" type="number" min="0.1" step="0.1" value="8.0">
-            </label>
-
-            <label>
-              <span>Avg Input Tokens</span>
-              <input id="input-tokens" name="avg_input_tokens" type="number" min="1" value="800">
-            </label>
-
-            <label>
-              <span>Avg Output Tokens</span>
-              <input id="output-tokens" name="avg_output_tokens" type="number" min="1" value="200">
-            </label>
-
-            <label>
-              <span>Total Chunks</span>
-              <input id="total-chunks" name="total_chunks" type="number" min="1" value="500">
-            </label>
-
-            <label>
-              <span>Cost Cap (USD)</span>
-              <input id="cost-cap" name="cost_cap_usd" type="number" min="1" step="1" value="120">
-            </label>
-
-            <div class="form-actions">
-              <button id="launch-button" type="submit">Launch Demo Session</button>
-            </div>
-          </form>
-
-          <section id="preview-toolbar" class="surface compact-surface" hidden>
-            <div class="section-heading">
-              <h3>Preview Mode</h3>
-              <span class="section-note">Local scene generator for fast design iteration.</span>
-            </div>
-            <div class="preview-toolbar-body">
-              <label class="preview-field">
-                <span>Scene</span>
-                <select id="preview-scene-select"></select>
-              </label>
-              <button id="load-preview-button" type="button" class="secondary-button">Load Scene</button>
-            </div>
-          </section>
-        </section>
-
-        <section class="panel stage">
-          <div class="panel-header stage-header">
-            <div>
+          <section class="panel stage">
+            <div class="stage-header">
               <h2>Clusters</h2>
-              <p>Live throughput, scaling controls, and quota posture during the batch run.</p>
-            </div>
-            <div class="session-chip">
-              <span class="badge-label">Launch Phase</span>
-              <strong id="launch-phase">-</strong>
-            </div>
-          </div>
-
-          <div class="clusters-grid">
-            <div class="clusters-main">
-              <div class="status-grid">
-                <article class="metric-card">
-                  <span class="metric-label">Runtime</span>
-                  <strong id="runtime-status" class="metric-value">-</strong>
-                </article>
-                <article class="metric-card">
-                  <span class="metric-label">Aggregate TPS</span>
-                  <strong id="aggregate-tps" class="metric-value">-</strong>
-                </article>
-                <article class="metric-card">
-                  <span class="metric-label">ETA</span>
-                  <strong id="eta-seconds" class="metric-value">-</strong>
-                </article>
-                <article class="metric-card">
-                  <span class="metric-label">Active Replicas</span>
-                  <strong id="active-replicas" class="metric-value">-</strong>
-                </article>
-                <article class="metric-card">
-                  <span class="metric-label">Progress</span>
-                  <strong id="progress-percent" class="metric-value">-</strong>
-                </article>
-                <article class="metric-card">
-                  <span class="metric-label">SLO Headroom</span>
-                  <strong id="slo-headroom" class="metric-value">-</strong>
-                </article>
-              </div>
-
-              <section class="surface progress-surface progress-surface-hero">
-                <div class="section-heading">
-                  <h3>Batch Progress</h3>
-                  <span id="token-progress" class="section-note">0 / 0 tokens</span>
-                </div>
+              <div class="stage-progress-header">
+                <span id="token-progress" class="section-note">0 / 0 tokens</span>
                 <div class="progress-bar">
                   <div id="progress-fill" class="progress-fill"></div>
                 </div>
-              </section>
-
-              <section class="surface compact-surface">
-                <div class="section-heading">
-                  <h3>Live Controls</h3>
-                  <span class="section-note">Manual actions update the current demo world immediately.</span>
-                </div>
-                <div class="control-strip">
-                  <label class="inline-control inline-control-wide">
-                    <span>GPU</span>
-                    <select id="manual-gpu-type"></select>
-                  </label>
-                  <label class="inline-control">
-                    <span>TP</span>
-                    <input id="manual-tp-size" type="number" min="1" value="4">
-                  </label>
-                  <label class="inline-control">
-                    <span>PP</span>
-                    <input id="manual-pp-size" type="number" min="1" value="1">
-                  </label>
-                  <label class="inline-control">
-                    <span>Replicas</span>
-                    <input id="manual-replica-count" type="number" min="1" value="1">
-                  </label>
-                  <button id="add-replica-button" type="button" class="secondary-button">Add Replica</button>
-                  <button id="kill-oldest-button" type="button" class="secondary-button danger-button">Kill Oldest</button>
-                  <button id="throttle-button" type="button" class="secondary-button warning-button">Throttle Oldest</button>
-                  <button id="restore-button" type="button" class="secondary-button">Restore TPS</button>
-                </div>
-              </section>
-
-              <section class="surface compact-surface">
-                <div class="section-heading">
-                  <h3>Replica Fleet</h3>
-                  <span class="section-note">Replica state, throughput, and controls.</span>
-                </div>
-                <div id="replica-grid" class="replica-list">
-                  <div class="console-empty">Launch a session to inspect live replicas.</div>
-                </div>
-              </section>
+              </div>
             </div>
 
-            <div class="clusters-side">
-              <section class="surface console-surface console-surface-pop">
-                <div class="section-heading">
-                  <h3>Live Console</h3>
-                  <span class="section-note">Meaningful Koi and simulator events, newest at the bottom.</span>
-                </div>
-                <div id="activity-console" class="console-feed">
-                  <div class="console-empty">Launch a session to start the console.</div>
-                </div>
-              </section>
+            <div class="cluster-kv-row">
+              <article class="cluster-kv-item">
+                <span class="cluster-kv-label">Runtime</span>
+                <strong id="runtime-status" class="cluster-kv-value">-</strong>
+              </article>
+              <article class="cluster-kv-item">
+                <span class="cluster-kv-label">Aggregate TPS</span>
+                <strong id="aggregate-tps" class="cluster-kv-value">-</strong>
+              </article>
+              <article class="cluster-kv-item">
+                <span class="cluster-kv-label">ETA</span>
+                <strong id="eta-seconds" class="cluster-kv-value">-</strong>
+              </article>
+              <article class="cluster-kv-item">
+                <span class="cluster-kv-label">Active Replicas</span>
+                <strong id="active-replicas" class="cluster-kv-value">-</strong>
+              </article>
+              <article class="cluster-kv-item">
+                <span class="cluster-kv-label">Progress</span>
+                <strong id="progress-percent" class="cluster-kv-value">-</strong>
+              </article>
+              <article class="cluster-kv-item">
+                <span class="cluster-kv-label">SLO Headroom</span>
+                <strong id="slo-headroom" class="cluster-kv-value">-</strong>
+              </article>
             </div>
-          </div>
+          </section>
         </section>
 
-        <details id="koi-reasoning-panel" class="panel reasoning-panel" open>
-          <summary class="reasoning-summary">
-            <div class="reasoning-summary-copy">
-              <h2>Koi Reasoning</h2>
-              <p>Expand to inspect Koi's current decision narrative for this session.</p>
+        <section class="panel live-controls-top-panel">
+          <details>
+            <summary class="section-toggle">Show Live Controls</summary>
+            <h2>Live Controls</h2>
+            <div class="live-controls-top-actions">
+              <button id="add-replica-button" type="button" class="secondary-button">Add Replica</button>
+              <button id="kill-oldest-button" type="button" class="secondary-button danger-button">Kill Oldest</button>
+              <button id="throttle-button" type="button" class="secondary-button warning-button">Throttle Oldest</button>
             </div>
-            <span id="koi-reasoning-status" class="status-pill">Idle</span>
-          </summary>
+            <div class="live-controls-top-configs">
+              <label class="inline-control inline-control-wide">
+                <span>GPU</span>
+                <select id="manual-gpu-type"></select>
+              </label>
+              <label class="inline-control">
+                <span>TP</span>
+                <input id="manual-tp-size" type="number" min="1" value="4">
+              </label>
+              <label class="inline-control">
+                <span>PP</span>
+                <input id="manual-pp-size" type="number" min="1" value="1">
+              </label>
+              <label class="inline-control">
+                <span>Replicas</span>
+                <input id="manual-replica-count" type="number" min="1" value="1">
+              </label>
+            </div>
+          </details>
+        </section>
 
-          <div class="reasoning-body">
-            <section class="surface compact-surface">
-              <div class="section-heading">
-                <h3>Decision Reasoning</h3>
-                <span id="koi-reasoning-meta" class="section-note">No Koi reasoning yet.</span>
-              </div>
-              <div id="koi-reasoning-text" class="reasoning-copy">Launch a session to inspect Koi's decision narrative here.</div>
-            </section>
-          </div>
-        </details>
+        <div class="legacy-state" hidden>
+          <div id="koi-thinking-banner"></div>
+          <div id="koi-details">No live Koi decision attached yet.</div>
+          <strong id="session-label">No demo session active yet.</strong>
+          <span id="launch-status">Idle</span>
+          <dl id="model-details"></dl>
+        </div>
+
       </section>
     </main>
+  </div>
+
+  <div id="quota-editor" class="quota-editor" hidden>
+    <div class="quota-editor-backdrop" data-quota-close="1"></div>
+    <div class="quota-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="quota-editor-title">
+      <header class="quota-editor-header">
+        <div>
+          <h2 id="quota-editor-title">Edit Quota</h2>
+          <p id="quota-editor-subtitle">Adjust vCPU ceilings per family. Saves persist across restarts.</p>
+        </div>
+        <button type="button" class="icon-button" data-quota-close="1" aria-label="Close">×</button>
+      </header>
+      <div id="quota-editor-lock" class="quota-editor-lock" hidden>
+        Quota editing is locked while a demo session is active.
+      </div>
+      <div id="quota-editor-body" class="quota-editor-body"></div>
+      <footer class="quota-editor-footer">
+        <span id="quota-editor-status" class="quota-editor-status"></span>
+        <div class="quota-editor-actions">
+          <button id="quota-editor-reset" type="button" class="secondary-button">Reset to defaults</button>
+          <button id="quota-editor-cancel" type="button" class="secondary-button" data-quota-close="1">Cancel</button>
+          <button id="quota-editor-save" type="button" class="secondary-button">Save</button>
+        </div>
+      </footer>
+    </div>
   </div>
 
   <script src="/demo/static/app.js"></script>

@@ -8,8 +8,6 @@ const sessionLabel = document.getElementById("session-label");
 const activityConsole = document.getElementById("activity-console");
 const replicaGrid = document.getElementById("replica-grid");
 const koiReasoningPanel = document.getElementById("koi-reasoning-panel");
-const koiReasoningStatus = document.getElementById("koi-reasoning-status");
-const koiReasoningMeta = document.getElementById("koi-reasoning-meta");
 const koiReasoningText = document.getElementById("koi-reasoning-text");
 const manualGpuType = document.getElementById("manual-gpu-type");
 const manualTpSize = document.getElementById("manual-tp-size");
@@ -18,17 +16,26 @@ const manualReplicaCount = document.getElementById("manual-replica-count");
 const addReplicaButton = document.getElementById("add-replica-button");
 const killOldestButton = document.getElementById("kill-oldest-button");
 const throttleButton = document.getElementById("throttle-button");
-const restoreButton = document.getElementById("restore-button");
-const previewToolbar = document.getElementById("preview-toolbar");
-const previewSceneSelect = document.getElementById("preview-scene-select");
-const loadPreviewButton = document.getElementById("load-preview-button");
 const themeToggle = document.getElementById("theme-toggle");
 const koiThinkingBanner = document.getElementById("koi-thinking-banner");
+const editQuotaButton = document.getElementById("edit-quota-button");
+const quotaEditor = document.getElementById("quota-editor");
+const quotaEditorBody = document.getElementById("quota-editor-body");
+const quotaEditorLock = document.getElementById("quota-editor-lock");
+const quotaEditorStatus = document.getElementById("quota-editor-status");
+const quotaEditorSaveButton = document.getElementById("quota-editor-save");
+const quotaEditorResetButton = document.getElementById("quota-editor-reset");
+
+const quotaEditorState = {
+  open: false,
+  locked: false,
+  presetSlug: null,
+  workingValues: {},
+};
 
 let activeSource = null;
 let catalog = null;
 let currentSnapshot = null;
-let previewScenes = [];
 let manualControlSessionId = null;
 const pageQuery = new URLSearchParams(window.location.search);
 const previewMode = pageQuery.get("preview") === "1";
@@ -126,17 +133,67 @@ function renderCatalog(data) {
   scenarioSelect.innerHTML = data.scenarios
     .map((scenario) => `<option value="${scenario.slug}">${scenario.title}</option>`)
     .join("");
-
-  previewScenes = data.preview_scenes || [];
-  if (previewSceneSelect) {
-    previewSceneSelect.innerHTML = previewScenes
-      .map((scene) => `<option value="${scene.slug}">${escapeHtml(scene.title)}</option>`)
-      .join("");
+  if (!scenarioSelect.value && data.scenarios[0]) {
+    scenarioSelect.value = data.scenarios[0].slug;
   }
+
+  updateQuotaLockState({
+    locked: Boolean(data.quota_locked),
+    activeSessions: Number(data.active_sessions || 0),
+  });
 
   renderSelectedQuota();
   renderSelectedScenario();
   syncManualScaleControls();
+}
+
+function findQuotaPreset(slug) {
+  if (!catalog) return null;
+  return (catalog.quota_presets || []).find((preset) => preset.slug === slug) || null;
+}
+
+function applyPresetOverridesInPlace(preset) {
+  if (!preset) return preset;
+  const overrides = preset.overrides || {};
+  if (!Object.keys(overrides).length) return preset;
+  const familyRegionMarket = (row) =>
+    `${String(row.family || "").toUpperCase()}|${String(row.region || "")}|${String(row.market || "")}`;
+  preset.quotas = (preset.quotas || []).map((row) => {
+    const key = familyRegionMarket(row);
+    if (key in overrides) {
+      return {...row, baseline_vcpus: Number(overrides[key] || 0)};
+    }
+    return row;
+  });
+  return preset;
+}
+
+function updateQuotaLockState({locked, activeSessions}) {
+  quotaEditorState.locked = Boolean(locked);
+  if (editQuotaButton) {
+    editQuotaButton.title = locked
+      ? `Locked — ${activeSessions || 1} active session`
+      : "Edit quota ceilings (persists across restarts)";
+  }
+  if (quotaEditor && quotaEditorState.open) {
+    renderQuotaEditorLock(activeSessions);
+  }
+}
+
+function renderQuotaEditorLock(activeSessions) {
+  if (!quotaEditorLock) return;
+  if (quotaEditorState.locked) {
+    quotaEditorLock.hidden = false;
+    quotaEditorLock.textContent = `Quota editing is locked — ${activeSessions || 1} live session${(activeSessions || 1) === 1 ? "" : "s"} running. Let the current run finish before saving changes.`;
+  } else {
+    quotaEditorLock.hidden = true;
+  }
+  if (quotaEditorSaveButton) {
+    quotaEditorSaveButton.disabled = quotaEditorState.locked;
+  }
+  if (quotaEditorResetButton) {
+    quotaEditorResetButton.disabled = quotaEditorState.locked;
+  }
 }
 
 const QUOTA_GPU_ORDER = ["A100", "L40", "L4", "A10G"];
@@ -392,7 +449,10 @@ function renderSession(snapshot) {
   }
 
   document.getElementById("runtime-status").textContent = runtime.status;
-  document.getElementById("launch-phase").textContent = runtime.launch_phase;
+  const launchPhase = document.getElementById("launch-phase");
+  if (launchPhase) {
+    launchPhase.textContent = runtime.launch_phase;
+  }
   document.getElementById("aggregate-tps").textContent = formatNumber(runtime.aggregate_tps);
   document.getElementById("eta-seconds").textContent = formatSeconds(runtime.eta_seconds);
   document.getElementById("active-replicas").textContent = formatNumber(runtime.active_replicas);
@@ -484,7 +544,7 @@ function isKoiBusy(snapshot) {
 }
 
 function renderKoiReasoningPanel(snapshot) {
-  if (!koiReasoningText || !koiReasoningMeta || !koiReasoningStatus) {
+  if (!koiReasoningText) {
     return;
   }
 
@@ -497,25 +557,21 @@ function renderKoiReasoningPanel(snapshot) {
 
   if (decision && decision.reasoning) {
     koiReasoningText.textContent = decision.reasoning;
-    koiReasoningMeta.textContent = latestActivity
-      ? `${decision._decision_id || "decision"} · Latest activity: ${latestActivity}`
-      : (decision._decision_id || "Decision ready");
+    koiReasoningText.classList.remove("is-empty");
   } else if (busy) {
     koiReasoningText.textContent = latestActivity
       ? `Koi is actively working. Latest step: ${latestActivity}.`
       : "Koi is actively deciding.";
-    koiReasoningMeta.textContent = `${events.length} recent event${events.length === 1 ? "" : "s"}`;
+    koiReasoningText.classList.remove("is-empty");
   } else {
-    koiReasoningText.textContent = "Launch a session to inspect Koi's decision narrative here.";
-    koiReasoningMeta.textContent = "No Koi reasoning yet.";
+    koiReasoningText.textContent = "No Koi reasoning yet. Launch a session to inspect Koi's decision narrative here.";
+    koiReasoningText.classList.add("is-empty");
   }
 
-  koiReasoningStatus.textContent = busy
-    ? "Thinking"
-    : (decision ? "Ready" : "Idle");
-
-  if (koiReasoningPanel && busy && !koiReasoningPanel.hasAttribute("open")) {
-    koiReasoningPanel.setAttribute("open", "open");
+  if (koiReasoningPanel) {
+    koiReasoningPanel.dataset.state = busy
+      ? "thinking"
+      : (decision ? "ready" : "idle");
   }
 }
 
@@ -609,63 +665,61 @@ function describeKoiEvent(event) {
 }
 
 function renderReplicaFleet(snapshot) {
+  if (!replicaGrid) return;
   const replicas = (snapshot.runtime && snapshot.runtime.replicas) || [];
   if (!replicas.length) {
     replicaGrid.innerHTML = `
-      <div class="replica-table-wrap">
-        <div class="replica-table-empty">
-          <div class="infra-empty-title">No live replicas yet</div>
-          <div class="infra-empty-body">Launch a session to see the worker fleet and control buttons here.</div>
-        </div>
+      <div class="replica-table-empty">
+        <div class="infra-empty-title">No live replicas yet</div>
+        <div class="infra-empty-body">Launch a session to see the worker fleet and control buttons here.</div>
       </div>
     `;
     return;
   }
 
   replicaGrid.innerHTML = `
-    <div class="replica-table-wrap">
-      <table class="replica-tbl">
-        <thead>
-          <tr>
-            <th>Replica</th>
-            <th>Status</th>
-            <th>GPU</th>
-            <th>Parallelism</th>
-            <th>Launch</th>
-            <th>TPS</th>
-            <th>Actions</th>
+    <table class="replica-tbl">
+      <thead>
+        <tr>
+          <th>Replica</th>
+          <th>Status</th>
+          <th>GPU</th>
+          <th>Parallelism</th>
+          <th>Launch</th>
+          <th>TPS</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${replicas.map((replica) => `
+          <tr class="replica-row">
+            <td>${escapeHtml(replica.replica_id)}</td>
+            <td>
+              <div class="replica-phase-cell">
+                <span class="replica-phase-dot tone-${phaseTone(replica.phase)}"></span>
+                <span>${escapeHtml(titleCase(replica.phase))}</span>
+              </div>
+            </td>
+            <td>${escapeHtml(replica.gpu_type)}</td>
+            <td>TP ${replica.tp} · PP ${replica.pp}</td>
+            <td>${escapeHtml(titleCase(replica.launch_phase || replica.phase))}</td>
+            <td>${formatNumber(replica.tps)}</td>
+            <td>
+              <div class="table-actions">
+                <button type="button" class="secondary-button danger-button" data-action="kill" data-replica-id="${replica.replica_id}">Kill</button>
+                <button type="button" class="secondary-button warning-button" data-action="throttle" data-replica-id="${replica.replica_id}">Throttle</button>
+                <button type="button" class="secondary-button" data-action="restore" data-replica-id="${replica.replica_id}">Restore</button>
+              </div>
+            </td>
           </tr>
-        </thead>
-        <tbody>
-          ${replicas.map((replica) => `
-            <tr class="replica-row">
-              <td>${escapeHtml(replica.replica_id)}</td>
-              <td>
-                <div class="replica-phase-cell">
-                  <span class="replica-phase-dot tone-${phaseTone(replica.phase)}"></span>
-                  <span>${escapeHtml(titleCase(replica.phase))}</span>
-                </div>
-              </td>
-              <td>${escapeHtml(replica.gpu_type)}</td>
-              <td>TP ${replica.tp} · PP ${replica.pp}</td>
-              <td>${escapeHtml(titleCase(replica.launch_phase || replica.phase))}</td>
-              <td>${formatNumber(replica.tps)}</td>
-              <td>
-                <div class="table-actions">
-                  <button type="button" class="secondary-button danger-button" data-action="kill" data-replica-id="${replica.replica_id}">Kill</button>
-                  <button type="button" class="secondary-button warning-button" data-action="throttle" data-replica-id="${replica.replica_id}">Throttle</button>
-                  <button type="button" class="secondary-button" data-action="restore" data-replica-id="${replica.replica_id}">Restore</button>
-                </div>
-              </td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-    </div>
+        `).join("")}
+      </tbody>
+    </table>
   `;
 }
 
 function renderActivityConsole(snapshot) {
+  if (!activityConsole) return;
   const runtimeEntries = ((snapshot.runtime && snapshot.runtime.events) || []).map((event) => {
     const description = describeRuntimeEvent(event);
     return {
@@ -768,6 +822,7 @@ function startStream(sessionId) {
     activeSource.close();
   }
 
+  let lockRefreshed = false;
   activeSource = new EventSource(`/demo/stream/${sessionId}`);
   activeSource.onmessage = (event) => {
     const snapshot = JSON.parse(event.data);
@@ -775,6 +830,11 @@ function startStream(sessionId) {
     launchStatus.textContent = snapshot.runtime.status === "koi_deciding"
       ? "Koi deciding..."
       : "Streaming";
+    if (!lockRefreshed && ["completed", "launch_failed"].includes(snapshot.runtime.status)) {
+      lockRefreshed = true;
+      // Pick up the lock-released state once the live session ends.
+      loadCatalog().catch(() => {});
+    }
   };
   activeSource.onerror = () => {
     launchStatus.textContent = "Stream disconnected";
@@ -783,7 +843,7 @@ function startStream(sessionId) {
 
 async function launchSession(payload) {
   if (previewMode) {
-    const scene = previewSceneSelect.value || pageQuery.get("scene") || "running_healthy";
+    const scene = pageQuery.get("scene") || "running_healthy";
     await loadPreviewScene(scene);
     return;
   }
@@ -801,6 +861,8 @@ async function launchSession(payload) {
   renderSession(session);
   startStream(session.session_id);
   launchStatus.textContent = "Koi deciding...";
+  // Refresh catalog so the Edit Quota lock state reflects the new live session.
+  loadCatalog().catch(() => {});
 }
 
 function getReplicaById(replicaId) {
@@ -985,6 +1047,181 @@ function previewSetReplicaTps(replicaId, targetTps) {
   renderSession(currentSnapshot);
 }
 
+// ---------------------------------------------------------------------------
+// Quota editor (persistent vCPU sliders per preset family/region/market)
+// ---------------------------------------------------------------------------
+
+function openQuotaEditor() {
+  if (!catalog || !quotaEditor || !quotaEditorBody) return;
+  const slug = quotaSelect.value;
+  const preset = findQuotaPreset(slug);
+  if (!preset) return;
+
+  quotaEditorState.open = true;
+  quotaEditorState.presetSlug = slug;
+
+  // Working copy: start from stored overrides, fall back to defaults.
+  const defaults = preset.defaults || {};
+  const stored = preset.overrides || {};
+  const working = {};
+  (preset.editable_rows || []).forEach((row) => {
+    const base = stored[row.key];
+    working[row.key] = Number(base !== undefined ? base : (defaults[row.key] ?? row.default_vcpus));
+  });
+  quotaEditorState.workingValues = working;
+
+  renderQuotaEditorBody();
+  renderQuotaEditorLock(catalog.active_sessions);
+  quotaEditorStatus.textContent = `Preset: ${preset.title || slug}`;
+  quotaEditorStatus.classList.remove("is-error", "is-ok");
+  quotaEditor.hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function closeQuotaEditor() {
+  quotaEditorState.open = false;
+  if (quotaEditor) quotaEditor.hidden = true;
+  document.body.style.overflow = "";
+}
+
+function renderQuotaEditorBody() {
+  if (!quotaEditorBody) return;
+  const preset = findQuotaPreset(quotaEditorState.presetSlug);
+  if (!preset) {
+    quotaEditorBody.innerHTML = "";
+    return;
+  }
+  const rows = preset.editable_rows || [];
+  if (!rows.length) {
+    quotaEditorBody.innerHTML = '<div class="quota-empty">No adjustable quota rows for this preset.</div>';
+    return;
+  }
+  quotaEditorBody.innerHTML = rows.map((row) => {
+    const value = Number(quotaEditorState.workingValues[row.key] ?? row.default_vcpus);
+    const marketLabel = String(row.market || "").replaceAll("_", " ");
+    return `
+      <div class="quota-editor-row" data-key="${escapeHtml(row.key)}">
+        <div class="meta">
+          <span class="title">${escapeHtml(row.family)}</span>
+          <span class="caption">${escapeHtml(row.region)} · ${escapeHtml(marketLabel)} · default ${row.default_vcpus} vCPU</span>
+        </div>
+        <span class="value" data-quota-value>${value} vCPU</span>
+        <input
+          type="range"
+          class="quota-editor-slider"
+          data-quota-slider
+          min="${row.min_vcpus}"
+          max="${row.max_vcpus}"
+          step="${row.step_vcpus}"
+          value="${value}"
+          ${quotaEditorState.locked ? "disabled" : ""}
+        >
+      </div>
+    `;
+  }).join("");
+
+  quotaEditorBody.querySelectorAll("[data-quota-slider]").forEach((slider) => {
+    slider.addEventListener("input", (event) => {
+      const row = event.target.closest(".quota-editor-row");
+      const key = row?.dataset?.key;
+      if (!key) return;
+      const value = Number(event.target.value);
+      quotaEditorState.workingValues[key] = value;
+      const display = row.querySelector("[data-quota-value]");
+      if (display) display.textContent = `${value} vCPU`;
+    });
+  });
+}
+
+async function saveQuotaOverrides() {
+  const slug = quotaEditorState.presetSlug;
+  if (!slug) return;
+  if (!quotaEditorSaveButton) return;
+  quotaEditorSaveButton.disabled = true;
+  quotaEditorStatus.textContent = "Saving…";
+  quotaEditorStatus.classList.remove("is-error", "is-ok");
+  try {
+    const response = await fetch("/demo/quota/overrides", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({preset_slug: slug, overrides: quotaEditorState.workingValues}),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const detail = body?.detail || "Failed to save";
+      throw new Error(detail);
+    }
+    quotaEditorState.locked = Boolean(body.locked);
+    await loadCatalog();
+    renderQuotaEditorLock(Number(body.active_sessions || 0));
+    quotaEditorStatus.textContent = "Saved.";
+    quotaEditorStatus.classList.add("is-ok");
+    setTimeout(() => closeQuotaEditor(), 600);
+  } catch (error) {
+    quotaEditorStatus.textContent = error.message;
+    quotaEditorStatus.classList.add("is-error");
+  } finally {
+    if (!quotaEditorState.locked) quotaEditorSaveButton.disabled = false;
+  }
+}
+
+async function resetQuotaOverrides() {
+  const slug = quotaEditorState.presetSlug;
+  if (!slug) return;
+  quotaEditorResetButton.disabled = true;
+  quotaEditorStatus.textContent = "Resetting…";
+  quotaEditorStatus.classList.remove("is-error", "is-ok");
+  try {
+    const response = await fetch(`/demo/quota/overrides/${encodeURIComponent(slug)}/reset`, {
+      method: "POST",
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body?.detail || "Failed to reset");
+    }
+    await loadCatalog();
+    const preset = findQuotaPreset(slug);
+    (preset?.editable_rows || []).forEach((row) => {
+      quotaEditorState.workingValues[row.key] = Number(row.default_vcpus);
+    });
+    renderQuotaEditorBody();
+    renderQuotaEditorLock(Number(body.active_sessions || 0));
+    quotaEditorStatus.textContent = "Reset to defaults.";
+    quotaEditorStatus.classList.add("is-ok");
+  } catch (error) {
+    quotaEditorStatus.textContent = error.message;
+    quotaEditorStatus.classList.add("is-error");
+  } finally {
+    if (!quotaEditorState.locked) quotaEditorResetButton.disabled = false;
+  }
+}
+
+if (editQuotaButton) {
+  editQuotaButton.addEventListener("click", openQuotaEditor);
+}
+
+if (quotaEditor) {
+  quotaEditor.addEventListener("click", (event) => {
+    if (event.target?.dataset?.quotaClose === "1") {
+      closeQuotaEditor();
+    }
+  });
+}
+
+if (quotaEditorSaveButton) {
+  quotaEditorSaveButton.addEventListener("click", saveQuotaOverrides);
+}
+
+if (quotaEditorResetButton) {
+  quotaEditorResetButton.addEventListener("click", resetQuotaOverrides);
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && quotaEditorState.open) {
+    closeQuotaEditor();
+  }
+});
+
 quotaSelect.addEventListener("change", () => {
   renderSelectedQuota();
   syncManualScaleControls(currentSnapshot);
@@ -1046,39 +1283,28 @@ throttleButton.addEventListener("click", async () => {
   }
 });
 
-restoreButton.addEventListener("click", async () => {
-  const running = (((currentSnapshot || {}).runtime || {}).replicas || []).find((replica) => replica.phase === "running");
-  if (!running) {
-    launchStatus.textContent = "No running replica to restore";
-    return;
-  }
-  try {
-    await setReplicaTps(running.replica_id, currentSnapshot.launch_preview.baseline_replica_tps);
-  } catch (error) {
-    launchStatus.textContent = error.message;
-  }
-});
+if (replicaGrid) {
+  replicaGrid.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-action]");
+    if (!button) return;
+    const replicaId = button.dataset.replicaId;
+    const action = button.dataset.action;
+    const replica = getReplicaById(replicaId);
+    if (!replica) return;
 
-replicaGrid.addEventListener("click", async (event) => {
-  const button = event.target.closest("button[data-action]");
-  if (!button) return;
-  const replicaId = button.dataset.replicaId;
-  const action = button.dataset.action;
-  const replica = getReplicaById(replicaId);
-  if (!replica) return;
-
-  try {
-    if (action === "kill") {
-      await killReplica(replicaId);
-    } else if (action === "throttle") {
-      await setReplicaTps(replicaId, 250);
-    } else if (action === "restore") {
-      await setReplicaTps(replicaId, currentSnapshot.launch_preview.baseline_replica_tps);
+    try {
+      if (action === "kill") {
+        await killReplica(replicaId);
+      } else if (action === "throttle") {
+        await setReplicaTps(replicaId, 250);
+      } else if (action === "restore") {
+        await setReplicaTps(replicaId, currentSnapshot.launch_preview.baseline_replica_tps);
+      }
+    } catch (error) {
+      launchStatus.textContent = error.message;
     }
-  } catch (error) {
-    launchStatus.textContent = error.message;
-  }
-});
+  });
+}
 
 if (themeToggle) {
   bootstrapTheme();
@@ -1092,35 +1318,27 @@ if (themeToggle) {
 
 if (previewMode) {
   document.body.classList.add("preview-mode");
-  previewToolbar.hidden = false;
   form.querySelectorAll("input, select, button").forEach((element) => {
     element.disabled = true;
   });
-  previewSceneSelect.disabled = false;
-  loadPreviewButton.disabled = false;
   launchStatus.textContent = "Preview mode";
 
   loadCatalog()
     .then(async () => {
       const initialScene = pageQuery.get("scene") || "running_healthy";
-      if (previewScenes.some((scene) => scene.slug === initialScene)) {
-        previewSceneSelect.value = initialScene;
-      } else if (previewScenes[0]) {
-        previewSceneSelect.value = previewScenes[0].slug;
+      try {
+        await loadPreviewScene(initialScene);
+      } catch (error) {
+        if (initialScene !== "running_healthy") {
+          await loadPreviewScene("running_healthy");
+          return;
+        }
+        throw error;
       }
-      await loadPreviewScene(previewSceneSelect.value || "running_healthy");
     })
     .catch((error) => {
       launchStatus.textContent = error.message;
     });
-
-  loadPreviewButton.addEventListener("click", async () => {
-    try {
-      await loadPreviewScene(previewSceneSelect.value || "running_healthy");
-    } catch (error) {
-      launchStatus.textContent = error.message;
-    }
-  });
 } else {
   loadCatalog().catch((error) => {
     launchStatus.textContent = error.message;

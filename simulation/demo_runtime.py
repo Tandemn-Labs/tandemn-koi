@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import random
 import threading
 import time
 from copy import deepcopy
@@ -12,6 +13,22 @@ from simulation.demo_scenarios import due_scenario_events
 from simulation.sim_engine import SimJob, SimReplica
 
 TERMINAL_REPLICA_PHASES = {"dead", "killed", "failed", "completed"}
+
+# Display-only Gaussian noise tuning. We only wobble the rendered TPS — underlying
+# base_tps used for chunk progression, SLO headroom, and agent decisions is untouched
+# so the simulator stays deterministic under the hood while the UI feels alive.
+#
+# Tests that assert exact TPS values can call ``set_tps_noise_sigma(0.0)`` to disable
+# the jitter. The default of 4.5% matches light realistic noise on a well-tuned
+# continuous-batching runtime.
+TPS_NOISE_SIGMA = 0.045  # 4.5% standard deviation on the rendered value
+TPS_NOISE_SLOT_SEC = 2.0  # jitter bucket: same value for ~2 seconds per replica
+
+
+def set_tps_noise_sigma(sigma: float) -> None:
+    """Adjust (or disable with 0.0) the display-time Gaussian noise sigma at runtime."""
+    global TPS_NOISE_SIGMA
+    TPS_NOISE_SIGMA = max(0.0, float(sigma))
 
 
 class DemoSessionManager:
@@ -507,7 +524,14 @@ class DemoSessionManager:
             running_replicas = self._running_replicas(session)
             launching_phase = self._session_launch_phase(session, now)
 
-            runtime["aggregate_tps"] = round(aggregate_tps, 1)
+            # Display aggregate uses jittered per-replica values so the UI wobbles
+            # coherently with the per-replica TPS, while progress accounting uses the
+            # deterministic aggregate.
+            display_aggregate_tps = sum(
+                self._replica_display_tps(session, replica, now)
+                for replica in job.replicas.values()
+            )
+            runtime["aggregate_tps"] = round(display_aggregate_tps, 1)
             runtime["active_replicas"] = len(running_replicas)
             runtime["launch_phase"] = launching_phase
             runtime["tokens_completed"] = min(
@@ -1288,6 +1312,28 @@ class DemoSessionManager:
             ramp = 1.0
         return max(0.0, round(base_tps * ramp, 1))
 
+    def _replica_display_tps(
+        self, session: dict[str, Any], replica: SimReplica, now: float
+    ) -> float:
+        """Return the per-replica TPS the UI should render, with light Gaussian jitter.
+
+        Only the *display* path uses this. Progress accounting stays on
+        `_replica_tps` so chunks progress deterministically and SLO headroom math
+        doesn't bounce every snapshot.
+        """
+        deterministic = self._replica_tps(session, replica, now)
+        if deterministic <= 0:
+            return deterministic
+        # Seed per replica per 2-second slot so identical snapshots fetched
+        # close together agree, while value wobbles naturally over time.
+        slot = int(now / max(TPS_NOISE_SLOT_SEC, 0.25))
+        seed_material = f"{replica.replica_id}:{slot}"
+        rng = random.Random(seed_material)
+        noise = rng.gauss(0.0, TPS_NOISE_SIGMA)
+        # Clamp so the UI never flips sign or collapses below a believable floor.
+        noise = max(-0.18, min(0.18, noise))
+        return max(0.0, round(deterministic * (1.0 + noise), 1))
+
     def _running_replicas(self, session: dict[str, Any]) -> list[SimReplica]:
         job: SimJob = session["_orca"]["job"]
         return [
@@ -1343,7 +1389,8 @@ class DemoSessionManager:
             "pp": replica.pp,
             "has_metrics": replica.phase == "running",
             "base_tps": float(replica.base_tps),
-            "tps": self._replica_tps(session, replica, now),
+            # UI-facing TPS with light Gaussian jitter so demo feels alive.
+            "tps": self._replica_display_tps(session, replica, now),
         }
 
     @staticmethod

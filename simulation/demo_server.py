@@ -30,8 +30,11 @@ from simulation.orca_webhooks import (
     heartbeat_message,
 )
 from simulation.demo_scenarios import (
+    default_quota_overrides,
     get_quota_preset,
     get_scenario,
+    list_quota_presets,
+    quota_preset_editable_rows,
     quota_preset_to_resource_map,
     serialize_catalog,
 )
@@ -58,6 +61,99 @@ DEMO_KOI_EVENT_LOG = os.environ.get(
 )
 HEARTBEAT_INTERVAL_S = 3.0
 LAUNCH_TASKS: set[asyncio.Task] = set()
+QUOTA_OVERRIDES_PATH = Path(
+    os.environ.get(
+        "KOI_DEMO_QUOTA_OVERRIDES_PATH",
+        str(REPO_ROOT / "data" / "quota_overrides.json"),
+    )
+)
+
+
+class QuotaOverrideStore:
+    """Persistent quota overrides per preset.
+
+    Each preset is mapped to ``{quota_row_key -> baseline_vcpus}``. The store is
+    loaded from disk on init and rewritten atomically on every ``set``.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._state: dict[str, dict[str, int]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            raw = self._path.read_text()
+        except FileNotFoundError:
+            return
+        except OSError as exc:  # pragma: no cover - unusual fs errors
+            logger.warning(
+                "quota_overrides_load_failed", path=str(self._path), error=str(exc)
+            )
+            return
+        try:
+            parsed = json.loads(raw) or {}
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "quota_overrides_corrupt",
+                path=str(self._path),
+                error=str(exc),
+            )
+            return
+        if not isinstance(parsed, dict):
+            return
+        clean: dict[str, dict[str, int]] = {}
+        for slug, rows in parsed.items():
+            if not isinstance(rows, dict):
+                continue
+            clean[str(slug)] = {
+                str(k): int(v) for k, v in rows.items() if isinstance(v, (int, float))
+            }
+        self._state = clean
+
+    def _save(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._state, sort_keys=True, indent=2))
+        tmp.replace(self._path)
+
+    def get(self, slug: str) -> dict[str, int]:
+        return dict(self._state.get(slug, {}))
+
+    def all(self) -> dict[str, dict[str, int]]:
+        return {slug: dict(rows) for slug, rows in self._state.items()}
+
+    def set(self, slug: str, overrides: dict[str, int]) -> None:
+        clean = {str(k): max(0, int(v)) for k, v in overrides.items()}
+        if clean:
+            self._state[slug] = clean
+        else:
+            self._state.pop(slug, None)
+        self._save()
+
+    def reset(self, slug: str) -> None:
+        if slug in self._state:
+            self._state.pop(slug)
+            self._save()
+
+
+QUOTA_OVERRIDES = QuotaOverrideStore(QUOTA_OVERRIDES_PATH)
+
+
+def _active_session_count() -> int:
+    """Return the number of sessions that are not already completed/failed."""
+    count = 0
+    for session in SESSION_MANAGER.sessions.values():
+        runtime = session.get("runtime") or {}
+        status = runtime.get("status")
+        if status in {"completed", "launch_failed"}:
+            continue
+        count += 1
+    return count
+
+
+def _quota_overrides_locked() -> bool:
+    return _active_session_count() > 0
 
 
 class DemoLaunchRequest(BaseModel):
@@ -87,6 +183,11 @@ class KillRequest(BaseModel):
 
 class ReplicaTpsRequest(BaseModel):
     target_tps: float = Field(gt=0)
+
+
+class QuotaOverrideRequest(BaseModel):
+    preset_slug: str
+    overrides: dict[str, int]
 
 
 async def _post_koi(path: str, payload: dict, timeout: float = 20.0) -> dict:
@@ -483,6 +584,16 @@ def _require_session(session_id: str) -> dict:
 def _resolve_session_id_from_job(job_id: str) -> str:
     if job_id in SESSION_MANAGER.sessions:
         return job_id
+    # Accept replica-suffixed job ids (e.g. "<session>-r0") by mapping via replicas.
+    for session_id, session in SESSION_MANAGER.sessions.items():
+        job = session.get("_orca", {}).get("job")
+        if job is not None and job_id in getattr(job, "replicas", {}):
+            return session_id
+    # Fallback: strip a trailing "-rN" segment if present.
+    if "-r" in job_id:
+        candidate = job_id.rsplit("-r", 1)[0]
+        if candidate in SESSION_MANAGER.sessions:
+            return candidate
     raise HTTPException(status_code=404, detail=f"unknown demo job: {job_id}")
 
 
@@ -819,7 +930,122 @@ async def demo_index():
 
 @app.get("/demo/catalog")
 async def demo_catalog():
-    return serialize_catalog()
+    payload = serialize_catalog()
+    # Augment each quota preset with slider metadata and currently persisted overrides
+    # so the "Edit Quota" UI has a single place to read from.
+    overrides_map = QUOTA_OVERRIDES.all()
+    for preset in payload.get("quota_presets", []):
+        slug = preset.get("slug")
+        if not slug:
+            continue
+        overrides = overrides_map.get(slug, {})
+        preset["editable_rows"] = quota_preset_editable_rows(slug)
+        preset["overrides"] = overrides
+        preset["defaults"] = default_quota_overrides(slug)
+        # Reflect overrides directly in the quotas list so UI and agent tooling
+        # see the effective values in a single place.
+        if overrides:
+            patched_quotas = []
+            for row in preset.get("quotas", []):
+                key = (
+                    f"{str(row.get('family', '') or '').upper()}|"
+                    f"{str(row.get('region', '') or '')}|"
+                    f"{str(row.get('market', '') or '')}"
+                )
+                if key in overrides:
+                    patched = dict(row)
+                    patched["baseline_vcpus"] = int(overrides[key])
+                    patched_quotas.append(patched)
+                else:
+                    patched_quotas.append(row)
+            preset["quotas"] = patched_quotas
+    payload["quota_locked"] = _quota_overrides_locked()
+    payload["active_sessions"] = _active_session_count()
+    return payload
+
+
+@app.get("/demo/quota/overrides")
+async def demo_quota_overrides():
+    presets_meta = [
+        {
+            "slug": preset.slug,
+            "title": preset.title,
+            "defaults": default_quota_overrides(preset.slug),
+            "editable_rows": quota_preset_editable_rows(preset.slug),
+        }
+        for preset in list_quota_presets()
+    ]
+    return {
+        "locked": _quota_overrides_locked(),
+        "active_sessions": _active_session_count(),
+        "overrides": QUOTA_OVERRIDES.all(),
+        "presets": presets_meta,
+    }
+
+
+@app.post("/demo/quota/overrides")
+async def demo_set_quota_overrides(req: QuotaOverrideRequest):
+    if _quota_overrides_locked():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "quota_locked: a demo session is active; wait for it to finish "
+                "before saving quota changes."
+            ),
+        )
+    try:
+        defaults = default_quota_overrides(req.preset_slug)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"unknown quota preset: {req.preset_slug}"
+        ) from exc
+
+    valid_keys = set(defaults.keys())
+    cleaned: dict[str, int] = {}
+    for key, value in (req.overrides or {}).items():
+        if key not in valid_keys:
+            continue
+        try:
+            cleaned[key] = max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+
+    # Drop entries that match the default so the store stays lean.
+    diff = {k: v for k, v in cleaned.items() if v != defaults.get(k, -1)}
+    QUOTA_OVERRIDES.set(req.preset_slug, diff)
+    return {
+        "status": "ok",
+        "preset_slug": req.preset_slug,
+        "overrides": QUOTA_OVERRIDES.get(req.preset_slug),
+        "locked": _quota_overrides_locked(),
+        "active_sessions": _active_session_count(),
+    }
+
+
+@app.post("/demo/quota/overrides/{preset_slug}/reset")
+async def demo_reset_quota_overrides(preset_slug: str):
+    if _quota_overrides_locked():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "quota_locked: a demo session is active; wait for it to finish "
+                "before resetting quota changes."
+            ),
+        )
+    try:
+        default_quota_overrides(preset_slug)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"unknown quota preset: {preset_slug}"
+        ) from exc
+    QUOTA_OVERRIDES.reset(preset_slug)
+    return {
+        "status": "ok",
+        "preset_slug": preset_slug,
+        "overrides": {},
+        "locked": _quota_overrides_locked(),
+        "active_sessions": _active_session_count(),
+    }
 
 
 @app.get("/demo/preview/catalog")
@@ -843,8 +1069,9 @@ async def demo_preview_scene(scene_slug: str):
 
 @app.post("/demo/launch")
 async def demo_launch(req: DemoLaunchRequest):
+    preset_overrides = QUOTA_OVERRIDES.get(req.quota_preset)
     try:
-        quota = get_quota_preset(req.quota_preset)
+        quota = get_quota_preset(req.quota_preset, overrides=preset_overrides)
     except KeyError as exc:
         raise HTTPException(
             status_code=404, detail=f"unknown quota preset: {req.quota_preset}"
@@ -864,7 +1091,9 @@ async def demo_launch(req: DemoLaunchRequest):
     )
 
     session_id = f"demo-{uuid.uuid4().hex[:10]}"
-    resource_map = quota_preset_to_resource_map(req.quota_preset)
+    resource_map = quota_preset_to_resource_map(
+        req.quota_preset, overrides=preset_overrides
+    )
     launch_preview, launch_config = _compute_launch_artifacts(
         session_id=session_id,
         req=req,

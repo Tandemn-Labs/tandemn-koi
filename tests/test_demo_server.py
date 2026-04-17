@@ -8,7 +8,19 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 import simulation.demo_server as demo_server
+from simulation import demo_runtime as _demo_runtime
 from simulation.demo_server import SESSION_MANAGER, app
+
+
+@pytest.fixture(autouse=True)
+def _disable_tps_noise():
+    """Keep TPS deterministic across assertions by disabling display jitter."""
+    original = _demo_runtime.TPS_NOISE_SIGMA
+    _demo_runtime.set_tps_noise_sigma(0.0)
+    try:
+        yield
+    finally:
+        _demo_runtime.set_tps_noise_sigma(original)
 
 
 @pytest_asyncio.fixture
@@ -1059,3 +1071,114 @@ class TestDemoOrcaApi:
             if replica["replica_id"] == replica_id
         )
         assert target["phase"] == "killed"
+
+
+class TestQuotaOverrides:
+    @pytest_asyncio.fixture(autouse=True)
+    async def _reset_overrides(self, client):
+        demo_server.QUOTA_OVERRIDES._state.clear()
+        if demo_server.QUOTA_OVERRIDES_PATH.exists():
+            demo_server.QUOTA_OVERRIDES_PATH.unlink()
+        yield
+        demo_server.QUOTA_OVERRIDES._state.clear()
+        if demo_server.QUOTA_OVERRIDES_PATH.exists():
+            demo_server.QUOTA_OVERRIDES_PATH.unlink()
+
+    @pytest.mark.asyncio
+    async def test_overrides_endpoint_exposes_defaults_and_lock_state(self, client):
+        resp = await client.get("/demo/quota/overrides")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["locked"] is False
+        assert body["active_sessions"] == 0
+        slugs = [preset["slug"] for preset in body["presets"]]
+        assert "aws_l40s_roomy" in slugs
+        aws = next(p for p in body["presets"] if p["slug"] == "aws_l40s_roomy")
+        assert "G6E|us-east-1|on_demand" in aws["defaults"]
+        assert any(row["family"] == "G6E" for row in aws["editable_rows"])
+
+    @pytest.mark.asyncio
+    async def test_save_override_persists_and_applies_to_launch(self, client):
+        save = await client.post(
+            "/demo/quota/overrides",
+            json={
+                "preset_slug": "aws_l40s_roomy",
+                "overrides": {"G6E|us-east-1|on_demand": 512},
+            },
+        )
+        assert save.status_code == 200
+        assert save.json()["overrides"]["G6E|us-east-1|on_demand"] == 512
+
+        # Disk persistence check
+        assert demo_server.QUOTA_OVERRIDES_PATH.exists()
+        stored = json.loads(demo_server.QUOTA_OVERRIDES_PATH.read_text())
+        assert stored["aws_l40s_roomy"]["G6E|us-east-1|on_demand"] == 512
+
+        # Catalog reflects overrides in both the per-preset map and quotas list.
+        catalog_resp = await client.get("/demo/catalog")
+        catalog = catalog_resp.json()
+        aws = next(p for p in catalog["quota_presets"] if p["slug"] == "aws_l40s_roomy")
+        assert aws["overrides"]["G6E|us-east-1|on_demand"] == 512
+        g6e_row = next(q for q in aws["quotas"] if q["family"] == "G6E")
+        assert g6e_row["baseline_vcpus"] == 512
+
+        # Launch path should see the overridden quota in resource_map.
+        launch = await client.post(
+            "/demo/launch",
+            json={
+                "model_name": "Qwen/Qwen3-32B",
+                "avg_input_tokens": 800,
+                "avg_output_tokens": 200,
+                "quota_preset": "aws_l40s_roomy",
+                "scenario": "hero_elastic",
+            },
+        )
+        assert launch.status_code == 200
+        body = launch.json()
+        g6e = next(
+            row
+            for row in body["resource_map"]["quotas"]
+            if row["family"] == "G6E"
+        )
+        assert g6e["baseline_vcpus"] == 512
+
+    @pytest.mark.asyncio
+    async def test_lock_blocks_save_while_session_active(self, client):
+        launch = await client.post(
+            "/demo/launch",
+            json={
+                "model_name": "Qwen/Qwen3-32B",
+                "avg_input_tokens": 800,
+                "avg_output_tokens": 200,
+                "quota_preset": "aws_l40s_roomy",
+                "scenario": "hero_elastic",
+            },
+        )
+        assert launch.status_code == 200
+
+        save = await client.post(
+            "/demo/quota/overrides",
+            json={
+                "preset_slug": "aws_l40s_roomy",
+                "overrides": {"G6E|us-east-1|on_demand": 512},
+            },
+        )
+        assert save.status_code == 409
+        assert "quota_locked" in save.json()["detail"]
+
+        reset = await client.post("/demo/quota/overrides/aws_l40s_roomy/reset")
+        assert reset.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_reset_clears_overrides(self, client):
+        await client.post(
+            "/demo/quota/overrides",
+            json={
+                "preset_slug": "aws_l40s_roomy",
+                "overrides": {"G6E|us-east-1|on_demand": 256},
+            },
+        )
+        reset = await client.post("/demo/quota/overrides/aws_l40s_roomy/reset")
+        assert reset.status_code == 200
+        assert reset.json()["overrides"] == {}
+        assert not demo_server.QUOTA_OVERRIDES.get("aws_l40s_roomy")
