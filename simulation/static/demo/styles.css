@@ -803,11 +803,14 @@ button:hover {
 }
 
 .live-controls-top-actions button {
-  min-height: 44px;
+  min-height: 64px;
   border-radius: 12px;
   border-color: #111111;
   background: transparent;
   color: #111111;
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 .live-controls-top-actions button:hover {
@@ -870,7 +873,7 @@ button:hover {
 }
 
 .logs-feed {
-  height: 320px;
+  height: 360px;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 0;
@@ -889,13 +892,21 @@ button:hover {
 .chains-panel > #replica-grid {
   display: flex;
   flex-direction: column;
+  height: 360px;
+  overflow-y: auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.chains-panel > #replica-grid::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .chains-panel > #replica-grid:has(> .console-empty:only-child),
 .chains-panel > #replica-grid:has(> .replica-table-empty:only-child) {
   align-items: center;
   justify-content: center;
-  min-height: 320px;
 }
 
 .logs-feed::-webkit-scrollbar {
@@ -959,15 +970,22 @@ button:hover {
 .replica-tbl {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.8rem;
+  font-size: 1.05rem;
   white-space: nowrap;
 }
 
+.replica-tbl thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
+}
+
 .replica-tbl th {
-  padding: 9px 10px;
+  padding: 10px 12px;
   text-align: left;
   color: var(--muted);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.1em;
   border-bottom: 1px solid var(--line);
@@ -975,8 +993,11 @@ button:hover {
 }
 
 .replica-tbl td {
-  padding: 9px 10px;
+  padding: 28px 12px;
   border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  height: 110px;
+  box-sizing: border-box;
 }
 
 .replica-tbl tbody tr:last-child td {
@@ -1020,8 +1041,8 @@ button:hover {
 }
 
 .table-actions .secondary-button {
-  padding: 6px 8px;
-  font-size: 0.73rem;
+  padding: 10px 14px;
+  font-size: 0.88rem;
 }
 
 .replica-table-empty,
@@ -1065,24 +1086,28 @@ button:hover {
   grid-template-columns: 84px 40px minmax(0, 1fr);
   gap: 10px;
   align-items: start;
-  padding: 10px 0;
-  border-top: 0;
+  min-height: 120px;
+  height: 120px;
+  padding: 24px 0;
+  border-top: 1px solid var(--line);
+  flex-shrink: 0;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .console-line:first-child {
   border-top: 0;
-  padding-top: 0;
 }
 
 .console-time {
   color: var(--muted);
-  font-size: 0.73rem;
+  font-size: 0.85rem;
   white-space: nowrap;
 }
 
 .console-source {
   color: var(--muted);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
@@ -1096,14 +1121,14 @@ button:hover {
 }
 
 .console-title {
-  font-size: 0.88rem;
-  line-height: 1.38;
+  font-size: 1.05rem;
+  line-height: 1.4;
 }
 
 .console-text {
   color: var(--muted);
-  font-size: 0.78rem;
-  line-height: 1.45;
+  font-size: 0.92rem;
+  line-height: 1.5;
 }
 
 .source-koi .console-source {
@@ -1122,11 +1147,25 @@ button:hover {
   font-weight: 650;
 }
 
+@keyframes reasoning-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
 .reasoning-panel {
   background: var(--surface);
   padding: 28px 32px 30px;
   display: grid;
   gap: 16px;
+}
+
+.reasoning-panel[data-state="thinking"] {
+  outline: 2px solid var(--text);
+  outline-offset: -2px;
+}
+
+.reasoning-panel[data-state="thinking"] .reasoning-copy {
+  animation: reasoning-pulse 1.4s ease-in-out infinite;
 }
 
 .reasoning-header {
@@ -1158,8 +1197,8 @@ button:hover {
   padding: 2px 4px 2px 0;
   border: 0;
   background: transparent;
-  font-size: 0.93rem;
-  line-height: 1.62;
+  font-size: 1.5rem;
+  line-height: 1.6;
 }
 
 .reasoning-copy.is-empty {

@@ -40,6 +40,29 @@ class DemoSessionManager:
         with self._lock:
             self.sessions.clear()
 
+    def fail_active_sessions(self, now: Optional[float] = None) -> int:
+        """Mark all non-terminal sessions as failed. Frees quota and stops progress."""
+        now = float(now or time.time())
+        failed = 0
+        with self._lock:
+            for session in self.sessions.values():
+                job: SimJob = session["_orca"]["job"]
+                if job.status in {"succeeded", "failed"}:
+                    continue
+                for replica in job.replicas.values():
+                    if replica.phase not in TERMINAL_REPLICA_PHASES:
+                        replica.phase = "failed"
+                job.status = "failed"
+                runtime = session["runtime"]
+                runtime["status"] = "launch_failed"
+                runtime["error"] = "Session abandoned on page reload"
+                session["launch_failure"] = {
+                    "reason": "abandoned",
+                    "message": "Session abandoned on page reload",
+                }
+                failed += 1
+        return failed
+
     def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             session = deepcopy(payload)
@@ -716,6 +739,8 @@ class DemoSessionManager:
             for instance in session.get("resource_map", {}).get("instances", [])
         }
         job: SimJob = session["_orca"]["job"]
+        if job.status in {"succeeded", "failed"}:
+            return usage
         for replica in job.replicas.values():
             if replica.phase in TERMINAL_REPLICA_PHASES:
                 continue
@@ -1121,12 +1146,13 @@ class DemoSessionManager:
                     ):
                         quotas_by_key[key] = deepcopy(quota)
                 job: SimJob = session["_orca"]["job"]
-                for replica in job.replicas.values():
-                    if replica.phase in TERMINAL_REPLICA_PHASES:
-                        continue
-                    allocated_gpus[replica.gpu_type] = allocated_gpus.get(
-                        replica.gpu_type, 0
-                    ) + max(1, int(replica.tp) * int(replica.pp))
+                if job.status not in {"succeeded", "failed"}:
+                    for replica in job.replicas.values():
+                        if replica.phase in TERMINAL_REPLICA_PHASES:
+                            continue
+                        allocated_gpus[replica.gpu_type] = allocated_gpus.get(
+                            replica.gpu_type, 0
+                        ) + max(1, int(replica.tp) * int(replica.pp))
 
             used_vcpus_by_key = self._cluster_quota_usage_locked(now)
 

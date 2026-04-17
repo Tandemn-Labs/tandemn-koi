@@ -925,6 +925,7 @@ async def demo_health():
 
 @app.get("/demo")
 async def demo_index():
+    SESSION_MANAGER.fail_active_sessions()
     return FileResponse(STATIC_DIR / "index.html")
 
 

@@ -4,6 +4,7 @@ const quotaSelect = document.getElementById("quota-select");
 const scenarioSelect = document.getElementById("scenario-select");
 const modelInput = document.getElementById("model-input");
 const launchStatus = document.getElementById("launch-status");
+const launchButton = document.getElementById("launch-button");
 const sessionLabel = document.getElementById("session-label");
 const activityConsole = document.getElementById("activity-console");
 const replicaGrid = document.getElementById("replica-grid");
@@ -830,7 +831,9 @@ function startStream(sessionId) {
     launchStatus.textContent = snapshot.runtime.status === "koi_deciding"
       ? "Koi deciding..."
       : "Streaming";
-    if (!lockRefreshed && ["completed", "launch_failed"].includes(snapshot.runtime.status)) {
+    const isDone = ["completed", "launch_failed"].includes(snapshot.runtime.status);
+    launchButton.textContent = isDone ? "Launch Demo" : "Running Demo";
+    if (!lockRefreshed && isDone) {
       lockRefreshed = true;
       // Pick up the lock-released state once the live session ends.
       loadCatalog().catch(() => {});
@@ -861,6 +864,7 @@ async function launchSession(payload) {
   renderSession(session);
   startStream(session.session_id);
   launchStatus.textContent = "Koi deciding...";
+  launchButton.textContent = "Running Demo";
   // Refresh catalog so the Edit Quota lock state reflects the new live session.
   loadCatalog().catch(() => {});
 }
