@@ -181,8 +181,24 @@ async def lifespan(app: FastAPI):
         "KOI_RUNTIME_STATE_PATH", "./data/koi_runtime.db"
     )
     orca_url = os.environ.get("ORCA_URL", "")
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     model = os.environ.get("KOI_LLM_MODEL", "claude-sonnet-4-6")
+
+    # Validate the API key at startup — but only when the real agent will
+    # actually be constructed. Sim / CI / KOI_TEST_FAKE_DECIDE=1 paths
+    # bypass the agent entirely and must keep working without a key.
+    if os.environ.get("KOI_TEST_FAKE_DECIDE") != "1":
+        if not api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is required to start Koi with the real "
+                "agent. Set the env var, or set KOI_TEST_FAKE_DECIDE=1 for "
+                "sim/CI paths that don't need an LLM."
+            )
+        if not api_key.startswith("sk-ant-"):
+            raise RuntimeError(
+                f"ANTHROPIC_API_KEY appears malformed (expected 'sk-ant-' "
+                f"prefix, got {api_key[:8]!r}...)."
+            )
 
     # PerfDB
     try:
