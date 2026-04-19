@@ -327,7 +327,7 @@ class JobTracker(BaseModel):
     config: PlacementConfig
     slo_deadline_hours: float
     total_tokens: int
-    predicted_tps: float
+    predicted_tps: Optional[float] = None
     started_at: datetime = Field(default_factory=datetime.utcnow)
 
     # Live state (updated every poll)

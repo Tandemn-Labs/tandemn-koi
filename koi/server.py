@@ -600,7 +600,7 @@ class JobStartedRequest(BaseModel):
     dp: int = 1
     slo_deadline_hours: float
     total_tokens: int
-    predicted_tps: float = 0.0
+    predicted_tps: Optional[float] = 0.0
     is_fallback: bool = False  # True if Orca used a fallback config (not primary)
 
 
