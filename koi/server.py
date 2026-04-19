@@ -12,12 +12,14 @@ Usage:
 """
 
 import asyncio
+import hashlib
+import json
 import os
 import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
@@ -30,7 +32,7 @@ from koi.event_tap import emit_event
 from koi.logging_config import setup_logging, get_logger, bind_context, clear_context
 from koi.monitor import MonitoringLoop
 from koi.resource_ledger import ResourceLedger
-from koi.runtime_state import RuntimeStateStore
+from koi.runtime_state import ClaimResult, RuntimeStateStore
 from koi.schemas import (
     AgentDecision,
     DataSource,
@@ -317,6 +319,89 @@ def _classify_failure(reason: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Inbox wrapping
+# ---------------------------------------------------------------------------
+
+
+def _hash_payload(payload: Dict[str, Any]) -> str:
+    """Stable sha256 hash of a payload — used for inbox payload_hash."""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def _synthesize_legacy_event_id(
+    payload: Dict[str, Any], event_type: str, job_id: str
+) -> str:
+    """Derive a stable event_id from a legacy (pre-envelope) payload.
+
+    Shape: 'legacy:<event_type>:<job_id>:<hash16>' — same payload produces
+    the same id, so a legacy Orca retrying the identical request still dedups.
+    """
+    return f"legacy:{event_type}:{job_id}:{_hash_payload(payload)[:16]}"
+
+
+async def _run_with_inbox(
+    req: BaseModel,
+    event_type: str,
+    job_id: str,
+    handler: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Claim the event, run the handler, mark processed on success.
+
+    Crash discipline: if the handler raises, the row stays in 'processing'
+    with last_error set. Orca's next retry, once the reclaim window elapses,
+    sees the claim as stale and re-runs the handler. No events lost.
+    """
+    runtime: Optional[RuntimeStateStore] = getattr(app.state, "runtime_state", None)
+    if runtime is None:
+        # Inbox not configured (dev harness / legacy embed) — pass-through.
+        return await handler()
+    payload = req.model_dump()
+    event_id = getattr(req, "event_id", None) or _synthesize_legacy_event_id(
+        payload, event_type, job_id
+    )
+    payload_hash = _hash_payload(payload)
+
+    result = runtime.claim_event(
+        event_id=event_id,
+        event_type=event_type,
+        job_id=job_id,
+        payload_hash=payload_hash,
+    )
+    if result == ClaimResult.ALREADY_PROCESSED:
+        logger.info(
+            "inbox_duplicate_ignored",
+            event_id=event_id,
+            event_type=event_type,
+            job_id=job_id,
+        )
+        return {"status": "duplicate_ignored", "event_id": event_id}
+    if result == ClaimResult.IN_FLIGHT:
+        logger.info(
+            "inbox_in_flight",
+            event_id=event_id,
+            event_type=event_type,
+            job_id=job_id,
+        )
+        return {"status": "in_flight", "event_id": event_id}
+    if result == ClaimResult.RECLAIMED_STALE:
+        logger.warning(
+            "inbox_reclaimed_stale",
+            event_id=event_id,
+            event_type=event_type,
+            job_id=job_id,
+        )
+    try:
+        response = await handler()
+        runtime.mark_processed(event_id)
+        return response
+    except Exception as exc:
+        runtime.mark_failed(event_id, repr(exc))
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -545,92 +630,108 @@ async def job_launching(req: JobLaunchingRequest):
 
     Gives Koi early visibility into GPU spend before model_ready.
     """
-    monitor: MonitoringLoop = app.state.monitor
-    now = time.time()
-    if req.decision_id:
-        app.state.ledger.touch(req.decision_id)
-    monitor.track_pending_launch(
-        req.job_id,
-        {
-            "decision_id": req.decision_id,
-            "group_id": req.group_id,
-            "gpu_type": req.gpu_type,
-            "instance_type": req.instance_type,
-            "tp": req.tp,
-            "pp": req.pp,
-            "region": req.region,
-            "market": req.market,
-            "attempt_index": req.attempt_index,
-            "launch_phase": "waiting_model_ready",
-            "launch_message": "Replica provisioned, waiting for model_ready",
-            "launched_at": now,
-            "last_heartbeat_at": now,
-        },
-    )
-    logger.info(
-        "job_launching",
-        job_id=req.job_id,
-        group_id=req.group_id,
-        gpu_type=req.gpu_type,
-        instance_type=req.instance_type,
-    )
-    emit_event(
-        "job_launching",
-        job_id=req.job_id,
-        group_id=req.group_id,
-        gpu_type=req.gpu_type,
-        instance_type=req.instance_type,
-    )
-    return {"status": "tracked", "job_id": req.job_id}
+
+    async def _do() -> Dict[str, Any]:
+        monitor: MonitoringLoop = app.state.monitor
+        now = time.time()
+        if req.decision_id:
+            app.state.ledger.touch(req.decision_id)
+        monitor.track_pending_launch(
+            req.job_id,
+            {
+                "decision_id": req.decision_id,
+                "group_id": req.group_id,
+                "gpu_type": req.gpu_type,
+                "instance_type": req.instance_type,
+                "tp": req.tp,
+                "pp": req.pp,
+                "region": req.region,
+                "market": req.market,
+                "attempt_index": req.attempt_index,
+                "launch_phase": "waiting_model_ready",
+                "launch_message": "Replica provisioned, waiting for model_ready",
+                "launched_at": now,
+                "last_heartbeat_at": now,
+            },
+        )
+        logger.info(
+            "job_launching",
+            job_id=req.job_id,
+            group_id=req.group_id,
+            gpu_type=req.gpu_type,
+            instance_type=req.instance_type,
+        )
+        emit_event(
+            "job_launching",
+            job_id=req.job_id,
+            group_id=req.group_id,
+            gpu_type=req.gpu_type,
+            instance_type=req.instance_type,
+        )
+        return {"status": "tracked", "job_id": req.job_id}
+
+    return await _run_with_inbox(req, "job_launching", req.job_id, _do)
 
 
 @app.post("/job/launch-heartbeat")
 async def job_launch_heartbeat(req: JobLaunchHeartbeatRequest):
     """Called by Orca while a replica is still searching/provisioning/bootstrapping."""
-    monitor: MonitoringLoop = app.state.monitor
-    heartbeat_at = req.timestamp or time.time()
-    refreshed = False
-    if req.decision_id:
-        refreshed = app.state.ledger.touch(req.decision_id)
-    monitor.track_pending_launch(
-        req.job_id,
-        {
-            "decision_id": req.decision_id,
-            "group_id": req.group_id,
-            "gpu_type": req.gpu_type,
-            "instance_type": req.instance_type,
-            "tp": req.tp,
-            "pp": req.pp,
-            "region": req.region,
-            "market": req.market,
-            "attempt_index": req.attempt_index,
-            "launch_phase": req.phase,
-            "launch_message": req.message,
-            "last_heartbeat_at": heartbeat_at,
-        },
-    )
-    logger.info(
-        "job_launch_heartbeat",
-        job_id=req.job_id,
-        group_id=req.group_id,
-        phase=req.phase,
-        attempt_index=req.attempt_index,
-        refreshed=refreshed,
-    )
-    emit_event(
-        "job_launch_heartbeat",
-        job_id=req.job_id,
-        group_id=req.group_id,
-        phase=req.phase,
-        attempt_index=req.attempt_index,
-        refreshed=refreshed,
-    )
-    return {"status": "tracked", "job_id": req.job_id, "lease_refreshed": refreshed}
+
+    async def _do() -> Dict[str, Any]:
+        monitor: MonitoringLoop = app.state.monitor
+        heartbeat_at = req.timestamp or time.time()
+        refreshed = False
+        if req.decision_id:
+            refreshed = app.state.ledger.touch(req.decision_id)
+        monitor.track_pending_launch(
+            req.job_id,
+            {
+                "decision_id": req.decision_id,
+                "group_id": req.group_id,
+                "gpu_type": req.gpu_type,
+                "instance_type": req.instance_type,
+                "tp": req.tp,
+                "pp": req.pp,
+                "region": req.region,
+                "market": req.market,
+                "attempt_index": req.attempt_index,
+                "launch_phase": req.phase,
+                "launch_message": req.message,
+                "last_heartbeat_at": heartbeat_at,
+            },
+        )
+        logger.info(
+            "job_launch_heartbeat",
+            job_id=req.job_id,
+            group_id=req.group_id,
+            phase=req.phase,
+            attempt_index=req.attempt_index,
+            refreshed=refreshed,
+        )
+        emit_event(
+            "job_launch_heartbeat",
+            job_id=req.job_id,
+            group_id=req.group_id,
+            phase=req.phase,
+            attempt_index=req.attempt_index,
+            refreshed=refreshed,
+        )
+        return {"status": "tracked", "job_id": req.job_id, "lease_refreshed": refreshed}
+
+    return await _run_with_inbox(req, "job_launch_heartbeat", req.job_id, _do)
 
 
 @app.post("/job/started")
 async def job_started(req: JobStartedRequest):
     """Called by Orca AFTER a job successfully launches. Registers in monitor."""
+
+    async def _do() -> Dict[str, Any]:
+        return await _job_started_impl(req)
+
+    return await _run_with_inbox(req, "job_started", req.job_id, _do)
+
+
+async def _job_started_impl(req: JobStartedRequest) -> Dict[str, Any]:
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
 
@@ -785,8 +886,16 @@ async def job_complete(req: JobCompleteRequest):
     Two modes:
       1. Single-chain job: req.job_id matches a tracked chain directly
       2. Job group (chunked): req.job_id matches the group_id of multiple chains
-         → aggregates metrics across all chains, records ONE outcome
+         → records PER-CHAIN outcomes across all chains
     """
+
+    async def _do() -> Dict[str, Any]:
+        return await _job_complete_impl(req)
+
+    return await _run_with_inbox(req, "job_complete", req.job_id, _do)
+
+
+async def _job_complete_impl(req: JobCompleteRequest) -> Dict[str, Any]:
     monitor: MonitoringLoop = app.state.monitor
     memory: AgenticMemory = app.state.memory
 
@@ -903,6 +1012,14 @@ class ReplicaFailedRequest(BaseModel):
 @app.post("/job/replica-failed")
 async def replica_failed(req: ReplicaFailedRequest):
     """Called by Orca when a replica dies mid-job. Triggers agent for diagnosis."""
+
+    async def _do() -> Dict[str, Any]:
+        return await _replica_failed_impl(req)
+
+    return await _run_with_inbox(req, "replica_failed", req.job_id, _do)
+
+
+async def _replica_failed_impl(req: ReplicaFailedRequest) -> Dict[str, Any]:
     monitor: MonitoringLoop = app.state.monitor
     tracker = monitor.tracked_jobs.get(req.job_id)
     if not tracker:
@@ -1022,6 +1139,14 @@ class ConfigAttemptRequest(BaseModel):
 @app.post("/job/config-attempted")
 async def config_attempted(req: ConfigAttemptRequest):
     """Called by Orca for EACH allocation attempt (success or failure)."""
+
+    async def _do() -> Dict[str, Any]:
+        return await _config_attempted_impl(req)
+
+    return await _run_with_inbox(req, "config_attempted", req.job_id, _do)
+
+
+async def _config_attempted_impl(req: ConfigAttemptRequest) -> Dict[str, Any]:
     memory: AgenticMemory = app.state.memory
     memory.record_launch_attempt(
         decision_id=req.decision_id or f"unknown-{req.job_id}",
@@ -1088,6 +1213,14 @@ class LaunchFailedRequest(BaseModel):
 @app.post("/job/launch-failed")
 async def job_launch_failed(req: LaunchFailedRequest):
     """Called by Orca when ALL alternative configs failed to launch."""
+
+    async def _do() -> Dict[str, Any]:
+        return await _job_launch_failed_impl(req)
+
+    return await _run_with_inbox(req, "launch_failed", req.job_id, _do)
+
+
+async def _job_launch_failed_impl(req: LaunchFailedRequest) -> Dict[str, Any]:
     memory: AgenticMemory = app.state.memory
     monitor: MonitoringLoop = app.state.monitor
 

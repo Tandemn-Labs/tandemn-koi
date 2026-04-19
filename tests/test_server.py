@@ -16,6 +16,7 @@ from koi.schemas import (
 )
 from koi.server import app
 from koi.resource_ledger import ResourceLedger
+from koi.runtime_state import RuntimeStateStore
 from koi.tools.memory import AgenticMemory
 from koi.tools.perfdb import PerfDB
 
@@ -58,6 +59,7 @@ async def client():
     app.state.perfdb = MagicMock()
     app.state.perfdb.record_count = 307
     app.state.memory = memory
+    app.state.runtime_state = RuntimeStateStore(":memory:")
     app.state.ledger = ResourceLedger()
     app.state.decide_lock = asyncio.Lock()
     app.state.orca = None
