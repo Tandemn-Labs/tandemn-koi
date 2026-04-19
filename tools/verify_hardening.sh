@@ -95,18 +95,31 @@ else
 fi
 
 # ----------------------------------------------------------------------
-echo "=== [5/5] Per-chain outcome uniqueness ==="
+# Only check outcomes written after the hardening was deployed. Pre-hardening
+# rows may have legacy duplicates; the unique index added in Phase 2d blocks
+# NEW duplicates but doesn't retroactively dedup. Tunable via env.
+echo "=== [5/5] Per-chain outcome uniqueness (recent only) ==="
+OUTCOME_SINCE_DAYS="${OUTCOME_SINCE_DAYS:-1}"
 if [ ! -f "$KOI_MEMORY_DB" ]; then
   echo "  (skip) $KOI_MEMORY_DB not found"
 else
   dupes=$(sqlite3 "$KOI_MEMORY_DB" \
-    "SELECT COUNT(*) FROM (SELECT decision_id, job_id, status, COUNT(*) n FROM outcomes
-     GROUP BY decision_id, job_id, status HAVING n > 1)" 2>/dev/null || echo err)
+    "SELECT COUNT(*) FROM (
+       SELECT decision_id, job_id, status, COUNT(*) n FROM outcomes
+       WHERE timestamp > datetime('now', '-${OUTCOME_SINCE_DAYS} day')
+       GROUP BY decision_id, job_id, status HAVING n > 1
+     )" 2>/dev/null || echo err)
+  recent=$(sqlite3 "$KOI_MEMORY_DB" \
+    "SELECT COUNT(*) FROM outcomes
+     WHERE timestamp > datetime('now', '-${OUTCOME_SINCE_DAYS} day')" 2>/dev/null || echo err)
   if [ "$dupes" = "0" ]; then
-    total=$(sqlite3 "$KOI_MEMORY_DB" "SELECT COUNT(*) FROM outcomes" 2>/dev/null || echo err)
-    ok "no duplicate outcomes (total=$total)"
+    ok "no duplicate outcomes in last ${OUTCOME_SINCE_DAYS}d (recent=$recent)"
   else
-    bad "$dupes duplicate (decision_id, job_id, status) groups"
+    bad "$dupes duplicate (decision_id, job_id, status) groups in last ${OUTCOME_SINCE_DAYS}d"
+    sqlite3 "$KOI_MEMORY_DB" \
+      "SELECT decision_id, job_id, status, COUNT(*) n FROM outcomes
+       WHERE timestamp > datetime('now', '-${OUTCOME_SINCE_DAYS} day')
+       GROUP BY decision_id, job_id, status HAVING n > 1 LIMIT 5"
   fi
 fi
 
