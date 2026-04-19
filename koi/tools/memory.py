@@ -116,12 +116,27 @@ class AgenticMemory:
             CREATE INDEX IF NOT EXISTS idx_decisions_model ON decisions(model_name);
             CREATE INDEX IF NOT EXISTS idx_outcomes_job ON outcomes(job_id);
             CREATE INDEX IF NOT EXISTS idx_outcomes_status ON outcomes(status);
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_outcomes_chain
-                ON outcomes(decision_id, job_id, status);
             CREATE INDEX IF NOT EXISTS idx_launch_instance ON launch_attempts(instance_type, region);
             CREATE INDEX IF NOT EXISTS idx_avail_gpu ON availability_priors(gpu_type);
         """)
         conn.commit()
+
+        # The outcomes table is append-only — we never delete historical rows.
+        # Dedup is enforced on INSERT via `WHERE NOT EXISTS` in record_outcome.
+        # The unique index is created BEST-EFFORT as belt-and-suspenders on
+        # fresh DBs; if a legacy DB already contains structural duplicates
+        # (from pre-hardening replays), index creation fails and we proceed
+        # without it — application-level dedup still prevents new duplicates.
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_outcomes_chain "
+                "ON outcomes(decision_id, job_id, status)"
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            # Legacy duplicates detected — leave historical rows untouched.
+            # record_outcome's WHERE NOT EXISTS still prevents new ones.
 
     # ------------------------------------------------------------------
     # Write operations
@@ -233,15 +248,24 @@ class AgenticMemory:
                 * 100
             )
 
+        # Append-only dedup: skip the INSERT if a row with the same
+        # (decision_id, job_id, status) already exists. Historical rows
+        # are never touched; we just don't add another. This is the second
+        # line of defense under inbox event dedup in koi/server.py.
         cur = conn.execute(
             """
-            INSERT OR IGNORE INTO outcomes (
+            INSERT INTO outcomes (
                 outcome_id, decision_id, job_id, status,
                 actual_tps, actual_cost_per_hour, actual_total_cost,
                 actual_runtime_hours,
                 delta_tps_pct, delta_cost_pct, slo_met, slo_headroom_pct,
                 failure_category, diagnosis, bottleneck, diff_from_parent
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM outcomes
+                WHERE decision_id = ? AND job_id = ? AND status = ?
+            )
         """,
             (
                 outcome_id,
@@ -260,13 +284,15 @@ class AgenticMemory:
                 diagnosis,
                 bottleneck,
                 diff_from_parent,
+                # Parameters for the NOT EXISTS sub-select:
+                decision_id,
+                job_id,
+                status,
             ),
         )
         conn.commit()
         if cur.rowcount == 0:
-            # Duplicate (decision_id, job_id, status) — return existing row's id
-            # so callers get a coherent value. ux_outcomes_chain is the
-            # SQL-level safety net under the inbox dedup in koi/server.py.
+            # Duplicate — return the existing row's outcome_id.
             existing = conn.execute(
                 "SELECT outcome_id FROM outcomes "
                 "WHERE decision_id = ? AND job_id = ? AND status = ?",

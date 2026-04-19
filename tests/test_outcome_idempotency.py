@@ -112,6 +112,66 @@ class TestLegitimatelyDistinctOutcomes:
         assert memory.outcome_count() == 3
 
 
+class TestAppendOnlyInvariant:
+    """The outcomes table is sacred learning data. `record_outcome` must
+    NEVER delete existing rows — only add new ones, and skip duplicates."""
+
+    def test_legacy_duplicates_preserved_across_init(self, tmp_path):
+        """Simulate a pre-hardening DB with structural duplicates and verify
+        that instantiating AgenticMemory on it does NOT delete the duplicates.
+        The unique index creation is best-effort and silently skipped when
+        the existing data would violate it."""
+        import sqlite3
+
+        db_path = tmp_path / "legacy.db"
+        # Hand-build an "old schema" DB (no unique index) with duplicate rows.
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            """
+            CREATE TABLE outcomes (
+                outcome_id TEXT PRIMARY KEY,
+                decision_id TEXT,
+                job_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                actual_tps REAL
+            )
+            """
+        )
+        raw.execute(
+            "INSERT INTO outcomes (outcome_id, decision_id, job_id, status, actual_tps) VALUES (?,?,?,?,?)",
+            ("legacy-1", "d-1", "mo-abc", "succeeded", 100),
+        )
+        raw.execute(
+            "INSERT INTO outcomes (outcome_id, decision_id, job_id, status, actual_tps) VALUES (?,?,?,?,?)",
+            ("legacy-2", "d-1", "mo-abc", "succeeded", 200),
+        )
+        raw.commit()
+        raw.close()
+
+        # Now open it via AgenticMemory — must not raise, must not delete.
+        from koi.tools.memory import AgenticMemory
+
+        memory = AgenticMemory(db_path=str(db_path))
+        assert memory.outcome_count() == 2, (
+            "init_tables must not touch existing outcome rows, even duplicates"
+        )
+
+    def test_record_outcome_never_deletes(self, memory):
+        """record_outcome inserts-or-skips, never deletes."""
+        did = _record_decision(memory)
+        memory.record_outcome(
+            decision_id=did, job_id="mo-abc", status="succeeded", actual_tps=100
+        )
+        # Call with different metrics on same (decision_id, job_id, status):
+        # dedup skips the new insert, but the original row stays unmodified.
+        memory.record_outcome(
+            decision_id=did, job_id="mo-abc", status="succeeded", actual_tps=9999
+        )
+        rows = memory.query_outcomes(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["actual_tps"] == 100  # first-write-wins, unchanged
+
+
 class TestPerChainGroupReplayScenario:
     """The real blocker #4 scenario: duplicate /job/complete webhook replays N
     per-chain outcomes, not one aggregate. The unique index makes the replay
