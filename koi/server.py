@@ -181,24 +181,37 @@ async def lifespan(app: FastAPI):
         "KOI_RUNTIME_STATE_PATH", "./data/koi_runtime.db"
     )
     orca_url = os.environ.get("ORCA_URL", "")
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    model = os.environ.get("KOI_LLM_MODEL", "claude-sonnet-4-6")
+    provider = os.environ.get("KOI_LLM_PROVIDER", "openrouter").lower()
+    base_url = os.environ.get("KOI_BASE_URL")
+    # KOI_LLM_MODEL is a deprecated alias for KOI_AGENT_MODEL.
+    legacy_model = os.environ.get("KOI_LLM_MODEL")
+    model = os.environ.get("KOI_AGENT_MODEL") or legacy_model
+    if legacy_model and not os.environ.get("KOI_AGENT_MODEL"):
+        logger.warning(
+            "koi_llm_model_deprecated",
+            message="KOI_LLM_MODEL is deprecated; use KOI_AGENT_MODEL",
+        )
+    if provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    else:
+        api_key = (
+            os.environ.get("KOI_API_KEY", "").strip()
+            or os.environ.get("OPENROUTER_API_KEY", "").strip()
+        )
 
     # Validate the API key at startup — but only when the real agent will
     # actually be constructed. Sim / CI / KOI_TEST_FAKE_DECIDE=1 paths
     # bypass the agent entirely and must keep working without a key.
-    if os.environ.get("KOI_TEST_FAKE_DECIDE") != "1":
-        if not api_key:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY is required to start Koi with the real "
-                "agent. Set the env var, or set KOI_TEST_FAKE_DECIDE=1 for "
-                "sim/CI paths that don't need an LLM."
-            )
-        if not api_key.startswith("sk-ant-"):
-            raise RuntimeError(
-                f"ANTHROPIC_API_KEY appears malformed (expected 'sk-ant-' "
-                f"prefix, got {api_key[:8]!r}...)."
-            )
+    if os.environ.get("KOI_TEST_FAKE_DECIDE") != "1" and not api_key:
+        expected = (
+            "ANTHROPIC_API_KEY" if provider == "anthropic"
+            else "KOI_API_KEY (or OPENROUTER_API_KEY)"
+        )
+        raise RuntimeError(
+            f"{expected} is required to start Koi with KOI_LLM_PROVIDER="
+            f"{provider!r}. Set the env var, or set KOI_TEST_FAKE_DECIDE=1 "
+            f"for sim/CI paths that don't need an LLM."
+        )
 
     # PerfDB
     try:
@@ -238,7 +251,7 @@ async def lifespan(app: FastAPI):
 
     # Agent
     if os.environ.get("KOI_TEST_FAKE_DECIDE") == "1":
-        app.state.agent = _FixedTestAgent(model=model)
+        app.state.agent = _FixedTestAgent(model=model or "test")
         logger.warning(
             "agent_ready_test_mode",
             model=app.state.agent.model,
@@ -253,8 +266,10 @@ async def lifespan(app: FastAPI):
             ledger=app.state.ledger,
             api_key=api_key,
             model=model,
+            base_url=base_url,
+            provider=provider,
         )
-        logger.info("agent_ready", model=model)
+        logger.info("agent_ready", provider=provider, model=app.state.agent.model)
 
     # Monitor
     app.state.monitor = MonitoringLoop(
