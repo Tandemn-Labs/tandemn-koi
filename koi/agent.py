@@ -1,7 +1,8 @@
 """
-koi/agent.py — The Koi Agent: Claude with domain tools for GPU placement.
+koi/agent.py — The Koi Agent: LLM with domain tools for GPU placement.
 
-Uses anthropic SDK's @beta_tool + tool_runner for automatic agentic loop.
+Drives the agentic loop through pydantic-ai (see koi/llm/). Provider chosen
+via KOI_LLM_PROVIDER: "openrouter" (default, OpenAI-compatible) or "anthropic".
 The agent queries PerfDB, memory, resources, and physics to make placement
 decisions, then launches via Orca and monitors via the monitoring loop.
 """
@@ -11,10 +12,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-import httpx
-from anthropic import AsyncAnthropic, beta_async_tool
-
 from koi.event_tap import emit_event
+from koi.llm import KoiToolRunner, build_model
 from koi.logging_config import get_logger
 from koi.schemas import (
     AgentDecision,
@@ -133,18 +132,22 @@ class KoiAgent:
         orca: Optional[OrcaClient] = None,
         ledger=None,
         api_key: Optional[str] = None,
-        model: str = "claude-sonnet-4-6",
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        provider: Optional[str] = None,
     ):
         self.perfdb = perfdb
         self.memory = memory
         self.orca = orca
         self.ledger = ledger
-        self.model = model
         self.monitor = None  # set by server.py after monitor is created
-        self._client = AsyncAnthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", ""),
-            timeout=httpx.Timeout(timeout=120.0, connect=5.0),
+        self._model = build_model(
+            provider=provider,
+            base_url=base_url,
+            model_id=model,
+            api_key=api_key,
         )
+        self.model = self._model.model_name
 
     # ------------------------------------------------------------------
     # Tools — defined as @beta_tool functions
@@ -177,7 +180,6 @@ class KoiAgent:
             live_snapshot["resource_map"] = rm
             return raw, rm
 
-        @beta_async_tool
         async def query_perfdb(
             model_name: Optional[str] = None,
             gpu_type: Optional[str] = None,
@@ -208,7 +210,6 @@ class KoiAgent:
             )
             return result
 
-        @beta_async_tool
         async def query_memory_tool(
             model_name: Optional[str] = None,
             job_id: Optional[str] = None,
@@ -222,7 +223,6 @@ class KoiAgent:
                 memory, model_name=model_name, job_id=job_id, status=status, limit=limit
             )
 
-        @beta_async_tool
         async def get_gpu_physics_tool(
             gpu_type: str,
             model_name: Optional[str] = None,
@@ -230,12 +230,10 @@ class KoiAgent:
             """Get GPU hardware specs (bandwidth, TFLOPS, VRAM). If model_name provided, shows per-TP VRAM analysis."""
             return get_gpu_physics(gpu_type, model_name=model_name)
 
-        @beta_async_tool
         async def get_model_arch_tool(model_name: str) -> str:
             """Get model architecture: params, layers, heads, KV heads, GQA ratio, size. Fetches from HF Hub if unknown."""
             return get_model_arch(model_name)
 
-        @beta_async_tool
         async def find_similar_models_tool(model_name: str) -> str:
             """Find PerfDB models with similar architecture (by physics-vector distance). Use when target model has no PerfDB data."""
             mf = get_model_features(model_name)
@@ -251,7 +249,6 @@ class KoiAgent:
                 )
             return "\n".join(lines)
 
-        @beta_async_tool
         async def get_resources_tool() -> str:
             """Get available GPU resources (types, counts, VRAM, cost, regions) from the cluster."""
             if resource_map:
@@ -268,7 +265,6 @@ class KoiAgent:
 
         if orca:
 
-            @beta_async_tool
             async def get_quota_status_tool(
                 gpu_type: Optional[str] = None,
                 region: Optional[str] = None,
@@ -285,7 +281,6 @@ class KoiAgent:
                     market=market,
                 )
 
-        @beta_async_tool
         async def record_outcome_tool(
             decision_id: str,
             job_id: str,
@@ -313,7 +308,6 @@ class KoiAgent:
                 bottleneck=bottleneck,
             )
 
-        @beta_async_tool
         async def get_failure_summary_tool(
             gpu_type: str,
             region: Optional[str] = None,
@@ -330,7 +324,6 @@ class KoiAgent:
         action_tools = []
         if orca:
 
-            @beta_async_tool
             async def scale_chain_tool(
                 job_id: str,
                 gpu_type: str,
@@ -539,7 +532,6 @@ class KoiAgent:
                     return f"{result}{market_note} decision_id={scale_dec_id}"
                 return f"{result}{market_note}"
 
-            @beta_async_tool
             async def kill_replica_tool(job_id: str, replica_ids: list[str]) -> str:
                 """Kill specific replicas by ID. Use when you identify degraded/sick replicas that should be removed."""
                 if monitor:
@@ -554,7 +546,6 @@ class KoiAgent:
                             monitor.persist_job(tracker.job_id)
                 return f"Killed {len(replica_ids)} replicas: {replica_ids}. {result}"
 
-            @beta_async_tool
             async def get_job_metrics_tool(job_id: str) -> str:
                 """Get live throughput, GPU utilization, KV cache usage, and chunk progress for a running job."""
                 from koi.tools.orca_api import async_get_job_metrics
@@ -575,7 +566,7 @@ class KoiAgent:
         ]
         if orca:
             tools.append(get_quota_status_tool)
-        return tools + action_tools
+        return {fn.__name__: fn for fn in (tools + action_tools)}
 
     # ------------------------------------------------------------------
     # Main decision entry point
@@ -601,18 +592,18 @@ class KoiAgent:
         )
 
         # Run the agentic loop with wall-clock timeout
-        runner = self._client.beta.messages.tool_runner(
-            model=self.model,
-            max_tokens=4096,
-            system=KOI_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+        runner = KoiToolRunner(
+            model=self._model,
+            system_prompt=KOI_SYSTEM_PROMPT,
             tools=tools,
-            max_iterations=10,
         )
 
         try:
-            tool_calls, final_text = await asyncio.wait_for(
-                self._consume_runner(runner, "decide", job_id=job_request.job_id),
+            tool_calls, final_text = await runner.run(
+                prompt,
+                label="decide",
+                job_id=job_request.job_id,
+                max_iterations=10,
                 timeout=DECIDE_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -684,18 +675,18 @@ class KoiAgent:
             job_id=trigger.job_id,
         )
 
-        runner = self._client.beta.messages.tool_runner(
-            model=self.model,
-            max_tokens=2048,
-            system=KOI_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+        runner = KoiToolRunner(
+            model=self._model,
+            system_prompt=KOI_SYSTEM_PROMPT,
             tools=tools,
-            max_iterations=5,
         )
 
         try:
-            _, final_text = await asyncio.wait_for(
-                self._consume_runner(runner, "trigger", job_id=trigger.job_id),
+            _, final_text = await runner.run(
+                prompt,
+                label="trigger",
+                job_id=trigger.job_id,
+                max_iterations=5,
                 timeout=TRIGGER_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -710,42 +701,6 @@ class KoiAgent:
         logger.info("trigger_response", response=final_text[:200])
         emit_event("trigger_response", job_id=trigger.job_id, response=final_text[:200])
         return final_text
-
-    # ------------------------------------------------------------------
-    # Runner helpers
-    # ------------------------------------------------------------------
-
-    async def _consume_runner(
-        self, runner, label: str, job_id: Optional[str] = None
-    ) -> tuple:
-        """Consume all events from tool_runner. Returns (tool_calls, final_text)."""
-        tool_calls = 0
-        final_text = ""
-        last_response = None
-        async for event in runner:
-            if hasattr(event, "content"):
-                last_response = event
-                for block in event.content:
-                    if hasattr(block, "type") and block.type == "tool_use":
-                        tool_calls += 1
-                        logger.info(
-                            "tool_call",
-                            label=label,
-                            call_number=tool_calls,
-                            tool=block.name,
-                        )
-                        emit_event(
-                            "tool_call",
-                            label=label,
-                            call_number=tool_calls,
-                            tool=block.name,
-                            job_id=job_id,
-                        )
-        if last_response and hasattr(last_response, "content"):
-            for block in last_response.content:
-                if hasattr(block, "text"):
-                    final_text += block.text
-        return tool_calls, final_text
 
     def _fallback_decision(
         self, req: JobRequest, rm: ResourceMap, elapsed: float
