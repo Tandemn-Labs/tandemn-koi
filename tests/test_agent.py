@@ -3,6 +3,21 @@
 import pytest
 from types import SimpleNamespace
 from koi.agent import KoiAgent, KOI_SYSTEM_PROMPT
+
+
+@pytest.fixture(autouse=True)
+def _clean_llm_env(monkeypatch):
+    # Keep LLM env vars off so KoiAgent construction in tests relies purely on
+    # the explicit `api_key="test-key"` kwarg + default "openrouter" provider.
+    for var in (
+        "KOI_LLM_PROVIDER",
+        "KOI_BASE_URL",
+        "KOI_AGENT_MODEL",
+        "KOI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
 from koi.schemas import (
     JobRequest,
     JobTracker,
@@ -135,7 +150,7 @@ class TestActionTools:
             perfdb=perfdb, memory=memory, orca=FakeOrca(), api_key="test-key"
         )
         tools = agent._build_tools(monitor=None)
-        quota_tool = next(t for t in tools if t.name == "get_quota_status_tool")
+        quota_tool = tools["get_quota_status_tool"]
 
         result = await quota_tool(gpu_type="L4")
 
@@ -209,7 +224,7 @@ class TestActionTools:
             _pending_replica_decisions={},
         )
         tools = agent._build_tools(resource_map=resource_map, monitor=monitor)
-        scale_tool = next(t for t in tools if t.name == "scale_chain_tool")
+        scale_tool = tools["scale_chain_tool"]
 
         result = await scale_tool(
             job_id="parent-job", gpu_type="L40S", tp=4, pp=1, count=1
@@ -271,7 +286,7 @@ class TestActionTools:
             perfdb=perfdb, memory=memory, orca=fake_orca, api_key="test-key"
         )
         tools = agent._build_tools(monitor=None)
-        scale_tool = next(t for t in tools if t.name == "scale_chain_tool")
+        scale_tool = tools["scale_chain_tool"]
 
         # No parent decision + no override should default to on-demand.
         await scale_tool(job_id="job-default", gpu_type="L4", tp=1, pp=1, count=1)
