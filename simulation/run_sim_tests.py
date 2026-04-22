@@ -7,12 +7,14 @@ Structured in three tiers:
 
   Tier 1 (direct)  — pure Python, no server needed            (always runs)
   Tier 2 (server)  — koi HTTP endpoints, no LLM               (always runs)
-  Tier 3 (llm)     — full agent loop via mock_orca + koi       (requires ANTHROPIC_API_KEY)
+  Tier 3 (llm)     — full agent loop via mock_orca + koi       (requires KOI_API_KEY or ANTHROPIC_API_KEY)
 
 Usage:
     cd /home/orange/Desktop/tandemn/koi
     python simulation/run_sim_tests.py
-    ANTHROPIC_API_KEY=sk-ant-... python simulation/run_sim_tests.py
+    KOI_API_KEY=sk-or-... python simulation/run_sim_tests.py
+    # Or, for direct Anthropic:
+    KOI_LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... python simulation/run_sim_tests.py
 """
 
 import os
@@ -94,21 +96,34 @@ def wait_for(url: str, timeout: int = 15, label: str = "") -> bool:
 
 @contextmanager
 def koi_server(api_key: str = "dummy", orca_url: str = "", extra_env: dict = None):
-    """Start koi server as a subprocess; yield db_path; kill on exit."""
+    """Start koi server as a subprocess; yield db_path; kill on exit.
+
+    api_key="dummy" → boot in KOI_TEST_FAKE_DECIDE=1 mode (no LLM at all).
+    Otherwise → wire the key into whichever provider the caller's env selects
+    (KOI_LLM_PROVIDER=openrouter [default] uses KOI_API_KEY; =anthropic uses
+    ANTHROPIC_API_KEY).
+    """
     db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     db.close()
     runtime_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     runtime_db.close()
     env = {
         **os.environ,
-        "ANTHROPIC_API_KEY": api_key,
         "ORCA_URL": orca_url,
         "KOI_PORT": str(KOI_PORT),
         "KOI_MEMORY_PATH": db.name,
         "KOI_RUNTIME_STATE_PATH": runtime_db.name,
         "KOI_PERFDB_PATH": "./perfdb/perfdb_all.csv",
-        **(extra_env or {}),
     }
+    if api_key == "dummy":
+        env["KOI_TEST_FAKE_DECIDE"] = "1"
+    else:
+        provider = env.get("KOI_LLM_PROVIDER", "openrouter").lower()
+        if provider == "anthropic":
+            env["ANTHROPIC_API_KEY"] = api_key
+        else:
+            env["KOI_API_KEY"] = api_key
+    env.update(extra_env or {})
     proc = subprocess.Popen(
         [sys.executable, "-m", "koi.server"],
         env=env,
@@ -1521,7 +1536,7 @@ def run_tier2():
         db.close()
         env = {
             **os.environ,
-            "ANTHROPIC_API_KEY": "dummy",
+            "KOI_TEST_FAKE_DECIDE": "1",
             "ORCA_URL": "",
             "KOI_PORT": str(KOI_PORT),
             "KOI_MEMORY_PATH": db.name,
@@ -2117,7 +2132,7 @@ def run_tier2():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TIER 3 — Full agent loop (requires ANTHROPIC_API_KEY)
+# TIER 3 — Full agent loop (requires KOI_API_KEY or ANTHROPIC_API_KEY)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -2284,7 +2299,7 @@ def run_tier3(api_key: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TIER 4 — Scenario tests (OVER_PROVISIONED + FALLING_BEHIND, requires ANTHROPIC_API_KEY)
+# TIER 4 — Scenario tests (OVER_PROVISIONED + FALLING_BEHIND, requires KOI_API_KEY or ANTHROPIC_API_KEY)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -2838,12 +2853,16 @@ def print_report():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = (
+        os.environ.get("KOI_API_KEY", "")
+        or os.environ.get("OPENROUTER_API_KEY", "")
+        or os.environ.get("ANTHROPIC_API_KEY", "")
+    )
     has_llm = bool(api_key and not api_key.startswith("dummy"))
 
     print(f"{BOLD}Koi Simulation Test Suite{RESET}")
     print(
-        f"LLM tests: {'enabled' if has_llm else 'disabled (set ANTHROPIC_API_KEY to enable)'}"
+        f"LLM tests: {'enabled' if has_llm else 'disabled (set KOI_API_KEY or ANTHROPIC_API_KEY to enable)'}"
     )
 
     run_tier1()
@@ -2867,7 +2886,7 @@ if __name__ == "__main__":
             "fast chain survives the falling_behind trigger",
             "exactly one chain killed per OVER_PROVISIONED trigger",
         ]:
-            skip(name, "no ANTHROPIC_API_KEY")
+            skip(name, "no LLM API key")
 
     ok = print_report()
     sys.exit(0 if ok else 1)
