@@ -2016,6 +2016,86 @@ def run_tier2():
         ]:
             skip(name, str(e))
 
+    # ── T2.10: mock_orca runtime cost context reaches /jobs ───────────────
+    section("T2.10  mock_orca runtime cost context appears in /jobs")
+
+    try:
+        fast_env = {"KOI_WARMUP_MINUTES": "0"}
+        with koi_server(api_key="dummy", orca_url=ORCA_URL, extra_env=fast_env) as db_path:
+            with mock_orca_server(replicas=1, tps=1200):
+                from koi.tools.memory import AgenticMemory
+
+                group_id, running, _ = _get_sim_replicas()
+                if not running:
+                    skip("/jobs exposes runtime cost context", "no replicas in mock_orca")
+                    skip(
+                        "runtime status remains SLO-driven under budget pressure",
+                        "no replicas in mock_orca",
+                    )
+                    return
+
+                m = AgenticMemory(db_path)
+                decision_id = m.record_decision(
+                    job_id=group_id,
+                    model_name="Qwen/Qwen3-32B",
+                    instance_type="g6e.12xlarge",
+                    gpu_type="L40S",
+                    tp=4,
+                    pp=1,
+                    dp=1,
+                    num_gpus=4,
+                    predicted_tps=1200.0,
+                    predicted_cost_per_hour=10.0,
+                    slo_deadline_hours=0.15,
+                    objective="cheapest",
+                    avg_input_tokens=953,
+                    avg_output_tokens=1024,
+                    num_requests=5000,
+                    cost_roofline_usd=5.0,
+                    market="on_demand",
+                )
+                _register_replicas_with_koi(
+                    group_id,
+                    running.keys(),
+                    total_tokens=6_000_000,
+                    slo=0.15,
+                    predicted_tps=1200.0,
+                    decision_id=decision_id,
+                )
+                time.sleep(8)
+
+                jobs = requests.get(f"{KOI_URL}/jobs", timeout=5).json()
+                tracked = [j for j in jobs.get("jobs", []) if j.get("job_id") in running]
+
+                def t_jobs_expose_runtime_cost_context():
+                    assert tracked, f"expected tracked jobs, got {jobs}"
+                    job = tracked[0]
+                    assert job.get("predicted_cost_per_hour") == 10.0, job
+                    assert job.get("projected_total_cost_usd") is not None, job
+                    assert job.get("cost_roofline_usd") == 5.0, job
+                    assert job.get("cost_overage_usd") is not None, job
+                    assert job.get("meets_cost_roofline") is False, job
+
+                def t_status_remains_slo_driven_under_budget_pressure():
+                    job = tracked[0]
+                    assert job.get("status") == "falling_behind", job
+
+                check(
+                    "/jobs exposes runtime cost context",
+                    t_jobs_expose_runtime_cost_context,
+                )
+                check(
+                    "runtime status remains SLO-driven under budget pressure",
+                    t_status_remains_slo_driven_under_budget_pressure,
+                )
+
+    except RuntimeError as e:
+        for name in [
+            "/jobs exposes runtime cost context",
+            "runtime status remains SLO-driven under budget pressure",
+        ]:
+            skip(name, str(e))
+
     # ── T2.7: concurrent /decide calls do not double-book ─────────────────
     section("T2.7  Concurrent /decide calls reserve GPUs only once")
 
@@ -2330,6 +2410,7 @@ def _register_replicas_with_koi(
     total_tokens,
     slo,
     predicted_tps=1200,
+    decision_id=None,
     region="us-east-1",
     market="on_demand",
 ):
@@ -2339,6 +2420,7 @@ def _register_replicas_with_koi(
             f"{KOI_URL}/job/started",
             {
                 "job_id": rid,
+                "decision_id": decision_id,
                 "group_id": group_id,
                 "gpu_type": "L40S",
                 "instance_type": "g6e.12xlarge",

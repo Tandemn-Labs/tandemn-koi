@@ -1375,6 +1375,26 @@ async def list_jobs():
                 "smoothed_tps": round(tracker.smoothed_tps, 1),
                 "slo_headroom_pct": round(tracker.slo_headroom_pct, 1),
                 "elapsed_hours": round(tracker.elapsed_hours, 2),
+                "predicted_cost_per_hour": tracker.predicted_cost_per_hour,
+                "projected_remaining_cost_usd": (
+                    round(tracker.projected_remaining_cost_usd, 2)
+                    if tracker.projected_remaining_cost_usd is not None
+                    and tracker.projected_remaining_cost_usd != float("inf")
+                    else tracker.projected_remaining_cost_usd
+                ),
+                "projected_total_cost_usd": (
+                    round(tracker.projected_total_cost_usd, 2)
+                    if tracker.projected_total_cost_usd is not None
+                    and tracker.projected_total_cost_usd != float("inf")
+                    else tracker.projected_total_cost_usd
+                ),
+                "cost_roofline_usd": tracker.cost_roofline_usd,
+                "cost_overage_usd": (
+                    round(tracker.cost_overage_usd, 2)
+                    if tracker.cost_overage_usd is not None
+                    else None
+                ),
+                "meets_cost_roofline": tracker.meets_cost_roofline,
                 "tokens_completed": tracker.tokens_completed,
                 "tokens_remaining": tracker.tokens_remaining,
             }
