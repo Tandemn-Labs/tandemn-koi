@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from typing import Callable, Coroutine, Dict, List, Optional
 
+from koi.costing import evaluate_cost_roofline, project_total_cost
 from koi.logging_config import get_logger, bind_context, clear_context
 from koi.runtime_state import RuntimeStateStore
 from koi.schemas import (
@@ -107,6 +108,8 @@ class MonitoringLoop:
         slo_deadline_hours: float,
         total_tokens: int,
         predicted_tps: float,
+        predicted_cost_per_hour: Optional[float] = None,
+        cost_roofline_usd: Optional[float] = None,
         decision_id: Optional[str] = None,
         group_id: Optional[str] = None,
     ):
@@ -121,6 +124,8 @@ class MonitoringLoop:
             slo_deadline_hours=slo_deadline_hours,
             total_tokens=total_tokens,
             predicted_tps=predicted_tps,
+            predicted_cost_per_hour=predicted_cost_per_hour,
+            cost_roofline_usd=cost_roofline_usd,
             tokens_remaining=total_tokens,
         )
         self.tracked_jobs[job_id] = tracker
@@ -482,6 +487,23 @@ class MonitoringLoop:
                 )
             else:
                 tracker.projected_eta_hours = float("inf")
+
+            # Cost projection
+            (
+                tracker.projected_remaining_cost_usd,
+                tracker.projected_total_cost_usd,
+            ) = project_total_cost(
+                tracker.predicted_cost_per_hour,
+                tracker.elapsed_hours,
+                tracker.projected_eta_hours,
+            )
+            (
+                tracker.meets_cost_roofline,
+                tracker.cost_overage_usd,
+            ) = evaluate_cost_roofline(
+                tracker.projected_total_cost_usd,
+                tracker.cost_roofline_usd,
+            )
 
             # Check for completion — don't emit trigger, /job/complete webhook handles outcome recording
             all_done = progress.get("all_done", False)

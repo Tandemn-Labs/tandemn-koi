@@ -293,6 +293,10 @@ class AgentDecision(BaseModel):
     predicted_cost_per_hour: float
     predicted_total_cost: Optional[float] = None
     predicted_runtime_hours: Optional[float] = None
+    meets_cost_roofline: Optional[bool] = None
+    cost_roofline_usd: Optional[float] = None
+    projected_cost_overage_usd: Optional[float] = None
+    cost_warning: Optional[str] = None
 
     # Agent's reasoning
     reasoning: str
@@ -329,6 +333,8 @@ class JobTracker(BaseModel):
     slo_deadline_hours: float
     total_tokens: int
     predicted_tps: Optional[float] = None
+    predicted_cost_per_hour: Optional[float] = None
+    cost_roofline_usd: Optional[float] = None
     started_at: datetime = Field(default_factory=datetime.utcnow)
 
     # Live state (updated every poll)
@@ -337,6 +343,10 @@ class JobTracker(BaseModel):
     elapsed_hours: float = 0.0
     smoothed_tps: float = 0.0
     projected_eta_hours: float = 0.0
+    projected_remaining_cost_usd: Optional[float] = None
+    projected_total_cost_usd: Optional[float] = None
+    meets_cost_roofline: Optional[bool] = None
+    cost_overage_usd: Optional[float] = None
     slo_headroom_pct: float = 100.0
     status: MonitoringStatus = MonitoringStatus.WARMING_UP
     warmup_complete: bool = False

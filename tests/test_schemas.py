@@ -190,6 +190,38 @@ class TestAgentDecision:
         assert dec.memory_hits == 3
         assert dec.data_source == DataSource.EXACT_MATCH
 
+    def test_cost_roofline_warning_fields(self):
+        cfg = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(tensor_parallel_size=4, pipeline_parallel_size=1),
+        )
+        dec = AgentDecision(
+            job_id="job-test123",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            config=cfg,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            predicted_total_cost=24.28,
+            predicted_runtime_hours=2.31,
+            reasoning="test",
+            confidence=0.8,
+            meets_cost_roofline=False,
+            cost_roofline_usd=20.0,
+            projected_cost_overage_usd=4.28,
+            cost_warning="Projected cost exceeds roofline.",
+        )
+        assert dec.meets_cost_roofline is False
+        assert dec.cost_roofline_usd == 20.0
+        assert dec.projected_cost_overage_usd == 4.28
+        assert dec.cost_warning == "Projected cost exceeds roofline."
+
 
 class TestJobTracker:
     def test_basic(self):

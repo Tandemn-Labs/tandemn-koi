@@ -399,6 +399,9 @@ class TestCostTableRanking:
                 "slo_headroom_pct": 5.0,
                 "elapsed_hours": 2.0,
                 "tokens_remaining": 5_000_000,
+                "projected_total_cost_usd": 148.0,
+                "cost_roofline_usd": 120.0,
+                "cost_overage_usd": 28.0,
                 "gpu_cache_usage": 0.85,
                 "gpu_sm_util": 90,
                 "gpu_mem_bw_util": 95,
@@ -409,6 +412,10 @@ class TestCostTableRanking:
         assert "falling_behind" in prompt
         assert "scale_chain_tool" in prompt
         assert "Throughput dropped" in prompt
+        assert "Projected total cost: $148.00" in prompt
+        assert "Cost roofline: $120.00" in prompt
+        assert "Projected overage: $28.00" in prompt
+        assert "SCALE UP FIRST" in prompt
 
     def test_trigger_prompt_completed(self, agent):
         trigger = MonitoringTrigger(
@@ -571,6 +578,9 @@ class TestCostTableRanking:
                 "elapsed_hours": 0.5,
                 "slo_deadline_hours": 4.0,
                 "tokens_remaining": 2_000_000,
+                "projected_total_cost_usd": 148.0,
+                "cost_roofline_usd": 120.0,
+                "cost_overage_usd": 28.0,
             },
             diagnosis_hint="Headroom=95%, can shed replicas",
         )
@@ -580,9 +590,30 @@ class TestCostTableRanking:
         assert "AT MOST one chain per trigger" in prompt
         # Explicit ban on positive-count scale
         assert "Do NOT call scale_chain_tool with a positive count" in prompt
+        assert "Projected total cost: $148.00" in prompt
+        assert "reduce cost while preserving SLO headroom" in prompt
 
 
 class TestParseDecision:
+    def test_parse_decision_sets_cost_roofline_warning_fields(
+        self, agent, resource_map
+    ):
+        req = JobRequest(
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            slo_deadline_hours=8.0,
+            cost_roofline_usd=20.0,
+            preferred_market="on_demand",
+        )
+        text = 'I recommend {"gpu_type": "L40S", "instance_type": "g6e.12xlarge", "tp": 4, "pp": 1, "dp": 1, "predicted_tps": 1200.0, "predicted_cost_per_hour": 10.49, "confidence": 0.75, "reasoning": "cheapest option"}'
+        decision = agent._parse_decision(text, req, resource_map, tool_calls=3, elapsed=8.0)
+        assert decision.meets_cost_roofline is False
+        assert decision.cost_roofline_usd == 20.0
+        assert decision.projected_cost_overage_usd > 0
+        assert "Projected cost exceeds roofline" in decision.cost_warning
+
     def test_parse_json_block(self, agent, job_request, resource_map):
         text = """Based on my analysis, here's the placement:
 

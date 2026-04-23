@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from koi.event_tap import emit_event
 from koi.llm import KoiToolRunner, build_model
 from koi.logging_config import get_logger
+from koi.costing import evaluate_cost_roofline
 from koi.schemas import (
     AgentDecision,
     DataSource,
@@ -497,6 +498,7 @@ class KoiAgent:
                         avg_output_tokens=parent["avg_output_tokens"] if parent else 0,
                         triggered_by="scale_up" if count > 0 else "scale_down",
                         parent_decision_id=parent_dec,
+                        cost_roofline_usd=parent.get("cost_roofline_usd") if parent else None,
                         market=market_str,
                     )
                     if monitor and count > 0:
@@ -710,6 +712,14 @@ class KoiAgent:
         viable = [r for r in rows if r.get("meets_slo")]
         if viable:
             best = viable[0]
+            meets_cost_roofline = best.get("under_cost_roofline")
+            overage = best.get("cost_overage_usd")
+            cost_warning = None
+            if meets_cost_roofline is False:
+                cost_warning = (
+                    "Projected cost exceeds roofline, but this is the cheapest "
+                    "SLO-meeting plan."
+                )
             config = PlacementConfig(
                 gpu_type=best["gpu_type"],
                 instance_type=best.get("instance_type", "unknown"),
@@ -734,6 +744,10 @@ class KoiAgent:
                 predicted_tps=best.get("predicted_tps", 0),
                 predicted_cost_per_hour=best.get("cost_per_hour", 0),
                 predicted_total_cost=best.get("total_cost", 0),
+                meets_cost_roofline=meets_cost_roofline,
+                cost_roofline_usd=req.cost_roofline_usd,
+                projected_cost_overage_usd=overage,
+                cost_warning=cost_warning,
                 reasoning=f"[TIMEOUT FALLBACK] Agent timed out after {elapsed:.0f}s. "
                 f"Auto-selected cheapest SLO-meeting config.",
                 confidence=0.3,
@@ -762,6 +776,7 @@ class KoiAgent:
             ),
             planned_market=req.preferred_market or "on_demand",
             predicted_tps=0,
+            cost_roofline_usd=req.cost_roofline_usd,
             reasoning=f"[TIMEOUT FALLBACK] No viable configs. Elapsed {elapsed:.0f}s.",
             confidence=0.1,
             data_source=DataSource.ANALYTICAL,
@@ -898,8 +913,11 @@ class KoiAgent:
                 row["under_cost_roofline"] = True
                 row["cost_overage_usd"] = 0.0
             else:
-                row["under_cost_roofline"] = row["total_cost"] <= roofline
-                row["cost_overage_usd"] = round(max(0.0, row["total_cost"] - roofline), 2)
+                meets_cost_roofline, cost_overage = evaluate_cost_roofline(
+                    row["total_cost"], roofline
+                )
+                row["under_cost_roofline"] = bool(meets_cost_roofline)
+                row["cost_overage_usd"] = cost_overage or 0.0
 
         # Sort by policy: SLO is hard, cost roofline is a soft preference,
         # total job cost breaks ties within each bucket.
@@ -1101,6 +1119,21 @@ class KoiAgent:
             sections.append(f"  Tokens remaining: {tokens_remaining:,}")
             sections.append(f"  Time left: {time_left_str}")
 
+        projected_total_cost = tracker.get("projected_total_cost_usd")
+        cost_roofline = tracker.get("cost_roofline_usd")
+        cost_overage = tracker.get("cost_overage_usd")
+        if projected_total_cost is not None or cost_roofline is not None:
+            sections.append("")
+            sections.append("COST CONTEXT (diagnostic only — SLO still takes priority):")
+            if projected_total_cost is not None:
+                sections.append(
+                    f"  Projected total cost: ${float(projected_total_cost):.2f}"
+                )
+            if cost_roofline is not None:
+                sections.append(f"  Cost roofline: ${float(cost_roofline):.2f}")
+            if cost_overage is not None:
+                sections.append(f"  Projected overage: ${float(cost_overage):.2f}")
+
         # Per-chain view — now *informational*, under the job-level block.
         if group_chains and len(group_chains) >= 1:
             tps_sorted = sorted(chain_tps_list) if chain_tps_list else []
@@ -1211,6 +1244,9 @@ class KoiAgent:
             sections.append(
                 "4) Do NOT call scale_chain_tool with a positive count in an "
                 "OVER_PROVISIONED trigger — that fights the monitor."
+            )
+            sections.append(
+                "5) If the cost roofline is exceeded, reduce cost while preserving SLO headroom."
             )
             sections.append(
                 "Do NOT use record_outcome_tool — this job is still RUNNING."
@@ -1335,6 +1371,15 @@ class KoiAgent:
             (total_tokens / max(predicted_tps, 1) / 3600) if predicted_tps > 0 else None
         )
         total_cost = (cost_per_hour * runtime_hours) if runtime_hours else None
+        meets_cost_roofline, projected_cost_overage = evaluate_cost_roofline(
+            total_cost, req.cost_roofline_usd
+        )
+        cost_warning = None
+        if meets_cost_roofline is False:
+            cost_warning = (
+                "Projected cost exceeds roofline, but this is the cheapest "
+                "SLO-meeting plan."
+            )
 
         # Map data_source string to enum
         ds_map = {
@@ -1378,6 +1423,10 @@ class KoiAgent:
             predicted_cost_per_hour=cost_per_hour,
             predicted_total_cost=total_cost,
             predicted_runtime_hours=runtime_hours,
+            meets_cost_roofline=meets_cost_roofline,
+            cost_roofline_usd=req.cost_roofline_usd,
+            projected_cost_overage_usd=projected_cost_overage,
+            cost_warning=cost_warning,
             reasoning=data.get("reasoning", text[:500]),
             confidence=float(data.get("confidence", 0.5)),
             data_source=data_source,

@@ -66,6 +66,7 @@ class AgenticMemory:
                 num_requests         INTEGER,
                 triggered_by         TEXT DEFAULT 'user',
                 parent_decision_id   TEXT,
+                cost_roofline_usd    REAL,
                 market               TEXT DEFAULT 'unknown'
             );
 
@@ -134,6 +135,14 @@ class AgenticMemory:
         # without it — application-level dedup still prevents new duplicates.
         try:
             conn.execute(
+                "ALTER TABLE decisions ADD COLUMN cost_roofline_usd REAL"
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            conn.rollback()
+
+        try:
+            conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_outcomes_chain "
                 "ON outcomes(decision_id, job_id, status)"
             )
@@ -171,6 +180,7 @@ class AgenticMemory:
         quantization: Optional[str] = None,
         triggered_by: str = "user",
         parent_decision_id: Optional[str] = None,
+        cost_roofline_usd: Optional[float] = None,
         market: str = "unknown",
     ) -> str:
         decision_id = f"dec-{uuid.uuid4().hex[:8]}"
@@ -183,8 +193,8 @@ class AgenticMemory:
                 predicted_tps, predicted_cost_per_hour, predicted_total_cost,
                 predicted_runtime_hours, prediction_confidence, prediction_source,
                 slo_deadline_hours, objective, avg_input_tokens, avg_output_tokens,
-                num_requests, triggered_by, parent_decision_id, market
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                num_requests, triggered_by, parent_decision_id, cost_roofline_usd, market
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
             (
                 decision_id,
@@ -210,6 +220,7 @@ class AgenticMemory:
                 num_requests,
                 triggered_by,
                 parent_decision_id,
+                cost_roofline_usd,
                 market,
             ),
         )

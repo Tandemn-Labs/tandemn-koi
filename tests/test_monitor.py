@@ -43,6 +43,7 @@ def _make_tracker(**overrides):
         slo_deadline_hours=8.0,
         total_tokens=7_500_000,
         predicted_tps=2590.0,
+        predicted_cost_per_hour=10.49,
         tokens_remaining=7_500_000,
     )
     defaults.update(overrides)
@@ -160,6 +161,10 @@ class TestOverprovisionWindow:
 
 
 class TestMonitoringLoopRegistration:
+    def test_job_tracker_can_carry_cost_roofline(self):
+        tracker = _make_tracker(cost_roofline_usd=120.0)
+        assert tracker.cost_roofline_usd == 120.0
+
     def test_register_job(self):
         monitor = MonitoringLoop(orca=MagicMock())
         monitor.register_job(
@@ -168,6 +173,7 @@ class TestMonitoringLoopRegistration:
             slo_deadline_hours=8.0,
             total_tokens=7_500_000,
             predicted_tps=2590.0,
+            predicted_cost_per_hour=10.49,
             decision_id="dec-abc",
         )
         assert "job-1" in monitor.tracked_jobs
@@ -181,6 +187,7 @@ class TestMonitoringLoopRegistration:
             slo_deadline_hours=8.0,
             total_tokens=7_500_000,
             predicted_tps=2590.0,
+            predicted_cost_per_hour=10.49,
         )
         monitor.unregister_job("job-1")
         assert "job-1" not in monitor.tracked_jobs
@@ -241,6 +248,7 @@ class TestTriggerSuppression:
                 slo_deadline_hours=8.0,
                 total_tokens=7_500_000,
                 predicted_tps=2590.0,
+                predicted_cost_per_hour=10.49,
                 group_id=group_id,
             )
 
@@ -276,6 +284,7 @@ class TestTriggerSuppression:
                 slo_deadline_hours=8.0,
                 total_tokens=7_500_000,
                 predicted_tps=2590.0,
+                predicted_cost_per_hour=10.49,
                 group_id=group_id,
             )
 
@@ -312,6 +321,7 @@ class TestTriggerSuppression:
                 slo_deadline_hours=8.0,
                 total_tokens=7_500_000,
                 predicted_tps=2590.0,
+                predicted_cost_per_hour=10.49,
                 group_id=group_id,
             )
         # Freeze r0 (simulating scale_chain_tool / kill_replica_tool firing)
@@ -341,6 +351,7 @@ class TestTriggerSuppression:
                 slo_deadline_hours=8.0,
                 total_tokens=7_500_000,
                 predicted_tps=2590.0,
+                predicted_cost_per_hour=10.49,
                 group_id=group_id,
             )
 
@@ -413,6 +424,7 @@ class TestMonitoringLoopPersistence:
             slo_deadline_hours=8.0,
             total_tokens=7_500_000,
             predicted_tps=2590.0,
+            predicted_cost_per_hour=10.49,
             decision_id="dec-abc",
             group_id="grp-1",
         )
@@ -495,8 +507,11 @@ class TestMonitoringLoopPersistence:
             slo_deadline_hours=8.0,
             total_tokens=10_000,
             predicted_tps=1200.0,
+            predicted_cost_per_hour=10.0,
+            cost_roofline_usd=19.5,
             decision_id="dec-1",
         )
+        monitor.tracked_jobs["job-1"].started_at = datetime.utcnow() - timedelta(hours=2)
 
         await monitor._poll_job("job-1")
 
@@ -504,6 +519,10 @@ class TestMonitoringLoopPersistence:
         assert persisted["smoothed_tps"] == pytest.approx(1000.0)
         assert persisted["tokens_completed"] == 5000
         assert persisted["gpu_cache_usage"] == 25.0
+        assert persisted["projected_total_cost_usd"] == pytest.approx(20.01, abs=0.05)
+        assert persisted["projected_remaining_cost_usd"] == pytest.approx(0.01, abs=0.02)
+        assert persisted["meets_cost_roofline"] is False
+        assert persisted["cost_overage_usd"] == pytest.approx(0.51, abs=0.05)
 
     def test_restore_runtime_state_rebuilds_monitor_and_clears_freeze(self, tmp_path):
         db_path = str(tmp_path / "runtime.sqlite")

@@ -580,6 +580,7 @@ async def decide(req: DecideRequest):
             avg_output_tokens=job_request.avg_output_tokens,
             num_requests=job_request.num_requests,
             triggered_by="user",
+            cost_roofline_usd=job_request.cost_roofline_usd,
             market=decision.planned_market,
         )
 
@@ -849,6 +850,7 @@ async def _job_started_impl(req: JobStartedRequest) -> Dict[str, Any]:
                 num_requests=original.get("num_requests"),
                 triggered_by="fallback",
                 parent_decision_id=req.decision_id,
+                cost_roofline_usd=original.get("cost_roofline_usd"),
                 market=(
                     resolved_market
                     if resolved_market != "unknown"
@@ -880,12 +882,24 @@ async def _job_started_impl(req: JobStartedRequest) -> Dict[str, Any]:
         market=resolved_market,
     )
 
+    decision_meta = memory.get_decision(actual_decision_id) if actual_decision_id else None
+
     monitor.register_job(
         job_id=req.job_id,
         config=config,
         slo_deadline_hours=req.slo_deadline_hours,
         total_tokens=req.total_tokens,
         predicted_tps=req.predicted_tps,
+        predicted_cost_per_hour=(
+            float(decision_meta.get("predicted_cost_per_hour") or 0.0)
+            if decision_meta
+            else None
+        ),
+        cost_roofline_usd=(
+            float(decision_meta.get("cost_roofline_usd"))
+            if decision_meta and decision_meta.get("cost_roofline_usd") is not None
+            else None
+        ),
         decision_id=actual_decision_id,
         group_id=req.group_id,
     )
