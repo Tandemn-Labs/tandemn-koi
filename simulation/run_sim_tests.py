@@ -2807,6 +2807,128 @@ def run_tier4(api_key: str):
         skip("agent scales up without killing fast replica", str(e))
         skip("fast chain survives the falling_behind trigger", str(e))
 
+    # ── T4.5: FALLING_BEHIND → cheaper valid scale-up preferred ────────────
+    section("T4.5  FALLING_BEHIND → cheaper valid scale-up preferred")
+
+    try:
+        fast_env = {"KOI_WARMUP_MINUTES": "0"}
+        with koi_server(
+            api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env
+        ) as db_path:
+            with mock_orca_server(replicas=2, tps=1200):
+                from koi.tools.memory import AgenticMemory
+
+                group_id, running, _ = _get_sim_replicas()
+                if not running:
+                    skip("agent prefers cheaper valid scale-up", "no replicas")
+                    return
+
+                rids = sorted(running.keys())
+                cheap_rid, expensive_rid = rids[0], rids[1]
+                requests.post(
+                    f"{ORCA_URL}/sim/set-tps/{expensive_rid}",
+                    json={"tps": 1800},
+                    timeout=5,
+                )
+
+                m = AgenticMemory(db_path)
+                cheap_dec = m.record_decision(
+                    job_id=cheap_rid,
+                    model_name="Qwen/Qwen3-32B",
+                    instance_type="g6e.12xlarge",
+                    gpu_type="L40S",
+                    tp=4,
+                    pp=1,
+                    dp=1,
+                    num_gpus=4,
+                    predicted_tps=1200.0,
+                    predicted_cost_per_hour=10.0,
+                    slo_deadline_hours=1.0,
+                    objective="cheapest",
+                    avg_input_tokens=953,
+                    avg_output_tokens=1024,
+                    num_requests=5000,
+                    market="on_demand",
+                )
+                expensive_dec = m.record_decision(
+                    job_id=expensive_rid,
+                    model_name="Qwen/Qwen3-32B",
+                    instance_type="g6e.48xlarge",
+                    gpu_type="L40S",
+                    tp=8,
+                    pp=1,
+                    dp=1,
+                    num_gpus=8,
+                    predicted_tps=1800.0,
+                    predicted_cost_per_hour=20.0,
+                    slo_deadline_hours=1.0,
+                    objective="cheapest",
+                    avg_input_tokens=953,
+                    avg_output_tokens=1024,
+                    num_requests=5000,
+                    market="on_demand",
+                )
+
+                post(
+                    f"{KOI_URL}/job/started",
+                    {
+                        "job_id": cheap_rid,
+                        "decision_id": cheap_dec,
+                        "group_id": group_id,
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "tp": 4,
+                        "pp": 1,
+                        "dp": 1,
+                        "slo_deadline_hours": 1.0,
+                        "total_tokens": 14_400_000,
+                        "predicted_tps": 1200.0,
+                    },
+                )
+                post(
+                    f"{KOI_URL}/job/started",
+                    {
+                        "job_id": expensive_rid,
+                        "decision_id": expensive_dec,
+                        "group_id": group_id,
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.48xlarge",
+                        "tp": 8,
+                        "pp": 1,
+                        "dp": 1,
+                        "slo_deadline_hours": 1.0,
+                        "total_tokens": 14_400_000,
+                        "predicted_tps": 1800.0,
+                    },
+                )
+                time.sleep(8)
+
+                deadline = time.time() + 150
+                chosen = None
+                while time.time() < deadline:
+                    time.sleep(5)
+                    decs = AgenticMemory(db_path).query_decisions(limit=20)
+                    scale_decs = [d for d in decs if d.get("triggered_by") == "scale_up"]
+                    if scale_decs:
+                        chosen = scale_decs[0]
+                        break
+                    elapsed = int(time.time() - (deadline - 150))
+                    print(f"    waiting for cheaper scale_up preference... ({elapsed}s)")
+
+                def t_cheaper_scale_up_preferred():
+                    assert chosen is not None, "No scale_up decision within 150s"
+                    assert chosen.get("tp") == 4 and chosen.get("pp") == 1, (
+                        f"expected cheaper TP=4/PP=1 scale-up, got {chosen}"
+                    )
+
+                check(
+                    "agent prefers cheaper valid scale-up",
+                    t_cheaper_scale_up_preferred,
+                )
+
+    except RuntimeError as e:
+        skip("agent prefers cheaper valid scale-up", str(e))
+
     # ── T4.4: OVER_PROVISIONED → kill at most one chain per trigger ─────────
     # Area 2's OVER_PROVISIONED framework says: kill AT MOST one chain per
     # trigger and the remaining aggregate TPS must still be >= 110% of

@@ -16,6 +16,14 @@ from koi.event_tap import emit_event
 from koi.llm import KoiToolRunner, build_model
 from koi.logging_config import get_logger
 from koi.costing import evaluate_cost_roofline
+from koi.runtime_policy import (
+    RuntimeChainState,
+    RuntimeJobState,
+    ScaleUpCandidate,
+    RankedSuggestion,
+    rank_falling_behind_suggestions,
+    rank_overprovisioned_suggestions,
+)
 from koi.schemas import (
     AgentDecision,
     DataSource,
@@ -1067,6 +1075,8 @@ class KoiAgent:
             f"  GPU mem BW: {tracker.get('gpu_mem_bw_util', 0):.0f}%",
         ]
 
+        ranked_suggestions = self._rank_runtime_policy_suggestions(trigger)
+
         # Job-level headroom block (the primary signal for health triggers).
         #
         # agg_tps  = sum(smoothed_tps) across live sibling chains
@@ -1133,6 +1143,24 @@ class KoiAgent:
                 sections.append(f"  Cost roofline: ${float(cost_roofline):.2f}")
             if cost_overage is not None:
                 sections.append(f"  Projected overage: ${float(cost_overage):.2f}")
+
+        if ranked_suggestions:
+            sections.append("")
+            sections.append("POLICY RANKING (cost-aware suggestions — prefer higher ranked viable options):")
+            for idx, suggestion in enumerate(ranked_suggestions, start=1):
+                sections.append(f"  {idx}. {suggestion.label} [{suggestion.source}]")
+                sections.append(
+                    f"     post-action TPS={suggestion.projected_post_action_tps:.0f} | "
+                    f"meets_slo={'yes' if suggestion.meets_slo else 'no'}"
+                )
+                if suggestion.projected_total_cost_usd is not None:
+                    sections.append(
+                        f"     projected total cost=${suggestion.projected_total_cost_usd:.2f}"
+                    )
+                if suggestion.cost_overage_usd is not None:
+                    sections.append(
+                        f"     projected overage=${suggestion.cost_overage_usd:.2f}"
+                    )
 
         # Per-chain view — now *informational*, under the job-level block.
         if group_chains and len(group_chains) >= 1:
@@ -1218,6 +1246,10 @@ class KoiAgent:
                 "working as designed."
             )
             sections.append(
+                "Prefer the highest-ranked POLICY RANKING option that restores SLO. "
+                "If you choose a lower-ranked option, explain why."
+            )
+            sections.append(
                 "Do NOT use record_outcome_tool — this job is still RUNNING."
             )
         elif trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
@@ -1247,6 +1279,9 @@ class KoiAgent:
             )
             sections.append(
                 "5) If the cost roofline is exceeded, reduce cost while preserving SLO headroom."
+            )
+            sections.append(
+                "Prefer the highest-ranked POLICY RANKING removal option unless there is a clear diagnosis-based reason not to."
             )
             sections.append(
                 "Do NOT use record_outcome_tool — this job is still RUNNING."
@@ -1315,6 +1350,100 @@ class KoiAgent:
             )
 
         return "\n".join(sections)
+
+    def _rank_runtime_policy_suggestions(
+        self, trigger: MonitoringTrigger
+    ) -> list[RankedSuggestion]:
+        tracker = trigger.job_tracker
+        config = tracker.get("config", {})
+        predicted_tps = float(tracker.get("predicted_tps") or 0.0)
+        predicted_cost_per_hour = float(tracker.get("predicted_cost_per_hour") or 0.0)
+        actual_tps = float(tracker.get("smoothed_tps") or 0.0)
+        slo_hours = float(tracker.get("slo_deadline_hours") or 0.0)
+        elapsed = float(tracker.get("elapsed_hours") or 0.0)
+        time_left_hours = max(0.0, slo_hours - elapsed)
+        tokens_remaining = int(tracker.get("tokens_remaining") or 0)
+        cost_roofline = tracker.get("cost_roofline_usd")
+
+        group_chains: dict = {}
+        if self.monitor and tracker.get("group_id"):
+            group_chains = self.monitor.get_group_chains(tracker["group_id"])
+
+        chain_states: list[RuntimeChainState] = []
+        if group_chains:
+            for rid, chain in group_chains.items():
+                chain_states.append(
+                    RuntimeChainState(
+                        replica_id=rid,
+                        gpu_type=getattr(chain.config, "gpu_type", "?"),
+                        tp=getattr(chain.config, "tp", 1),
+                        pp=getattr(chain.config, "pp", 1),
+                        smoothed_tps=float(getattr(chain, "smoothed_tps", 0.0) or 0.0),
+                        predicted_tps=float(getattr(chain, "predicted_tps", 0.0) or 0.0),
+                        cost_per_hour=float(
+                            getattr(chain, "predicted_cost_per_hour", 0.0) or 0.0
+                        ),
+                        status=getattr(getattr(chain, "status", None), "value", None)
+                        or str(getattr(chain, "status", "unknown")),
+                    )
+                )
+        else:
+            chain_states.append(
+                RuntimeChainState(
+                    replica_id=trigger.job_id,
+                    gpu_type=str(config.get("gpu_type", "?")),
+                    tp=int(config.get("tp", 1) or 1),
+                    pp=int(config.get("pp", 1) or 1),
+                    smoothed_tps=actual_tps,
+                    predicted_tps=predicted_tps,
+                    cost_per_hour=predicted_cost_per_hour,
+                    status=str(trigger.trigger_type.value),
+                )
+            )
+
+        aggregate_tps = sum(chain.smoothed_tps for chain in chain_states)
+        job = RuntimeJobState(
+            trigger_type=trigger.trigger_type.value,
+            elapsed_hours=elapsed,
+            time_left_hours=time_left_hours,
+            tokens_remaining=tokens_remaining,
+            aggregate_tps=aggregate_tps,
+            cost_roofline_usd=(float(cost_roofline) if cost_roofline is not None else None),
+        )
+
+        if trigger.trigger_type == MonitoringStatus.FALLING_BEHIND:
+            candidates: dict[tuple[str, int, int], ScaleUpCandidate] = {}
+
+            if predicted_tps > 0:
+                candidates[(str(config.get("gpu_type", "?")), int(config.get("tp", 1) or 1), int(config.get("pp", 1) or 1))] = ScaleUpCandidate(
+                    gpu_type=str(config.get("gpu_type", "?")),
+                    tp=int(config.get("tp", 1) or 1),
+                    pp=int(config.get("pp", 1) or 1),
+                    predicted_tps=predicted_tps,
+                    cost_per_hour=predicted_cost_per_hour,
+                    source="current_config",
+                )
+
+            if chain_states:
+                best_chain = max(chain_states, key=lambda chain: chain.smoothed_tps)
+                if best_chain.predicted_tps > 0:
+                    candidates[(best_chain.gpu_type, best_chain.tp, best_chain.pp)] = ScaleUpCandidate(
+                        gpu_type=best_chain.gpu_type,
+                        tp=best_chain.tp,
+                        pp=best_chain.pp,
+                        predicted_tps=best_chain.predicted_tps,
+                        cost_per_hour=best_chain.cost_per_hour,
+                        source="best_running",
+                    )
+
+            return rank_falling_behind_suggestions(
+                job, chain_states, list(candidates.values())
+            )[:3]
+
+        if trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
+            return rank_overprovisioned_suggestions(job, chain_states)[:3]
+
+        return []
 
     # ------------------------------------------------------------------
     # Response parser

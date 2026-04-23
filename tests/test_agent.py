@@ -434,7 +434,18 @@ class TestCostTableRanking:
 
     # ----- Area 2 tests: job-headroom-first trigger prompt ------------------
 
-    def _make_chain_tracker(self, job_id, group_id, gpu, tp, pp, tps, status):
+    def _make_chain_tracker(
+        self,
+        job_id,
+        group_id,
+        gpu,
+        tp,
+        pp,
+        tps,
+        status,
+        predicted_tps=None,
+        predicted_cost_per_hour=10.0,
+    ):
         """Build a live JobTracker for a mocked chain."""
         return JobTracker(
             job_id=job_id,
@@ -455,7 +466,8 @@ class TestCostTableRanking:
             ),
             slo_deadline_hours=1.0,
             total_tokens=12_000_000,
-            predicted_tps=tps,
+            predicted_tps=tps if predicted_tps is None else predicted_tps,
+            predicted_cost_per_hour=predicted_cost_per_hour,
             smoothed_tps=tps,
             status=status,
         )
@@ -592,6 +604,126 @@ class TestCostTableRanking:
         assert "Do NOT call scale_chain_tool with a positive count" in prompt
         assert "Projected total cost: $148.00" in prompt
         assert "reduce cost while preserving SLO headroom" in prompt
+
+    def test_trigger_prompt_ranks_cheaper_valid_scale_up_first(self, agent):
+        group_id = "cost-job"
+        chains = {
+            "cost-job-r0": self._make_chain_tracker(
+                "cost-job-r0",
+                group_id,
+                "L40S",
+                4,
+                1,
+                600.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.0,
+            ),
+            "cost-job-r1": self._make_chain_tracker(
+                "cost-job-r1",
+                group_id,
+                "A100-80GB",
+                8,
+                1,
+                900.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=20.0,
+            ),
+        }
+        fake_monitor = SimpleNamespace(get_group_chains=lambda _gid: chains)
+        agent.monitor = fake_monitor
+        try:
+            trigger = MonitoringTrigger(
+                trigger_type=MonitoringStatus.FALLING_BEHIND,
+                job_id="cost-job-r0",
+                job_tracker={
+                    "group_id": group_id,
+                    "config": {"gpu_type": "L40S", "tp": 4, "pp": 1, "dp": 1},
+                    "slo_deadline_hours": 1.0,
+                    "elapsed_hours": 0.5,
+                    "tokens_remaining": 3_600_000,
+                    "smoothed_tps": 600.0,
+                    "predicted_tps": 1200.0,
+                    "predicted_cost_per_hour": 10.0,
+                    "slo_headroom_pct": -10.0,
+                },
+                diagnosis_hint="Headroom=-10%, TPS=1500",
+            )
+            prompt = agent._build_trigger_prompt(trigger)
+        finally:
+            agent.monitor = None
+
+        assert "POLICY RANKING" in prompt
+        assert "scale_up L40S TP=4 PP=1 count=1 [current_config]" in prompt
+        assert "scale_up A100-80GB TP=8 PP=1 count=1 [best_running]" in prompt
+        assert prompt.index("scale_up L40S TP=4 PP=1 count=1") < prompt.index(
+            "scale_up A100-80GB TP=8 PP=1 count=1"
+        )
+
+    def test_trigger_prompt_ranks_safe_lowest_tps_removal_first(self, agent):
+        group_id = "over-job"
+        chains = {
+            "over-job-r-fast": self._make_chain_tracker(
+                "over-job-r-fast",
+                group_id,
+                "A100-80GB",
+                8,
+                1,
+                1500.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_cost_per_hour=20.0,
+            ),
+            "over-job-r-mid": self._make_chain_tracker(
+                "over-job-r-mid",
+                group_id,
+                "L40S",
+                4,
+                1,
+                900.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_cost_per_hour=10.0,
+            ),
+            "over-job-r-slow": self._make_chain_tracker(
+                "over-job-r-slow",
+                group_id,
+                "L40S",
+                4,
+                1,
+                600.0,
+                MonitoringStatus.ON_TRACK,
+                predicted_cost_per_hour=10.0,
+            ),
+        }
+        fake_monitor = SimpleNamespace(get_group_chains=lambda _gid: chains)
+        agent.monitor = fake_monitor
+        try:
+            trigger = MonitoringTrigger(
+                trigger_type=MonitoringStatus.OVER_PROVISIONED,
+                job_id="over-job-r-fast",
+                job_tracker={
+                    "group_id": group_id,
+                    "config": {"gpu_type": "A100-80GB", "tp": 8, "pp": 1, "dp": 1},
+                    "slo_deadline_hours": 4.0,
+                    "elapsed_hours": 0.5,
+                    "tokens_remaining": 2_000_000,
+                    "smoothed_tps": 1500.0,
+                    "predicted_tps": 1500.0,
+                    "predicted_cost_per_hour": 20.0,
+                    "slo_headroom_pct": 95.0,
+                },
+                diagnosis_hint="Headroom=95%, can shed replicas",
+            )
+            prompt = agent._build_trigger_prompt(trigger)
+        finally:
+            agent.monitor = None
+
+        assert "POLICY RANKING" in prompt
+        assert "kill_replica over-job-r-slow" in prompt
+        assert "kill_replica over-job-r-mid" in prompt
+        assert prompt.index("kill_replica over-job-r-slow") < prompt.index(
+            "kill_replica over-job-r-mid"
+        )
 
 
 class TestParseDecision:
