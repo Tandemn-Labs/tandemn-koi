@@ -918,21 +918,21 @@ class KoiAgent:
         for row in rows:
             roofline = req.cost_roofline_usd
             if roofline is None:
-                row["under_cost_roofline"] = True
-                row["cost_overage_usd"] = 0.0
+                row["under_cost_roofline"] = None
+                row["cost_overage_usd"] = None
             else:
                 meets_cost_roofline, cost_overage = evaluate_cost_roofline(
                     row["total_cost"], roofline
                 )
-                row["under_cost_roofline"] = bool(meets_cost_roofline)
-                row["cost_overage_usd"] = cost_overage or 0.0
+                row["under_cost_roofline"] = meets_cost_roofline
+                row["cost_overage_usd"] = cost_overage
 
         # Sort by policy: SLO is hard, cost roofline is a soft preference,
         # total job cost breaks ties within each bucket.
         rows.sort(
             key=lambda r: (
                 not r["meets_slo"],
-                not r["under_cost_roofline"],
+                r["under_cost_roofline"] is False,
                 r["total_cost"],
             )
         )
@@ -1241,6 +1241,13 @@ class KoiAgent:
             )
             sections.append("")
             sections.append(
+                "4) If MULTIPLE scale-up options would restore SLO, prefer the "
+                "CHEAPEST one in the POLICY RANKING. Going over the cost roofline is "
+                "allowed when needed to save SLO, but do NOT pick a more expensive "
+                "option when a cheaper one already restores SLO."
+            )
+            sections.append("")
+            sections.append(
                 "You are reasoning about the JOB, not about individual chains. "
                 "A 210 TPS L40S chain running alongside a 1140 TPS A100 chain is "
                 "working as designed."
@@ -1276,9 +1283,6 @@ class KoiAgent:
             sections.append(
                 "4) Do NOT call scale_chain_tool with a positive count in an "
                 "OVER_PROVISIONED trigger — that fights the monitor."
-            )
-            sections.append(
-                "5) If the cost roofline is exceeded, reduce cost while preserving SLO headroom."
             )
             sections.append(
                 "Prefer the highest-ranked POLICY RANKING removal option unless there is a clear diagnosis-based reason not to."

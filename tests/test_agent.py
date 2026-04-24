@@ -345,6 +345,35 @@ class TestCostTableRanking:
         assert row["under_cost_roofline"] is False
         assert row["cost_overage_usd"] > 0
 
+    def test_build_cost_table_uses_none_without_cost_roofline(self, memory, resource_map):
+        class StubPerfDB:
+            def query(self, **kwargs):
+                return [
+                    {
+                        "gpu_type": "L40S",
+                        "tp": 4,
+                        "pp": 1,
+                        "dp": 1,
+                        "throughput_tps": 1200.0,
+                    }
+                ]
+
+        agent = KoiAgent(perfdb=StubPerfDB(), memory=memory, api_key="test-key")
+        req = JobRequest(
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            slo_deadline_hours=8.0,
+            preferred_market="on_demand",
+        )
+
+        agent._build_cost_table(req, resource_map)
+
+        row = agent._last_cost_rows[0]
+        assert row["under_cost_roofline"] is None
+        assert row["cost_overage_usd"] is None
+
     def test_build_cost_table_sorts_slo_meeting_before_cheaper_slo_miss(
         self, memory, resource_map
     ):

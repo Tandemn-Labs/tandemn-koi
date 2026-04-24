@@ -32,10 +32,17 @@ def evaluate_cost_roofline(
     total_cost: Optional[float],
     cost_roofline_usd: Optional[float],
 ) -> Tuple[Optional[bool], Optional[float]]:
-    """Return (meets_cost_roofline, cost_overage_usd)."""
+    """Return ``(meets_cost_roofline, cost_overage_usd)``.
+
+    Conventions:
+    - ``(None, None)``: no roofline or no total-cost estimate is available yet.
+    - ``(True, 0.0)``: total cost is under or exactly at the roofline.
+    - ``(False, <finite>)``: total cost is over the roofline by a real amount.
+    - ``(False, inf)``: total cost is unbounded/infinite, so overage is also unbounded.
+    """
     if total_cost is None or cost_roofline_usd is None:
         return None, None
     if not math.isfinite(total_cost):
-        return False, None
+        return False, math.inf
     meets = total_cost <= cost_roofline_usd
     return meets, round(max(0.0, total_cost - cost_roofline_usd), 2)

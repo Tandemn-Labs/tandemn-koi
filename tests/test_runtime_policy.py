@@ -7,10 +7,21 @@ from koi.runtime_policy import (
     rank_falling_behind_suggestions,
     rank_overprovisioned_suggestions,
 )
+from koi.costing import evaluate_cost_roofline
 
 
 def test_compute_required_tps_handles_deadline_exceeded():
     assert compute_required_tps(1_000_000, 0.0) == float("inf")
+
+
+def test_evaluate_cost_roofline_returns_none_without_roofline():
+    assert evaluate_cost_roofline(10.0, None) == (None, None)
+
+
+def test_evaluate_cost_roofline_returns_infinite_overage_for_infinite_cost():
+    meets, overage = evaluate_cost_roofline(float("inf"), 10.0)
+    assert meets is False
+    assert overage == float("inf")
 
 
 def test_filter_dominated_actions_drops_more_expensive_no_better_option():
