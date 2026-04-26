@@ -889,6 +889,36 @@ class KoiAgent:
                     job_id=trigger.job_id,
                     error=str(e),
                 )
+
+        try:
+            from koi.harness.config import fail_open_enabled, prompt_enabled
+
+            use_pscale_harness = prompt_enabled("pscale")
+        except Exception:
+            use_pscale_harness = False
+            fail_open_enabled = lambda: True  # type: ignore[assignment]
+
+        if use_pscale_harness and trigger.trigger_type in (
+            MonitoringStatus.FALLING_BEHIND,
+            MonitoringStatus.OVER_PROVISIONED,
+        ):
+            try:
+                from koi.harness.pscale import run_runtime_scale
+
+                return await run_runtime_scale(
+                    self,
+                    trigger,
+                    precomputed_candidates=precomputed,
+                )
+            except Exception as e:
+                if not fail_open_enabled():
+                    raise
+                logger.warning(
+                    "pscale_harness_failed_open",
+                    job_id=trigger.job_id,
+                    trigger_type=trigger.trigger_type.value,
+                    error=str(e),
+                )
         prompt = self._build_trigger_prompt(
             trigger, precomputed_candidates=precomputed
         )
