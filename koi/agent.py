@@ -607,6 +607,28 @@ class KoiAgent:
         """Run the agent to make a placement decision."""
         t0 = time.time()
 
+        try:
+            from koi.harness.config import fail_open_enabled, prompt_enabled
+
+            use_p0_harness = prompt_enabled("p0")
+        except Exception:
+            use_p0_harness = False
+            fail_open_enabled = lambda: True  # type: ignore[assignment]
+
+        if use_p0_harness:
+            try:
+                from koi.harness.p0 import run_initial_placement
+
+                return await run_initial_placement(self, job_request, resource_map)
+            except Exception as e:
+                if not fail_open_enabled():
+                    raise
+                logger.warning(
+                    "p0_harness_failed_open",
+                    job_id=job_request.job_id,
+                    error=str(e),
+                )
+
         # Build the user prompt with all context
         prompt = self._build_decide_prompt(job_request, resource_map)
         tools = self._build_tools(resource_map=resource_map)
@@ -982,6 +1004,7 @@ class KoiAgent:
             ),
             planned_market=req.preferred_market or "on_demand",
             predicted_tps=0,
+            predicted_cost_per_hour=0,
             cost_roofline_usd=req.cost_roofline_usd,
             reasoning=f"[TIMEOUT FALLBACK] No viable configs. Elapsed {elapsed:.0f}s.",
             confidence=0.1,
