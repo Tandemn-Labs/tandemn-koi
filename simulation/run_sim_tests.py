@@ -2632,6 +2632,16 @@ def _register_replicas_with_koi(
         )
 
 
+def _pscale_harness_env(**extra):
+    """Enable the runtime scaling harness for Tier 4 scenarios."""
+    return {
+        "KOI_HARNESS": "1",
+        "KOI_HARNESS_PROMPTS": "pscale",
+        "KOI_HARNESS_FAIL_OPEN": "0",
+        **extra,
+    }
+
+
 def run_tier4(api_key: str):
     # ── T4.1: OVER_PROVISIONED → scale-down → no self-fight ──────────────────
     section("T4.1  OVER_PROVISIONED → scale-down → no self-fight")
@@ -2640,7 +2650,10 @@ def run_tier4(api_key: str):
     # required_tps = 1M / (2 * 3600) = 139 TPS. Headroom ≈ 97%. Massively over-provisioned.
     # KOI_WARMUP_MINUTES=0 + KOI_OVERPROV_MIN_ELAPSED=0.001 so it fires immediately.
     try:
-        fast_env = {"KOI_WARMUP_MINUTES": "0", "KOI_OVERPROV_MIN_ELAPSED": "0.001"}
+        fast_env = _pscale_harness_env(
+            KOI_WARMUP_MINUTES="0",
+            KOI_OVERPROV_MIN_ELAPSED="0.001",
+        )
         with koi_server(
             api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env
         ) as db_path:
@@ -2757,7 +2770,7 @@ def run_tier4(api_key: str):
     # Setup: 1 replica × 1200 TPS, SLO = 0.15h (9 min), total = 6M tokens
     # required_tps = 6M / (0.15 * 3600) = 11,111 TPS. 1 replica gets ~1200 → FALLING_BEHIND.
     try:
-        fast_env = {"KOI_WARMUP_MINUTES": "0"}
+        fast_env = _pscale_harness_env(KOI_WARMUP_MINUTES="0")
         with koi_server(
             api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env
         ) as db_path:
@@ -2931,7 +2944,7 @@ def run_tier4(api_key: str):
     section("T4.3  FALLING_BEHIND heterogeneous chains → preserve fastest chain")
 
     try:
-        fast_env = {"KOI_WARMUP_MINUTES": "0"}
+        fast_env = _pscale_harness_env(KOI_WARMUP_MINUTES="0")
         with koi_server(
             api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env
         ) as db_path:
@@ -3007,7 +3020,7 @@ def run_tier4(api_key: str):
     section("T4.5  FALLING_BEHIND → cheaper valid scale-up preferred")
 
     try:
-        fast_env = {"KOI_WARMUP_MINUTES": "0"}
+        fast_env = _pscale_harness_env(KOI_WARMUP_MINUTES="0")
         with koi_server(
             api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env
         ) as db_path:
@@ -3143,10 +3156,10 @@ def run_tier4(api_key: str):
     section("T4.4  OVER_PROVISIONED → exactly one kill per trigger")
 
     try:
-        fast_env = {
-            "KOI_WARMUP_MINUTES": "0",
-            "KOI_OVERPROV_MIN_ELAPSED": "0.001",
-        }
+        fast_env = _pscale_harness_env(
+            KOI_WARMUP_MINUTES="0",
+            KOI_OVERPROV_MIN_ELAPSED="0.001",
+        )
         with koi_server(
             api_key=api_key, orca_url=ORCA_URL, extra_env=fast_env
         ) as db_path:
