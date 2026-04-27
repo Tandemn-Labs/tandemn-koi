@@ -8,14 +8,29 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import re
-import string
 import time
 from typing import Any, Optional
 
 from koi.event_tap import emit_event
+from koi.harness.decision_utils import (
+    alternative_payloads,
+    placement_config_from_payload,
+    source_to_prediction_source,
+)
+from koi.harness.failures import (
+    config_key,
+    decision_chain as load_decision_chain,
+    failed_entries as build_failed_entries,
+    matches_failed_same_scope,
+    retry_budget_limit,
+    retry_budget_used,
+    same_topology_different_market,
+)
+from koi.harness.feasibility import physics_for_row
+from koi.harness.ids import action_id as make_action_id
+from koi.harness.packet_tools import build_packet_read_tools
 from koi.harness.reasoner import HarnessReasoner
+from koi.harness.resources import resource_map_for
 from koi.harness.schemas import (
     ActionOption,
     ChosenAction,
@@ -26,24 +41,14 @@ from koi.harness.schemas import (
 )
 from koi.harness.validator import NoValidActionError, validate_choice
 from koi.logging_config import get_logger
-from koi.model_features import compute_config_features, get_model_features
-from koi.schemas import EngineConfig, JobRequest, PlacementConfig, ResourceMap
+from koi.schemas import JobRequest, ResourceMap
 from koi.tools.memory import AgenticMemory
-from koi.tools.resources import parse_orca_resources
 
 logger = get_logger("koi.harness.p1")
 
 P1_TIMEOUT = 120.0
 P1_MAX_ITERATIONS = 3
 MAX_MENU_OPTIONS = 8
-DEFAULT_RETRY_BUDGET = 2
-
-_FAILURE_PATTERNS = [
-    (re.compile(r"spot|preempt", re.I), "spot_preemption"),
-    (re.compile(r"insufficient.?capacity|no.?capacity", re.I), "no_capacity"),
-    (re.compile(r"oom|out.?of.?memory|cuda.?oom", re.I), "oom"),
-    (re.compile(r"quota", re.I), "quota"),
-]
 
 _KNOWN_SECTIONS = (
     "physics",
@@ -56,45 +61,6 @@ _KNOWN_SECTIONS = (
     "executor_payload",
     "row",
 )
-
-
-def _action_id(index: int) -> str:
-    if index < len(string.ascii_lowercase):
-        return string.ascii_lowercase[index]
-    return f"a{index + 1}"
-
-
-def _retry_budget_limit() -> int:
-    raw = os.environ.get("KOI_HARNESS_P1_RETRY_BUDGET", str(DEFAULT_RETRY_BUDGET))
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return DEFAULT_RETRY_BUDGET
-
-
-def _classify_failure(reason: str) -> str:
-    for pattern, category in _FAILURE_PATTERNS:
-        if pattern.search(reason or ""):
-            return category
-    return "unknown"
-
-
-def _decision_chain(memory: AgenticMemory, decision_id: Optional[str]) -> list[dict[str, Any]]:
-    chain: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    current = decision_id
-    while current and current not in seen:
-        seen.add(current)
-        row = memory.get_decision(current)
-        if not row:
-            break
-        chain.append(row)
-        current = row.get("parent_decision_id")
-    return chain
-
-
-def _retry_budget_used(chain: list[dict[str, Any]]) -> int:
-    return sum(1 for row in chain if row.get("triggered_by") == "launch_recovery")
 
 
 def _reconstruct_job_request(
@@ -122,146 +88,13 @@ def _reconstruct_job_request(
     )
 
 
-async def _resource_map_for(
-    agent: Any,
-    ledger: Any = None,
-    resource_map: Optional[ResourceMap] = None,
-) -> Optional[ResourceMap]:
-    if resource_map is not None:
-        return ledger.apply_to_resource_map(resource_map) if ledger is not None else resource_map
-    orca = getattr(agent, "orca", None)
-    if orca is None or not hasattr(orca, "get_resources"):
-        return None
-    raw = await orca.get_resources()
-    rm = parse_orca_resources(raw)
-    if ledger is not None:
-        rm = ledger.apply_to_resource_map(rm)
-    return rm
-
-
-def _failed_entries(req: Any, decision: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
-    configs = list(getattr(req, "configs_tried", []) or [])
-    reasons = list(getattr(req, "failure_reasons", []) or [])
-    entries: list[dict[str, Any]] = []
-    for idx, cfg in enumerate(configs):
-        item = dict(cfg or {})
-        if decision and item.get("gpu_type") == decision.get("gpu_type"):
-            item.setdefault("tp", decision.get("tp"))
-            item.setdefault("pp", decision.get("pp"))
-            item.setdefault("dp", decision.get("dp"))
-        reason = reasons[idx] if idx < len(reasons) else "unknown"
-        item["failure_reason"] = reason
-        item["failure_category"] = _classify_failure(reason)
-        entries.append(item)
-    return entries
-
-
-def _cfg_key(config: dict[str, Any], *, include_market: bool = True) -> tuple[Any, ...]:
-    key: tuple[Any, ...] = (
-        config.get("gpu_type"),
-        config.get("instance_type"),
-        int(config.get("tp") or 0),
-        int(config.get("pp") or 0),
-        int(config.get("dp") or 1),
-    )
-    if include_market:
-        key = key + (config.get("market") or config.get("planned_market") or "unknown",)
-    return key
-
-
-def _matches_failed_same_scope(row: dict[str, Any], failed: list[dict[str, Any]]) -> bool:
-    row_key = _cfg_key(row, include_market=True)
-    for item in failed:
-        if _cfg_key(item, include_market=True) == row_key:
-            return True
-        # Older Orca payloads may omit TP/PP. Treat same GPU+instance+market as
-        # tried when topology is absent so we do not immediately retry it.
-        if not item.get("tp") and not item.get("pp"):
-            if (
-                item.get("gpu_type") == row.get("gpu_type")
-                and item.get("instance_type") == row.get("instance_type")
-                and (item.get("market") or "unknown") == (row.get("planned_market") or row.get("market") or "unknown")
-            ):
-                return True
-    return False
-
-
-def _same_topology_different_market(row: dict[str, Any], failed: list[dict[str, Any]]) -> bool:
-    row_no_market = _cfg_key(row, include_market=False)
-    row_market = row.get("planned_market") or row.get("market") or "unknown"
-    for item in failed:
-        if _cfg_key(item, include_market=False) == row_no_market:
-            return (item.get("market") or "unknown") != row_market
-    return False
-
-
 def _source_for_row(row: dict[str, Any], failed: list[dict[str, Any]]) -> str:
-    if _same_topology_different_market(row, failed):
+    if same_topology_different_market(row, failed):
         return "market_alternate"
     failed_gpus = {item.get("gpu_type") for item in failed if item.get("gpu_type")}
     if row.get("gpu_type") and row.get("gpu_type") not in failed_gpus:
         return "gpu_family_alternate"
     return "topology_or_instance_alternate"
-
-
-def _estimate_num_instances(row: dict[str, Any], rm: Optional[ResourceMap]) -> int:
-    tp = int(row.get("tp") or 1)
-    pp = int(row.get("pp") or 1)
-    dp = int(row.get("dp") or 1)
-    num_gpus = tp * pp * dp
-    resource = rm.get_resource(str(row.get("gpu_type"))) if rm is not None else None
-    if resource is None:
-        return max(1, -(-num_gpus // 8))
-    return max(1, -(-num_gpus // max(1, resource.gpus_per_instance)))
-
-
-def _physics_for_row(req: JobRequest, rm: Optional[ResourceMap], row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    gpu_type = str(row.get("gpu_type") or "unknown")
-    resource = rm.get_resource(gpu_type) if rm is not None else None
-    tp = int(row.get("tp") or 1)
-    pp = int(row.get("pp") or 1)
-    dp = int(row.get("dp") or 1)
-    num_gpus = tp * pp * dp
-    hard = {
-        "gpu_type": gpu_type,
-        "instance_type": row.get("instance_type"),
-        "capacity_ok": resource is None or num_gpus <= resource.available_gpus,
-        "runtime_supported": resource is not None,
-    }
-    physics: dict[str, Any] = {}
-    try:
-        mf = get_model_features(req.model_name, dtype=req.quantization or "fp16")
-        if resource is not None:
-            feats = compute_config_features(
-                mf,
-                gpu_type=gpu_type,
-                tp=tp,
-                pp=pp,
-                dp=dp,
-                input_len=req.avg_input_tokens,
-                output_len=req.avg_output_tokens,
-                gpus_per_node=resource.gpus_per_instance,
-                price_per_gpu_hour=resource.cost_per_gpu_hour_usd,
-                gpu_memory_gb_override=resource.gpu_memory_gb,
-            )
-            vram_headroom_gb = float(feats.get("vram_headroom_gb", 0.0) or 0.0)
-            hard.update(
-                {
-                    "vram_fit": vram_headroom_gb >= 8.0,
-                    "vram_headroom_gb": round(vram_headroom_gb, 2),
-                    "tp_heads_valid": mf.num_attention_heads % tp == 0,
-                    "pp_layers_valid": mf.num_layers % pp == 0,
-                    "crosses_node_boundary": bool(feats.get("crosses_node_boundary", 0)),
-                }
-            )
-            physics = {
-                "bandwidth_per_param": round(float(feats.get("bandwidth_per_param", 0.0) or 0.0), 3),
-                "flops_per_param": round(float(feats.get("flops_per_param", 0.0) or 0.0), 3),
-                "roofline_decode_tps": round(float(feats.get("roofline_decode_tps", 0.0) or 0.0), 1),
-            }
-    except Exception as exc:
-        hard["physics_error"] = str(exc)
-    return hard, physics
 
 
 def _section_keys_for(action_id: str) -> list[str]:
@@ -401,12 +234,12 @@ def _candidate_rows_from_cost_table(
     for raw in rows:
         row = dict(raw)
         row["planned_market"] = row.get("planned_market") or req.preferred_market or "on_demand"
-        if _matches_failed_same_scope(row, failed_entries):
+        if matches_failed_same_scope(row, failed_entries):
             continue
         source = _source_for_row(row, failed_entries)
         row["prediction_source"] = row.get("source", "unknown")
         row["source"] = source
-        key = _cfg_key({**row, "market": row["planned_market"]}, include_market=True)
+        key = config_key({**row, "market": row["planned_market"]}, include_market=True)
         if key in seen:
             continue
         seen.add(key)
@@ -417,7 +250,7 @@ def _candidate_rows_from_cost_table(
 
 
 def _abort_option(rank: int, reason: str) -> ActionOption:
-    action_id = _action_id(rank - 1)
+    action_id = make_action_id(rank - 1)
     return ActionOption(
         action_id=action_id,
         action_type="abort_launch",
@@ -440,12 +273,12 @@ async def build_p1_packet(
     retry_budget: Optional[int] = None,
 ) -> TransitionPacket:
     decision_id = getattr(req, "decision_id", None)
-    decision_chain = _decision_chain(memory, decision_id)
+    decision_chain = load_decision_chain(memory, decision_id)
     decision = decision_chain[0] if decision_chain else None
-    budget_limit = _retry_budget_limit() if retry_budget is None else retry_budget
-    budget_used = _retry_budget_used(decision_chain)
+    budget_limit = retry_budget_limit() if retry_budget is None else retry_budget
+    budget_used = retry_budget_used(decision_chain)
     budget_remaining = max(0, budget_limit - budget_used)
-    failed_entries = _failed_entries(req, decision)
+    failed_entries = build_failed_entries(req, decision)
     failure_categories = sorted({item["failure_category"] for item in failed_entries})
     force_on_demand = any(
         item.get("market") == "spot"
@@ -456,7 +289,7 @@ async def build_p1_packet(
     detail_sections: dict[str, Any] = {}
     options: list[ActionOption] = []
     job_context: dict[str, Any] = {"job_id": getattr(req, "job_id", "unknown")}
-    rm = await _resource_map_for(agent, ledger=ledger, resource_map=resource_map)
+    rm = await resource_map_for(agent, ledger=ledger, resource_map=resource_map)
     reconstructed: Optional[JobRequest] = None
 
     if decision is not None:
@@ -489,8 +322,10 @@ async def build_p1_packet(
             failed_entries=failed_entries,
         )
         for idx, row in enumerate(rows[: MAX_MENU_OPTIONS - 1]):
-            action_id = _action_id(idx)
-            hard, physics = _physics_for_row(reconstructed, rm, row)
+            action_id = make_action_id(idx)
+            physics_payload = physics_for_row(reconstructed, rm, row)
+            hard = physics_payload["hard_feasibility"]
+            physics = physics_payload["physics"]
             valid = bool(row.get("meets_slo", True)) and all(
                 hard.get(key, True)
                 for key in ("capacity_ok", "runtime_supported", "vram_fit", "tp_heads_valid", "pp_layers_valid")
@@ -637,51 +472,7 @@ def render_p1_prompt(packet: TransitionPacket) -> str:
 
 
 def _packet_tools(memory: AgenticMemory, packet: TransitionPacket) -> dict[str, Any]:
-    async def list_detail_sections(action_id: str) -> str:
-        option = packet.get_action(action_id)
-        if option is None:
-            return f"unknown action_id={action_id!r}"
-        return json.dumps(option.detail_refs, indent=2)
-
-    async def read_option_detail(action_id: str, section: str = "all") -> str:
-        option = packet.get_action(action_id)
-        if option is None:
-            return f"unknown action_id={action_id!r}"
-        if section == "all":
-            return json.dumps(
-                {ref: packet.detail_sections.get(ref) for ref in option.detail_refs},
-                indent=2,
-                default=str,
-            )
-        ref = f"{section}:{action_id}"
-        if ref not in option.detail_refs and section not in _KNOWN_SECTIONS:
-            return (
-                f"unknown section={section!r} for action_id={action_id!r}; "
-                f"available={option.detail_refs}"
-            )
-        return json.dumps({"section": ref, "data": packet.detail_sections.get(ref)}, indent=2, default=str)
-
-    async def compare_options(action_ids: list[str], lens: str = "summary") -> str:
-        selected = []
-        for action_id in action_ids:
-            option = packet.get_action(action_id)
-            if option is None:
-                continue
-            selected.append(
-                {
-                    "action_id": option.action_id,
-                    "rank": option.rank,
-                    "type": option.action_type,
-                    "valid": option.valid,
-                    "summary": option.summary,
-                    "performance": option.performance,
-                    "cost": option.cost,
-                    "availability": option.availability,
-                    "risk": option.risk,
-                    "physics": option.physics if lens == "physics" else {},
-                }
-            )
-        return json.dumps(selected, indent=2, default=str)
+    tools = build_packet_read_tools(packet, known_sections=_KNOWN_SECTIONS)
 
     async def get_failure_summary(gpu_type: str, region: Optional[str] = None, market: Optional[str] = None) -> str:
         try:
@@ -693,63 +484,8 @@ def _packet_tools(memory: AgenticMemory, packet: TransitionPacket) -> dict[str, 
         except Exception as exc:
             return f"get_failure_summary failed: {exc}"
 
-    return {
-        "list_detail_sections": list_detail_sections,
-        "read_option_detail": read_option_detail,
-        "compare_options": compare_options,
-        "get_failure_summary": get_failure_summary,
-    }
-
-
-def _source_to_prediction_source(source: str) -> str:
-    if source == "VERIFIED":
-        return "memory_verified"
-    if source == "PerfDB":
-        return "perfdb_exact"
-    return source or "analytical"
-
-
-def _config_from_payload(payload: dict[str, Any], rm_region: str = "unknown") -> PlacementConfig:
-    tp = int(payload.get("tp") or 1)
-    pp = int(payload.get("pp") or 1)
-    dp = int(payload.get("dp") or 1)
-    num_gpus = tp * pp * dp
-    return PlacementConfig(
-        gpu_type=str(payload.get("gpu_type") or "unknown"),
-        instance_type=str(payload.get("instance_type") or "unknown"),
-        num_gpus=num_gpus,
-        num_instances=max(1, int(payload.get("num_instances") or -(-num_gpus // 8))),
-        tp=tp,
-        pp=pp,
-        dp=dp,
-        region=str(payload.get("region") or rm_region or "unknown"),
-        engine_config=EngineConfig(tensor_parallel_size=tp, pipeline_parallel_size=pp),
-        market=str(payload.get("market") or "on_demand"),
-    )
-
-
-def _alternative_payloads(packet: TransitionPacket, selected_action_id: str) -> list[dict[str, Any]]:
-    alternatives: list[dict[str, Any]] = []
-    for option in packet.valid_actions():
-        if option.action_id == selected_action_id or option.action_type != "retry_launch":
-            continue
-        payload = packet.detail_sections.get(option.executor_payload_ref or "", {})
-        alternatives.append(
-            {
-                "gpu_type": payload.get("gpu_type"),
-                "instance_type": payload.get("instance_type"),
-                "tp": payload.get("tp"),
-                "pp": payload.get("pp"),
-                "dp": payload.get("dp", 1),
-                "region": payload.get("region"),
-                "market": payload.get("market"),
-                "predicted_tps": payload.get("predicted_tps"),
-                "source": payload.get("source"),
-            }
-        )
-        if len(alternatives) >= 3:
-            break
-    return alternatives
+    tools["get_failure_summary"] = get_failure_summary
+    return tools
 
 
 def _abort_plan(packet: TransitionPacket, validated: Optional[ValidatedAction] = None, reason: Optional[str] = None) -> dict[str, Any]:
@@ -780,7 +516,10 @@ def _recovery_plan_from_action(
         return _abort_plan(packet, validated)
 
     payload = packet.detail_sections.get(option.executor_payload_ref or "", {})
-    config = _config_from_payload(payload, packet.job_context.get("region", "unknown"))
+    config = placement_config_from_payload(
+        payload,
+        fallback_region=packet.job_context.get("region", "unknown"),
+    )
     parent_decision_id = packet.job_context.get("parent_decision_id")
     predicted_tps = float(payload.get("predicted_tps") or 0.0)
     predicted_cost = float(payload.get("predicted_cost_per_hour") or 0.0)
@@ -798,7 +537,7 @@ def _recovery_plan_from_action(
         predicted_total_cost=payload.get("predicted_total_cost"),
         predicted_runtime_hours=payload.get("predicted_runtime_hours"),
         prediction_confidence=validated.choice.confidence,
-        prediction_source=_source_to_prediction_source(str(payload.get("prediction_source") or payload.get("source") or "")),
+        prediction_source=source_to_prediction_source(str(payload.get("prediction_source") or payload.get("source") or "")),
         slo_deadline_hours=float(packet.job_context.get("slo_deadline_hours") or 0.0),
         objective=str(packet.job_context.get("objective") or "cheapest"),
         avg_input_tokens=int(packet.job_context.get("avg_input_tokens") or 0),
@@ -828,7 +567,11 @@ def _recovery_plan_from_action(
         "parent_decision_id": parent_decision_id,
         "action_id": option.action_id,
         "config": config.model_dump(mode="json"),
-        "alternatives": _alternative_payloads(packet, option.action_id),
+        "alternatives": alternative_payloads(
+            packet,
+            option.action_id,
+            action_type="retry_launch",
+        ),
         "reasoning": rationale,
         "confidence": validated.choice.confidence,
         "retry_budget_remaining": max(0, remaining_before - 1),

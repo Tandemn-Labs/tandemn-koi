@@ -7,6 +7,8 @@ import json
 from typing import Any, Optional
 
 from koi.event_tap import emit_event
+from koi.harness.ids import action_id as make_action_id
+from koi.harness.packet_tools import build_packet_read_tools
 from koi.harness.reasoner import HarnessReasoner
 from koi.harness.schemas import (
     ActionOption,
@@ -31,10 +33,6 @@ logger = get_logger("koi.harness.pscale")
 PSCALE_TIMEOUT = 45.0
 PSCALE_MAX_ITERATIONS = 3
 MAX_MENU_OPTIONS = 8
-
-
-def _action_id(index: int) -> str:
-    return chr(ord("a") + index) if index < 26 else f"a{index + 1}"
 
 
 def _group_id(trigger: MonitoringTrigger) -> str:
@@ -303,7 +301,7 @@ async def build_pscale_packet(
     detail_sections: dict[str, Any] = {}
 
     for idx, suggestion in enumerate(menu_result.suggestions[: MAX_MENU_OPTIONS - 1]):
-        action_id = _action_id(idx)
+        action_id = make_action_id(idx)
         candidate = menu_result.candidates_by_action.get(suggestion.label)
         if suggestion.kind == "scale_up":
             action_type = "scale_up"
@@ -405,7 +403,7 @@ async def build_pscale_packet(
             )
         )
 
-    noop_id = _action_id(len(options))
+    noop_id = make_action_id(len(options))
     detail_sections[f"executor_payload:{noop_id}"] = {"tool": "noop"}
     detail_sections[f"suggestion:{noop_id}"] = {
         "kind": "noop",
@@ -560,70 +558,7 @@ def _next_custom_action_id(packet: TransitionPacket) -> str:
 
 
 def _packet_tools(agent: Any, packet: TransitionPacket) -> dict[str, Any]:
-    async def list_detail_sections(action_id: str) -> str:
-        """List the named detail sections available for one action_id."""
-        option = packet.get_action(action_id)
-        if option is None:
-            return f"unknown action_id={action_id!r}"
-        return json.dumps(option.detail_refs, indent=2)
-
-    async def read_option_detail(action_id: str, section: str = "all") -> str:
-        """Read a specific detail section for one runtime action option.
-
-        Sections include: physics, perfdb_exact, perfdb_proxy, memory_success,
-        memory_failure, quota, recent_failures, runtime_metrics,
-        executor_payload, suggestion, all.
-        """
-        option = packet.get_action(action_id)
-        if option is None:
-            return f"unknown action_id={action_id!r}"
-        if section == "all":
-            details = {ref: packet.detail_sections.get(ref) for ref in option.detail_refs}
-            return json.dumps(details, indent=2, default=str)
-        ref = f"{section}:{action_id}"
-        if ref not in option.detail_refs:
-            return (
-                f"unknown section={section!r} for action_id={action_id!r}; "
-                f"available={option.detail_refs}"
-            )
-        return json.dumps(
-            {"section": ref, "data": packet.detail_sections.get(ref)},
-            indent=2,
-            default=str,
-        )
-
-    async def compare_options(action_ids: list[str], lens: str = "summary") -> str:
-        """Compare precomputed runtime options."""
-        selected = []
-        for action_id in action_ids:
-            option = packet.get_action(action_id)
-            if option is None:
-                continue
-            selected.append(
-                {
-                    "action_id": option.action_id,
-                    "rank": option.rank,
-                    "type": option.action_type,
-                    "summary": option.summary,
-                    "performance": option.performance,
-                    "cost": option.cost,
-                    "risk": option.risk,
-                }
-            )
-        return json.dumps(selected, indent=2, default=str)
-
-    async def read_packet_section(section_id: str) -> str:
-        """Read a named section from the transition packet."""
-        if section_id == "runtime_context":
-            return json.dumps(packet.runtime_context, indent=2, default=str)
-        if section_id == "evidence_summary":
-            return json.dumps(packet.evidence_summary, indent=2, default=str)
-        if section_id == "guards":
-            return json.dumps(packet.guards, indent=2, default=str)
-        section = packet.detail_sections.get(section_id)
-        if section is None:
-            return f"unknown section_id={section_id!r}"
-        return json.dumps(section, indent=2, default=str)
+    tools = build_packet_read_tools(packet, include_packet_sections=True)
 
     async def request_custom_scale_option(
         gpu_type: str,
@@ -714,13 +649,7 @@ def _packet_tools(agent: Any, packet: TransitionPacket) -> dict[str, Any]:
             default=str,
         )
 
-    tools: dict[str, Any] = {
-        "list_detail_sections": list_detail_sections,
-        "read_option_detail": read_option_detail,
-        "compare_options": compare_options,
-        "read_packet_section": read_packet_section,
-        "request_custom_scale_option": request_custom_scale_option,
-    }
+    tools["request_custom_scale_option"] = request_custom_scale_option
 
     # Existing production read tools remain available as an exploration escape
     # hatch. Keep mutating tools out of this surface; execution still goes

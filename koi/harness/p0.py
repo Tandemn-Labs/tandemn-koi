@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import string
 import time
 from typing import Any, Optional
 
 from koi.costing import evaluate_cost_roofline
 from koi.event_tap import emit_event
+from koi.harness.decision_utils import source_to_data_source
+from koi.harness.feasibility import estimate_num_instances, physics_for_row
+from koi.harness.ids import action_id as make_action_id
+from koi.harness.packet_tools import build_packet_read_tools
 from koi.harness.reasoner import HarnessReasoner
 from koi.harness.schemas import (
     ActionOption,
@@ -25,10 +28,9 @@ from koi.harness.schemas import (
 )
 from koi.harness.validator import NoValidActionError, validate_choice
 from koi.logging_config import get_logger
-from koi.model_features import compute_config_features, get_model_features
+from koi.model_features import get_model_features
 from koi.schemas import (
     AgentDecision,
-    DataSource,
     EngineConfig,
     JobRequest,
     PlacementConfig,
@@ -40,96 +42,6 @@ logger = get_logger("koi.harness.p0")
 P0_TIMEOUT = 120.0
 P0_MAX_ITERATIONS = 3
 MAX_MENU_OPTIONS = 8
-
-
-def _action_id(index: int) -> str:
-    if index < len(string.ascii_lowercase):
-        return string.ascii_lowercase[index]
-    return f"a{index + 1}"
-
-
-def _source_to_data_source(source: str) -> DataSource:
-    if source == "VERIFIED":
-        return DataSource.MEMORY
-    if source == "PerfDB":
-        return DataSource.EXACT_MATCH
-    return DataSource.ANALYTICAL
-
-
-def _estimate_num_instances(row: dict[str, Any], rm: ResourceMap) -> int:
-    resource = rm.get_resource(str(row.get("gpu_type", "")))
-    num_gpus = int(row.get("tp", 1)) * int(row.get("pp", 1)) * int(row.get("dp", 1))
-    if not resource:
-        return max(1, -(-num_gpus // 8))
-    return max(1, -(-num_gpus // resource.gpus_per_instance))
-
-
-def _physics_for_row(req: JobRequest, rm: ResourceMap, row: dict[str, Any]) -> dict[str, Any]:
-    gpu_type = str(row.get("gpu_type", "unknown"))
-    resource = rm.get_resource(gpu_type)
-    if resource is None:
-        return {
-            "hard_feasibility": {
-                "capacity_ok": False,
-                "runtime_supported": False,
-            },
-            "physics": {},
-        }
-
-    tp = int(row.get("tp", 1) or 1)
-    pp = int(row.get("pp", 1) or 1)
-    dp = int(row.get("dp", 1) or 1)
-    try:
-        mf = get_model_features(req.model_name, dtype=req.quantization or "fp16")
-        feats = compute_config_features(
-            mf,
-            gpu_type=gpu_type,
-            tp=tp,
-            pp=pp,
-            dp=dp,
-            input_len=req.avg_input_tokens,
-            output_len=req.avg_output_tokens,
-            gpus_per_node=resource.gpus_per_instance,
-            price_per_gpu_hour=resource.cost_per_gpu_hour_usd,
-            gpu_memory_gb_override=resource.gpu_memory_gb,
-        )
-        vram_headroom_gb = float(feats.get("vram_headroom_gb", 0.0) or 0.0)
-        hard_feasibility = {
-            "vram_fit": vram_headroom_gb >= 8.0,
-            "vram_headroom_gb": round(vram_headroom_gb, 2),
-            "tp_heads_valid": mf.num_attention_heads % tp == 0,
-            "pp_layers_valid": mf.num_layers % pp == 0,
-            "kv_heads_per_tp_shard": round(float(feats.get("kv_heads_per_tp_shard", 0.0) or 0.0), 3),
-            "crosses_node_boundary": bool(feats.get("crosses_node_boundary", 0)),
-            "capacity_ok": int(row.get("tp", 1)) * int(row.get("pp", 1)) * int(row.get("dp", 1)) <= resource.available_gpus,
-            "runtime_supported": True,
-        }
-        physics = {
-            "bandwidth_per_param": round(float(feats.get("bandwidth_per_param", 0.0) or 0.0), 3),
-            "flops_per_param": round(float(feats.get("flops_per_param", 0.0) or 0.0), 3),
-            "roofline_decode_tps": round(float(feats.get("roofline_decode_tps", 0.0) or 0.0), 1),
-            "io_ratio": round(float(feats.get("io_ratio", req.prefill_decode_ratio) or 0.0), 3),
-            "gqa_ratio": round(float(getattr(mf, "gqa_ratio", 0.0) or 0.0), 3),
-        }
-        return {
-            "hard_feasibility": hard_feasibility,
-            "physics": physics,
-            "detail": feats,
-        }
-    except Exception as exc:
-        logger.warning(
-            "p0_physics_failed",
-            job_id=req.job_id,
-            gpu_type=gpu_type,
-            error=str(exc),
-        )
-        return {
-            "hard_feasibility": {
-                "capacity_ok": True,
-                "runtime_supported": True,
-            },
-            "physics": {},
-        }
 
 
 def _section_keys_for(action_id: str) -> list[str]:
@@ -303,8 +215,8 @@ def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionP
     detail_sections: dict[str, Any] = {}
 
     for idx, row in enumerate(rows[:MAX_MENU_OPTIONS]):
-        action_id = _action_id(idx)
-        physics_payload = _physics_for_row(req, rm, row)
+        action_id = make_action_id(idx)
+        physics_payload = physics_for_row(req, rm, row)
         hard_feasibility = physics_payload["hard_feasibility"]
         row_meets_slo = bool(row.get("meets_slo"))
         valid = row_meets_slo and all(
@@ -461,66 +373,7 @@ _KNOWN_SECTIONS = (
 
 
 def _packet_tools(packet: TransitionPacket) -> dict[str, Any]:
-    async def list_detail_sections(action_id: str) -> str:
-        """List the named detail sections available for one action_id."""
-        option = packet.get_action(action_id)
-        if option is None:
-            return f"unknown action_id={action_id!r}"
-        return json.dumps(option.detail_refs, indent=2)
-
-    async def read_option_detail(action_id: str, section: str = "all") -> str:
-        """Read a specific detail section for one action_id.
-
-        Sections follow the harness spec:
-          physics, perfdb_exact, perfdb_proxy, memory_success, memory_failure,
-          quota, recent_failures, executor_payload, row, all.
-        """
-        option = packet.get_action(action_id)
-        if option is None:
-            return f"unknown action_id={action_id!r}"
-        if section == "all":
-            data = {
-                ref: packet.detail_sections.get(ref) for ref in option.detail_refs
-            }
-            return json.dumps(data, indent=2, default=str)
-        ref = f"{section}:{action_id}"
-        if ref not in option.detail_refs and section not in _KNOWN_SECTIONS:
-            return (
-                f"unknown section={section!r} for action_id={action_id!r}; "
-                f"available={option.detail_refs}"
-            )
-        payload = packet.detail_sections.get(ref)
-        if payload is None:
-            return json.dumps({"section": ref, "data": None}, indent=2, default=str)
-        return json.dumps({"section": ref, "data": payload}, indent=2, default=str)
-
-    async def compare_options(action_ids: list[str], lens: str = "summary") -> str:
-        """Compare precomputed option summaries for the requested action IDs."""
-        selected = []
-        for action_id in action_ids:
-            option = packet.get_action(action_id)
-            if option is None:
-                continue
-            selected.append(
-                {
-                    "action_id": option.action_id,
-                    "rank": option.rank,
-                    "valid": option.valid,
-                    "summary": option.summary,
-                    "performance": option.performance,
-                    "cost": option.cost,
-                    "availability": option.availability,
-                    "evidence": option.evidence,
-                    "physics": option.physics if lens == "physics" else {},
-                }
-            )
-        return json.dumps(selected, indent=2, default=str)
-
-    return {
-        "list_detail_sections": list_detail_sections,
-        "read_option_detail": read_option_detail,
-        "compare_options": compare_options,
-    }
+    return build_packet_read_tools(packet, known_sections=_KNOWN_SECTIONS)
 
 
 def _decision_from_action(
@@ -547,7 +400,7 @@ def _decision_from_action(
     num_gpus = tp * pp * dp
     resource = rm.get_resource(str(gpu_type))
     instance_type = row.get("instance_type") or (resource.instance_type if resource else "unknown")
-    num_instances = _estimate_num_instances(row, rm)
+    num_instances = estimate_num_instances(row, rm)
     planned_market = row.get("planned_market") or req.preferred_market or "on_demand"
     cost_per_hour = float(row.get("cost_per_hour") or option.cost.get("cost_per_hour") or 0.0)
     predicted_tps = float(row.get("predicted_tps") or option.performance.get("predicted_tps") or 0.0)
@@ -594,7 +447,7 @@ def _decision_from_action(
         cost_warning=cost_warning,
         reasoning=reasoning,
         confidence=validated.choice.confidence,
-        data_source=_source_to_data_source(str(row.get("source", ""))),
+        data_source=source_to_data_source(str(row.get("source", ""))),
         agent_model=agent_model,
         tool_calls_made=tool_calls,
         latency_seconds=elapsed,

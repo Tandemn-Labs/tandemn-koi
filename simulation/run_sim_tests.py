@@ -2210,6 +2210,109 @@ def run_tier2():
         ]:
             skip(name, str(e))
 
+    # ── T2.11: P1 launch recovery harness (deterministic, no LLM) ─────────
+    section("T2.11  /job/launch-failed P1 harness returns recovery plan")
+
+    try:
+        p1_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p1",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_HARNESS_P1_RETRY_BUDGET": "2",
+            "KOI_TEST_FAKE_DECIDE": "1",
+        }
+        with koi_server(api_key="dummy", extra_env=p1_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            no_decision_response = post(
+                f"{KOI_URL}/job/launch-failed",
+                {
+                    "job_id": "p1-no-decision",
+                    "configs_tried": [
+                        {
+                            "gpu_type": "L40S",
+                            "instance_type": "g6e.12xlarge",
+                            "region": "us-east-1",
+                            "market": "spot",
+                        }
+                    ],
+                    "failure_reasons": ["SpotInstanceInterruption"],
+                    "total_time_seconds": 12.0,
+                },
+            )
+
+            seed_memory = AgenticMemory(db_path)
+            parent_decision_id = seed_memory.record_decision(
+                job_id="p1-with-decision",
+                model_name="Qwen/Qwen3-32B",
+                instance_type="g6e.12xlarge",
+                gpu_type="L40S",
+                tp=4,
+                pp=1,
+                dp=1,
+                num_gpus=4,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.49,
+                slo_deadline_hours=1.0,
+                objective="cheapest",
+                avg_input_tokens=1024,
+                avg_output_tokens=1024,
+                num_requests=1500,
+                market="spot",
+                cost_roofline_usd=100.0,
+            )
+
+            with_decision_response = post(
+                f"{KOI_URL}/job/launch-failed",
+                {
+                    "job_id": "p1-with-decision",
+                    "decision_id": parent_decision_id,
+                    "configs_tried": [
+                        {
+                            "gpu_type": "L40S",
+                            "instance_type": "g6e.12xlarge",
+                            "tp": 4,
+                            "pp": 1,
+                            "region": "us-east-1",
+                            "market": "spot",
+                        }
+                    ],
+                    "failure_reasons": ["InsufficientCapacity"],
+                    "total_time_seconds": 30.0,
+                },
+            )
+
+            def t_p1_recovery_when_decision_missing_aborts():
+                assert no_decision_response.get("status") == "recorded", no_decision_response
+                recovery = no_decision_response.get("recovery")
+                assert recovery is not None, no_decision_response
+                assert recovery.get("action") == "abort", recovery
+
+            def t_p1_recovery_with_decision_returns_plan():
+                assert with_decision_response.get("status") == "recorded", with_decision_response
+                recovery = with_decision_response.get("recovery")
+                assert recovery is not None, with_decision_response
+                # The fake agent has no perfdb/cost-table so retry candidates
+                # cannot be synthesized; harness should abort safely.
+                assert recovery.get("action") == "abort", recovery
+                assert recovery.get("parent_decision_id") == parent_decision_id, recovery
+
+            check(
+                "P1 returns abort recovery when decision_id is missing",
+                t_p1_recovery_when_decision_missing_aborts,
+            )
+            check(
+                "P1 returns recovery plan referencing parent decision",
+                t_p1_recovery_with_decision_returns_plan,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P1 returns abort recovery when decision_id is missing",
+            "P1 returns recovery plan referencing parent decision",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 3 — Full agent loop (requires KOI_API_KEY or ANTHROPIC_API_KEY)
@@ -2374,6 +2477,99 @@ def run_tier3(api_key: str):
             "agent responded to FAILED trigger (scale_up decision in memory)",
             "scale_up decision recorded in memory",
             "agent uses market=on_demand after 2 spot preemptions",
+        ]:
+            skip(name, str(e))
+
+    # ── T3.3: P1 launch recovery LLM scenario ─────────────────────────────
+    section("T3.3  P1 harness picks recovery candidate after launch failure")
+
+    try:
+        p1_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p1",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_HARNESS_P1_RETRY_BUDGET": "2",
+        }
+        with koi_server(api_key=api_key, extra_env=p1_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            seed_memory = AgenticMemory(db_path)
+            parent_decision_id = seed_memory.record_decision(
+                job_id="p1-llm-recovery",
+                model_name="Qwen/Qwen3-32B",
+                instance_type="g6e.12xlarge",
+                gpu_type="L40S",
+                tp=4,
+                pp=1,
+                dp=1,
+                num_gpus=4,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.49,
+                slo_deadline_hours=1.0,
+                objective="cheapest",
+                avg_input_tokens=1024,
+                avg_output_tokens=1024,
+                num_requests=1500,
+                market="spot",
+                cost_roofline_usd=100.0,
+            )
+
+            payload = {
+                "job_id": "p1-llm-recovery",
+                "decision_id": parent_decision_id,
+                "configs_tried": [
+                    {
+                        "gpu_type": "L40S",
+                        "instance_type": "g6e.12xlarge",
+                        "tp": 4,
+                        "pp": 1,
+                        "region": "us-east-1",
+                        "market": "spot",
+                    }
+                ],
+                "failure_reasons": ["SpotInstanceInterruption"],
+                "total_time_seconds": 45.0,
+            }
+            recovery_response = requests.post(
+                f"{KOI_URL}/job/launch-failed",
+                json=payload,
+                timeout=180,
+            ).json()
+
+            def t_p1_llm_returns_recovery_field():
+                assert recovery_response.get("status") == "recorded", recovery_response
+                recovery = recovery_response.get("recovery")
+                assert recovery is not None, recovery_response
+                assert recovery.get("parent_decision_id") == parent_decision_id, recovery
+
+            def t_p1_llm_action_is_known():
+                recovery = recovery_response.get("recovery") or {}
+                assert recovery.get("action") in {"retry_launch", "abort"}, recovery
+
+            def t_p1_llm_retry_records_child_decision():
+                recovery = recovery_response.get("recovery") or {}
+                if recovery.get("action") != "retry_launch":
+                    return
+                child_id = recovery.get("decision_id")
+                assert child_id and child_id != parent_decision_id, recovery
+                m = AgenticMemory(db_path)
+                child = m.get_decision(child_id)
+                assert child is not None, child_id
+                assert child.get("parent_decision_id") == parent_decision_id, child
+                assert child.get("triggered_by") == "launch_recovery", child
+
+            check("P1 LLM returns recovery field with parent decision", t_p1_llm_returns_recovery_field)
+            check("P1 LLM picks a known recovery action", t_p1_llm_action_is_known)
+            check(
+                "P1 LLM retry recovery records a child decision in memory",
+                t_p1_llm_retry_records_child_decision,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P1 LLM returns recovery field with parent decision",
+            "P1 LLM picks a known recovery action",
+            "P1 LLM retry recovery records a child decision in memory",
         ]:
             skip(name, str(e))
 
