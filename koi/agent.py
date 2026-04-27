@@ -1710,6 +1710,7 @@ class KoiAgent:
         self,
         trigger: MonitoringTrigger,
         precomputed_candidates: Optional[list[ScaleUpCandidate]] = None,
+        limit: int = 3,
     ) -> list[RankedSuggestion]:
         tracker = trigger.job_tracker
         config = tracker.get("config", {})
@@ -1825,10 +1826,10 @@ class KoiAgent:
                     )
 
             capped = list(candidates.values())[:8]
-            return rank_falling_behind_suggestions(job, chain_states, capped)[:3]
+            return rank_falling_behind_suggestions(job, chain_states, capped)[:limit]
 
         if trigger.trigger_type == MonitoringStatus.OVER_PROVISIONED:
-            return rank_overprovisioned_suggestions(job, chain_states)[:3]
+            return rank_overprovisioned_suggestions(job, chain_states)[:limit]
 
         return []
 

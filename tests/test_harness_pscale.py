@@ -4,7 +4,13 @@ import pytest
 from pydantic_ai.models.test import TestModel
 
 from koi.agent import KoiAgent
-from koi.harness.pscale import build_pscale_packet, run_runtime_scale
+from koi.harness.pscale import (
+    _execute_validated_action,
+    _packet_tools,
+    build_pscale_packet,
+    render_pscale_prompt,
+    run_runtime_scale,
+)
 from koi.schemas import EngineConfig, MonitoringStatus, MonitoringTrigger, PlacementConfig
 from koi.tools.memory import AgenticMemory
 
@@ -161,6 +167,89 @@ async def test_pscale_packet_builds_scale_up_menu(memory):
     assert packet.action_options[0].valid is True
     assert packet.action_options[-1].action_type == "noop"
     assert packet.action_options[-1].valid is False
+
+
+@pytest.mark.asyncio
+async def test_pscale_packet_exposes_granular_detail_sections(memory):
+    agent = _agent(memory)
+    packet = await build_pscale_packet(agent, _falling_trigger())
+
+    scale_option = packet.action_options[0]
+    expected = {
+        f"physics:{scale_option.action_id}",
+        f"perfdb_exact:{scale_option.action_id}",
+        f"perfdb_proxy:{scale_option.action_id}",
+        f"memory_success:{scale_option.action_id}",
+        f"memory_failure:{scale_option.action_id}",
+        f"quota:{scale_option.action_id}",
+        f"recent_failures:{scale_option.action_id}",
+        f"runtime_metrics:{scale_option.action_id}",
+        f"executor_payload:{scale_option.action_id}",
+        f"suggestion:{scale_option.action_id}",
+    }
+    assert set(scale_option.detail_refs) == expected
+    assert all(ref in packet.detail_sections for ref in expected)
+    physics = packet.detail_sections[f"physics:{scale_option.action_id}"]
+    assert physics["gpu_type"] == "L40S"
+    assert physics["tp"] == 4
+
+    tools = _packet_tools(agent, packet)
+    listing = await tools["list_detail_sections"](scale_option.action_id)
+    assert "physics:" in listing
+    by_section = await tools["read_option_detail"](
+        scale_option.action_id, section="physics"
+    )
+    assert "physics:" in by_section
+    assert "L40S" in by_section
+    invalid = await tools["read_option_detail"](
+        scale_option.action_id, section="bogus"
+    )
+    assert "unknown section" in invalid
+
+
+@pytest.mark.asyncio
+async def test_pscale_exposes_read_tools_and_custom_scale_option(memory):
+    orca = FakeScaleOrca()
+    monitor = FakeMonitor()
+    agent = _agent(memory, orca=orca, monitor=monitor)
+    packet = await build_pscale_packet(agent, _falling_trigger())
+    tools = _packet_tools(agent, packet)
+
+    assert "read_option_detail" in tools
+    assert "get_resources_tool" in tools
+    assert "request_custom_scale_option" in tools
+    assert "scale_chain_tool" not in tools
+    assert "kill_replica_tool" not in tools
+
+    result = await tools["request_custom_scale_option"](
+        gpu_type="A100-80GB",
+        tp=8,
+        pp=1,
+        count=1,
+        on_demand=True,
+        reason="explored faster GPU family",
+    )
+
+    assert "x1" in result
+    custom = packet.get_action("x1")
+    assert custom is not None
+    assert custom.action_type == "scale_up"
+    assert custom.evidence["source"] == "llm_exploration"
+
+    exec_result = await _execute_validated_action(agent, packet, "x1")
+    assert "Scaled up" in exec_result
+    assert orca.scale_calls[0]["gpu_type"] == "A100-80GB"
+    assert orca.scale_calls[0]["on_demand"] is True
+
+
+@pytest.mark.asyncio
+async def test_pscale_prompt_explicitly_allows_bounded_exploration(memory):
+    packet = await build_pscale_packet(_agent(memory), _falling_trigger())
+    prompt = render_pscale_prompt(packet)
+
+    assert "explore alternatives" in prompt
+    assert "request_custom_scale_option" in prompt
+    assert "Do not execute raw cluster mutations directly" in prompt
 
 
 @pytest.mark.asyncio

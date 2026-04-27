@@ -132,6 +132,171 @@ def _physics_for_row(req: JobRequest, rm: ResourceMap, row: dict[str, Any]) -> d
         }
 
 
+def _section_keys_for(action_id: str) -> list[str]:
+    return [
+        f"physics:{action_id}",
+        f"perfdb_exact:{action_id}",
+        f"perfdb_proxy:{action_id}",
+        f"memory_success:{action_id}",
+        f"memory_failure:{action_id}",
+        f"quota:{action_id}",
+        f"recent_failures:{action_id}",
+        f"executor_payload:{action_id}",
+        f"row:{action_id}",
+    ]
+
+
+def _build_p0_detail_sections(
+    agent: Any,
+    req: JobRequest,
+    rm: ResourceMap,
+    row: dict[str, Any],
+    physics_payload: dict[str, Any],
+    action_id: str,
+) -> dict[str, Any]:
+    """Build granular per-action detail sections per ARCHITECTURE-HARNESS section 8."""
+
+    sections: dict[str, Any] = {}
+    gpu_type = row.get("gpu_type")
+    tp = int(row.get("tp", 1) or 1)
+    pp = int(row.get("pp", 1) or 1)
+    dp = int(row.get("dp", 1) or 1)
+
+    # physics: full per-config feature dict + arch summary.
+    physics_detail = dict(physics_payload.get("detail", {}))
+    try:
+        mf = get_model_features(req.model_name, dtype=req.quantization or "fp16")
+        physics_detail.setdefault(
+            "model_arch",
+            {
+                "params_billions": getattr(mf, "num_params_billions", None),
+                "num_layers": getattr(mf, "num_layers", None),
+                "num_attention_heads": getattr(mf, "num_attention_heads", None),
+                "num_kv_heads": getattr(mf, "num_kv_heads", None),
+                "gqa_ratio": getattr(mf, "gqa_ratio", None),
+                "hidden_dim": getattr(mf, "hidden_dim", None),
+                "is_moe": getattr(mf, "is_moe", False),
+            },
+        )
+    except Exception as exc:
+        physics_detail.setdefault("model_arch_error", str(exc))
+    sections[f"physics:{action_id}"] = physics_detail
+
+    # perfdb_exact: best-effort exact rows from PerfDB for this gpu/tp/pp.
+    perfdb = getattr(agent, "perfdb", None)
+    perfdb_exact: list[dict[str, Any]] = []
+    perfdb_proxy: list[dict[str, Any]] = []
+    if perfdb is not None and gpu_type:
+        try:
+            perfdb_exact = perfdb.query(
+                model_name=req.model_name,
+                gpu_type=str(gpu_type),
+                tp=tp,
+                pp=pp,
+                limit=10,
+            ) or []
+        except Exception as exc:
+            perfdb_exact = [{"error": str(exc)}]
+
+        if not perfdb_exact:
+            try:
+                from koi.tools.physics import find_similar_models, get_model_features as _gmf
+
+                target = _gmf(req.model_name, dtype=req.quantization or "fp16")
+                distinct = perfdb.get_distinct_models() if hasattr(perfdb, "get_distinct_models") else []
+                proxies = find_similar_models(target, distinct or [])
+                for proxy in proxies[:3]:
+                    proxy_name = proxy.get("model_name")
+                    proxy_records = perfdb.query(
+                        model_name=str(proxy_name),
+                        gpu_type=str(gpu_type),
+                        tp=tp,
+                        pp=pp,
+                        limit=5,
+                    ) or []
+                    perfdb_proxy.append(
+                        {
+                            "proxy_model": proxy_name,
+                            "distance": proxy.get("distance"),
+                            "confidence": proxy.get("confidence"),
+                            "records": proxy_records,
+                        }
+                    )
+            except Exception as exc:
+                perfdb_proxy = [{"error": str(exc)}]
+    sections[f"perfdb_exact:{action_id}"] = perfdb_exact
+    sections[f"perfdb_proxy:{action_id}"] = perfdb_proxy
+
+    # memory_success / memory_failure: per-model history from AgenticMemory.
+    memory = getattr(agent, "memory", None)
+    memory_success: list[dict[str, Any]] = []
+    memory_failure: list[dict[str, Any]] = []
+    if memory is not None:
+        try:
+            memory_success = memory.query_outcomes(
+                model_name=req.model_name, status="succeeded", limit=10
+            ) or []
+        except Exception as exc:
+            memory_success = [{"error": str(exc)}]
+        try:
+            memory_failure = memory.query_outcomes(
+                model_name=req.model_name, status="failed", limit=10
+            ) or []
+        except Exception as exc:
+            memory_failure = [{"error": str(exc)}]
+    sections[f"memory_success:{action_id}"] = memory_success
+    sections[f"memory_failure:{action_id}"] = memory_failure
+
+    # quota: live snapshot per (gpu_type, market) using availability priors.
+    quota_section: dict[str, Any] = {
+        "gpu_type": gpu_type,
+        "preferred_market": req.preferred_market,
+    }
+    if memory is not None and gpu_type:
+        try:
+            quota_section["failure_summary"] = memory.get_failure_summary(
+                str(gpu_type), market=req.preferred_market
+            )
+        except Exception as exc:
+            quota_section["failure_summary_error"] = str(exc)
+    resource = rm.get_resource(str(gpu_type)) if gpu_type else None
+    if resource is not None:
+        quota_section.update(
+            {
+                "available_gpus": resource.available_gpus,
+                "total_gpus": resource.total_gpus,
+                "allocated_gpus": resource.allocated_gpus,
+                "instance_type": resource.instance_type,
+                "region": resource.region,
+                "interconnect": resource.interconnect,
+            }
+        )
+    sections[f"quota:{action_id}"] = quota_section
+
+    # recent_failures: short-horizon cooloff overlay placeholder. Phase 4 will
+    # populate this from the cooloff store; for now we return the same
+    # failure_summary slice so the section reference is non-empty.
+    sections[f"recent_failures:{action_id}"] = quota_section.get("failure_summary", {})
+
+    # executor_payload: how this action will execute deterministically.
+    sections[f"executor_payload:{action_id}"] = {
+        "gpu_type": gpu_type,
+        "instance_type": row.get("instance_type"),
+        "tp": tp,
+        "pp": pp,
+        "dp": dp,
+        "planned_market": row.get("planned_market") or req.preferred_market,
+        "cost_per_hour": row.get("cost_per_hour"),
+        "predicted_tps": row.get("predicted_tps"),
+        "total_cost": row.get("total_cost"),
+        "eta_h": row.get("eta_h"),
+    }
+
+    # row: keep the raw cost-table row for full transparency.
+    sections[f"row:{action_id}"] = {"row": row}
+    return sections
+
+
 def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionPacket:
     _, rows = agent._build_cost_table(req, rm)
     options: list[ActionOption] = []
@@ -173,10 +338,30 @@ def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionP
             f"TPS={performance['predicted_tps']:.0f} | total=${float(row.get('total_cost') or 0.0):.2f} | "
             f"SLO={'yes' if row_meets_slo else 'no'}"
         )
-        detail_key = f"row:{action_id}"
-        detail_sections[detail_key] = {
-            "row": row,
-            "physics": physics_payload.get("detail", {}),
+        per_action_sections = _build_p0_detail_sections(
+            agent, req, rm, row, physics_payload, action_id
+        )
+        detail_sections.update(per_action_sections)
+        evidence = {
+            "source": row.get("source", "unknown"),
+            "memory_successes": len(per_action_sections[f"memory_success:{action_id}"]) if isinstance(per_action_sections[f"memory_success:{action_id}"], list) else 0,
+            "memory_failures": len(per_action_sections[f"memory_failure:{action_id}"]) if isinstance(per_action_sections[f"memory_failure:{action_id}"], list) else 0,
+            "perfdb_exact_rows": len(per_action_sections[f"perfdb_exact:{action_id}"]) if isinstance(per_action_sections[f"perfdb_exact:{action_id}"], list) else 0,
+            "perfdb_proxy_rows": len(per_action_sections[f"perfdb_proxy:{action_id}"]) if isinstance(per_action_sections[f"perfdb_proxy:{action_id}"], list) else 0,
+            "proxy_model": (
+                per_action_sections[f"perfdb_proxy:{action_id}"][0].get("proxy_model")
+                if per_action_sections[f"perfdb_proxy:{action_id}"]
+                and isinstance(per_action_sections[f"perfdb_proxy:{action_id}"][0], dict)
+                and "proxy_model" in per_action_sections[f"perfdb_proxy:{action_id}"][0]
+                else None
+            ),
+            "proxy_distance": (
+                per_action_sections[f"perfdb_proxy:{action_id}"][0].get("distance")
+                if per_action_sections[f"perfdb_proxy:{action_id}"]
+                and isinstance(per_action_sections[f"perfdb_proxy:{action_id}"][0], dict)
+                and "distance" in per_action_sections[f"perfdb_proxy:{action_id}"][0]
+                else None
+            ),
         }
         options.append(
             ActionOption(
@@ -188,18 +373,12 @@ def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionP
                 hard_feasibility=hard_feasibility,
                 performance=performance,
                 physics=physics_payload["physics"],
-                evidence={
-                    "source": row.get("source", "unknown"),
-                    "memory_successes": 1 if row.get("source") == "VERIFIED" else 0,
-                    "memory_failures": 0,
-                    "proxy_model": None,
-                    "proxy_distance": None,
-                },
+                evidence=evidence,
                 availability=availability,
                 cost=cost,
                 risk={},
-                executor_payload_ref=detail_key,
-                detail_refs=[detail_key],
+                executor_payload_ref=f"executor_payload:{action_id}",
+                detail_refs=_section_keys_for(action_id),
             )
         )
 
@@ -268,18 +447,52 @@ def render_p0_prompt(packet: TransitionPacket) -> str:
     return "\n".join(lines)
 
 
+_KNOWN_SECTIONS = (
+    "physics",
+    "perfdb_exact",
+    "perfdb_proxy",
+    "memory_success",
+    "memory_failure",
+    "quota",
+    "recent_failures",
+    "executor_payload",
+    "row",
+)
+
+
 def _packet_tools(packet: TransitionPacket) -> dict[str, Any]:
-    async def read_option_detail(action_id: str, section: str = "row") -> str:
-        """Read a precomputed detail section for one action_id."""
+    async def list_detail_sections(action_id: str) -> str:
+        """List the named detail sections available for one action_id."""
         option = packet.get_action(action_id)
         if option is None:
             return f"unknown action_id={action_id!r}"
-        details = {
-            ref: packet.detail_sections.get(ref)
-            for ref in option.detail_refs
-            if section == "all" or ref.startswith(f"{section}:") or ref.startswith("row:")
-        }
-        return json.dumps(details, indent=2, default=str)
+        return json.dumps(option.detail_refs, indent=2)
+
+    async def read_option_detail(action_id: str, section: str = "all") -> str:
+        """Read a specific detail section for one action_id.
+
+        Sections follow the harness spec:
+          physics, perfdb_exact, perfdb_proxy, memory_success, memory_failure,
+          quota, recent_failures, executor_payload, row, all.
+        """
+        option = packet.get_action(action_id)
+        if option is None:
+            return f"unknown action_id={action_id!r}"
+        if section == "all":
+            data = {
+                ref: packet.detail_sections.get(ref) for ref in option.detail_refs
+            }
+            return json.dumps(data, indent=2, default=str)
+        ref = f"{section}:{action_id}"
+        if ref not in option.detail_refs and section not in _KNOWN_SECTIONS:
+            return (
+                f"unknown section={section!r} for action_id={action_id!r}; "
+                f"available={option.detail_refs}"
+            )
+        payload = packet.detail_sections.get(ref)
+        if payload is None:
+            return json.dumps({"section": ref, "data": None}, indent=2, default=str)
+        return json.dumps({"section": ref, "data": payload}, indent=2, default=str)
 
     async def compare_options(action_ids: list[str], lens: str = "summary") -> str:
         """Compare precomputed option summaries for the requested action IDs."""
@@ -297,12 +510,14 @@ def _packet_tools(packet: TransitionPacket) -> dict[str, Any]:
                     "performance": option.performance,
                     "cost": option.cost,
                     "availability": option.availability,
+                    "evidence": option.evidence,
                     "physics": option.physics if lens == "physics" else {},
                 }
             )
         return json.dumps(selected, indent=2, default=str)
 
     return {
+        "list_detail_sections": list_detail_sections,
         "read_option_detail": read_option_detail,
         "compare_options": compare_options,
     }
@@ -319,8 +534,12 @@ def _decision_from_action(
     agent_model: str,
 ) -> AgentDecision:
     option = validated.option
-    detail = packet.detail_sections.get(option.executor_payload_ref or "", {})
-    row = detail.get("row", {})
+    row_ref = f"row:{option.action_id}"
+    row = packet.detail_sections.get(row_ref, {}).get("row", {})
+    if not row:
+        # Backward-compat for older bundled rows still keyed by executor_payload_ref.
+        legacy = packet.detail_sections.get(option.executor_payload_ref or "", {})
+        row = legacy.get("row", legacy if isinstance(legacy, dict) else {})
     gpu_type = row.get("gpu_type") or option.hard_feasibility.get("gpu_type") or "L40S"
     tp = int(row.get("tp", 1) or 1)
     pp = int(row.get("pp", 1) or 1)

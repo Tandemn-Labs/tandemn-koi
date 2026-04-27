@@ -88,6 +88,197 @@ def _runtime_context(agent: Any, trigger: MonitoringTrigger) -> dict[str, Any]:
     }
 
 
+_PSCALE_SECTION_KEYS = (
+    "physics",
+    "perfdb_exact",
+    "perfdb_proxy",
+    "memory_success",
+    "memory_failure",
+    "quota",
+    "recent_failures",
+    "runtime_metrics",
+    "executor_payload",
+    "suggestion",
+)
+
+
+def _pscale_section_keys_for(action_id: str) -> list[str]:
+    return [f"{section}:{action_id}" for section in _PSCALE_SECTION_KEYS]
+
+
+def _build_pscale_detail_sections(
+    agent: Any,
+    trigger: MonitoringTrigger,
+    suggestion: Any,
+    action_id: str,
+    executor_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Granular per-action detail sections for Pscale (architecture spec §8)."""
+
+    sections: dict[str, Any] = {}
+    tracker = trigger.job_tracker
+    config = tracker.get("config", {}) if isinstance(tracker, dict) else {}
+    gpu_type = getattr(suggestion, "gpu_type", None) or config.get("gpu_type")
+    tp = getattr(suggestion, "tp", None) or config.get("tp", 1) or 1
+    pp = getattr(suggestion, "pp", None) or config.get("pp", 1) or 1
+    market = config.get("market", "on_demand")
+    region = config.get("region")
+
+    # physics: derive per-config physics for the suggestion's target topology.
+    physics_section: dict[str, Any] = {
+        "gpu_type": gpu_type,
+        "tp": tp,
+        "pp": pp,
+    }
+    parent_model_name: Optional[str] = None
+    parent_decision = None
+    parent_decision_id = tracker.get("decision_id") if isinstance(tracker, dict) else None
+    memory = getattr(agent, "memory", None)
+    if memory is not None and parent_decision_id:
+        try:
+            parent_decision = memory.get_decision(parent_decision_id)
+        except Exception:
+            parent_decision = None
+    if parent_decision and isinstance(parent_decision, dict):
+        parent_model_name = parent_decision.get("model_name")
+    if parent_model_name:
+        try:
+            from koi.model_features import compute_config_features, get_model_features
+            from koi.tools.physics import lookup_gpu_spec
+
+            gpu_spec = lookup_gpu_spec(str(gpu_type)) if gpu_type else {}
+            mf = get_model_features(parent_model_name, dtype=parent_decision.get("quantization") or "fp16")
+            feats = compute_config_features(
+                mf,
+                gpu_type=str(gpu_type or "unknown"),
+                tp=int(tp),
+                pp=int(pp),
+                dp=1,
+                input_len=int(parent_decision.get("avg_input_tokens", 512) or 512),
+                output_len=int(parent_decision.get("avg_output_tokens", 256) or 256),
+                gpus_per_node=int(gpu_spec.get("gpus_per_node", 8) or 8) if gpu_spec else 8,
+                price_per_gpu_hour=0.0,
+            )
+            physics_section.update(
+                {
+                    "model_name": parent_model_name,
+                    "model_arch": {
+                        "params_billions": getattr(mf, "num_params_billions", None),
+                        "num_layers": getattr(mf, "num_layers", None),
+                        "num_attention_heads": getattr(mf, "num_attention_heads", None),
+                        "num_kv_heads": getattr(mf, "num_kv_heads", None),
+                        "is_moe": getattr(mf, "is_moe", False),
+                    },
+                    "config_features": feats,
+                }
+            )
+        except Exception as exc:
+            physics_section["error"] = str(exc)
+    sections[f"physics:{action_id}"] = physics_section
+
+    # perfdb_exact / perfdb_proxy: rows for this gpu/tp/pp from PerfDB.
+    perfdb = getattr(agent, "perfdb", None)
+    perfdb_exact: list[dict[str, Any]] = []
+    perfdb_proxy: list[dict[str, Any]] = []
+    if perfdb is not None and parent_model_name and gpu_type:
+        try:
+            perfdb_exact = perfdb.query(
+                model_name=str(parent_model_name),
+                gpu_type=str(gpu_type),
+                tp=int(tp),
+                pp=int(pp),
+                limit=10,
+            ) or []
+        except Exception as exc:
+            perfdb_exact = [{"error": str(exc)}]
+        if not perfdb_exact:
+            try:
+                from koi.tools.physics import find_similar_models, get_model_features as _gmf
+
+                target = _gmf(str(parent_model_name), dtype=parent_decision.get("quantization") or "fp16")
+                distinct = perfdb.get_distinct_models() if hasattr(perfdb, "get_distinct_models") else []
+                for proxy in (find_similar_models(target, distinct or []) or [])[:3]:
+                    proxy_records = perfdb.query(
+                        model_name=str(proxy.get("model_name")),
+                        gpu_type=str(gpu_type),
+                        tp=int(tp),
+                        pp=int(pp),
+                        limit=5,
+                    ) or []
+                    perfdb_proxy.append(
+                        {
+                            "proxy_model": proxy.get("model_name"),
+                            "distance": proxy.get("distance"),
+                            "confidence": proxy.get("confidence"),
+                            "records": proxy_records,
+                        }
+                    )
+            except Exception as exc:
+                perfdb_proxy = [{"error": str(exc)}]
+    sections[f"perfdb_exact:{action_id}"] = perfdb_exact
+    sections[f"perfdb_proxy:{action_id}"] = perfdb_proxy
+
+    # memory_success / memory_failure
+    memory_success: list[dict[str, Any]] = []
+    memory_failure: list[dict[str, Any]] = []
+    if memory is not None and parent_model_name:
+        try:
+            memory_success = memory.query_outcomes(
+                model_name=str(parent_model_name), status="succeeded", limit=10
+            ) or []
+        except Exception as exc:
+            memory_success = [{"error": str(exc)}]
+        try:
+            memory_failure = memory.query_outcomes(
+                model_name=str(parent_model_name), status="failed", limit=10
+            ) or []
+        except Exception as exc:
+            memory_failure = [{"error": str(exc)}]
+    sections[f"memory_success:{action_id}"] = memory_success
+    sections[f"memory_failure:{action_id}"] = memory_failure
+
+    # quota / recent_failures from the long-term beta priors slice.
+    quota_section: dict[str, Any] = {
+        "gpu_type": gpu_type,
+        "region": region,
+        "market": market,
+    }
+    if memory is not None and gpu_type:
+        try:
+            quota_section["failure_summary"] = memory.get_failure_summary(
+                str(gpu_type), region=region, market=market
+            )
+        except Exception as exc:
+            quota_section["failure_summary_error"] = str(exc)
+    sections[f"quota:{action_id}"] = quota_section
+    sections[f"recent_failures:{action_id}"] = quota_section.get("failure_summary", {})
+
+    # runtime_metrics: per-replica live metrics for kill suggestions, fleet
+    # snapshot for scale-up suggestions.
+    runtime_metrics: dict[str, Any] = {}
+    if agent.monitor and tracker.get("group_id"):
+        group_chains = agent.monitor.get_group_chains(tracker["group_id"]) or {}
+        for chain_id, chain in group_chains.items():
+            runtime_metrics[chain_id] = {
+                "smoothed_tps": getattr(chain, "smoothed_tps", 0.0),
+                "predicted_tps": getattr(chain, "predicted_tps", 0.0),
+                "cost_per_hour": getattr(chain, "predicted_cost_per_hour", 0.0),
+                "status": getattr(getattr(chain, "status", None), "value", None)
+                or str(getattr(chain, "status", "unknown")),
+                "gpu_type": getattr(chain.config, "gpu_type", None),
+                "tp": getattr(chain.config, "tp", None),
+                "pp": getattr(chain.config, "pp", None),
+            }
+    sections[f"runtime_metrics:{action_id}"] = runtime_metrics
+
+    # executor_payload + suggestion blob (deterministic execution + raw)
+    sections[f"executor_payload:{action_id}"] = executor_payload
+    sections[f"suggestion:{action_id}"] = (
+        suggestion.__dict__ if hasattr(suggestion, "__dict__") else {}
+    )
+    return sections
+
+
 async def build_pscale_packet(
     agent: Any,
     trigger: MonitoringTrigger,
@@ -96,6 +287,7 @@ async def build_pscale_packet(
     suggestions = agent._rank_runtime_policy_suggestions(
         trigger,
         precomputed_candidates=precomputed_candidates,
+        limit=MAX_MENU_OPTIONS - 1,
     )
     options: list[ActionOption] = []
     detail_sections: dict[str, Any] = {}
@@ -123,10 +315,28 @@ async def build_pscale_packet(
             action_type = suggestion.kind
             executor_payload = {"tool": "noop"}
 
-        detail_key = f"suggestion:{action_id}"
-        detail_sections[detail_key] = {
-            "suggestion": suggestion.__dict__,
-            "executor_payload": executor_payload,
+        per_action_sections = _build_pscale_detail_sections(
+            agent, trigger, suggestion, action_id, executor_payload
+        )
+        detail_sections.update(per_action_sections)
+        evidence = {
+            "source": suggestion.source,
+            "gpu_type": suggestion.gpu_type,
+            "memory_successes": (
+                len(per_action_sections[f"memory_success:{action_id}"])
+                if isinstance(per_action_sections[f"memory_success:{action_id}"], list)
+                else 0
+            ),
+            "memory_failures": (
+                len(per_action_sections[f"memory_failure:{action_id}"])
+                if isinstance(per_action_sections[f"memory_failure:{action_id}"], list)
+                else 0
+            ),
+            "perfdb_exact_rows": (
+                len(per_action_sections[f"perfdb_exact:{action_id}"])
+                if isinstance(per_action_sections[f"perfdb_exact:{action_id}"], list)
+                else 0
+            ),
         }
         options.append(
             ActionOption(
@@ -144,23 +354,23 @@ async def build_pscale_packet(
                     "meets_slo": suggestion.meets_slo,
                     "cost_per_mtoken_usd": suggestion.cost_per_mtoken_usd,
                 },
-                evidence={
-                    "source": suggestion.source,
-                    "gpu_type": suggestion.gpu_type,
-                },
+                evidence=evidence,
                 cost={
                     "projected_total_cost_usd": suggestion.projected_total_cost_usd,
                     "cost_overage_usd": suggestion.cost_overage_usd,
                 },
                 risk={},
-                executor_payload_ref=detail_key,
-                detail_refs=[detail_key],
+                executor_payload_ref=f"executor_payload:{action_id}",
+                detail_refs=_pscale_section_keys_for(action_id),
             )
         )
 
     noop_id = _action_id(len(options))
-    noop_detail_key = f"suggestion:{noop_id}"
-    detail_sections[noop_detail_key] = {"executor_payload": {"tool": "noop"}}
+    detail_sections[f"executor_payload:{noop_id}"] = {"tool": "noop"}
+    detail_sections[f"suggestion:{noop_id}"] = {
+        "kind": "noop",
+        "reason": "no scale or kill suggested",
+    }
     options.append(
         ActionOption(
             action_id=noop_id,
@@ -171,8 +381,11 @@ async def build_pscale_packet(
             risk={
                 "reason": "Use only when no listed scale action is safe or necessary."
             },
-            executor_payload_ref=noop_detail_key,
-            detail_refs=[noop_detail_key],
+            executor_payload_ref=f"executor_payload:{noop_id}",
+            detail_refs=[
+                f"executor_payload:{noop_id}",
+                f"suggestion:{noop_id}",
+            ],
         )
     )
 
@@ -204,6 +417,9 @@ def render_pscale_prompt(packet: TransitionPacket) -> str:
         "Choose one valid action_id from the runtime menu.",
         "SLO is hard. Cost is a soft ranking signal unless all SLO-saving actions are costly.",
         "The ranking is guidance, not a command; explain non-top choices.",
+        "You may use packet/read-only tools to inspect details or explore alternatives before choosing.",
+        "If the recommended menu is missing a necessary DEGRADED scale-up, call request_custom_scale_option first, then choose the returned action_id.",
+        "Do not execute raw cluster mutations directly; final execution still happens through the chosen action_id.",
         "",
         "RUNTIME CONTEXT:",
         json.dumps(packet.runtime_context, indent=2, sort_keys=True, default=str),
@@ -226,14 +442,46 @@ def render_pscale_prompt(packet: TransitionPacket) -> str:
     return "\n".join(lines)
 
 
-def _packet_tools(packet: TransitionPacket) -> dict[str, Any]:
-    async def read_option_detail(action_id: str, section: str = "all") -> str:
-        """Read a precomputed detail section for one runtime action option."""
+def _next_custom_action_id(packet: TransitionPacket) -> str:
+    used = {option.action_id for option in packet.action_options}
+    idx = 1
+    while f"x{idx}" in used:
+        idx += 1
+    return f"x{idx}"
+
+
+def _packet_tools(agent: Any, packet: TransitionPacket) -> dict[str, Any]:
+    async def list_detail_sections(action_id: str) -> str:
+        """List the named detail sections available for one action_id."""
         option = packet.get_action(action_id)
         if option is None:
             return f"unknown action_id={action_id!r}"
-        details = {ref: packet.detail_sections.get(ref) for ref in option.detail_refs}
-        return json.dumps(details, indent=2, default=str)
+        return json.dumps(option.detail_refs, indent=2)
+
+    async def read_option_detail(action_id: str, section: str = "all") -> str:
+        """Read a specific detail section for one runtime action option.
+
+        Sections include: physics, perfdb_exact, perfdb_proxy, memory_success,
+        memory_failure, quota, recent_failures, runtime_metrics,
+        executor_payload, suggestion, all.
+        """
+        option = packet.get_action(action_id)
+        if option is None:
+            return f"unknown action_id={action_id!r}"
+        if section == "all":
+            details = {ref: packet.detail_sections.get(ref) for ref in option.detail_refs}
+            return json.dumps(details, indent=2, default=str)
+        ref = f"{section}:{action_id}"
+        if ref not in option.detail_refs:
+            return (
+                f"unknown section={section!r} for action_id={action_id!r}; "
+                f"available={option.detail_refs}"
+            )
+        return json.dumps(
+            {"section": ref, "data": packet.detail_sections.get(ref)},
+            indent=2,
+            default=str,
+        )
 
     async def compare_options(action_ids: list[str], lens: str = "summary") -> str:
         """Compare precomputed runtime options."""
@@ -255,10 +503,264 @@ def _packet_tools(packet: TransitionPacket) -> dict[str, Any]:
             )
         return json.dumps(selected, indent=2, default=str)
 
-    return {
+    async def read_packet_section(section_id: str) -> str:
+        """Read a named section from the transition packet."""
+        if section_id == "runtime_context":
+            return json.dumps(packet.runtime_context, indent=2, default=str)
+        if section_id == "evidence_summary":
+            return json.dumps(packet.evidence_summary, indent=2, default=str)
+        if section_id == "guards":
+            return json.dumps(packet.guards, indent=2, default=str)
+        section = packet.detail_sections.get(section_id)
+        if section is None:
+            return f"unknown section_id={section_id!r}"
+        return json.dumps(section, indent=2, default=str)
+
+    async def request_custom_scale_option(
+        gpu_type: str,
+        tp: int,
+        pp: int,
+        count: int = 1,
+        on_demand: Optional[bool] = None,
+        reason: str = "",
+    ) -> str:
+        """Add a custom scale-up option after bounded exploration.
+
+        This preserves the harness boundary: the model may propose an explored
+        config, but it must still choose the returned action_id as its final
+        typed output before any cluster mutation happens.
+        """
+        if packet.state != HarnessState.DEGRADED:
+            return "custom scale options are only allowed for DEGRADED scale-up decisions"
+        if count <= 0:
+            return "custom scale option rejected: count must be positive"
+        if tp <= 0 or pp <= 0:
+            return "custom scale option rejected: tp and pp must be positive"
+        if len([o for o in packet.action_options if o.action_id.startswith("x")]) >= 2:
+            return "custom scale option rejected: custom option limit reached"
+
+        action_id = _next_custom_action_id(packet)
+        executor_payload = {
+            "tool": "scale_chain_tool",
+            "job_id": packet.runtime_context.get("group_id") or packet.job_id,
+            "gpu_type": gpu_type,
+            "tp": tp,
+            "pp": pp,
+            "count": count,
+            "on_demand": on_demand,
+        }
+        packet.detail_sections[f"executor_payload:{action_id}"] = executor_payload
+        packet.detail_sections[f"suggestion:{action_id}"] = {
+            "kind": "custom_scale_up",
+            "source": "llm_exploration",
+            "reason": reason,
+        }
+        # Best-effort: leave other granular section slots empty so list_detail_sections
+        # reports them as available (returns None when read).
+        for placeholder in (
+            "physics",
+            "perfdb_exact",
+            "perfdb_proxy",
+            "memory_success",
+            "memory_failure",
+            "quota",
+            "recent_failures",
+            "runtime_metrics",
+        ):
+            packet.detail_sections.setdefault(f"{placeholder}:{action_id}", None)
+        packet.action_options.append(
+            ActionOption(
+                action_id=action_id,
+                action_type="scale_up",
+                summary=(
+                    f"Custom scale_up {gpu_type} TP={tp} PP={pp} "
+                    f"count={count}"
+                ),
+                rank=len(packet.action_options) + 1,
+                valid=True,
+                performance={
+                    "gpu_type": gpu_type,
+                    "tp": tp,
+                    "pp": pp,
+                    "replica_id": None,
+                    "meets_slo": None,
+                    "source": "llm_exploration",
+                },
+                evidence={"source": "llm_exploration", "gpu_type": gpu_type},
+                risk={
+                    "reason": reason,
+                    "note": "Custom option was proposed by the LLM after reading packet/tool context.",
+                },
+                executor_payload_ref=f"executor_payload:{action_id}",
+                detail_refs=_pscale_section_keys_for(action_id),
+            )
+        )
+        return json.dumps(
+            {
+                "added_action_id": action_id,
+                "instruction": "Use this action_id in your final ChosenAction if you want to execute it.",
+                "executor_payload": executor_payload,
+            },
+            indent=2,
+            default=str,
+        )
+
+    tools: dict[str, Any] = {
+        "list_detail_sections": list_detail_sections,
         "read_option_detail": read_option_detail,
         "compare_options": compare_options,
+        "read_packet_section": read_packet_section,
+        "request_custom_scale_option": request_custom_scale_option,
     }
+
+    # Existing production read tools remain available as an exploration escape
+    # hatch. Keep mutating tools out of this surface; execution still goes
+    # through validated action_id payloads. Each wrapper catches backend errors
+    # and returns them as tool text so an exploratory miss does not abort the
+    # whole runtime decision.
+    try:
+        production_tools = agent._build_tools(monitor=agent.monitor)
+    except Exception as exc:
+        logger.warning("pscale_read_tool_build_failed", error=str(exc))
+        production_tools = {}
+
+    async def query_perfdb_tool(
+        model_name: Optional[str] = None,
+        gpu_type: Optional[str] = None,
+        tp: Optional[int] = None,
+        pp: Optional[int] = None,
+        limit: int = 10,
+    ) -> str:
+        """Explore PerfDB rows without mutating state."""
+        tool = production_tools.get("query_perfdb")
+        if tool is None:
+            return "query_perfdb unavailable"
+        try:
+            return await tool(
+                model_name=model_name,
+                gpu_type=gpu_type,
+                tp=tp,
+                pp=pp,
+                limit=limit,
+            )
+        except Exception as exc:
+            return f"query_perfdb failed: {exc}"
+
+    async def query_memory_tool(
+        model_name: Optional[str] = None,
+        job_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 10,
+    ) -> str:
+        """Explore prior decisions/outcomes without mutating state."""
+        tool = production_tools.get("query_memory_tool")
+        if tool is None:
+            return "query_memory_tool unavailable"
+        try:
+            return await tool(
+                model_name=model_name,
+                job_id=job_id,
+                status=status,
+                limit=limit,
+            )
+        except Exception as exc:
+            return f"query_memory_tool failed: {exc}"
+
+    async def get_gpu_physics_tool(
+        gpu_type: str = "L40S",
+        model_name: Optional[str] = None,
+    ) -> str:
+        """Explore GPU/model physics without mutating state."""
+        tool = production_tools.get("get_gpu_physics_tool")
+        if tool is None:
+            return "get_gpu_physics_tool unavailable"
+        try:
+            return await tool(gpu_type=gpu_type, model_name=model_name)
+        except Exception as exc:
+            return f"get_gpu_physics_tool failed: {exc}"
+
+    async def get_model_arch_tool(model_name: str = "unknown") -> str:
+        """Explore model architecture without mutating state."""
+        tool = production_tools.get("get_model_arch_tool")
+        if tool is None:
+            return "get_model_arch_tool unavailable"
+        try:
+            return await tool(model_name=model_name)
+        except Exception as exc:
+            return f"get_model_arch_tool failed: {exc}"
+
+    async def find_similar_models_tool(model_name: str = "unknown") -> str:
+        """Explore physics-similar models without mutating state."""
+        tool = production_tools.get("find_similar_models_tool")
+        if tool is None:
+            return "find_similar_models_tool unavailable"
+        try:
+            return await tool(model_name=model_name)
+        except Exception as exc:
+            return f"find_similar_models_tool failed: {exc}"
+
+    async def get_resources_tool() -> str:
+        """Explore current resources without mutating state."""
+        tool = production_tools.get("get_resources_tool")
+        if tool is None:
+            return "get_resources_tool unavailable"
+        try:
+            return await tool()
+        except Exception as exc:
+            return f"get_resources_tool failed: {exc}"
+
+    async def get_quota_status_tool(
+        gpu_type: Optional[str] = None,
+        region: Optional[str] = None,
+        market: Optional[str] = None,
+    ) -> str:
+        """Explore quota state without mutating state."""
+        tool = production_tools.get("get_quota_status_tool")
+        if tool is None:
+            return "get_quota_status_tool unavailable"
+        try:
+            return await tool(gpu_type=gpu_type, region=region, market=market)
+        except Exception as exc:
+            return f"get_quota_status_tool failed: {exc}"
+
+    async def get_failure_summary_tool(
+        gpu_type: str = "L40S",
+        region: Optional[str] = None,
+        market: Optional[str] = None,
+    ) -> str:
+        """Explore failure priors without mutating state."""
+        tool = production_tools.get("get_failure_summary_tool")
+        if tool is None:
+            return "get_failure_summary_tool unavailable"
+        try:
+            return await tool(gpu_type=gpu_type, region=region, market=market)
+        except Exception as exc:
+            return f"get_failure_summary_tool failed: {exc}"
+
+    async def get_job_metrics_tool(job_id: str = "") -> str:
+        """Explore live job metrics without mutating state."""
+        tool = production_tools.get("get_job_metrics_tool")
+        if tool is None:
+            return "get_job_metrics_tool unavailable"
+        try:
+            return await tool(job_id=job_id or packet.job_id)
+        except Exception as exc:
+            return f"get_job_metrics_tool failed: {exc}"
+
+    tools.update(
+        {
+            "query_perfdb_tool": query_perfdb_tool,
+            "query_memory_tool": query_memory_tool,
+            "get_gpu_physics_tool": get_gpu_physics_tool,
+            "get_model_arch_tool": get_model_arch_tool,
+            "find_similar_models_tool": find_similar_models_tool,
+            "get_resources_tool": get_resources_tool,
+            "get_quota_status_tool": get_quota_status_tool,
+            "get_failure_summary_tool": get_failure_summary_tool,
+            "get_job_metrics_tool": get_job_metrics_tool,
+        }
+    )
+    return tools
 
 
 async def _execute_validated_action(agent: Any, packet: TransitionPacket, action_id: str) -> str:
@@ -266,7 +768,10 @@ async def _execute_validated_action(agent: Any, packet: TransitionPacket, action
     if option is None:
         return f"No action executed: unknown action_id={action_id!r}"
     detail = packet.detail_sections.get(option.executor_payload_ref or "", {})
-    payload = detail.get("executor_payload", {})
+    if isinstance(detail, dict) and "tool" in detail:
+        payload = detail
+    else:
+        payload = detail.get("executor_payload", {}) if isinstance(detail, dict) else {}
     tool_name = payload.get("tool")
     if tool_name == "noop" or option.action_type == "noop":
         return "No action executed: noop selected."
@@ -282,6 +787,7 @@ async def _execute_validated_action(agent: Any, packet: TransitionPacket, action
             tp=int(payload["tp"]),
             pp=int(payload["pp"]),
             count=int(payload["count"]),
+            on_demand=payload.get("on_demand"),
         )
     if tool_name == "kill_replica_tool":
         tool = tools.get("kill_replica_tool")
@@ -363,7 +869,7 @@ async def run_runtime_scale(
     prompt = render_pscale_prompt(packet)
     reasoner = HarnessReasoner(
         model=agent._model,
-        tools=_packet_tools(packet),
+        tools=_packet_tools(agent, packet),
     )
     try:
         _, choice = await reasoner.choose(

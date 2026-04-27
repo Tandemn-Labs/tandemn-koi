@@ -121,6 +121,49 @@ def test_p0_packet_builds_valid_physics_annotated_menu(agent, job_request, resou
     assert "row:a" in packet.detail_sections
 
 
+def test_p0_packet_emits_granular_detail_sections(agent, job_request, resource_map):
+    packet = build_p0_packet(agent, job_request, resource_map)
+    first = packet.action_options[0]
+
+    expected = {
+        "physics:a",
+        "perfdb_exact:a",
+        "perfdb_proxy:a",
+        "memory_success:a",
+        "memory_failure:a",
+        "quota:a",
+        "recent_failures:a",
+        "executor_payload:a",
+        "row:a",
+    }
+    assert set(first.detail_refs) == expected
+    assert all(ref in packet.detail_sections for ref in expected)
+    physics = packet.detail_sections["physics:a"]
+    assert "model_arch" in physics
+    quota_section = packet.detail_sections["quota:a"]
+    assert quota_section["gpu_type"] == "L40S"
+
+
+@pytest.mark.asyncio
+async def test_p0_read_option_detail_supports_specific_section(
+    agent, job_request, resource_map
+):
+    from koi.harness.p0 import _packet_tools
+
+    packet = build_p0_packet(agent, job_request, resource_map)
+    tools = _packet_tools(packet)
+
+    listing = await tools["list_detail_sections"]("a")
+    assert "physics:a" in listing
+
+    physics_blob = await tools["read_option_detail"]("a", section="physics")
+    assert "physics:a" in physics_blob
+    assert "model_arch" in physics_blob
+
+    bogus = await tools["read_option_detail"]("a", section="random")
+    assert "unknown section" in bogus
+
+
 def test_absolute_fallback_decision_has_required_cost_field(
     agent, job_request, resource_map
 ):
