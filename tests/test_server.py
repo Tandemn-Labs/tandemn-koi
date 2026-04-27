@@ -974,6 +974,197 @@ class TestReplicaFailed:
         )
 
     @pytest.mark.asyncio
+    async def test_real_monitor_poll_then_webhook_no_self_fight(self):
+        """End-to-end production race: drive both observers — the real
+        MonitoringLoop._poll_job AND the real /job/replica-failed handler —
+        against the same MonitoringLoop. Whichever runs first must consume
+        the marker without leaving the other in a FAILED-trigger state.
+
+        This mirrors the actual production sequence: real Orca returns
+        phase='killed' to the poll AND emits /job/replica-failed; whichever
+        Koi observes first must keep the system out of self-fight."""
+        from koi.monitor import MonitoringLoop
+        from koi.schemas import MonitoringStatus
+        from koi.tools.memory import AgenticMemory
+        from koi.server import _replica_failed_impl, ReplicaFailedRequest
+
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
+            market="on_demand",
+        )
+
+        orca = MagicMock()
+        orca.get_replicas = AsyncMock(
+            return_value={
+                "replicas": [
+                    {"replica_id": "prod-r0", "phase": "killed"},
+                ]
+            }
+        )
+
+        memory = AgenticMemory(db_path=":memory:")
+        monitor = MonitoringLoop(orca=orca)
+        decision_id = memory.record_decision(
+            job_id="prod-group",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            market="on_demand",
+        )
+        monitor.register_job(
+            job_id="prod-r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1200.0,
+            decision_id=decision_id,
+            group_id="prod-group",
+        )
+        monitor.tracked_jobs["prod-r0"].smoothed_tps = 1200.0
+
+        # Pscale just decided to scale-down: register the marker.
+        monitor._koi_initiated_kills.add("prod-r0")
+
+        # Wire app.state for the real /job/replica-failed handler.
+        original_monitor = app.state.monitor
+        original_memory = app.state.memory
+        app.state.monitor = monitor
+        app.state.memory = memory
+        try:
+            # Observer #1 wins: monitor poll observes the killed replica
+            # FIRST and consumes the marker.
+            await monitor._poll_job("prod-r0")
+            tracker = monitor.tracked_jobs["prod-r0"]
+            assert tracker.status == MonitoringStatus.COMPLETED
+            assert "prod-r0" not in monitor._koi_initiated_kills
+            assert monitor._trigger_queue.empty()
+
+            # Observer #2 arrives: real Orca's /job/replica-failed webhook.
+            req = ReplicaFailedRequest(
+                job_id="prod-r0",
+                group_id="prod-group",
+                status="failed",
+                reason="Orca observed replica killed",
+            )
+            response = await _replica_failed_impl(req)
+
+            # Webhook must recognize it as the same intentional kill and
+            # NOT re-emit a FAILED trigger that would scale-up.
+            assert response["status"] == "intentional_kill"
+            assert monitor._trigger_queue.empty()
+            assert tracker.status == MonitoringStatus.COMPLETED
+        finally:
+            app.state.monitor = original_monitor
+            app.state.memory = original_memory
+
+    @pytest.mark.asyncio
+    async def test_real_webhook_then_monitor_poll_no_double_trigger(self):
+        """Reverse order: webhook arrives first, then the 10s poll runs.
+        Poll must short-circuit on the COMPLETED status and not re-emit."""
+        from koi.monitor import MonitoringLoop
+        from koi.schemas import MonitoringStatus
+        from koi.tools.memory import AgenticMemory
+        from koi.server import _replica_failed_impl, ReplicaFailedRequest
+
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(
+                tensor_parallel_size=4, pipeline_parallel_size=1
+            ),
+            market="on_demand",
+        )
+        orca = MagicMock()
+        orca.get_replicas = AsyncMock(
+            return_value={
+                "replicas": [
+                    {"replica_id": "prod-r0", "phase": "killed"},
+                ]
+            }
+        )
+        memory = AgenticMemory(db_path=":memory:")
+        monitor = MonitoringLoop(orca=orca)
+        decision_id = memory.record_decision(
+            job_id="prod-group",
+            model_name="Qwen/Qwen3-32B",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            market="on_demand",
+        )
+        monitor.register_job(
+            job_id="prod-r0",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1200.0,
+            decision_id=decision_id,
+            group_id="prod-group",
+        )
+        monitor.tracked_jobs["prod-r0"].smoothed_tps = 1200.0
+        monitor._koi_initiated_kills.add("prod-r0")
+
+        original_monitor = app.state.monitor
+        original_memory = app.state.memory
+        app.state.monitor = monitor
+        app.state.memory = memory
+        try:
+            req = ReplicaFailedRequest(
+                job_id="prod-r0",
+                group_id="prod-group",
+                status="failed",
+                reason="Orca observed replica killed",
+            )
+            response = await _replica_failed_impl(req)
+            assert response["status"] == "intentional_kill"
+            assert monitor._trigger_queue.empty()
+
+            # Now the 10s poll runs. Tracker is COMPLETED and replica is in
+            # dead_replicas; the poll must NOT re-emit anything.
+            await monitor._poll_job("prod-r0")
+            assert monitor._trigger_queue.empty()
+        finally:
+            app.state.monitor = original_monitor
+            app.state.memory = original_memory
+
+    @pytest.mark.asyncio
     async def test_intentional_kill_after_monitor_consumed_marker(self, client):
         """Regression: the monitor poll can consume `_koi_initiated_kills` first
         and mark the tracker COMPLETED. A subsequent /job/replica-failed for

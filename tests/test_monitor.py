@@ -160,6 +160,95 @@ class TestOverprovisionWindow:
         assert required >= WARMUP_MINUTES / 60
 
 
+class TestKoiInitiatedKillRace:
+    """Production race: a Pscale-initiated kill is observed by both
+    /job/replica-failed (Orca webhook) and MonitoringLoop._poll_job (10s
+    poll). Whichever wins first must consume the marker without leaving the
+    other observer in a state that triggers a spurious FAILED → scale_up
+    "self-fight". These tests drive the real production functions, not just
+    the post-conditions, so the race fix is locked down for production."""
+
+    def _make_grouped_tracker(self, monitor, replica_id: str, group_id: str):
+        monitor.register_job(
+            job_id=replica_id,
+            config=_make_config(),
+            slo_deadline_hours=8.0,
+            total_tokens=7_500_000,
+            predicted_tps=2590.0,
+            predicted_cost_per_hour=10.49,
+            decision_id=f"dec-{replica_id}",
+            group_id=group_id,
+        )
+        tracker = monitor.tracked_jobs[replica_id]
+        tracker.smoothed_tps = 1200.0
+        return tracker
+
+    @pytest.mark.asyncio
+    async def test_poll_observes_intentional_kill_without_emitting_failed(self):
+        """When the monitor poll arrives first, it must mark the tracker
+        COMPLETED, discard the marker, AND NOT emit a FAILED trigger."""
+        orca = MagicMock()
+        orca.get_replicas = AsyncMock(
+            return_value={
+                "replicas": [
+                    {"replica_id": "grp-r0", "phase": "killed"},
+                ]
+            }
+        )
+        monitor = MonitoringLoop(orca=orca)
+        self._make_grouped_tracker(monitor, replica_id="grp-r0", group_id="grp")
+        monitor._koi_initiated_kills.add("grp-r0")
+
+        await monitor._poll_job("grp-r0")
+
+        tracker = monitor.tracked_jobs["grp-r0"]
+        assert tracker.status == MonitoringStatus.COMPLETED
+        assert "grp-r0" not in monitor._koi_initiated_kills
+        assert "grp-r0" in tracker.dead_replicas
+        # Critical: no spurious FAILED trigger queued — that's the self-fight.
+        assert monitor._trigger_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_poll_after_webhook_consumed_marker_is_idempotent(self):
+        """When the webhook consumed the marker first (so dead_replicas
+        already contains the replica), a later monitor poll must NOT
+        re-emit a FAILED trigger."""
+        orca = MagicMock()
+        orca.get_replicas = AsyncMock(
+            return_value={
+                "replicas": [
+                    {"replica_id": "grp-r0", "phase": "killed"},
+                ]
+            }
+        )
+        # Fallback metric/progress mocks for the post-liveness branch — the
+        # `dead_replicas`-skip should short-circuit before they're called,
+        # but we mock them defensively so a failure here proves the skip.
+        orca.get_replica_metrics = AsyncMock(
+            return_value={"avg_generation_throughput_toks_per_s": 0.0}
+        )
+        orca.get_chunk_progress = AsyncMock(
+            return_value={"total": 10, "completed": 5, "failed": 0, "all_done": False}
+        )
+        orca.get_job_status = AsyncMock(return_value={"status": "running"})
+        monitor = MonitoringLoop(orca=orca)
+        tracker = self._make_grouped_tracker(
+            monitor, replica_id="grp-r0", group_id="grp"
+        )
+        # Webhook already ran: status=COMPLETED, marker discarded, replica
+        # added to dead_replicas. The poll must short-circuit on the
+        # `if tracker.status in (FAILED, COMPLETED): return` guard.
+        tracker.status = MonitoringStatus.COMPLETED
+        tracker.dead_replicas.append("grp-r0")
+        tracker.smoothed_tps = 0
+
+        await monitor._poll_job("grp-r0")
+
+        # No FAILED trigger emitted, marker remains absent.
+        assert monitor._trigger_queue.empty()
+        assert "grp-r0" not in monitor._koi_initiated_kills
+
+
 class TestMonitoringLoopRegistration:
     def test_job_tracker_can_carry_cost_roofline(self):
         tracker = _make_tracker(cost_roofline_usd=120.0)
