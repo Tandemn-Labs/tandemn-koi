@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import time
 
 import pytest
 from pydantic_ai.models.test import TestModel
@@ -146,6 +147,37 @@ async def test_p1_packet_builds_market_and_gpu_recovery_menu(agent, memory):
     first = packet.action_options[0]
     assert f"failure:{first.action_id}" in first.detail_refs
     assert f"executor_payload:{first.action_id}" in packet.detail_sections
+
+
+@pytest.mark.asyncio
+async def test_p1_recent_failure_downranks_same_scope_recovery(agent, memory):
+    decision_id = _record_parent(memory)
+    now = time.time()
+    memory.record_cooloff(
+        key="L40S|g6e.12xlarge|us-east-1|on_demand",
+        gpu_type="L40S",
+        instance_type="g6e.12xlarge",
+        region="us-east-1",
+        market="on_demand",
+        tp=4,
+        pp=1,
+        dp=1,
+        reason="recent no capacity",
+        diagnosis_code="no_capacity",
+        avoid_until=now + 600,
+    )
+
+    packet = await build_p1_packet(agent, _launch_failed(decision_id), memory)
+
+    assert packet.action_options[0].evidence["source"] == "gpu_family_alternate"
+    l40s = next(
+        option
+        for option in packet.action_options
+        if option.evidence.get("source") == "market_alternate"
+    )
+    assert l40s.valid is True
+    assert l40s.risk["recent_failure"]["diagnosis_code"] == "no_capacity"
+    assert packet.detail_sections[f"recent_failures:{l40s.action_id}"]["recent_failure"]["same_scope"] is True
 
 
 @pytest.mark.asyncio

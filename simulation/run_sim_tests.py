@@ -2458,6 +2458,121 @@ def run_tier2():
         ]:
             skip(name, str(e))
 
+    # ── T2.13: Phase 4.5 recent-failure-aware ranking ────────────────────
+    section("T2.13  Recent failure signals downrank without hard-blocking")
+
+    try:
+        from koi.harness.recent_failures import annotate_and_rank_rows
+        from koi.schemas import GPUResource, ResourceMap
+        from koi.tools.memory import AgenticMemory
+
+        memory = AgenticMemory(db_path=":memory:")
+        now = time.time()
+        memory.record_cooloff(
+            key="L40S|g6e.12xlarge|us-east-1|on_demand",
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            region="us-east-1",
+            market="on_demand",
+            tp=4,
+            pp=1,
+            dp=1,
+            reason="recent no-capacity launch failure",
+            diagnosis_code="no_capacity",
+            avoid_until=now + 20 * 60,
+            source_event_id="sim-recent-failure",
+        )
+        rm = ResourceMap(
+            vpc_id="sim",
+            region="us-east-1",
+            resources=[
+                GPUResource(
+                    gpu_type="L40S",
+                    instance_type="g6e.12xlarge",
+                    gpus_per_instance=4,
+                    total_gpus=16,
+                    allocated_gpus=0,
+                    cost_per_instance_hour_usd=10.49,
+                    gpu_memory_gb=48.0,
+                    region="us-east-1",
+                    interconnect="PCIe",
+                ),
+                GPUResource(
+                    gpu_type="A100-80GB",
+                    instance_type="p4de.24xlarge",
+                    gpus_per_instance=8,
+                    total_gpus=16,
+                    allocated_gpus=0,
+                    cost_per_instance_hour_usd=40.96,
+                    gpu_memory_gb=80.0,
+                    region="us-east-1",
+                    interconnect="NVLink",
+                ),
+            ],
+        )
+        rows = [
+            {
+                "gpu_type": "L40S",
+                "instance_type": "g6e.12xlarge",
+                "tp": 4,
+                "pp": 1,
+                "dp": 1,
+                "planned_market": "on_demand",
+                "predicted_tps": 1200.0,
+                "cost_per_hour": 10.49,
+                "total_cost": 2.0,
+                "meets_slo": True,
+                "under_cost_roofline": True,
+            },
+            {
+                "gpu_type": "A100-80GB",
+                "instance_type": "p4de.24xlarge",
+                "tp": 8,
+                "pp": 1,
+                "dp": 1,
+                "planned_market": "on_demand",
+                "predicted_tps": 2400.0,
+                "cost_per_hour": 40.96,
+                "total_cost": 9.0,
+                "meets_slo": True,
+                "under_cost_roofline": True,
+            },
+        ]
+        ranked = annotate_and_rank_rows(
+            memory,
+            rows,
+            rm,
+            default_market="on_demand",
+            now=now + 60,
+        )
+
+        def t_recent_failure_downranks_same_scope():
+            assert ranked[0]["gpu_type"] == "A100-80GB", ranked
+            assert ranked[1]["gpu_type"] == "L40S", ranked
+
+        def t_recent_failure_keeps_candidate_valid_and_annotated():
+            risky = ranked[1]
+            assert risky["meets_slo"] is True, risky
+            assert risky["recent_failure"]["same_scope"] is True, risky
+            assert risky["recent_failure"]["diagnosis_code"] == "no_capacity", risky
+            assert "Prefer alternate" in risky["recent_failure"]["recommendation"], risky
+
+        check(
+            "recent failure downranks same-scope candidate below safer option",
+            t_recent_failure_downranks_same_scope,
+        )
+        check(
+            "recent failure keeps viable candidate valid and annotated",
+            t_recent_failure_keeps_candidate_valid_and_annotated,
+        )
+
+    except Exception as e:
+        for name in [
+            "recent failure downranks same-scope candidate below safer option",
+            "recent failure keeps viable candidate valid and annotated",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 3 — Full agent loop (requires KOI_API_KEY or ANTHROPIC_API_KEY)

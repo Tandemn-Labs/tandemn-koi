@@ -47,7 +47,7 @@ The LLM should not have to discover basic facts every time. The packet should al
 - memory outcomes and diagnoses
 - model/GPU physics
 - quota and beta priors
-- recent cooloffs from fresh failures
+- recent failure signals from fresh failures
 - ranked feasible actions
 
 The LLM can still ask for more detail, but the default path should require zero external info-seeking.
@@ -187,7 +187,7 @@ production event
 | `LLMReasoner` | Let the model inspect packet details and choose a final action. |
 | `Validator` | Check output shape, action id, safety, and freshness. |
 | `Executor` | Map action id to current production operations. |
-| `Recorder` | Write decisions, outcomes, diagnoses, cooloffs, and events. |
+| `Recorder` | Write decisions, outcomes, diagnoses, recent failure signals, and events. |
 
 The LLM sees a bounded action surface. The executor performs cluster mutation.
 
@@ -215,7 +215,7 @@ Do not add a second authoritative FSM database in v0. Derive state from current 
 Explicit FSM tables can be added later for audit/replay if needed, but they are not required for v0. Early persistence should focus only on targeted data:
 
 - retry budgets
-- recent cooloffs
+- recent failure signals
 - optional packet/choice audit rows if debugging requires them
 
 ---
@@ -255,7 +255,7 @@ koi/harness/
 | `reasoner.py` | LLM invocation, typed final output, packet-scoped read tools. |
 | `validator.py` | Action validation and fallback selection. |
 | `executor.py` | Deterministic mapping from action id to production operation. |
-| `cooloff.py` | Recent failure cooloff read/write and menu penalties. |
+| `cooloff.py` | Recent failure signal read/write and menu ranking evidence. |
 | `p0.py` | Initial placement packet/menu/prompt logic. |
 | `p1.py` | Launch recovery packet/menu/prompt logic. |
 | `pscale.py` | Runtime scale/up/down/upgrade/noop logic. |
@@ -365,8 +365,9 @@ Recommended fields:
   - `live_quota`
   - `beta_launch_success_pct`
   - `recent_no_capacity_failures`
-  - `fresh_preempt_same_scope`
-  - `cooloff_remaining_min`
+  - `recent_same_scope_failure`
+  - `last_failure_age_min`
+  - `recent_failure_reason`
 - cost
   - `cost_per_hour`
   - `projected_total_cost_usd`
@@ -421,17 +422,17 @@ The LLM should see the source and confidence on every option.
 
 ---
 
-## 10. Recent Failure Cooloffs
+## 10. Recent Failure Evidence
 
-Long-term beta priors are useful but too slow for fresh failure avoidance. Add a short-horizon cooloff overlay.
+Long-term beta priors are useful but too slow for fresh failure avoidance. Add short-horizon recent-failure evidence, not hard cooldown enforcement.
 
 ### Why
 
-If `A100 spot us-east-1` was preempted minutes ago, the next decision should know that immediately. This is not just a long-term prior update; it is a fresh operational risk.
+If `A100 spot us-east-1` was preempted minutes ago, the next decision should know that immediately. This is not just a long-term prior update; it is a fresh operational risk. However, v0 should avoid arbitrary rules like "block this for 30 minutes" because the failed scope may still be the only SLO-saving path.
 
 ### Scope
 
-For spot/no-capacity failures, key cooloffs by:
+For spot/no-capacity failures, key recent failure signals by:
 
 ```text
 gpu_type + instance_type + region + market
@@ -445,12 +446,29 @@ tp + pp + dp
 
 ### Behavior
 
-- Fresh spot preemption can hard-exclude the same scope briefly.
-- After the brief hard window, it decays into a soft penalty.
-- Do not globally blacklist the GPU family.
-- If the cooloffed option is the only SLO-saving path, keep it in the menu but mark it high risk.
+- `P5c` writes when a scope failed, why it failed, and what scope it applies to.
+- `P0`, `P1`, `Pscale`, and `P4` consume recent failures as ranking evidence.
+- Keep options valid unless they are truly infeasible (`no_quota`, invalid topology, confirmed unchanged OOM, etc.).
+- Deterministically downrank same-scope recent failures instead of hard-blocking them.
+- Surface the failure evidence directly on the card: `last_failed_at`, `age_minutes`, `diagnosis_code`, `same_scope`, and `recommendation`.
+- Let the LLM choose a recently failed scope if it is still the only viable SLO-saving path.
+- Do not globally blacklist a GPU family because one market/region/scope failed.
 
-`P5c` should write cooloff signals. `P0`, `P1`, `Pscale`, and `P4` should consume them in menu ranking.
+The persisted table may keep the historical `cooloffs` name for implementation continuity, but the intended semantics are recent-failure signals and ranking evidence, not rigid cooldown timers.
+
+Example card annotation:
+
+```json
+{
+  "recent_failure": {
+    "same_scope": true,
+    "last_failed_at": "2026-04-27T21:43:00Z",
+    "age_minutes": 7,
+    "diagnosis_code": "spot_preemption",
+    "recommendation": "Prefer on_demand or another GPU if available"
+  }
+}
+```
 
 ---
 
@@ -521,7 +539,7 @@ Packet builder:
 - run physics-vector proxy fallback if needed
 - compute physics features per candidate
 - compute total job cost
-- annotate quota, priors, and cooloffs
+- annotate quota, priors, and recent failure signals
 - build a launch menu
 
 Menu options:
@@ -544,7 +562,7 @@ Packet builder:
 
 - read failed launch attempts
 - classify failure categories
-- read beta priors and fresh cooloffs
+- read beta priors and recent failure signals
 - reconstruct job request from the original decision
 - generate retry/switch/abort options
 
@@ -574,7 +592,7 @@ Packet builder:
 - inspect current replicas
 - include action freeze/cooldown
 - include cost projection
-- include recent failures/cooloffs
+- include recent failure signals
 - generate scale/up/down/upgrade/noop options
 
 Menu options for `DEGRADED`:
@@ -617,13 +635,26 @@ Output:
 - `next_fix`
 - `failure_scope`
 - `event_at`
-- `avoid_until` when applicable
+- recent failure signal fields such as `last_failed_at`, `failure_scope`, and `diagnosis_code`
 
 Recorder:
 
 - writes outcome diagnosis and bottleneck
 - updates availability priors when appropriate
-- writes recent cooloff for fresh spot/no-capacity/OOM signals
+- writes recent failure signal for fresh spot/no-capacity/OOM signals
+
+### Phase 4.5: Recent-Failure-Aware Menu Ranking
+
+Triggered inside menu builders after `P5c` begins writing recent failure signals.
+
+Shared policy:
+
+- read active/recent failure signals for each candidate scope
+- annotate option cards with `last_failed_at`, `age_minutes`, `diagnosis_code`, and `same_scope`
+- downrank same-scope recent failures in `P0`, `P1`, and `Pscale`
+- keep recently failed options valid unless they are otherwise infeasible
+- surface recently failed candidates in the prompt so the LLM can override when SLO requires it
+- add deterministic tests proving recent failures demote, but do not hard-block, otherwise viable options
 
 ### P4: Replica Recovery
 
@@ -635,7 +666,7 @@ Packet builder:
 - inspect remaining fleet health
 - check whether aggregate TPS still meets SLO
 - include physics if changing config or GPU family
-- include priors and cooloffs
+- include priors and recent-failure signals
 - build replacement/migration/hold/abort options
 
 Menu options:
@@ -707,12 +738,12 @@ Add typed final-output support. If typed output plus tools is unsupported by the
 Do not add full FSM tables in v0. Add only targeted persistence if needed:
 
 - retry budget entries
-- cooloff entries
+- recent-failure entries (currently stored in the `cooloffs` table)
 - optional packet/choice audit entries
 
 ### `koi/tools/memory.py`
 
-Reuse existing decisions/outcomes/launch_attempts/availability_priors. Add targeted helpers only if current queries cannot retrieve cooloff/failure-scope data cleanly.
+Reuse existing decisions/outcomes/launch_attempts/availability_priors. Add targeted helpers only if current queries cannot retrieve recent failure/failure-scope data cleanly.
 
 ---
 
@@ -763,17 +794,28 @@ Use fail-open in development/canary. Use fail-closed in simulation when validati
 - build recovery menu
 - use current Orca flow rather than new Koi launch primitive in v0
 
-### Phase 4: P5c and Cooloffs
+### Phase 4: P5c and Recent Failure Signals
 
 - run per-chain post-mortem on replica failure or chain death
 - write diagnosis and bottleneck
 - update availability priors
-- write recent cooloff signals
+- write recent failure signals with failed scope, timestamp, and diagnosis code
+
+### Phase 4.5: Recent-Failure-Aware Ranking
+
+- wire recent failure signals into `P0`, `P1`, and `Pscale` menus
+- annotate cards with recent same-scope failures and recommendation text
+- downrank recently failed scopes without hard-blocking viable options
+- keep LLM override available when SLO requires the recently failed path
+- add simulations proving a fresh preemption demotes same-scope spot and prefers safer alternatives
 
 ### Phase 5: P4 Replica Recovery
 
 - consume P5c diagnosis
+- consume Phase 4.5 recent-failure annotations
+- inspect remaining live fleet and aggregate SLO health
 - build replacement/migration/hold/abort menu
+- prefer diagnosis-aligned repairs such as spot -> on_demand or OOM -> higher VRAM
 - execute valid replacement/migration through production flow
 
 ### Phase 6: P5j Job Post-Mortem
@@ -804,7 +846,7 @@ Only add persistent FSM tables if derived-state observability is insufficient. I
 - menu builders
 - physics feature extraction
 - physics proxy fallback
-- cooloff logic
+- recent-failure ranking logic
 - validator/executor mapping
 - prompt output parsing
 
@@ -823,7 +865,7 @@ Only add persistent FSM tables if derived-state observability is insufficient. I
 - strong-model parity run
 - weak-model run with `xiaomi/mimo-v2-pro`
 - launch retry scenario
-- spot preemption cooloff scenario
+- spot preemption recent-failure ranking scenario
 - post-mortem coverage scenario
 - invalid model output fallback scenario
 
@@ -853,7 +895,7 @@ harness.choice_validated
 harness.executed
 harness.fallback_used
 harness.non_top_choice
-harness.cooloff_applied
+harness.recent_failure_signal_applied
 harness.state_transition
 ```
 
@@ -870,7 +912,7 @@ Track metrics:
 - SLO rescue rate
 - cost overage
 - post-mortem coverage
-- cooloff hit rate
+- recent-failure hit rate
 
 ---
 
@@ -900,7 +942,7 @@ Koi/Orca event
 -> LLM reasoned choice
 -> validator
 -> deterministic executor
--> memory/runtime/cooloff update
+-> memory/runtime/recent-failure update
 ```
 
 This gives Koi a harnessed agent loop that is reliable enough for small local models while preserving the useful part of agentic behavior: reasoned decision-making over rich, causal evidence.

@@ -29,6 +29,7 @@ from koi.harness.failures import (
 from koi.harness.feasibility import physics_for_row
 from koi.harness.ids import action_id as make_action_id
 from koi.harness.packet_tools import build_packet_read_tools
+from koi.harness.recent_failures import annotate_and_rank_rows
 from koi.harness.reasoner import HarnessReasoner
 from koi.harness.resources import resource_map_for
 from koi.harness.schemas import (
@@ -185,7 +186,10 @@ def _detail_sections_for(
     except Exception as exc:
         quota_section["failure_summary_error"] = str(exc)
     sections[f"quota:{action_id}"] = quota_section
-    sections[f"recent_failures:{action_id}"] = quota_section.get("failure_summary", {})
+    sections[f"recent_failures:{action_id}"] = {
+        "failure_summary": quota_section.get("failure_summary", {}),
+        "recent_failure": row.get("recent_failure"),
+    }
 
     related_failures = [
         item for item in failed_entries if item.get("gpu_type") == gpu_type
@@ -217,6 +221,7 @@ def _detail_sections_for(
 def _candidate_rows_from_cost_table(
     *,
     agent: Any,
+    memory: AgenticMemory,
     req: JobRequest,
     rm: ResourceMap,
     failed_entries: list[dict[str, Any]],
@@ -246,7 +251,12 @@ def _candidate_rows_from_cost_table(
         candidates.append(row)
         if len(candidates) >= MAX_MENU_OPTIONS - 1:
             break
-    return candidates
+    return annotate_and_rank_rows(
+        memory,
+        candidates,
+        rm,
+        default_market=req.preferred_market or "on_demand",
+    )
 
 
 def _abort_option(rank: int, reason: str) -> ActionOption:
@@ -317,6 +327,7 @@ async def build_p1_packet(
     if decision is not None and reconstructed is not None and rm is not None and budget_remaining > 0:
         rows = _candidate_rows_from_cost_table(
             agent=agent,
+            memory=memory,
             req=reconstructed,
             rm=rm,
             failed_entries=failed_entries,
@@ -367,6 +378,7 @@ async def build_p1_packet(
                     evidence={
                         "source": source,
                         "failure_categories": failure_categories,
+                        "recent_failure": row.get("recent_failure"),
                     },
                     availability=sections[f"quota:{action_id}"].get("failure_summary", {}),
                     cost={
@@ -377,6 +389,7 @@ async def build_p1_packet(
                     },
                     risk={
                         "fresh_failures_same_gpu": len(sections[f"failure:{action_id}"]["related_failed_attempts"]),
+                        "recent_failure": row.get("recent_failure"),
                     },
                     executor_payload_ref=f"executor_payload:{action_id}",
                     detail_refs=_section_keys_for(action_id),

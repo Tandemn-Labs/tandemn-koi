@@ -17,6 +17,7 @@ from koi.harness.decision_utils import source_to_data_source
 from koi.harness.feasibility import estimate_num_instances, physics_for_row
 from koi.harness.ids import action_id as make_action_id
 from koi.harness.packet_tools import build_packet_read_tools
+from koi.harness.recent_failures import annotate_and_rank_rows
 from koi.harness.reasoner import HarnessReasoner
 from koi.harness.schemas import (
     ActionOption,
@@ -185,10 +186,10 @@ def _build_p0_detail_sections(
         )
     sections[f"quota:{action_id}"] = quota_section
 
-    # recent_failures: short-horizon cooloff overlay placeholder. Phase 4 will
-    # populate this from the cooloff store; for now we return the same
-    # failure_summary slice so the section reference is non-empty.
-    sections[f"recent_failures:{action_id}"] = quota_section.get("failure_summary", {})
+    sections[f"recent_failures:{action_id}"] = {
+        "failure_summary": quota_section.get("failure_summary", {}),
+        "recent_failure": row.get("recent_failure"),
+    }
 
     # executor_payload: how this action will execute deterministically.
     sections[f"executor_payload:{action_id}"] = {
@@ -211,6 +212,12 @@ def _build_p0_detail_sections(
 
 def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionPacket:
     _, rows = agent._build_cost_table(req, rm)
+    rows = annotate_and_rank_rows(
+        getattr(agent, "memory", None),
+        rows,
+        rm,
+        default_market=req.preferred_market or "on_demand",
+    )
     options: list[ActionOption] = []
     detail_sections: dict[str, Any] = {}
 
@@ -241,8 +248,7 @@ def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionP
             "beta_launch_success_pct": row.get("avail_pct"),
             "availability_uncertainty_pct": row.get("avail_unc"),
             "recent_no_capacity_failures": None,
-            "fresh_preempt_same_scope": False,
-            "cooloff_remaining_min": 0,
+            "recent_failure": row.get("recent_failure"),
         }
         summary = (
             f"Launch {row.get('gpu_type')} TP={row.get('tp')} PP={row.get('pp')} "
@@ -274,7 +280,11 @@ def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionP
                 and "distance" in per_action_sections[f"perfdb_proxy:{action_id}"][0]
                 else None
             ),
+            "recent_failure": row.get("recent_failure"),
         }
+        risk = {}
+        if row.get("recent_failure"):
+            risk["recent_failure"] = row["recent_failure"]
         options.append(
             ActionOption(
                 action_id=action_id,
@@ -288,7 +298,7 @@ def build_p0_packet(agent: Any, req: JobRequest, rm: ResourceMap) -> TransitionP
                 evidence=evidence,
                 availability=availability,
                 cost=cost,
-                risk={},
+                risk=risk,
                 executor_payload_ref=f"executor_payload:{action_id}",
                 detail_refs=_section_keys_for(action_id),
             )
@@ -352,6 +362,8 @@ def render_p0_prompt(packet: TransitionPacket) -> str:
         )
         if option.physics:
             lines.append(f"   physics={json.dumps(option.physics, sort_keys=True)}")
+        if option.risk:
+            lines.append(f"   risk={json.dumps(option.risk, sort_keys=True)}")
     lines.extend([
         "",
         "Return your final answer as the typed ChosenAction schema.",

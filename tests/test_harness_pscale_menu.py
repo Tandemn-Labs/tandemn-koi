@@ -264,6 +264,52 @@ def test_dominance_filter_drops_strictly_dominated_options():
     assert any("dominated_by" in rec.reason for rec in excluded)
 
 
+def test_recent_failure_candidate_does_not_dominate_safer_option():
+    risky_strong = MenuCandidate(
+        kind="scale_up", source="tp_pp_alternate", gpu_type="L40S",
+        tp=4, pp=2, dp=1, market="on_demand", instance_type="g6e.12xlarge",
+        predicted_tps=2000.0, cost_per_hour=20.0,
+        prediction_source="perfdb_exact", prediction_confidence=0.85,
+        recent_failure={"same_scope": True, "diagnosis_code": "no_capacity"},
+    )
+    safer_weaker = MenuCandidate(
+        kind="scale_up", source="gpu_family_alternate", gpu_type="A100-80GB",
+        tp=4, pp=2, dp=1, market="on_demand", instance_type="p4de.24xlarge",
+        predicted_tps=1800.0, cost_per_hour=25.0,
+        prediction_source="perfdb_exact", prediction_confidence=0.85,
+    )
+
+    kept, excluded = _dominance_filter(
+        [risky_strong, safer_weaker],
+        required_tps=300.0,
+        current_aggregate=370.0,
+    )
+
+    assert risky_strong in kept
+    assert safer_weaker in kept
+    assert excluded == []
+
+
+def test_source_caps_downrank_recent_failure_within_same_source():
+    risky = MenuCandidate(
+        kind="scale_up", source="tp_pp_alternate", gpu_type="L40S",
+        tp=4, pp=2, dp=1, market="on_demand", instance_type="g6e.12xlarge",
+        predicted_tps=2000.0, cost_per_hour=20.0,
+        prediction_source="perfdb_exact", prediction_confidence=0.85,
+        recent_failure={"same_scope": True, "diagnosis_code": "no_capacity"},
+    )
+    safer = MenuCandidate(
+        kind="scale_up", source="tp_pp_alternate", gpu_type="A100-80GB",
+        tp=4, pp=2, dp=1, market="on_demand", instance_type="p4de.24xlarge",
+        predicted_tps=1800.0, cost_per_hour=25.0,
+        prediction_source="perfdb_exact", prediction_confidence=0.85,
+    )
+
+    capped = _apply_source_caps([risky, safer], current_aggregate=370.0, max_total=1)
+
+    assert capped == [safer]
+
+
 # ---------------------------------------------------------------------------
 # Menu builder integration
 # ---------------------------------------------------------------------------

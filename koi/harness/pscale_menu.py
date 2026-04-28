@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from koi.costing import evaluate_cost_roofline
+from koi.harness.recent_failures import recent_failure_for_scope, recent_failure_penalty
 from koi.logging_config import get_logger
 from koi.runtime_policy import (
     RuntimeChainState,
@@ -73,6 +74,7 @@ class MenuCandidate:
     replica_id: Optional[str] = None
     proxy_model: Optional[str] = None
     proxy_distance: Optional[float] = None
+    recent_failure: Optional[dict[str, Any]] = None
 
     def key(self) -> tuple[str, int, int]:
         return (self.gpu_type, self.tp, self.pp)
@@ -559,6 +561,7 @@ def _annotate_feasibility(
     candidate: MenuCandidate,
     parent_decision: Optional[dict],
     rm,
+    memory: Any = None,
 ) -> tuple[MenuCandidate, Optional[str]]:
     """Compute hard feasibility flags. Returns (candidate, reject_reason or None)."""
     feasibility: dict[str, Any] = {}
@@ -646,6 +649,20 @@ def _annotate_feasibility(
 
     candidate.feasibility = feasibility
     candidate.physics = physics
+    region = None
+    if resource is not None:
+        region = resource.region
+    signal = recent_failure_for_scope(
+        memory,
+        gpu_type=candidate.gpu_type,
+        instance_type=candidate.instance_type or (resource.instance_type if resource else None),
+        region=region,
+        market=candidate.market,
+        tp=candidate.tp,
+        pp=candidate.pp,
+        dp=candidate.dp,
+    )
+    candidate.recent_failure = signal
     return candidate, reject_reason
 
 
@@ -673,6 +690,10 @@ def _dominance_filter(
             if other is c:
                 continue
             if _meets_slo(other) != _meets_slo(c):
+                continue
+            if recent_failure_penalty(other) > recent_failure_penalty(c):
+                # A recently failed option should not dominate a safer option;
+                # keep the safer option visible even if raw cost/TPS is worse.
                 continue
             same_or_better_tps = _post_tps(other) >= _post_tps(c)
             same_or_lower_cost = other.cost_per_hour <= c.cost_per_hour
@@ -724,7 +745,9 @@ def _apply_source_caps(
     for c in candidates:
         by_source.setdefault(c.source, []).append(c)
     for src in list(by_source.keys()):
-        by_source[src].sort(key=lambda c: _cost_per_mtoken(c, current_aggregate))
+        by_source[src].sort(
+            key=lambda c: (recent_failure_penalty(c), _cost_per_mtoken(c, current_aggregate))
+        )
 
     reserved: list[MenuCandidate] = []
     for src, items in by_source.items():
@@ -735,7 +758,9 @@ def _apply_source_caps(
     remaining_pool = [
         c for c in candidates if (c.source, c.gpu_type, c.tp, c.pp) not in reserved_keys
     ]
-    remaining_pool.sort(key=lambda c: _cost_per_mtoken(c, current_aggregate))
+    remaining_pool.sort(
+        key=lambda c: (recent_failure_penalty(c), _cost_per_mtoken(c, current_aggregate))
+    )
 
     slots_left = max_total - len(reserved)
     if slots_left <= 0:
@@ -838,7 +863,12 @@ async def build_menu(
     excluded: list[ExclusionRecord] = []
     valid: list[MenuCandidate] = []
     for c in candidates:
-        annotated, reject = _annotate_feasibility(c, parent_decision, rm)
+        annotated, reject = _annotate_feasibility(
+            c,
+            parent_decision,
+            rm,
+            getattr(agent, "memory", None),
+        )
         if reject is not None:
             excluded.append(
                 ExclusionRecord(
@@ -883,6 +913,16 @@ async def build_menu(
     candidates_by_label = {
         f"{c.kind} {c.gpu_type} TP={c.tp} PP={c.pp} count=1": c for c in valid
     }
+    suggestions.sort(
+        key=lambda suggestion: (
+            not suggestion.meets_slo,
+            recent_failure_penalty(candidates_by_label.get(suggestion.label)),
+            suggestion.cost_per_mtoken_usd
+            if suggestion.cost_per_mtoken_usd is not None
+            else float("inf"),
+            suggestion.label,
+        )
+    )
     candidates_by_action: dict[str, MenuCandidate] = {}
     for sugg in suggestions:
         cand = candidates_by_label.get(sugg.label)

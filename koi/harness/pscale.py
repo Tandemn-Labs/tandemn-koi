@@ -369,12 +369,21 @@ async def build_pscale_packet(
                     "market": candidate.market,
                     "proxy_model": candidate.proxy_model,
                     "proxy_distance": candidate.proxy_distance,
+                    "recent_failure": candidate.recent_failure,
                 }
             )
             if candidate.feasibility:
                 risk["feasibility"] = candidate.feasibility
             if candidate.physics:
                 risk["physics"] = candidate.physics
+            if candidate.recent_failure:
+                risk["recent_failure"] = candidate.recent_failure
+                per_action_sections[f"recent_failures:{action_id}"] = {
+                    "failure_summary": per_action_sections.get(
+                        f"recent_failures:{action_id}", {}
+                    ),
+                    "recent_failure": candidate.recent_failure,
+                }
 
         options.append(
             ActionOption(
