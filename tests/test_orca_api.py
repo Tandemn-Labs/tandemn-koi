@@ -120,6 +120,48 @@ class TestScale:
         with pytest.raises(Exception, match="HTTP 409"):
             await orca.scale_job("job-123", "A100-80GB", 4, 2, 2)
 
+    @pytest.mark.asyncio
+    async def test_scale_job_default_force_false(self, orca, mock_session):
+        """Default behavior: force=False is sent so Orca runs the
+        feasibility check. This is the normal scale-up path used by
+        runtime triggers."""
+        captured = {}
+
+        original_post = mock_session.post
+
+        def _capture_post(url, json=None, **kwargs):
+            captured["url"] = url
+            captured["json"] = json
+            return original_post(url, json=json, **kwargs)
+
+        mock_session.post = _capture_post
+        mock_session.set_response("post", "/job/job-1/scale", {"status": "scaling"})
+
+        await orca.scale_job("job-1", "L40S", 1, 1, 1)
+        assert captured["json"]["force"] is False
+
+    @pytest.mark.asyncio
+    async def test_scale_job_force_true_passed_through(self, orca, mock_session):
+        """Recovery path: force=True must reach Orca's payload so the
+        feasibility check is skipped (the agent has already overridden
+        the solver's recommendation with a deliberate alternative)."""
+        captured = {}
+
+        original_post = mock_session.post
+
+        def _capture_post(url, json=None, **kwargs):
+            captured["url"] = url
+            captured["json"] = json
+            return original_post(url, json=json, **kwargs)
+
+        mock_session.post = _capture_post
+        mock_session.set_response("post", "/job/job-1/scale", {"status": "scaling"})
+
+        await orca.scale_job("job-1", "L40S", 1, 1, 1, force=True)
+        assert captured["json"]["force"] is True
+        assert captured["json"]["gpu_type"] == "L40S"
+        assert captured["json"]["count"] == 1
+
 
 class TestKill:
     @pytest.mark.asyncio

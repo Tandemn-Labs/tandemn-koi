@@ -238,6 +238,181 @@ class TestActionTools:
         assert monitor._pending_replica_decisions == {}
 
     @pytest.mark.asyncio
+    async def test_scale_chain_recovery_mode_passes_force_true_to_orca(
+        self, perfdb, memory, resource_map
+    ):
+        """recovery_mode=True is the boundary signal that this tool-set is
+        being used for cold-start failure recovery. scale_chain_tool must
+        thread force=True down to orca.scale_job so Orca's feasibility
+        check is bypassed (the agent has already overridden the solver's
+        recommendation that just OOMed)."""
+        captured = {}
+
+        class FakeOrca:
+            async def get_resources(self):
+                return {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "interconnect": "PCIe",
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                }
+
+            async def scale_job(self, *args, **kwargs):
+                captured.update(kwargs)
+                return {"status": "scaling", "new_replicas": ["new-r0"]}
+
+        agent = KoiAgent(
+            perfdb=perfdb, memory=memory, orca=FakeOrca(), api_key="test-key"
+        )
+        parent_decision = memory.record_decision(
+            job_id="parent-rec",
+            model_name="Qwen/Qwen3-4B",
+            instance_type="g6.xlarge",
+            gpu_type="L4",
+            tp=1,
+            pp=1,
+            dp=1,
+            num_gpus=1,
+            predicted_tps=1400.0,
+            predicted_cost_per_hour=2.62,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            market="on_demand",
+        )
+        tracker = SimpleNamespace(
+            group_id="parent-rec",
+            job_id="parent-rec-r0",
+            decision_id=parent_decision,
+            action_in_progress=False,
+            action_freeze_until=None,
+        )
+        monitor = SimpleNamespace(
+            tracked_jobs={"parent-rec-r0": tracker},
+            _koi_initiated_kills=set(),
+            _pending_replica_decisions={},
+            persist_job=lambda *a, **k: None,
+            register_pending_replica_decision=lambda *a, **k: None,
+        )
+        # recovery_mode=True is the boundary flag set by
+        # recover_from_startup_failure when invoking the agent.
+        tools = agent._build_tools(
+            resource_map=resource_map, monitor=monitor, recovery_mode=True
+        )
+        scale_tool = tools["scale_chain_tool"]
+
+        result = await scale_tool(
+            job_id="parent-rec", gpu_type="L40S", tp=1, pp=1, count=1
+        )
+
+        assert "Scaled up" in result
+        # The boundary signal must reach Orca so its feasibility check is skipped.
+        assert captured.get("force") is True
+        assert captured.get("planned_market") in ("on_demand", "spot")
+
+    @pytest.mark.asyncio
+    async def test_scale_chain_default_mode_passes_force_false(
+        self, perfdb, memory, resource_map
+    ):
+        """Default behavior (no recovery_mode flag) keeps force=False so
+        the runtime trigger path retains its feasibility safety net."""
+        captured = {}
+
+        class FakeOrca:
+            async def get_resources(self):
+                return {
+                    "instances": [
+                        {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_type": "L40S",
+                            "gpus_per_instance": 4,
+                            "vcpus": 48,
+                            "quota_family": "G",
+                            "gpu_memory_gb": 48.0,
+                            "cost_per_instance_hour_usd": 10.49,
+                            "interconnect": "PCIe",
+                        },
+                    ],
+                    "quotas": [
+                        {
+                            "family": "G",
+                            "region": "us-east-1",
+                            "market": "on_demand",
+                            "baseline_vcpus": 96,
+                            "used_vcpus": 0,
+                        },
+                    ],
+                }
+
+            async def scale_job(self, *args, **kwargs):
+                captured.update(kwargs)
+                return {"status": "scaling"}
+
+        agent = KoiAgent(
+            perfdb=perfdb, memory=memory, orca=FakeOrca(), api_key="test-key"
+        )
+        parent_decision = memory.record_decision(
+            job_id="parent-norm",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1200.0,
+            predicted_cost_per_hour=10.49,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+            num_requests=5000,
+            market="on_demand",
+        )
+        tracker = SimpleNamespace(
+            group_id="parent-norm",
+            job_id="parent-norm-r0",
+            decision_id=parent_decision,
+            action_in_progress=False,
+            action_freeze_until=None,
+        )
+        monitor = SimpleNamespace(
+            tracked_jobs={"parent-norm-r0": tracker},
+            _koi_initiated_kills=set(),
+            _pending_replica_decisions={},
+            persist_job=lambda *a, **k: None,
+            register_pending_replica_decision=lambda *a, **k: None,
+        )
+        # Default tools — no recovery_mode flag
+        tools = agent._build_tools(resource_map=resource_map, monitor=monitor)
+        scale_tool = tools["scale_chain_tool"]
+
+        await scale_tool(
+            job_id="parent-norm", gpu_type="L40S", tp=4, pp=1, count=1
+        )
+
+        assert captured.get("force") is False
+
+    @pytest.mark.asyncio
     async def test_scale_chain_defaults_on_demand_and_avoids_spot_without_quota(
         self, perfdb, memory
     ):
