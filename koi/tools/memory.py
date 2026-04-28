@@ -369,6 +369,41 @@ class AgenticMemory:
     # Read operations
     # ------------------------------------------------------------------
 
+    def count_launch_attempts(self, job_id: str, *, only_failed: bool = True) -> int:
+        """Count launch attempts for retry-budget enforcement.
+
+        Matches both the parent group_id (e.g. ``mo-qwen4b-69c9``) and any of
+        its replica suffixes (``mo-qwen4b-69c9-r0``, ``...-r1``, ...). Used by
+        the cold-start recovery path in koi/server.py to decide whether the
+        agent gets another chance to re-decide or whether the job is given
+        up on as unrecoverable.
+        """
+        conn = self._conn()
+        q = "SELECT COUNT(*) FROM launch_attempts WHERE (job_id = ? OR job_id LIKE ?)"
+        params: list = [job_id, f"{job_id}-r%"]
+        if only_failed:
+            q += " AND launched = 0"
+        return conn.execute(q, params).fetchone()[0]
+
+    def get_failed_configs(self, job_id: str) -> List[Dict[str, Any]]:
+        """Return distinct (instance_type, gpu_type, region, market) tuples
+        already attempted unsuccessfully for this job, with their dominant
+        failure_category. Used as the agent's "don't repeat" set when
+        recovering from a cold-start failure."""
+        conn = self._conn()
+        rows = conn.execute(
+            """
+            SELECT instance_type, gpu_type, region, market,
+                   failure_category, COUNT(*) AS attempts
+              FROM launch_attempts
+             WHERE (job_id = ? OR job_id LIKE ?)
+               AND launched = 0
+             GROUP BY instance_type, gpu_type, region, market, failure_category
+            """,
+            (job_id, f"{job_id}-r%"),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_decision(self, decision_id: str) -> Optional[Dict[str, Any]]:
         """Look up a single decision by ID."""
         conn = self._conn()
