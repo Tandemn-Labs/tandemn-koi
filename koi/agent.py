@@ -669,6 +669,173 @@ class KoiAgent:
         return decision
 
     # ------------------------------------------------------------------
+    # Cold-start failure recovery
+    # ------------------------------------------------------------------
+
+    async def recover_from_startup_failure(
+        self,
+        *,
+        parent_job_id: str,
+        decision_id: Optional[str],
+        failed_configs: List[Dict[str, Any]],
+        failure_category: str,
+        original_decision: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Run the agent to choose a NEW config after a cold-start failure
+        and use scale_chain_tool to launch a replacement replica.
+
+        Caller is responsible for retry budget enforcement (memory.count_launch_attempts);
+        this method assumes an attempt is allowed and just chooses what to try next.
+
+        Returns the agent's text response (which describes the action taken
+        or why it declined). Callers should not parse the text — instead
+        they should observe scale_chain_tool's effect via Orca.
+        """
+        prompt = self._build_recovery_prompt(
+            parent_job_id=parent_job_id,
+            decision_id=decision_id,
+            failed_configs=failed_configs,
+            failure_category=failure_category,
+            original_decision=original_decision,
+        )
+        tools = self._build_tools(monitor=self.monitor)
+
+        logger.info(
+            "recovery_handling",
+            parent_job_id=parent_job_id,
+            failure_category=failure_category,
+            failed_count=len(failed_configs),
+        )
+        emit_event(
+            "recovery_handling",
+            job_id=parent_job_id,
+            failure_category=failure_category,
+            failed_count=len(failed_configs),
+        )
+
+        runner = KoiToolRunner(
+            model=self._model,
+            system_prompt=KOI_SYSTEM_PROMPT,
+            tools=tools,
+        )
+        try:
+            _, final_text = await runner.run(
+                prompt,
+                label="recovery",
+                job_id=parent_job_id,
+                max_iterations=8,
+                timeout=TRIGGER_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "recovery_timeout",
+                parent_job_id=parent_job_id,
+                timeout=TRIGGER_TIMEOUT,
+            )
+            return f"[TIMEOUT] Recovery agent did not respond within {TRIGGER_TIMEOUT}s"
+
+        logger.info("recovery_response", response=final_text[:200])
+        emit_event(
+            "recovery_response",
+            job_id=parent_job_id,
+            response=final_text[:200],
+        )
+        return final_text
+
+    def _build_recovery_prompt(
+        self,
+        *,
+        parent_job_id: str,
+        decision_id: Optional[str],
+        failed_configs: List[Dict[str, Any]],
+        failure_category: str,
+        original_decision: Optional[Dict[str, Any]],
+    ) -> str:
+        """Build the user message for cold-start failure recovery."""
+        exclude_gpus = set(
+            g.strip()
+            for g in os.environ.get("KOI_EXCLUDE_GPUS", "").split(",")
+            if g.strip()
+        )
+
+        # Render the failed configs as a bullet list — agent should AVOID these.
+        failed_block = (
+            "\n".join(
+                f"  - instance={f.get('instance_type','?')} gpu={f.get('gpu_type','?')} "
+                f"market={f.get('market','?')} category={f.get('failure_category','?')} "
+                f"attempts={f.get('attempts',1)}"
+                for f in failed_configs
+            )
+            if failed_configs
+            else "  (none recorded — first attempt)"
+        )
+
+        # Render the original decision (if known) for context on cost roofline,
+        # predicted TPS, model size — anything the agent needs to bound the
+        # search space for the replacement config.
+        if original_decision:
+            orig = original_decision
+            orig_block = (
+                f"  Model: {orig.get('model_name','?')}\n"
+                f"  Original config: {orig.get('instance_type','?')} ({orig.get('gpu_type','?')}) "
+                f"TP={orig.get('tp','?')} PP={orig.get('pp','?')} DP={orig.get('dp','?')}\n"
+                f"  Market: {orig.get('market','?')}\n"
+                f"  Predicted TPS: {orig.get('predicted_tps','?')}\n"
+                f"  Predicted cost/hr: ${orig.get('predicted_cost_per_hour','?')}\n"
+                f"  Cost roofline: ${orig.get('cost_roofline_usd','?')}"
+            )
+        else:
+            orig_block = "  (original decision not found in memory)"
+
+        category_guidance = {
+            "oom": (
+                "OOM during cold-start. Pick a GPU with MORE VRAM (e.g. L40S 48GB > L4 16GB), "
+                "OR keep the same GPU and reduce max_num_seqs / gpu_memory_utilization, "
+                "OR widen TP so weights+KV split across more GPUs. "
+                "Do NOT pick the same instance_type that just OOMed."
+            ),
+            "no_capacity": (
+                "AWS capacity exhausted in the attempted region/AZ. Try a different "
+                "region (us-east-2, us-west-2) or fall back to on-demand if you tried spot."
+            ),
+            "spot_preemption": (
+                "Spot instance was preempted. Switch to on-demand market for the retry."
+            ),
+            "quota": (
+                "AWS service quota was hit. Pick a different instance family the account "
+                "has remaining quota for."
+            ),
+        }.get(failure_category, "Unknown failure category — try a meaningfully different config.")
+
+        sections = [
+            "COLD-START FAILURE RECOVERY",
+            "",
+            f"Parent job: {parent_job_id}",
+            f"Original decision_id: {decision_id or '(none)'}",
+            f"Failure category: {failure_category}",
+            "",
+            "ORIGINAL DECISION CONTEXT:",
+            orig_block,
+            "",
+            "FAILED CONFIGS (do NOT pick any of these again):",
+            failed_block,
+            "",
+            f"GUIDANCE FOR {failure_category.upper()}:",
+            f"  {category_guidance}",
+            "",
+            f"EXCLUDED GPU TYPES (do not use): {', '.join(sorted(exclude_gpus))}"
+            if exclude_gpus
+            else "",
+            "",
+            "ACTION:",
+            f"  Use scale_chain_tool(job_id={parent_job_id!r}, gpu_type=..., tp=..., pp=..., count=1, on_demand=...) "
+            "to launch ONE replacement replica with a config that avoids the failure mode above. "
+            "If no viable alternative exists (e.g. all roofline-feasible configs already failed), "
+            "respond with the literal text 'NO_VIABLE_ALTERNATIVE' and do not call any tools.",
+        ]
+        return "\n".join(s for s in sections if s is not None)
+
+    # ------------------------------------------------------------------
     # Monitoring trigger handler
     # ------------------------------------------------------------------
 
