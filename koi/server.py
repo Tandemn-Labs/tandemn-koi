@@ -53,6 +53,15 @@ logger = get_logger("koi.server")
 
 KOI_PORT = int(os.environ.get("KOI_PORT", "8090"))
 
+# Cold-start failure recovery: how many launch attempts (across all replicas
+# of a parent group) before Koi gives up and surfaces a terminal launch-failed.
+# Counts launched=0 rows in the launch_attempts table.
+MAX_STARTUP_RETRIES = int(os.environ.get("KOI_MAX_STARTUP_RETRIES", "3"))
+
+# Failure categories that warrant an agent-driven retry. Other categories
+# (e.g. "unknown", "quota") record the failure but don't auto-recover.
+RECOVERABLE_FAILURE_CATEGORIES = {"oom", "no_capacity", "spot_preemption"}
+
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -1101,10 +1110,105 @@ async def replica_failed(req: ReplicaFailedRequest):
     return await _run_with_inbox(req, "replica_failed", req.job_id, _do)
 
 
+async def _handle_startup_failure(
+    req: ReplicaFailedRequest, pending: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Recovery path for replicas that die during vLLM cold-start.
+
+    The replica was registered in ``_pending_launches`` but never made it to
+    ``/job/started``, so it never appeared in ``tracked_jobs``. Record the
+    failed attempt, clear the dead pending entry, then ask the agent to
+    pick a new config (different GPU, different region, etc.) — bounded
+    by ``MAX_STARTUP_RETRIES`` per parent group to prevent infinite loops.
+    """
+    monitor: MonitoringLoop = app.state.monitor
+    memory: AgenticMemory = app.state.memory
+    parent_job_id = req.group_id or req.job_id.rsplit("-r", 1)[0]
+    decision_id = req.decision_id or pending.get("decision_id")
+    failure_category = _classify_failure(req.reason)
+
+    memory.record_launch_attempt(
+        decision_id=decision_id or f"unknown-{req.job_id}",
+        job_id=req.job_id,
+        instance_type=req.instance_type
+        if req.instance_type != "unknown"
+        else pending.get("instance_type", "unknown"),
+        gpu_type=pending.get("gpu_type", "unknown"),
+        region=req.region if req.region != "unknown" else pending.get("region", "unknown"),
+        market=req.market if req.market != "unknown" else pending.get("market", "unknown"),
+        count=1,
+        launched=False,
+        failure_reason=req.reason,
+        failure_category=failure_category,
+    )
+
+    monitor.clear_pending_launch(req.job_id)
+
+    logger.info(
+        "startup_failure_recorded",
+        job_id=req.job_id,
+        parent_job_id=parent_job_id,
+        failure_category=failure_category,
+    )
+    emit_event(
+        "startup_failure_recorded",
+        job_id=req.job_id,
+        parent_job_id=parent_job_id,
+        failure_category=failure_category,
+    )
+
+    if failure_category not in RECOVERABLE_FAILURE_CATEGORIES:
+        return {
+            "status": "recorded_no_recovery",
+            "job_id": req.job_id,
+            "failure_category": failure_category,
+        }
+
+    attempts = memory.count_launch_attempts(parent_job_id)
+    if attempts >= MAX_STARTUP_RETRIES:
+        logger.warning(
+            "startup_retries_exhausted",
+            parent_job_id=parent_job_id,
+            attempts=attempts,
+            max_retries=MAX_STARTUP_RETRIES,
+        )
+        return {
+            "status": "exhausted",
+            "job_id": req.job_id,
+            "attempts": attempts,
+        }
+
+    agent_response = await app.state.agent.recover_from_startup_failure(
+        parent_job_id=parent_job_id,
+        decision_id=decision_id,
+        failed_configs=memory.get_failed_configs(parent_job_id),
+        failure_category=failure_category,
+        original_decision=memory.get_decision(decision_id) if decision_id else None,
+    )
+
+    if "NO_VIABLE_ALTERNATIVE" in (agent_response or ""):
+        return {"status": "no_alternative", "job_id": req.job_id}
+
+    return {
+        "status": "retrying",
+        "job_id": req.job_id,
+        "parent_job_id": parent_job_id,
+        "attempts": attempts,
+    }
+
+
 async def _replica_failed_impl(req: ReplicaFailedRequest) -> Dict[str, Any]:
     monitor: MonitoringLoop = app.state.monitor
     tracker = monitor.tracked_jobs.get(req.job_id)
     if not tracker:
+        # The replica died before reaching /job/started — i.e. during cold
+        # startup (e.g. CUDA OOM, missing model arch). Check pending_launches:
+        # if Koi was tracking the launch, treat this as a startup failure
+        # and dispatch to the recovery handler. Only if there's no record at
+        # all do we log replica_failed_unknown and drop the event.
+        pending = monitor.get_pending_launch(req.job_id)
+        if pending:
+            return await _handle_startup_failure(req, pending)
         logger.warning("replica_failed_unknown", job_id=req.job_id)
         return {"status": "unknown", "job_id": req.job_id}
 
@@ -1359,6 +1463,52 @@ async def _job_launch_failed_impl(req: LaunchFailedRequest) -> Dict[str, Any]:
     # Unregister from monitor
     if tracker:
         monitor.unregister_job(req.job_id)
+
+    # Cold-start recovery: if every config tried hit a recoverable failure
+    # category (e.g. all OOMed), ask the agent to pick a different config
+    # and re-launch. Bounded by MAX_STARTUP_RETRIES.
+    categories = [_classify_failure(r) for r in req.failure_reasons]
+    dominant = (
+        max(set(categories), key=categories.count)
+        if categories
+        else "unknown"
+    )
+    if dominant in RECOVERABLE_FAILURE_CATEGORIES:
+        attempts = memory.count_launch_attempts(req.job_id)
+        if attempts >= MAX_STARTUP_RETRIES:
+            logger.warning(
+                "launch_failed_retries_exhausted",
+                job_id=req.job_id,
+                attempts=attempts,
+                max_retries=MAX_STARTUP_RETRIES,
+            )
+            return {
+                "status": "exhausted",
+                "job_id": req.job_id,
+                "attempts_recorded": len(req.configs_tried),
+            }
+
+        agent_response = await app.state.agent.recover_from_startup_failure(
+            parent_job_id=req.job_id,
+            decision_id=decision_id,
+            failed_configs=memory.get_failed_configs(req.job_id),
+            failure_category=dominant,
+            original_decision=memory.get_decision(decision_id) if decision_id else None,
+        )
+
+        if "NO_VIABLE_ALTERNATIVE" in (agent_response or ""):
+            return {
+                "status": "no_alternative",
+                "job_id": req.job_id,
+                "attempts_recorded": len(req.configs_tried),
+            }
+
+        return {
+            "status": "retrying",
+            "job_id": req.job_id,
+            "attempts": attempts,
+            "attempts_recorded": len(req.configs_tried),
+        }
 
     return {
         "status": "recorded",
