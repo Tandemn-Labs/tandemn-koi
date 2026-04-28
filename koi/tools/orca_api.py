@@ -185,14 +185,21 @@ class OrcaClient:
         count: int,
         on_demand: bool = False,
         planned_market: Optional[str] = None,
+        force: bool = False,
     ) -> Dict[str, Any]:
-        """POST /job/{id}/scale → add replicas (can be different GPU type)."""
+        """POST /job/{id}/scale → add replicas (can be different GPU type).
+
+        force=True bypasses Orca's feasibility check (used during cold-start
+        recovery when the feasibility solver's recommendation OOMed and the
+        agent has explicitly chosen a different config).
+        """
         payload = {
             "count": count,
             "gpu_type": gpu_type,
             "tp_size": tp,
             "pp_size": pp,
             "on_demand": on_demand,
+            "force": force,
         }
         if planned_market:
             payload["planned_market"] = planned_market

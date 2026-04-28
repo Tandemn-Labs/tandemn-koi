@@ -165,8 +165,21 @@ class KoiAgent:
     # Tools — defined as @beta_tool functions
     # ------------------------------------------------------------------
 
-    def _build_tools(self, resource_map: Optional[ResourceMap] = None, monitor=None):
-        """Create tool functions bound to this agent's backing services."""
+    def _build_tools(
+        self,
+        resource_map: Optional[ResourceMap] = None,
+        monitor=None,
+        recovery_mode: bool = False,
+    ):
+        """Create tool functions bound to this agent's backing services.
+
+        recovery_mode=True flags this tool-set as a cold-start failure
+        recovery context. scale_chain_tool then passes force=True to
+        orca.scale_job so Orca's feasibility check is bypassed — the
+        agent has explicitly chosen a config that overrides the
+        solver's recommendation (which OOMed). Set at the recovery
+        boundary, invisible to the agent.
+        """
         perfdb = self.perfdb
         memory = self.memory
         orca = self.orca
@@ -465,6 +478,7 @@ class KoiAgent:
                         count,
                         on_demand=use_on_demand,
                         planned_market=market_str,
+                        force=recovery_mode,
                     )
                     if scale_response.get("status") != "scaling":
                         logger.warning(
@@ -698,7 +712,9 @@ class KoiAgent:
             failure_category=failure_category,
             original_decision=original_decision,
         )
-        tools = self._build_tools(monitor=self.monitor)
+        # recovery_mode=True → scale_chain_tool will pass force=True to Orca,
+        # bypassing the feasibility check that blocked the original launch.
+        tools = self._build_tools(monitor=self.monitor, recovery_mode=True)
 
         logger.info(
             "recovery_handling",
