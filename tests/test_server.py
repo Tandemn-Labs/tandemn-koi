@@ -1825,3 +1825,50 @@ class TestListJobs:
         assert job["cost_roofline_usd"] == 9.0
         assert job["cost_overage_usd"] == 1.25
         assert job["meets_cost_roofline"] is False
+
+    @pytest.mark.asyncio
+    async def test_inf_cost_projections_serialize_as_null(self, client):
+        """Regression: when smoothed_tps==0 (just after /job/started), monitor
+        sets projected_eta_hours=inf, which propagates to projected_remaining_cost,
+        projected_total_cost, and cost_overage. Previously /jobs returned a raw
+        float('inf'), which fails JSON serialization with 'Out of range float
+        values are not JSON compliant'. The endpoint must coerce non-finite
+        floats to null instead of 500-ing the whole response."""
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.xlarge",
+            num_gpus=1,
+            num_instances=1,
+            tp=1,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(tensor_parallel_size=1, pipeline_parallel_size=1),
+            market="on_demand",
+        )
+        from koi.schemas import JobTracker
+
+        app.state.monitor.tracked_jobs["job-inf"] = JobTracker(
+            job_id="job-inf",
+            config=config,
+            slo_deadline_hours=2.0,
+            total_tokens=1_000_000,
+            predicted_tps=1000.0,
+            predicted_cost_per_hour=2.62,
+            cost_roofline_usd=10.0,
+            smoothed_tps=0.0,
+            projected_remaining_cost_usd=float("inf"),
+            projected_total_cost_usd=float("inf"),
+            cost_overage_usd=float("inf"),
+            meets_cost_roofline=False,
+            tokens_remaining=1_000_000,
+        )
+
+        resp = await client.get("/jobs")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        job = next(j for j in body["jobs"] if j["job_id"] == "job-inf")
+        assert job["projected_remaining_cost_usd"] is None
+        assert job["projected_total_cost_usd"] is None
+        assert job["cost_overage_usd"] is None

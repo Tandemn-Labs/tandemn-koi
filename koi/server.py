@@ -14,6 +14,7 @@ Usage:
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -308,6 +309,14 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Koi Placement Service", version="2.0", lifespan=lifespan)
+
+
+def _finite_or_none(v: Optional[float], ndigits: Optional[int] = None) -> Optional[float]:
+    """Sanitize a float for JSON: replace nan/inf with None, optionally round."""
+    if v is None or not math.isfinite(v):
+        return None
+    return round(v, ndigits) if ndigits is not None else v
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -1376,23 +1385,15 @@ async def list_jobs():
                 "slo_headroom_pct": round(tracker.slo_headroom_pct, 1),
                 "elapsed_hours": round(tracker.elapsed_hours, 2),
                 "predicted_cost_per_hour": tracker.predicted_cost_per_hour,
-                "projected_remaining_cost_usd": (
-                    round(tracker.projected_remaining_cost_usd, 2)
-                    if tracker.projected_remaining_cost_usd is not None
-                    and tracker.projected_remaining_cost_usd != float("inf")
-                    else tracker.projected_remaining_cost_usd
+                "projected_remaining_cost_usd": _finite_or_none(
+                    tracker.projected_remaining_cost_usd, ndigits=2
                 ),
-                "projected_total_cost_usd": (
-                    round(tracker.projected_total_cost_usd, 2)
-                    if tracker.projected_total_cost_usd is not None
-                    and tracker.projected_total_cost_usd != float("inf")
-                    else tracker.projected_total_cost_usd
+                "projected_total_cost_usd": _finite_or_none(
+                    tracker.projected_total_cost_usd, ndigits=2
                 ),
-                "cost_roofline_usd": tracker.cost_roofline_usd,
-                "cost_overage_usd": (
-                    round(tracker.cost_overage_usd, 2)
-                    if tracker.cost_overage_usd is not None
-                    else None
+                "cost_roofline_usd": _finite_or_none(tracker.cost_roofline_usd),
+                "cost_overage_usd": _finite_or_none(
+                    tracker.cost_overage_usd, ndigits=2
                 ),
                 "meets_cost_roofline": tracker.meets_cost_roofline,
                 "tokens_completed": tracker.tokens_completed,
