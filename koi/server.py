@@ -175,6 +175,9 @@ class _FixedTestAgent:
     async def handle_trigger(self, trigger: MonitoringTrigger) -> str:
         return f"[TEST FAKE TRIGGER] {trigger.trigger_type.value}"
 
+    async def recover_from_startup_failure(self, **kwargs) -> str:
+        return "RECOVERY_NOT_AVAILABLE — test fake agent does not launch recovery"
+
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -1014,8 +1017,25 @@ async def _job_complete_impl(req: JobCompleteRequest) -> Dict[str, Any]:
                 status=req.status,
             )
 
+        response: Dict[str, Any] = {"status": "recorded", "job_id": req.job_id}
+        if req.status != "succeeded":
+            group_chains = {req.job_id: tracker}
+            postmortem = await _run_job_postmortem_if_enabled(req, group_chains)
+            if postmortem is not None:
+                terminal_outcome_id = _record_terminal_job_postmortem(
+                    memory=memory,
+                    req=req,
+                    postmortem=postmortem,
+                    group_chains=group_chains,
+                    actual_tps=actual_tps,
+                    actual_runtime_hours=tracker.elapsed_hours,
+                )
+                response["postmortem"] = postmortem.model_dump(mode="json")
+                if terminal_outcome_id:
+                    response["terminal_outcome_id"] = terminal_outcome_id
+
         monitor.unregister_job(req.job_id)
-        return {"status": "recorded", "job_id": req.job_id}
+        return response
 
     # Mode 2: job group completion (chunked job)
     group_chains = monitor.get_group_chains(req.job_id)
@@ -1062,18 +1082,150 @@ async def _job_complete_impl(req: JobCompleteRequest) -> Dict[str, Any]:
             status=req.status,
         )
 
+        postmortem = None
+        terminal_outcome_id = None
+        if req.status != "succeeded":
+            postmortem = await _run_job_postmortem_if_enabled(req, group_chains)
+            if postmortem is not None:
+                terminal_outcome_id = _record_terminal_job_postmortem(
+                    memory=memory,
+                    req=req,
+                    postmortem=postmortem,
+                    group_chains=group_chains,
+                    actual_tps=req.metrics.get("throughput_tokens_per_sec") or total_tps,
+                    actual_runtime_hours=max_elapsed,
+                )
+
         # Unregister all chains in the group
         monitor.unregister_group(req.job_id)
-        return {
+        response = {
             "status": "recorded",
             "job_id": req.job_id,
             "chains_closed": len(group_chains),
             "outcomes_recorded": outcomes_recorded,
             "aggregate_tps": round(total_tps, 1),
         }
+        if postmortem is not None:
+            response["postmortem"] = postmortem.model_dump(mode="json")
+            if terminal_outcome_id:
+                response["terminal_outcome_id"] = terminal_outcome_id
+        return response
 
     logger.warning("job_complete_unknown", job_id=req.job_id)
     return {"status": "unknown_job", "job_id": req.job_id}
+
+
+async def _run_job_postmortem_if_enabled(
+    req: JobCompleteRequest,
+    group_chains: Dict[str, Any],
+) -> Optional[Any]:
+    try:
+        from koi.harness.config import fail_open_enabled, prompt_enabled
+
+        use_p5j_harness = prompt_enabled("p5j")
+    except Exception:
+        use_p5j_harness = False
+        fail_open_enabled = lambda: True  # type: ignore[assignment]
+
+    if not use_p5j_harness:
+        return None
+
+    try:
+        from koi.harness.p5j import run_job_postmortem
+
+        return await run_job_postmortem(
+            agent=app.state.agent,
+            req=req,
+            memory=app.state.memory,
+            group_chains=group_chains,
+        )
+    except Exception as e:
+        if not fail_open_enabled():
+            raise
+        logger.warning(
+            "p5j_harness_failed_open",
+            job_id=req.job_id,
+            error=str(e),
+        )
+        return None
+
+
+def _record_terminal_job_postmortem(
+    *,
+    memory: AgenticMemory,
+    req: JobCompleteRequest,
+    postmortem: Any,
+    group_chains: Dict[str, Any],
+    actual_tps: Optional[float] = None,
+    actual_runtime_hours: Optional[float] = None,
+) -> Optional[str]:
+    decision_id = req.decision_id
+    if not decision_id:
+        for tracker in group_chains.values():
+            decision_id = getattr(tracker, "decision_id", None)
+            if decision_id:
+                break
+    if not decision_id:
+        logger.warning("p5j_no_decision_for_terminal_outcome", job_id=req.job_id)
+        return None
+
+    if actual_tps is None:
+        metric_tps = req.metrics.get("throughput_tokens_per_sec") or req.metrics.get(
+            "avg_generation_throughput_toks_per_s"
+        )
+        actual_tps = float(metric_tps) if metric_tps is not None else None
+    if actual_runtime_hours is None and group_chains:
+        actual_runtime_hours = max(
+            float(getattr(tracker, "elapsed_hours", 0.0) or 0.0)
+            for tracker in group_chains.values()
+        )
+
+    postmortem_json = json.dumps(postmortem.model_dump(), sort_keys=True)
+    diagnosis_text = f"{postmortem.diagnosis_code}: {postmortem.rationale}"[:500]
+    return memory.record_outcome(
+        decision_id=decision_id,
+        job_id=req.job_id,
+        status="terminal_failed",
+        actual_tps=actual_tps,
+        actual_runtime_hours=actual_runtime_hours,
+        slo_met=False,
+        failure_category=postmortem.diagnosis_code,
+        diagnosis=diagnosis_text,
+        bottleneck=postmortem.bottleneck,
+        diff_from_parent=postmortem_json,
+    )
+
+
+async def _attach_terminal_job_postmortem(
+    response: Dict[str, Any],
+    *,
+    job_id: str,
+    decision_id: Optional[str] = None,
+    reason_detail: Optional[str] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+    group_chains: Optional[Dict[str, Any]] = None,
+    response_key: str = "job_postmortem",
+) -> None:
+    terminal_req = JobCompleteRequest(
+        job_id=job_id,
+        decision_id=decision_id,
+        status="failed",
+        metrics=metrics or {},
+        reason_detail=reason_detail,
+    )
+    chains = group_chains or {}
+    postmortem = await _run_job_postmortem_if_enabled(terminal_req, chains)
+    if postmortem is None:
+        return
+    terminal_outcome_id = _record_terminal_job_postmortem(
+        memory=app.state.memory,
+        req=terminal_req,
+        postmortem=postmortem,
+        group_chains=chains,
+    )
+    response[response_key] = postmortem.model_dump(mode="json")
+    if terminal_outcome_id:
+        response["terminal_outcome_id"] = terminal_outcome_id
 
 
 class ReplicaFailedRequest(BaseModel):
@@ -1172,11 +1324,18 @@ async def _handle_startup_failure(
             attempts=attempts,
             max_retries=MAX_STARTUP_RETRIES,
         )
-        return {
+        response = {
             "status": "exhausted",
             "job_id": req.job_id,
             "attempts": attempts,
         }
+        await _attach_terminal_job_postmortem(
+            response,
+            job_id=parent_job_id,
+            decision_id=decision_id,
+            reason_detail=f"startup retry budget exhausted after {attempts} attempts: {req.reason}",
+        )
+        return response
 
     agent_response = await app.state.agent.recover_from_startup_failure(
         parent_job_id=parent_job_id,
@@ -1186,8 +1345,18 @@ async def _handle_startup_failure(
         original_decision=memory.get_decision(decision_id) if decision_id else None,
     )
 
+    if "RECOVERY_NOT_AVAILABLE" in (agent_response or ""):
+        return {"status": "recorded_no_recovery", "job_id": req.job_id}
+
     if "NO_VIABLE_ALTERNATIVE" in (agent_response or ""):
-        return {"status": "no_alternative", "job_id": req.job_id}
+        response = {"status": "no_alternative", "job_id": req.job_id}
+        await _attach_terminal_job_postmortem(
+            response,
+            job_id=parent_job_id,
+            decision_id=decision_id,
+            reason_detail=f"startup recovery found no viable alternative: {req.reason}",
+        )
+        return response
 
     return {
         "status": "retrying",
@@ -1396,6 +1565,15 @@ async def _replica_failed_impl(req: ReplicaFailedRequest) -> Dict[str, Any]:
                 ledger=app.state.ledger,
             )
             response["recovery"] = recovery
+            if isinstance(recovery, dict) and recovery.get("action") == "abort":
+                chains = monitor.get_group_chains(req.group_id) if req.group_id else {req.job_id: tracker}
+                await _attach_terminal_job_postmortem(
+                    response,
+                    job_id=req.group_id or req.job_id,
+                    decision_id=tracker.decision_id,
+                    reason_detail=f"replica recovery aborted: {recovery.get('reasoning', '')}",
+                    group_chains=chains,
+                )
         except Exception as e:
             if not fail_open_enabled():
                 raise
@@ -1604,6 +1782,13 @@ async def _job_launch_failed_impl(req: LaunchFailedRequest) -> Dict[str, Any]:
                 ledger=app.state.ledger,
             )
             response["recovery"] = recovery
+            if isinstance(recovery, dict) and recovery.get("action") == "abort":
+                await _attach_terminal_job_postmortem(
+                    response,
+                    job_id=req.job_id,
+                    decision_id=decision_id,
+                    reason_detail=f"launch recovery aborted: {recovery.get('reasoning', '')}",
+                )
         except Exception as e:
             if not fail_open_enabled():
                 raise
@@ -1632,11 +1817,18 @@ async def _job_launch_failed_impl(req: LaunchFailedRequest) -> Dict[str, Any]:
                 attempts=attempts,
                 max_retries=MAX_STARTUP_RETRIES,
             )
-            return {
+            response = {
                 "status": "exhausted",
                 "job_id": req.job_id,
                 "attempts_recorded": len(req.configs_tried),
             }
+            await _attach_terminal_job_postmortem(
+                response,
+                job_id=req.job_id,
+                decision_id=decision_id,
+                reason_detail=f"launch retry budget exhausted after {attempts} attempts",
+            )
+            return response
 
         agent_response = await app.state.agent.recover_from_startup_failure(
             parent_job_id=req.job_id,
@@ -1646,12 +1838,22 @@ async def _job_launch_failed_impl(req: LaunchFailedRequest) -> Dict[str, Any]:
             original_decision=memory.get_decision(decision_id) if decision_id else None,
         )
 
+        if "RECOVERY_NOT_AVAILABLE" in (agent_response or ""):
+            return response
+
         if "NO_VIABLE_ALTERNATIVE" in (agent_response or ""):
-            return {
+            response = {
                 "status": "no_alternative",
                 "job_id": req.job_id,
                 "attempts_recorded": len(req.configs_tried),
             }
+            await _attach_terminal_job_postmortem(
+                response,
+                job_id=req.job_id,
+                decision_id=decision_id,
+                reason_detail="launch recovery found no viable alternative",
+            )
+            return response
 
         return {
             "status": "retrying",

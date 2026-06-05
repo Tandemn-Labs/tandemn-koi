@@ -2715,6 +2715,103 @@ def run_tier2():
         ]:
             skip(name, str(e))
 
+    # ── T2.15: P5j job post-mortem (deterministic, no LLM) ────────────────
+    section("T2.15  /job/complete failed P5j writes terminal job diagnosis")
+
+    try:
+        p5j_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p5j",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_TEST_FAKE_DECIDE": "1",
+            "KOI_TEST_GPU_TYPE": "L40S",
+            "KOI_TEST_REQUIRED_GPUS": "4",
+            "KOI_WARMUP_MINUTES": "0",
+        }
+        with koi_server(api_key="dummy", extra_env=p5j_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            m = AgenticMemory(db_path)
+            decision_id = m.record_decision(
+                job_id="p5j-group",
+                model_name="Qwen/Qwen3-32B",
+                instance_type="g6e.12xlarge",
+                gpu_type="L40S",
+                tp=4,
+                pp=1,
+                dp=1,
+                num_gpus=4,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.49,
+                slo_deadline_hours=8.0,
+                objective="cheapest",
+                avg_input_tokens=953,
+                avg_output_tokens=1024,
+                num_requests=5000,
+                market="spot",
+            )
+
+            post(
+                f"{KOI_URL}/job/started",
+                {
+                    "job_id": "p5j-r0",
+                    "decision_id": decision_id,
+                    "group_id": "p5j-group",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 8.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                },
+            )
+
+            response = post(
+                f"{KOI_URL}/job/complete",
+                {
+                    "job_id": "p5j-group",
+                    "status": "failed",
+                    "metrics": {"throughput_tokens_per_sec": 0.0},
+                    "reason_detail": "SpotInstanceInterruption ended the job",
+                },
+            )
+
+            def t_p5j_response_includes_job_postmortem():
+                assert response.get("status") == "recorded", response
+                pm = response.get("postmortem")
+                assert pm is not None, response
+                assert pm.get("diagnosis_code") == "job_capacity_exhausted", pm
+                assert pm.get("bottleneck") == "market_capacity", pm
+
+            def t_p5j_records_terminal_failed_outcome():
+                m = AgenticMemory(db_path)
+                outcomes = m.query_outcomes(status="terminal_failed", limit=5)
+                assert outcomes, "expected terminal_failed outcome"
+                latest = outcomes[0]
+                assert latest["job_id"] == "p5j-group", latest
+                assert latest["bottleneck"] == "market_capacity", latest
+                assert "job_capacity_exhausted" in (latest.get("diagnosis") or ""), latest
+
+            check(
+                "P5j attaches structured job postmortem to failed completion",
+                t_p5j_response_includes_job_postmortem,
+            )
+            check(
+                "P5j records terminal_failed job outcome",
+                t_p5j_records_terminal_failed_outcome,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P5j attaches structured job postmortem to failed completion",
+            "P5j records terminal_failed job outcome",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 3 — Full agent loop (requires KOI_API_KEY or ANTHROPIC_API_KEY)
@@ -3714,6 +3811,100 @@ def run_tier3(api_key: str):
         ]:
             skip(name, str(e))
 
+    # ── T3.8: P5j job post-mortem LLM scenario ────────────────────────────
+    section("T3.8  P5j LLM job post-mortem after terminal failure")
+
+    try:
+        p5j_llm_env = {
+            "KOI_HARNESS": "1",
+            "KOI_HARNESS_PROMPTS": "p5j",
+            "KOI_HARNESS_FAIL_OPEN": "0",
+            "KOI_WARMUP_MINUTES": "0",
+        }
+        with koi_server(api_key=api_key, extra_env=p5j_llm_env) as db_path:
+            from koi.tools.memory import AgenticMemory
+
+            m = AgenticMemory(db_path)
+            decision_id = m.record_decision(
+                job_id="p5j-llm-group",
+                model_name="p5j-llm-test/Qwen-32B",
+                instance_type="g6e.12xlarge",
+                gpu_type="L40S",
+                tp=4,
+                pp=1,
+                dp=1,
+                num_gpus=4,
+                predicted_tps=1200.0,
+                predicted_cost_per_hour=10.49,
+                slo_deadline_hours=2.0,
+                objective="cheapest",
+                avg_input_tokens=512,
+                avg_output_tokens=512,
+                num_requests=5000,
+                market="spot",
+            )
+
+            post(
+                f"{KOI_URL}/job/started",
+                {
+                    "job_id": "p5j-llm-r0",
+                    "decision_id": decision_id,
+                    "group_id": "p5j-llm-group",
+                    "gpu_type": "L40S",
+                    "instance_type": "g6e.12xlarge",
+                    "region": "us-east-1",
+                    "market": "spot",
+                    "tp": 4,
+                    "pp": 1,
+                    "dp": 1,
+                    "slo_deadline_hours": 2.0,
+                    "total_tokens": 6_000_000,
+                    "predicted_tps": 1200.0,
+                },
+            )
+
+            response = requests.post(
+                f"{KOI_URL}/job/complete",
+                json={
+                    "job_id": "p5j-llm-group",
+                    "status": "failed",
+                    "metrics": {"throughput_tokens_per_sec": 0.0},
+                    "reason_detail": "SpotInstanceInterruption ended the job",
+                },
+                timeout=120,
+            ).json()
+
+            def t_p5j_llm_postmortem_present():
+                assert response.get("status") == "recorded", response
+                pm = response.get("postmortem") or {}
+                assert pm.get("diagnosis_code"), response
+                assert pm.get("terminal_status") == "failed", pm
+                assert pm.get("chain_diagnoses"), pm
+
+            def t_p5j_llm_persists_terminal_outcome():
+                m2 = AgenticMemory(db_path)
+                outcomes = m2.query_outcomes(status="terminal_failed", limit=5)
+                assert outcomes, "expected terminal_failed outcome"
+                latest = outcomes[0]
+                assert latest["job_id"] == "p5j-llm-group", latest
+                assert latest.get("diff_from_parent"), latest
+
+            check(
+                "P5j LLM returns job postmortem with diagnosis_code",
+                t_p5j_llm_postmortem_present,
+            )
+            check(
+                "P5j LLM persists terminal_failed outcome",
+                t_p5j_llm_persists_terminal_outcome,
+            )
+
+    except RuntimeError as e:
+        for name in [
+            "P5j LLM returns job postmortem with diagnosis_code",
+            "P5j LLM persists terminal_failed outcome",
+        ]:
+            skip(name, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TIER 4 — Scenario tests (OVER_PROVISIONED + FALLING_BEHIND, requires KOI_API_KEY or ANTHROPIC_API_KEY)
@@ -4447,6 +4638,8 @@ if __name__ == "__main__":
             "P5c LLM returns postmortem field with diagnosis_code",
             "P5c LLM persists outcome with bottleneck and structured diagnosis",
             "P5c LLM persists active cooloff for spot scope",
+            "P5j LLM returns job postmortem with diagnosis_code",
+            "P5j LLM persists terminal_failed outcome",
             "P0 LLM does not pick recently failed launch scope",
             "P0 LLM picks an alternative GPU or market vs failed scope",
             "P4 LLM returns recovery plan tied to parent decision",

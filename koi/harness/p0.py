@@ -350,6 +350,7 @@ def render_p0_prompt(packet: TransitionPacket) -> str:
         "Choose one valid action_id from the launch menu.",
         "SLO is hard. Cost roofline is a soft preference unless no SLO-valid option exists.",
         "The ranking is guidance, not a command; explain if you choose a lower-ranked option.",
+        "If an option has risk.recent_failure.same_scope=true, avoid it when any other valid SLO-meeting option exists; use it only when it is the only SLO-saving path.",
         "",
         "JOB CONTEXT:",
         json.dumps(packet.job_context, indent=2, sort_keys=True),

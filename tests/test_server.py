@@ -2462,6 +2462,202 @@ class TestGroupedCompletion:
         assert {o["decision_id"] for o in group_outcomes} == {dec1, dec2}
         assert {o["actual_tps"] for o in group_outcomes} == {1200.0, 1400.0}
 
+    @pytest.mark.asyncio
+    async def test_group_failed_runs_p5j_and_records_terminal_outcome(
+        self, client, monkeypatch
+    ):
+        """P5j should attach a job-level diagnosis on terminal group failure."""
+        from koi.harness.p5j import P5jDiagnosis
+        from koi.schemas import JobTracker
+        import koi.harness.p5j as p5j_module
+
+        dec1 = app.state.memory.record_decision(
+            job_id="parent-failed",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1100.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+        )
+        dec2 = app.state.memory.record_decision(
+            job_id="parent-failed",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1150.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+        )
+        config = PlacementConfig(
+            gpu_type="L40S",
+            instance_type="g6e.12xlarge",
+            num_gpus=4,
+            num_instances=1,
+            tp=4,
+            pp=1,
+            dp=1,
+            region="us-east-1",
+            engine_config=EngineConfig(
+                tensor_parallel_size=4,
+                pipeline_parallel_size=1,
+            ),
+            market="spot",
+        )
+        tracker1 = JobTracker(
+            job_id="r0",
+            decision_id=dec1,
+            group_id="parent-failed",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1100.0,
+        )
+        tracker1.status = MonitoringStatus.FAILED
+        tracker1.smoothed_tps = 0.0
+        tracker1.elapsed_hours = 1.0
+        tracker2 = JobTracker(
+            job_id="r1",
+            decision_id=dec2,
+            group_id="parent-failed",
+            config=config,
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1150.0,
+        )
+        tracker2.status = MonitoringStatus.FAILED
+        tracker2.smoothed_tps = 0.0
+        tracker2.elapsed_hours = 1.5
+        app.state.monitor.get_group_chains = MagicMock(
+            return_value={"r0": tracker1, "r1": tracker2}
+        )
+        app.state.monitor.unregister_group = MagicMock(return_value=["r0", "r1"])
+
+        async def _stub_postmortem(**kwargs):
+            assert set(kwargs["group_chains"]) == {"r0", "r1"}
+            return P5jDiagnosis(
+                diagnosis_code="job_capacity_exhausted",
+                bottleneck="market_capacity",
+                next_fix="retry_same_topology_on_demand",
+                failure_scope="parent-failed",
+                terminal_status="failed",
+                failed_chains=2,
+                diagnosed_chains=2,
+                chain_diagnoses=[{"diagnosis_code": "spot_preemption"}],
+                rationale="all chains lost spot capacity",
+            )
+
+        monkeypatch.setenv("KOI_HARNESS", "1")
+        monkeypatch.setenv("KOI_HARNESS_PROMPTS", "p5j")
+        monkeypatch.setattr(p5j_module, "run_job_postmortem", _stub_postmortem)
+
+        resp = await client.post(
+            "/job/complete",
+            json={
+                "job_id": "parent-failed",
+                "status": "failed",
+                "metrics": {"throughput_tokens_per_sec": 0.0},
+                "reason_detail": "all chains failed",
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "recorded"
+        assert body["postmortem"]["diagnosis_code"] == "job_capacity_exhausted"
+        assert body["terminal_outcome_id"]
+
+        terminal = app.state.memory.query_outcomes(status="terminal_failed")
+        assert len(terminal) == 1
+        assert terminal[0]["job_id"] == "parent-failed"
+        assert terminal[0]["bottleneck"] == "market_capacity"
+        assert "job_capacity_exhausted" in terminal[0]["diagnosis"]
+
+    @pytest.mark.asyncio
+    async def test_group_failed_p5j_fail_open_preserves_response(
+        self, client, monkeypatch
+    ):
+        from koi.schemas import JobTracker
+        import koi.harness.p5j as p5j_module
+
+        dec_id = app.state.memory.record_decision(
+            job_id="parent-p5j-open",
+            model_name="Qwen/Qwen2.5-72B-Instruct",
+            instance_type="g6e.12xlarge",
+            gpu_type="L40S",
+            tp=4,
+            pp=1,
+            dp=1,
+            num_gpus=4,
+            predicted_tps=1100.0,
+            predicted_cost_per_hour=6.85,
+            slo_deadline_hours=8.0,
+            objective="cheapest",
+            avg_input_tokens=953,
+            avg_output_tokens=1024,
+        )
+        tracker = JobTracker(
+            job_id="r0",
+            decision_id=dec_id,
+            group_id="parent-p5j-open",
+            config=PlacementConfig(
+                gpu_type="L40S",
+                instance_type="g6e.12xlarge",
+                num_gpus=4,
+                num_instances=1,
+                tp=4,
+                pp=1,
+                dp=1,
+                region="us-east-1",
+                engine_config=EngineConfig(
+                    tensor_parallel_size=4,
+                    pipeline_parallel_size=1,
+                ),
+            ),
+            slo_deadline_hours=8.0,
+            total_tokens=6_000_000,
+            predicted_tps=1100.0,
+        )
+        app.state.monitor.get_group_chains = MagicMock(return_value={"r0": tracker})
+        app.state.monitor.unregister_group = MagicMock(return_value=["r0"])
+
+        async def _boom(**kwargs):
+            raise RuntimeError("p5j exploded")
+
+        monkeypatch.setenv("KOI_HARNESS", "1")
+        monkeypatch.setenv("KOI_HARNESS_PROMPTS", "p5j")
+        monkeypatch.setenv("KOI_HARNESS_FAIL_OPEN", "1")
+        monkeypatch.setattr(p5j_module, "run_job_postmortem", _boom)
+
+        resp = await client.post(
+            "/job/complete",
+            json={
+                "job_id": "parent-p5j-open",
+                "status": "failed",
+                "metrics": {"throughput_tokens_per_sec": 0.0},
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "recorded"
+        assert "postmortem" not in body
+        assert app.state.memory.query_outcomes(status="terminal_failed") == []
+
 
 class TestListJobs:
     @pytest.mark.asyncio
