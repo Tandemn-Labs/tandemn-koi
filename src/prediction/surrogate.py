@@ -1,9 +1,3 @@
-# from dotenv import load_dotenv
-# from huggingface_hub import hf_hub_download
-# import json
-# import os
-
-
 class SurrogatePrediction:
     def __init__(self, objective="batched"):
         self.objective = objective  # can be online or batched
@@ -574,7 +568,6 @@ class SurrogatePrediction:
 # if __name__ == "__main__":
 #     # Define the DAG
 #     class MockCandidateGraph:
-
 #         x = (
 #             "model_params_b",
 #             "model_size_gb",
