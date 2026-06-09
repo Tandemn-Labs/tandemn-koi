@@ -119,14 +119,21 @@ class MechanismRegistry:
         self.mechanisms_by_status["active"].discard(mechanism_id)
         return True
 
-    def filter_by_scope(self, job_features):
-        # Placeholder: filter mechanisms by JobFeatures (workload, hardware, workload type)
-        pass
+    def filter_by_scope(self, subset_x, subset_v):
+        # Placeholder: filter mechanisms by adding subset_x and subset_v to the scope
+        # the idea is that we just go through all the mechanisms and search the subset_x and subset_v
+        # in the scope and the % match and return if >25%
+        matching_mechanisms = []
+        for mechanism in self.mechanism_table.values():
+            if self.percentage_scope_match(subset_x, subset_v, mechanism) > 25:
+                matching_mechanisms.append(mechanism)
+        return matching_mechanisms
 
-    def does_scope_match(self, Scope, job_features):
-        # Placeholder: check whether a scope matches given job features
-        pass
+    def percentage_scope_match(self, subset_x, subset_v, mechanism):
+        requested_terms = set(subset_x) | set(subset_v)
+        if not requested_terms:
+            return 0.0
 
-    def val_mechanism(self, Mechanism):
-        # Placeholder: validate a mechanism, return (Bool, Optional[List[Violation]])
-        pass
+        scope_text = json.dumps(mechanism.scope, sort_keys=True)
+        matched_terms = sum(term in scope_text for term in requested_terms)
+        return 100.0 * matched_terms / len(requested_terms)
