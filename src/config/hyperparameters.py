@@ -48,6 +48,8 @@ B_MAX = 10  # B_max
 # Regret
 W_REGRET = 20  # W_regret, regret window (ticks)
 W_Q1 = 20  # W_q1, Q1 rate window (ticks)
+DEFAULT_Q1_STAR: float = 1.0  # default Q1 star value
+
 
 # Agent
 K_P = 1  # K_p, plan samples per tick (v0=1, v2=>1)

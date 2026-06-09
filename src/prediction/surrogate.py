@@ -28,7 +28,7 @@ class SurrogatePrediction:
         # this is a very AIC/DynoSim specific control
         # so TODO - maybe we can move into a different function?
         # to maintain a very modular architecture
-        simulator_controls = self.build_simulator_controls(
+        simulator_controls = self._build_simulator_controls(
             self.objective,
             job_config,
             job_features,
@@ -269,7 +269,7 @@ class SurrogatePrediction:
 
         return 98.32  # placeholder for now TODO
 
-    def build_simulator_controls(self, objective, job_config, job_features, direct_x_values):
+    def _build_simulator_controls(self, objective, job_config, job_features, direct_x_values):
         # Build DynoSim run controls. These are not DAG X values.
         # Inputs: objective, JobConfig, JobFeatures, direct_x_values
         # Outputs: simulator_controls
@@ -775,7 +775,7 @@ class SurrogatePrediction:
 #     print("env_vector:", env_vector)
 #     print("direct_x_values:", direct_x_values)
 #     print("aic_system:", predictor.map_gpu_to_aic_system(direct_x_values["gpu_type"]))
-#     simulator_controls = predictor.build_simulator_controls(
+#     simulator_controls = predictor._build_simulator_controls(
 #         objective=predictor.objective,
 #         job_config=job_config,
 #         job_features=job_features,
