@@ -1,36 +1,3 @@
-from dataclasses import dataclass, field
-
-
-@dataclass
-class Node:
-    node_id: str
-    node_type: str
-    description: str | None = None
-    unit: str | None = None
-
-
-@dataclass
-class Edge:
-    edge_id: str
-    src: str
-    dst: str
-    src_type: str
-    dst_type: str
-    status: str = "active"
-
-
-@dataclass
-class EdgeMetadata:
-    edge_id: str
-    confidence: float
-    visit_count: int = 0
-    last_touched_tick: int | None = None
-    q_histogram: dict[str, int] = field(
-        default_factory=lambda: {"Q1": 0, "Q2": 0, "Q3": 0, "Q4": 0}
-    )
-    q3_frequency: float = 0.0
-
-
 class CandidateGraph:
     def __init__(self, node_table, edge_table, edge_metadata_table=None):
         self.node_table = node_table
