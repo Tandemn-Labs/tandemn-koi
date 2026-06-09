@@ -1,19 +1,22 @@
-import json
-import os
-from dotenv import load_dotenv
-from huggingface_hub import hf_hub_download
+# from dotenv import load_dotenv
+# from huggingface_hub import hf_hub_download
+# import json
+# import os
+
 
 class SurrogatePrediction:
     def __init__(self, objective="batched"):
-        self.objective = objective # can be online or batched
+        self.objective = objective  # can be online or batched
 
-    def compose_prediction(self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",)):
-        model_id = job_config.model_id
-        model_config = self.get_model_config(model_id)
-        env_vector = self.get_env_row(job_features) 
+    def compose_prediction(
+        self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",)
+    ):
+        env_vector = self.get_env_row(job_features)
         price_vector = self.fetch_cloud_prices(env_vector)
         # 1. Resolve what this surrogate is allowed to use/produce in the prediction
-        direct_x, derive_x, direct_v, derive_v, direct_y, derive_y = self.resolve_prediction_scope(candidate_graph, method)
+        direct_x, _derive_x, _direct_v, derive_v, _direct_y, derive_y = (
+            self.resolve_prediction_scope(candidate_graph, method)
+        )
         # field names only
 
         # 2. Pull actual values for the DAG X fields
@@ -23,6 +26,7 @@ class SurrogatePrediction:
             job_features,
             env_vector,
         )
+        direct_x_values["model_id"] = job_config["model_id"]
         # field names -> actual values from job_config/env_vector
 
         # 3. Add simulator-only controls that are NOT in the DAG
@@ -69,25 +73,25 @@ class SurrogatePrediction:
         y_hat = self.merge_outputs(y_hat_direct, y_hat_derived)
         v_hat = self.merge_outputs(v_hat_direct, v_hat_derived)
         # final output
-        pass
+        return y_hat, v_hat
 
-    def get_model_config(self, model_id):
-        # Fetch model architecture from Huggingface or a similar place
-        # Inputs: model_id
-        # Outputs: config.json
-        load_dotenv()
-        hf_token = os.getenv("HF_TOKEN")
-        if not hf_token:
-            raise ValueError("HF_TOKEN is not set")
+    # def get_model_config(self, model_id):
+    #     # Fetch model architecture from Huggingface or a similar place
+    #     # Inputs: model_id
+    #     # Outputs: config.json
+    #     load_dotenv()
+    #     hf_token = os.getenv("HF_TOKEN")
+    #     if not hf_token:
+    #         raise ValueError("HF_TOKEN is not set")
 
-        config_path = hf_hub_download(
-            repo_id=model_id,
-            filename="config.json",
-            token=hf_token,
-        )
+    #     config_path = hf_hub_download(
+    #         repo_id=model_id,
+    #         filename="config.json",
+    #         token=hf_token,
+    #     )
 
-        with open(config_path) as f:
-            return json.load(f)
+    #     with open(config_path) as f:
+    #         return json.load(f)
 
     def get_env_row(self, job_features):
         # Fetch the Env and the cloud we want for the prediction
@@ -172,40 +176,80 @@ class SurrogatePrediction:
         candidate_v = set(candidate_graph.v)
         candidate_y = set(candidate_graph.y)
         method_scope = {
-          "AIC_DynoSim": {
-              "direct_x": {"gpu_type","engine_name","engine_version","tp","ep",
-                  "block_size","max_num_seq","max_num_batched_tokens","gpu_mem_util",
-                  "prefix_cache_enabled","chunked_prefill_enable","pd_enabled","prefill_worker_count",
-                  "decode_worker_count","kv_transfer_method","preemption_policy","router_policy",
-                  "isl_token_avg","osl_token_avg","request_arrival_rate",
-                  "workload_prefix_concentration","shared_prefix_length_avg","is_session_affinity"
-              },
-              "derive_x": {
-                  "cloud","region","market","instance_type","interconnect_type",
-                  "num_nodes_per_chain","target_p99_ttft_ms","target_p99_tpot_ms",
-                  "gpu_mem_gb","gpu_bandwidth_gbps","gpu_tflops_fp16","nvlink_bandwidth_gbps",
-                  "pcie_bandwidth_gbps","internode_bandwidth_gbps","gpu_watts","model_params_b",
-                  "model_size_gb","num_hidden_layers","hidden_size","num_attn_heads",
-                  "num_kv_heads","attn_heads_per_kv_head","intermediate_size","max_pos_embeddings",
-                  "vocab_size","is_moe","num_routed_experts","num_active_experts","weight_dtype",
-                  "kvcache_dtype","weight_quantization_bits"
-              },
-              "direct_v": {
-                  "input_length_observed","output_length_observed","kvcache_hit_rate"
-              },
-              "derive_v": {
-                  "gpu_mem_used_fraction","kv_cache_util","vram_headroom_gb",
-                  "total_token_budget","kv_pressure_score","per_tok_comm_bytes",
-                  "comm_overhead_pct","pd_inbalance"
+            "AIC_DynoSim": {
+                "direct_x": {
+                    "gpu_type",
+                    "engine_name",
+                    "engine_version",
+                    "tp",
+                    "ep",
+                    "block_size",
+                    "max_num_seq",
+                    "max_num_batched_tokens",
+                    "gpu_mem_util",
+                    "prefix_cache_enabled",
+                    "chunked_prefill_enable",
+                    "pd_enabled",
+                    "prefill_worker_count",
+                    "decode_worker_count",
+                    "kv_transfer_method",
+                    "preemption_policy",
+                    "router_policy",
+                    "isl_token_avg",
+                    "osl_token_avg",
+                    "request_arrival_rate",
+                    "workload_prefix_concentration",
+                    "shared_prefix_length_avg",
+                    "is_session_affinity",
                 },
-              "direct_y": {
-                  "p99_ttft_ms","p99_tpot_ms","throughput_token_per_sec"
-              },
-              "derive_y": {
-                  "cost_per_token","slo_margin"
-              },
+                "derive_x": {
+                    "cloud",
+                    "region",
+                    "market",
+                    "instance_type",
+                    "interconnect_type",
+                    "num_nodes_per_chain",
+                    "target_p99_ttft_ms",
+                    "target_p99_tpot_ms",
+                    "gpu_mem_gb",
+                    "gpu_bandwidth_gbps",
+                    "gpu_tflops_fp16",
+                    "nvlink_bandwidth_gbps",
+                    "pcie_bandwidth_gbps",
+                    "internode_bandwidth_gbps",
+                    "gpu_watts",
+                    "model_params_b",
+                    "model_size_gb",
+                    "num_hidden_layers",
+                    "hidden_size",
+                    "num_attn_heads",
+                    "num_kv_heads",
+                    "attn_heads_per_kv_head",
+                    "intermediate_size",
+                    "max_pos_embeddings",
+                    "vocab_size",
+                    "is_moe",
+                    "num_routed_experts",
+                    "num_active_experts",
+                    "weight_dtype",
+                    "kvcache_dtype",
+                    "weight_quantization_bits",
+                },
+                "direct_v": {"input_length_observed", "output_length_observed", "kvcache_hit_rate"},
+                "derive_v": {
+                    "gpu_mem_used_fraction",
+                    "kv_cache_util",
+                    "vram_headroom_gb",
+                    "total_token_budget",
+                    "kv_pressure_score",
+                    "per_tok_comm_bytes",
+                    "comm_overhead_pct",
+                    "pd_inbalance",
+                },
+                "direct_y": {"p99_ttft_ms", "p99_tpot_ms", "throughput_token_per_sec"},
+                "derive_y": {"cost_per_token", "slo_margin"},
             }
-            }
+        }
         if method_name not in method_scope:
             raise ValueError(f"Unsupported surrogate method: {method_name}")
 
@@ -225,8 +269,11 @@ class SurrogatePrediction:
         # Fetch real-time per-hour cost of compute resources
         # Inputs: EnvVector
         # Outputs: Per Hour Pricing
-        pricing_of_the_gpu = get_gpu_pricing(env_vector) # TODO: Implement this function (helper function?)
-        return pricing_of_the_gpu
+        # pricing_of_the_gpu = get_gpu_pricing(
+        #     env_vector
+        # )  # TODO: Implement this function (helper function?)
+
+        return 98.32  # placeholder for now TODO
 
     def build_simulator_controls(self, objective, job_config, job_features, direct_x_values):
         # Build DynoSim run controls. These are not DAG X values.
@@ -239,9 +286,7 @@ class SurrogatePrediction:
             max_num_batched_tokens = direct_x_values.get("max_num_batched_tokens")
 
             if max_num_seq is None or max_num_batched_tokens is None:
-                raise ValueError(
-                    "Batched simulation needs max_num_seq and max_num_batched_tokens"
-                )
+                raise ValueError("Batched simulation needs max_num_seq and max_num_batched_tokens")
 
             tokens_per_request = isl + osl
             target_concurrency = int(
@@ -251,7 +296,7 @@ class SurrogatePrediction:
                 )
             )
             target_concurrency = max(1, target_concurrency)
-            sim_num_waves = 20 # TODO - hardcoded for now, need discussion
+            sim_num_waves = 20  # TODO - hardcoded for now, need discussion
 
             return {
                 "request_count": target_concurrency * sim_num_waves,
@@ -262,7 +307,7 @@ class SurrogatePrediction:
 
         if objective == "online":
             request_arrival_rate = direct_x_values.get("request_arrival_rate")
-            sim_duration_s = 60 # TODO - hardcoded for now, need discussion
+            sim_duration_s = 60  # TODO - hardcoded for now, need discussion
 
             return {
                 "request_count": max(1, int(request_arrival_rate * sim_duration_s)),
@@ -275,7 +320,9 @@ class SurrogatePrediction:
         # Translate direct X values + simulator controls into AIC/DynoSim args.
         # Inputs: direct_x_values, simulator_controls, method
         # Outputs: SurrogateInput
-        method_name = method[0] if isinstance(method, (list, tuple)) and len(method) == 1 else method
+        method_name = (
+            method[0] if isinstance(method, (list, tuple)) and len(method) == 1 else method
+        )
 
         if method_name != "AIC_DynoSim":
             raise ValueError(f"Unsupported method or multi method is not supported yet: {method}")
@@ -338,17 +385,16 @@ class SurrogatePrediction:
         # Run the surrogate model.
         # Inputs: SurrogateInput, Method=List[DynoSim, LLMSimulator, etc], accumulate_logic: average,llm decides
         # Outputs: y_hat, v_hat
-        if len(method) == 1:
+        if len(method) == 1 and method[0] == "AIC_DynoSim":
             # dont accumulate, just run the surrogate model
-            if method[0] == "AIC_DynoSim":
-                return self.run_aic_dynosim(surrogate_input)
+            return self.run_aic_dynosim(surrogate_input)
 
     def run_aic_dynosim(self, surrogate_input):
         # Run the AIC DynoSim model.
         # Inputs: SurrogateInput
         # Outputs: y_hat, v_hat
-        from dynamo.mocker import MockEngineArgs
-        from dynamo.replay.api import run_synthetic_trace_replay
+        from dynamo.mocker import MockEngineArgs  # type: ignore[import-untyped]
+        from dynamo.replay.api import run_synthetic_trace_replay  # type: ignore[import-untyped]
 
         engine_args = surrogate_input["engine_args"]
         replay_args = surrogate_input["replay_args"]
@@ -407,16 +453,12 @@ class SurrogatePrediction:
         # TODO - general helper, can be moved out of this file/class
         # Convert raw DynoSim report keys into DAG V/Y names.
         completed_requests = (
-            raw_report.get("completed_requests")
-            or raw_report.get("num_requests")
-            or 1
+            raw_report.get("completed_requests") or raw_report.get("num_requests") or 1
         )
 
         v_hat_direct = {
-            "input_length_observed": raw_report.get("total_input_tokens", 0)
-            / completed_requests,
-            "output_length_observed": raw_report.get("total_output_tokens", 0)
-            / completed_requests,
+            "input_length_observed": raw_report.get("total_input_tokens", 0) / completed_requests,
+            "output_length_observed": raw_report.get("total_output_tokens", 0) / completed_requests,
             "kvcache_hit_rate": raw_report.get("prefix_cache_reused_ratio"),
         }
 
@@ -484,8 +526,12 @@ class SurrogatePrediction:
                 y_hat_derived["cost_per_token"] = price_per_hour / (throughput * 3600.0)
 
         if "slo_margin" in requested_y:
-            ttft_target = job_features.get("target_p99_ttft_ms") or job_config.get("target_p99_ttft_ms")
-            tpot_target = job_features.get("target_p99_tpot_ms") or job_config.get("target_p99_tpot_ms")
+            ttft_target = job_features.get("target_p99_ttft_ms") or job_config.get(
+                "target_p99_ttft_ms"
+            )
+            tpot_target = job_features.get("target_p99_tpot_ms") or job_config.get(
+                "target_p99_tpot_ms"
+            )
 
             ttft_margin = None
             tpot_margin = None
@@ -529,7 +575,7 @@ class SurrogatePrediction:
 #     # Define the DAG
 #     class MockCandidateGraph:
 
-#         x = [
+#         x = (
 #             "model_params_b",
 #             "model_size_gb",
 #             "num_hidden_layers",
@@ -633,9 +679,9 @@ class SurrogatePrediction:
 #             "gpu_shared_fraction",
 #             "max_concurrent_streaming",
 #             "min_chain_warmup_time",
-#         ]
+#         )
 
-#         v = [
+#         v = (
 #             "gpu_mem_used_fraction",
 #             "kv_cache_util",
 #             "activation_mem_pressure",
@@ -658,15 +704,15 @@ class SurrogatePrediction:
 #             "per_tok_comm_bytes",
 #             "kv_pressure_score",
 #             "dispatch_overhead_ms",
-#         ]
+#         )
 
-#         y = [
+#         y = (
 #             "cost_per_token",
 #             "p99_ttft_ms",
 #             "p99_tpot_ms",
 #             "throughput_token_per_sec",
 #             "slo_margin",
-#         ]
+#         )
 
 #     predictor = SurrogatePrediction(objective="batched")
 
@@ -683,7 +729,7 @@ class SurrogatePrediction:
 #     print("derive_v:", derive_v)
 #     print("direct_y:", direct_y)
 #     print("derive_y:", derive_y)
-    
+
 #     # Assume this is the Job Config
 #     job_config = {
 #         "model_id": "nvidia/Llama-3.1-8B-Instruct-FP8",
@@ -703,7 +749,7 @@ class SurrogatePrediction:
 #         "preemption_policy": "lifo",
 #         "router_policy": "round_robin",
 #     }
-    
+
 #     # Assume these are Job Features
 #     job_features = {
 #         "cloud": "aws",
@@ -778,4 +824,13 @@ class SurrogatePrediction:
 #     v_hat = predictor.merge_outputs(v_hat_direct, v_hat_derived)
 #     print("y_hat:", y_hat)
 #     print("v_hat:", v_hat)
-  
+
+#     # Run compose_prediction as well
+#     y_hat_cp, v_hat_cp = predictor.compose_prediction(
+#         job_config=job_config,
+#         job_features=job_features,
+#         candidate_graph=MockCandidateGraph(),
+#         method=("AIC_DynoSim",),
+#     )
+#     print("compose_prediction y_hat:", y_hat_cp)
+#     print("compose_prediction v_hat:", v_hat_cp)

@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
-  
+
+
 @dataclass
 class Node:
     node_id: str
@@ -40,7 +41,7 @@ class CandidateGraph:
         self.edges_by_dst = {}
         self.edge_by_pair = {}
         self.build_indexes()
-        
+
     def build_indexes(self):
         for edge_id, edge in self.edge_table.items():
             src = edge.src
@@ -50,8 +51,12 @@ class CandidateGraph:
             if pair in self.edge_by_pair:
                 raise ValueError(f"Duplicate edge: {src}->{dst}")
 
-            self.edges_by_src.setdefault(src, set()).add(edge_id) #For this source node, remember this outgoing edge.
-            self.edges_by_dst.setdefault(dst, set()).add(edge_id) #For this destination node, remember this incoming edge.
+            self.edges_by_src.setdefault(src, set()).add(
+                edge_id
+            )  # For this source node, remember this outgoing edge.
+            self.edges_by_dst.setdefault(dst, set()).add(
+                edge_id
+            )  # For this destination node, remember this incoming edge.
             self.edge_by_pair[pair] = edge_id
 
     def get_all_edges(self):
@@ -75,11 +80,7 @@ class CandidateGraph:
         if edge.src_type != self.get_node_type(edge.src):
             return False
 
-        if edge.dst_type != self.get_node_type(edge.dst):
-            return False
-
-        return True
-
+        return edge.dst_type == self.get_node_type(edge.dst)
 
     def val_topology(self, edges):
         seen_pairs = set()
@@ -102,7 +103,6 @@ class CandidateGraph:
 
         return True
 
-
     def check_connected(self, edges):
         for edge in edges:
             if not self.val_edges(edge):
@@ -110,13 +110,11 @@ class CandidateGraph:
 
         return self.val_topology(edges)
 
-
     def get_node_type(self, node_id):
         if node_id not in self.node_table:
             raise ValueError(f"Unknown node: {node_id}")
 
         return self.node_table[node_id].node_type
-
 
 
 # if __name__ == "__main__":

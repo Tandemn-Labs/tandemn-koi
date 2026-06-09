@@ -2,7 +2,8 @@ class EvidenceService:
     def append_row(self, residual_history):
         # Placeholder: append an EvidenceRow
         # uses write_theory_narrative() internally
-        return residual_history, theory_blob
+        # this returns the residual history and the theory blob
+        pass
 
     def get_row(self, job_id, rank_id, chain_id):
         # Placeholder: return EvidenceRow for (job_id, rank_id, chain_id)

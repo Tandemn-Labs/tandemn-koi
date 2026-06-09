@@ -8,4 +8,7 @@ class Telemetry:
         pass
 
     def collect_telemtry(self):
-        return telemtry
+        """
+        this returns telemetry data
+        """
+        pass

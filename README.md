@@ -10,7 +10,7 @@ These are build/runtime dependencies for Dynamo’s Rust/Python bindings.
 
 ```
 curl -LsSf https://astral.sh/uv/install.sh | sh
-source "$HOME/.local/bin/env" 
+source "$HOME/.local/bin/env"
 ```
 
 Verify:
@@ -36,7 +36,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-### 5. Get Dynamo Source and Install it in the same uv venv 
+### 5. Get Dynamo Source and Install it in the same uv venv
 
 ```
 cd ..
