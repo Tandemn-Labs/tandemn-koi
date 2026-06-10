@@ -247,7 +247,8 @@ class CandidateGraph:
 #             )
 #             edge_metadata_table[edge_id] = EdgeMetadata(
 #                 edge_id=edge_id,
-#                 confidence=0.5,
+#                 alpha=1.0,
+#                 beta=1.0,
 #             )
 
 #     for src in v_nodes:
@@ -262,7 +263,8 @@ class CandidateGraph:
 #             )
 #             edge_metadata_table[edge_id] = EdgeMetadata(
 #                 edge_id=edge_id,
-#                 confidence=0.5,
+#                 alpha=1.0,
+#                 beta=1.0,
 #             )
 
 #     graph = CandidateGraph(
@@ -284,7 +286,8 @@ class CandidateGraph:
 #     print("node_type(tp):", graph.get_node_type("tp"))
 #     print("edges_from(tp):", len(graph.get_edges_from("tp")))
 #     print("edges_to(p99_ttft_ms):", len(graph.get_edges_to("p99_ttft_ms")))
-#     print("confidence(tp->gpu_mem_used_fraction):", graph.edge_metadata_table["tp->gpu_mem_used_fraction"].confidence)
+#     metadata = graph.edge_metadata_table["tp->gpu_mem_used_fraction"]
+#     print("confidence(tp->gpu_mem_used_fraction):", metadata.alpha / (metadata.alpha + metadata.beta))
 #     import time
 
 #     # Measure time to search edges from "tp"

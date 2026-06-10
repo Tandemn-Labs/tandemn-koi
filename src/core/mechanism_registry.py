@@ -6,8 +6,8 @@ from src.core.models import MechanismMetadata
 
 class MechanismRegistry:
     def __init__(self, mechanism_table=None, mechanism_metadata_table=None):
-        self.mechanism_table = mechanism_table
-        self.mechanism_metadata_table = mechanism_metadata_table
+        self.mechanism_table = mechanism_table or {}
+        self.mechanism_metadata_table = mechanism_metadata_table or {}
 
         self.mechanisms_by_edge = {}
         self.mechanisms_by_status = {
@@ -56,7 +56,8 @@ class MechanismRegistry:
         if mechanism.mechanism_id not in self.mechanism_metadata_table:
             self.mechanism_metadata_table[mechanism.mechanism_id] = MechanismMetadata(
                 mechanism_id=mechanism.mechanism_id,
-                confidence=0.5,  # TODO - an LLM Call should seed this, and not us
+                alpha=1.0,
+                beta=1.0,  # TODO - an LLM should assign and seed these
             )
         self.mechanisms_by_status.setdefault(mechanism.status, set()).add(mechanism.mechanism_id)
 
