@@ -22,12 +22,14 @@ class Edge:
 @dataclass
 class EdgeMetadata:
     edge_id: str
-    confidence: float
+    alpha: float = 1.0
+    beta: float = 1.0
     visit_count: int = 0
     last_touched_tick: int | None = None
     q_histogram: dict[str, int] = field(
         default_factory=lambda: {"Q1": 0, "Q2": 0, "Q3": 0, "Q4": 0}
     )
+    envs_seen: set[str] = field(default_factory=set)
     q3_frequency: float = 0.0
 
 
@@ -44,7 +46,8 @@ class Mechanism:
 @dataclass
 class MechanismMetadata:
     mechanism_id: str
-    confidence: float = 0.5
+    alpha: float = 1.0
+    beta: float = 1.0
     visit_count: int = 0
     envs_seen: set[str] = field(default_factory=set)
     last_touched_tick: int | None = None
@@ -52,3 +55,15 @@ class MechanismMetadata:
         default_factory=lambda: {"Q1": 0, "Q2": 0, "Q3": 0, "Q4": 0}
     )
     inspection_count: int = 0
+
+
+@dataclass(frozen=True)  # we add frozen to make class immutable and hashable to use in dicts
+class EdgeConfidenceRecord:
+    edge: Edge
+    metadata: EdgeMetadata
+
+
+@dataclass(frozen=True)
+class MechanismConfidenceRecord:
+    mechanism: Mechanism
+    metadata: MechanismMetadata
