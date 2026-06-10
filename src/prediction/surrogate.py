@@ -240,7 +240,7 @@ class SurrogatePrediction:
                     "comm_overhead_pct",
                     "pd_inbalance",
                 },
-                "direct_y": {"p99_ttft_ms", "p99_tpot_ms", "throughput_token_per_sec"},
+                "direct_y": {"p99_ttft_ms", "p99_tpot_ms", "throughput_tokens_per_sec"},
                 "derive_y": {"cost_per_token", "slo_margin"},
             }
         }
@@ -459,7 +459,7 @@ class SurrogatePrediction:
         y_hat_direct = {
             "p99_ttft_ms": raw_report.get("p99_ttft_ms"),
             "p99_tpot_ms": raw_report.get("p99_tpot_ms", raw_report.get("p99_itl_ms")),
-            "throughput_token_per_sec": raw_report.get("output_throughput_tok_s"),
+            "throughput_tokens_per_sec": raw_report.get("output_throughput_tok_s"),
         }
 
         return y_hat_direct, v_hat_direct
@@ -482,7 +482,7 @@ class SurrogatePrediction:
 
         input_tokens = v_hat_direct.get("input_length_observed")
         output_tokens = v_hat_direct.get("output_length_observed")
-        throughput = y_hat_direct.get("throughput_token_per_sec")
+        throughput = y_hat_direct.get("throughput_tokens_per_sec")
 
         if input_tokens is not None and output_tokens is not None:
             total_tokens = input_tokens + output_tokens
@@ -703,7 +703,7 @@ class SurrogatePrediction:
 #             "cost_per_token",
 #             "p99_ttft_ms",
 #             "p99_tpot_ms",
-#             "throughput_token_per_sec",
+#             "throughput_tokens_per_sec",
 #             "slo_margin",
 #         )
 
