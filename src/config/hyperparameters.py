@@ -21,8 +21,35 @@ H_CUSUM_SIGMA = 4.0  # h_CUSUM multiplier, range [3 sigma, 6 sigma]
 SLO_TOLERANCE = 0.15  # slo_tolerance, range [0.10, 0.20]
 
 # ConfidenceService - hand-set lookup tables
-DELTA_C_EDGE_LOOKUP = None  # delta_c_edge_lookup, see confidence table
-DELTA_C_MECH_LOOKUP = None  # delta_c_mech_lookup, see confidence table
+# DELTA_C_EDGE_LOOKUP = None  # delta_c_edge_lookup, see confidence table
+# DELTA_C_MECH_LOOKUP = None  # delta_c_mech_lookup, see confidence table
+EDGE_BETA_UPDATE = {
+    "accept": {
+        "Q1": (1.00, 0.00),
+        "Q2": (0.50, 0.00),
+        "Q3": (0.25, 0.00),
+        "Q4": (0.10, 0.00),
+    },
+    "reject": {
+        "Q1": (0.00, 0.50),
+        "Q2": (0.00, 0.75),
+        "Q3": (0.00, 1.00),
+        "Q4": (0.00, 1.50),
+    },
+    "undecided": {
+        "Q1": (0.10, 0.00),
+        "Q2": (0.00, 0.00),
+        "Q3": (0.00, 0.25),
+        "Q4": (0.00, 0.50),
+    },
+}
+
+MECHANISM_BETA_UPDATE = {
+    "Q1": (1.00, 0.00),
+    "Q2": (0.50, 0.00),
+    "Q3": (0.00, 1.00),
+    "Q4": (0.00, 1.50),
+}
 
 # DRO
 EPSILON_DRO_INIT = 0.15  # epsilon_DRO^(0), range [0.05, 0.30]
