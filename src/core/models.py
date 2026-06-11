@@ -71,30 +71,77 @@ class MechanismConfidenceRecord:
     metadata: MechanismMetadata
 
 
+# @dataclass
+# class EvidenceRow:
+#     row_id: str  # f"{tick}_{job_id}_{rank_id}"
+#     tick: int  # integer FSM tick id
+#     job_id: str
+#     rank_id: str
+#     env_label: tuple[str, str, str, str]  # (cloud, region, market, gpu_type) - ICP env
+#     mechanism_id: tuple[str, ...] # List of all applicable ids
+#     X: dict[str, object]  # ~60 decision variables (deploy snapshot)
+#     W_observed: dict[str, float]  # 22 workload features at deploy time
+#     V_observed_trajectory: dict[str, np.ndarray]  # sub-tick samples per V in bundle
+#     V_predicted_trajectory: dict[str, np.ndarray]  # surrogate-predicted V (or broadcast scalar)
+#     y_observed_trajectory: dict[str, np.ndarray]  # sub-tick Y samples - needed for Y-CUSUM
+#     y_predicted: dict[str, float]  # surrogate y_hat per Y, constant during tick
+#     residuals_per_v: dict[str, np.ndarray]  # precomputed observed - predicted for ICP
+#     residuals_per_y: dict[str, np.ndarray]  # ditto, per-objective
+#     v_cusum_result: object  # MATCHED / DIVERGED on V bundle
+#     y_cusum_result: object  # MATCHED / DIVERGED on Y bundle
+#     icp_result_per_edge: dict[str, object]  # ACCEPT / REJECT / UNDECIDED per edge_id
+#     q_label: object | None  # None if any ICP UNDECIDED -> excluded from Q1 rate
+#     w_t_snapshot: dict[str, float]  # Tchebycheff weights at deploy time
+#     z_star_snapshot: dict[str, float]  # Pareto reference at deploy time
+#     J_realized: float  # Tchebycheff scalar actually achieved
+#     sigma_realized: float  # per-candidate sigma achieved
+#     cusum_params_v: dict[str, tuple[float, float]]  # (delta, h) per V used this tick
+#     cusum_params_y: dict[str, tuple[float, float]]  # (delta, h) per Y used this tick
+#     theory_blob: str | None = None  # NL retrospective from agent
+
+
 @dataclass
 class EvidenceRow:
+    # ── Identity ───────────────────────────────────────────────────────
     row_id: str  # f"{tick}_{job_id}_{rank_id}"
     tick: int  # integer FSM tick id
+    deploy_timestamp_utc: float  # forensics; replay anchoring
+
     job_id: str
     rank_id: str
-    env_label: tuple[str, str, str, str]  # (cloud, region, market, gpu_type) - ICP env
-    mechanism_id: str  # the ONE mechanism the agent committed to
-    X: dict[str, object]  # ~60 decision variables (deploy snapshot)
-    W_observed: dict[str, float]  # 22 workload features at deploy time
-    V_observed_trajectory: dict[str, np.ndarray]  # sub-tick samples per V in bundle
-    V_predicted_trajectory: dict[str, np.ndarray]  # surrogate-predicted V (or broadcast scalar)
-    y_observed_trajectory: dict[str, np.ndarray]  # sub-tick Y samples - needed for Y-CUSUM
-    y_predicted: dict[str, float]  # surrogate y_hat per Y, constant during tick
-    residuals_per_v: dict[str, np.ndarray]  # precomputed observed - predicted for ICP
-    residuals_per_y: dict[str, np.ndarray]  # ditto, per-objective
-    v_cusum_result: object  # MATCHED / DIVERGED on V bundle
-    y_cusum_result: object  # MATCHED / DIVERGED on Y bundle
-    icp_result_per_edge: dict[str, object]  # ACCEPT / REJECT / UNDECIDED per edge_id
-    q_label: object | None  # None if any ICP UNDECIDED -> excluded from Q1 rate
-    w_t_snapshot: dict[str, float]  # Tchebycheff weights at deploy time
-    z_star_snapshot: dict[str, float]  # Pareto reference at deploy time
-    J_realized: float  # Tchebycheff scalar actually achieved
-    sigma_realized: float  # per-candidate sigma achieved
-    cusum_params_v: dict[str, tuple[float, float]]  # (delta, h) per V used this tick
-    cusum_params_y: dict[str, tuple[float, float]]  # (delta, h) per Y used this tick
-    theory_blob: str | None = None  # NL retrospective from agent
+    env_label: tuple[str, str, str, str]  # (cloud, region, market, gpu_type)
+
+    # ── Inputs (rank-level — same for all applicable mechanisms) ───────
+    X: dict[str, object]  # ~60 decision variables
+    W_observed: dict[str, float]  # 22 workload features
+
+    # ── Observed/predicted trajectories (rank-level) ───────────────────
+    V_observed_trajectory: dict[str, np.ndarray]  # sub-tick V samples (all measured V's)
+    V_predicted_trajectory: dict[str, np.ndarray]  # surrogate's V̂(t)
+    y_observed_trajectory: dict[str, np.ndarray]  # sub-tick Y samples — Y-CUSUM input
+    y_predicted: dict[str, float]  # surrogate's ŷ (scalar; CUSUM broadcasts)
+
+    # ── Denormalized summaries (derived at row build time, kept for cheap reads)
+    y_observed_mean: dict[str, float]  # mean of y_observed_trajectory per obj
+    # used by compute_z_star_t (avoid recomputing per row)
+
+    # ── Precomputed residuals (rank-level, per-dim) ────────────────────
+    residuals_per_v: dict[str, np.ndarray]  # V_obs - V_pred — ICP + CUSUM recalibration
+    residuals_per_y: dict[str, np.ndarray]  # y_obs - ŷ — ICP + DRO coverage tracking
+
+    # ── Mechanism interpretation layer (PER MECHANISM) ─────────────────
+    mechanism_ids: list[str]  # all whose scope matched (includes committed)
+    cusum_per_mechanism: dict[str, tuple[object, object]]
+    q_label_per_mechanism: dict[str, object | None]  # None where any ICP=UNDECIDED
+
+    # ── Edge-level evidence (rank-level, shared across mechanisms) ─────
+    icp_result_per_edge: dict[str, object]
+
+    # ── Slow-state snapshot at deploy time ───────────
+    w_t_snapshot: dict[str, float]  # Tchebycheff weights
+    z_star_snapshot: dict[str, float]  #
+    J_realized: float  # achieved Tchebycheff scalar
+    sigma_realized: float  #
+
+    # ── Optional metadata ────────────────────────────
+    theory_blob: str | None = None
