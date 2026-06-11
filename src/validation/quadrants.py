@@ -1,17 +1,28 @@
 """
-Four-quadrant classifier combines trajectory validity with outcome accuracy.
+Four-Quadrant classifier: V-CUSUM x Y-CUSUM -> Q1 / Q2 / Q3 / Q4.
 
-Outcome accuracy alone cannot tell real mechanism success from lucky success.
-CUSUM checks whether the mechanism's internal V trajectory actually matched the
-prediction, while the outcome check verifies whether final performance was right.
+Both axes are now CUSUM verdicts over sub-tick trajectories - V (mediators)
+and Y (outcomes) treated symmetrically. The end-of-tick |y_hat - y| point check
+was the degenerate n=1 case of Y-CUSUM; using the full trajectory tightens
+the lucky-arm trap (Q3) because a transient outcome drift during the tick
+no longer averages itself away into a passing point-check.
 
-Quadrants:
-    Q1 = matched  + accurate    # reliable success
-    Q2 = matched  + inaccurate  # sound mechanism, bad outcome
-    Q3 = diverged + accurate    # lucky-arm, punish hard
-    Q4 = diverged + inaccurate  # falsified, punish harder
+Why two axes (not just "did outcome match prediction?"):
+    A naive outcome-only optimizer cannot distinguish
+        "good outcome because mechanism is sound"        (Q1)
+    from
+        "good outcome because of luck"                   (Q3 - lucky-arm)
+    Trapping Q3 is the main reason V-CUSUM exists. Outcome-only learning
+    would reward lucky-arm mechanisms and entrench them.
 
-These labels drive confidence updates for edges and mechanisms.
+The four quadrants:
+    Q1  V matched   and  Y matched     -> replicable success
+    Q2  V matched   and  Y diverged    -> sound mechanism, bad luck on outcome
+    Q3  V diverged  and  Y matched     -> lucky-arm (PUNISH HARD)
+    Q4  V diverged  and  Y diverged    -> falsified (PUNISH HARDER)
+
+Quadrant labels drive per-edge and per-mechanism beta evidence updates
+via the ConfidenceService beta update tables.
 """
 
 from collections import Counter
@@ -26,30 +37,31 @@ class Quadrant(Enum):
 
 
 class QuadrantValidator:
-    def classify_quadrant(self, cusum_result, outcome_accuracy: bool) -> Quadrant:
+    def classify_quadrant(self, v_cusum_result, y_cusum_result) -> Quadrant:
         """
-        Definition: Combine the CUSUM trajectory axis with the outcome-
-                    accuracy axis into the four-quadrant label.
-                        matched and accurate         -> Q1
-                        matched and not accurate     -> Q2
-                        not matched and accurate     -> Q3 (lucky-arm)
-                        not matched and not accurate -> Q4 (falsified)
-        Usage:      Validator.s2_validate per (job, rank) deployed in
-                    [t-1, t]. Returned label is stored in EvidenceStore
-                    and consumed by ConfidenceService for beta evidence updates.
+        Definition: Combine the V-CUSUM (mediator) and Y-CUSUM (outcome)
+                    verdicts into the four-quadrant label.
+                        V_matched   and Y_matched    -> Q1
+                        V_matched   and Y_diverged   -> Q2
+                        V_diverged  and Y_matched    -> Q3 (lucky-arm)
+                        V_diverged  and Y_diverged   -> Q4 (falsified)
+        Usage:      Per (job, rank) deployed in [t-1, t], inside S2 of the
+                    FSM tick. Returned label is stored in EvidenceStore and
+                    consumed by ConfidenceService for beta evidence updates.
         Inputs:
-            cusum_result     : CusumResult enum or "matched"/"diverged" string
-            outcome_accuracy : True iff y_hat is within tolerance of realized y
-                               (see check_outcome_accuracy)
-        Outputs: Quadrant
+            v_cusum_result : CusumResult enum or "matched"/"diverged" string
+            y_cusum_result : CusumResult enum or "matched"/"diverged" string
+        Outputs:
+            Quadrant
         """
-        matched = self._is_matched(cusum_result)
+        v_matched = self._is_matched(v_cusum_result)
+        y_matched = self._is_matched(y_cusum_result)
 
-        if matched and outcome_accuracy:
+        if v_matched and y_matched:
             return Quadrant.Q1
-        if matched and not outcome_accuracy:
+        if v_matched and not y_matched:
             return Quadrant.Q2
-        if not matched and outcome_accuracy:
+        if not v_matched and y_matched:
             return Quadrant.Q3
         return Quadrant.Q4
 
@@ -62,53 +74,17 @@ class QuadrantValidator:
         Definition: Count Q1/Q2/Q3/Q4 occurrences in recent DECIDED rows.
                     Excludes ICP-undecided rows so the denominator reflects
                     statistically-supported labels only.
-        Usage:      agent.phase_1 ingest; dashboards; building block for
-                    Q1-rate / regret computations.
+        Usage:      Agent ingest; dashboards; building block for Q1-rate /
+                    regret computations.
         Inputs:
             evidence_store : EvidenceStore exposing get_recently_decided(window)
             window         : tick count to look back
-        Outputs: Dict[Quadrant -> int]  (zero-filled for absent quadrants)
+        Outputs:
+            Dict[Quadrant -> int]  (zero-filled for absent quadrants)
         """
         rows = evidence_store.get_recently_decided(window)
-        counts = Counter(r.quadrant for r in rows)
+        counts = Counter(r.q_label for r in rows)
         return {q: counts.get(q, 0) for q in Quadrant}
-
-    def check_outcome_accuracy(
-        self,
-        pred_y: dict[str, float],
-        obs_y: dict[str, float],
-        tolerance: float,
-        typical_ranges: dict[str, float],
-    ) -> bool:
-        """
-        Definition: Per-objective relative-error check.
-                        accurate iff for all j present in BOTH pred_y and obs_y:
-                            abs(y_hat_j - y_j) / range_j < tolerance.
-                    Objectives absent from obs_y are skipped (e.g., latency
-                    metrics on batch jobs).
-        Usage:      Inner helper for classify_quadrant.
-        Inputs:
-            pred_y         : objective -> y_hat_j (from surrogate at deploy time)
-            obs_y          : objective -> realized y_j (from telemetry)
-            tolerance      : relative error threshold (typical 0.15)
-            typical_ranges : objective -> range_j (per-objective scale)
-        Outputs: bool
-        Notes:
-            typical_ranges is REQUIRED. Different objectives differ by
-            orders of magnitude (cost ~ 1e-7, throughput ~ 1e4); a single
-            absolute tolerance cannot serve both.
-        """
-        if not typical_ranges:
-            raise ValueError("typical_ranges is required for accuracy check")
-
-        for obj, y_hat in pred_y.items():
-            y = obs_y.get(obj)
-            if y is None or y_hat is None:
-                continue
-            r = max(typical_ranges.get(obj, 1.0), 1e-9)
-            if abs(float(y_hat) - float(y)) / r > tolerance:
-                return False
-        return True
 
     @staticmethod
     def _is_matched(cusum_result) -> bool:
@@ -116,3 +92,65 @@ class QuadrantValidator:
         if hasattr(cusum_result, "value"):
             return cusum_result.value == "matched"
         return cusum_result == "matched"
+
+
+# added smoke test below
+# if __name__ == "__main__":
+#     from src.core.models import EvidenceRow
+#     from src.validation.cusum import CusumResult
+
+#     def make_row(row_id, quadrant):
+#         return EvidenceRow(
+#             row_id=row_id,
+#             tick=1,
+#             job_id="job_1",
+#             rank_id="rank_1",
+#             env_label=("aws", "us-east-1", "on_demand", "H100"),
+#             mechanism_id="M_demo",
+#             X={},
+#             W_observed={},
+#             V_observed_trajectory={},
+#             V_predicted_trajectory={},
+#             y_observed_trajectory={},
+#             y_predicted={},
+#             residuals_per_v={},
+#             residuals_per_y={},
+#             v_cusum_result=CusumResult.MATCHED,
+#             y_cusum_result=CusumResult.MATCHED,
+#             icp_result_per_edge={},
+#             q_label=quadrant,
+#             w_t_snapshot={},
+#             z_star_snapshot={},
+#             J_realized=0.0,
+#             sigma_realized=0.0,
+#             cusum_params_v={},
+#             cusum_params_y={},
+#         )
+
+#     class DemoEvidenceStore:
+#         def get_recently_decided(self, window):
+#             return [
+#                 make_row("row_1", Quadrant.Q1),
+#                 make_row("row_2", Quadrant.Q4),
+#                 make_row("row_3", Quadrant.Q4),
+#             ][-window:]
+
+#     validator = QuadrantValidator()
+
+#     print("Q1:", validator.classify_quadrant(CusumResult.MATCHED, CusumResult.MATCHED))
+#     print("Q2:", validator.classify_quadrant(CusumResult.MATCHED, CusumResult.DIVERGED))
+#     print("Q3:", validator.classify_quadrant(CusumResult.DIVERGED, CusumResult.MATCHED))
+#     print("Q4:", validator.classify_quadrant(CusumResult.DIVERGED, CusumResult.DIVERGED))
+
+#     histogram = validator.aggregate_quadrant_histogram(DemoEvidenceStore(), window=3)
+#     print("histogram:", histogram)
+
+#     assert validator.classify_quadrant(CusumResult.MATCHED, CusumResult.MATCHED) == Quadrant.Q1
+#     assert validator.classify_quadrant(CusumResult.MATCHED, CusumResult.DIVERGED) == Quadrant.Q2
+#     assert validator.classify_quadrant(CusumResult.DIVERGED, CusumResult.MATCHED) == Quadrant.Q3
+#     assert validator.classify_quadrant(CusumResult.DIVERGED, CusumResult.DIVERGED) == Quadrant.Q4
+#     assert histogram[Quadrant.Q1] == 1
+#     assert histogram[Quadrant.Q2] == 0
+#     assert histogram[Quadrant.Q3] == 0
+#     assert histogram[Quadrant.Q4] == 2
+#     print("All quadrant smoke tests passed.")
