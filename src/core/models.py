@@ -102,46 +102,27 @@ class MechanismConfidenceRecord:
 
 @dataclass
 class EvidenceRow:
-    # ── Identity ───────────────────────────────────────────────────────
     row_id: str  # f"{tick}_{job_id}_{rank_id}"
     tick: int  # integer FSM tick id
     deploy_timestamp_utc: float  # forensics; replay anchoring
-
     job_id: str
     rank_id: str
     env_label: tuple[str, str, str, str]  # (cloud, region, market, gpu_type)
-
-    # ── Inputs (rank-level — same for all applicable mechanisms) ───────
     X: dict[str, object]  # ~60 decision variables
     W_observed: dict[str, float]  # 22 workload features
-
-    # ── Observed/predicted trajectories (rank-level) ───────────────────
     V_observed_trajectory: dict[str, np.ndarray]  # sub-tick V samples (all measured V's)
-    V_predicted_trajectory: dict[str, np.ndarray]  # surrogate's V̂(t)
+    V_predicted_trajectory: dict[str, np.ndarray]  # surrogate's V_hat(t)
     y_observed_trajectory: dict[str, np.ndarray]  # sub-tick Y samples — Y-CUSUM input
-    y_predicted: dict[str, float]  # surrogate's ŷ (scalar; CUSUM broadcasts)
-
-    # ── Denormalized summaries (derived at row build time, kept for cheap reads)
+    y_predicted: dict[str, float]  # surrogate's y_hat (scalar; CUSUM broadcasts)
     y_observed_mean: dict[str, float]  # mean of y_observed_trajectory per obj
-    # used by compute_z_star_t (avoid recomputing per row)
-
-    # ── Precomputed residuals (rank-level, per-dim) ────────────────────
     residuals_per_v: dict[str, np.ndarray]  # V_obs - V_pred — ICP + CUSUM recalibration
-    residuals_per_y: dict[str, np.ndarray]  # y_obs - ŷ — ICP + DRO coverage tracking
-
-    # ── Mechanism interpretation layer (PER MECHANISM) ─────────────────
+    residuals_per_y: dict[str, np.ndarray]  # y_obs - y_hat — ICP + DRO coverage tracking
     mechanism_ids: list[str]  # all whose scope matched (includes committed)
     cusum_per_mechanism: dict[str, tuple[object, object]]
     q_label_per_mechanism: dict[str, object | None]  # None where any ICP=UNDECIDED
-
-    # ── Edge-level evidence (rank-level, shared across mechanisms) ─────
     icp_result_per_edge: dict[str, object]
-
-    # ── Slow-state snapshot at deploy time ───────────
     w_t_snapshot: dict[str, float]  # Tchebycheff weights
     z_star_snapshot: dict[str, float]  #
     J_realized: float  # achieved Tchebycheff scalar
     sigma_realized: float  #
-
-    # ── Optional metadata ────────────────────────────
     theory_blob: str | None = None

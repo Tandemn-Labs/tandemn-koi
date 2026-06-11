@@ -65,25 +65,60 @@ class QuadrantValidator:
             return Quadrant.Q3
         return Quadrant.Q4
 
+    # def aggregate_quadrant_histogram(
+    #     self,
+    #     evidence_store,
+    #     window: int,
+    # ) -> dict[Quadrant, int]:
+    #     """
+    #     Definition: Count Q1/Q2/Q3/Q4 occurrences in recent DECIDED rows.
+    #                 Excludes ICP-undecided rows so the denominator reflects
+    #                 statistically-supported labels only.
+    #     Usage:      Agent ingest; dashboards; building block for Q1-rate /
+    #                 regret computations.
+    #     Inputs:
+    #         evidence_store : EvidenceStore exposing get_recently_decided(window)
+    #         window         : tick count to look back
+    #     Outputs:
+    #         Dict[Quadrant -> int]  (zero-filled for absent quadrants)
+    #     """
+    #     rows = evidence_store.get_recently_decided(window)
+    #     counts = Counter(r.q_label for r in rows)
+    #     return {q: counts.get(q, 0) for q in Quadrant}
+
     def aggregate_quadrant_histogram(
         self,
         evidence_store,
         window: int,
+        mechanism_id: str | None = None,
+        tick: int | None = None,
     ) -> dict[Quadrant, int]:
+        """Count Q1/Q2/Q3/Q4 occurrences across (row, mechanism) pairs.
+
+        Excludes pairs whose Q label is None (those rows are undecided
+        for that mechanism because at least one edge in the mechanism's
+        bundle had ICP=UNDECIDED), so the denominator reflects
+        statistically-supported labels only.
+
+        Args:
+            evidence_store: EvidenceStore exposing
+                iter_decided_per_mechanism(window, tick).
+            window: Tick count to look back.
+            mechanism_id: If given, restrict to that mechanism's labels.
+                If None, sum across all applicable mechanisms.
+            tick: Inclusive upper-bound tick. If None, the store uses its
+                own current_tick() so callers can omit it for "as of now"
+                histograms.
+
+        Returns:
+            Dict mapping each Quadrant to its count, zero-filled for any
+            absent quadrant.
         """
-        Definition: Count Q1/Q2/Q3/Q4 occurrences in recent DECIDED rows.
-                    Excludes ICP-undecided rows so the denominator reflects
-                    statistically-supported labels only.
-        Usage:      Agent ingest; dashboards; building block for Q1-rate /
-                    regret computations.
-        Inputs:
-            evidence_store : EvidenceStore exposing get_recently_decided(window)
-            window         : tick count to look back
-        Outputs:
-            Dict[Quadrant -> int]  (zero-filled for absent quadrants)
-        """
-        rows = evidence_store.get_recently_decided(window)
-        counts = Counter(r.q_label for r in rows)
+        counts: Counter[Quadrant] = Counter()
+        for _row, mid, q in evidence_store.iter_decided_per_mechanism(window, tick):
+            if mechanism_id is not None and mid != mechanism_id:
+                continue
+            counts[q] += 1
         return {q: counts.get(q, 0) for q in Quadrant}
 
     @staticmethod
@@ -103,37 +138,40 @@ class QuadrantValidator:
 #         return EvidenceRow(
 #             row_id=row_id,
 #             tick=1,
+#             deploy_timestamp_utc=0.0,
 #             job_id="job_1",
 #             rank_id="rank_1",
 #             env_label=("aws", "us-east-1", "on_demand", "H100"),
-#             mechanism_id="M_demo",
+#             mechanism_ids=["M_demo"],
 #             X={},
 #             W_observed={},
 #             V_observed_trajectory={},
 #             V_predicted_trajectory={},
 #             y_observed_trajectory={},
 #             y_predicted={},
+#             y_observed_mean={},
 #             residuals_per_v={},
 #             residuals_per_y={},
-#             v_cusum_result=CusumResult.MATCHED,
-#             y_cusum_result=CusumResult.MATCHED,
+#             cusum_per_mechanism={"M_demo": (CusumResult.MATCHED, CusumResult.MATCHED)},
 #             icp_result_per_edge={},
-#             q_label=quadrant,
+#             q_label_per_mechanism={"M_demo": quadrant},
 #             w_t_snapshot={},
 #             z_star_snapshot={},
 #             J_realized=0.0,
 #             sigma_realized=0.0,
-#             cusum_params_v={},
-#             cusum_params_y={},
 #         )
 
 #     class DemoEvidenceStore:
-#         def get_recently_decided(self, window):
-#             return [
+#         def iter_decided_per_mechanism(self, window, tick):
+#             rows = [
 #                 make_row("row_1", Quadrant.Q1),
 #                 make_row("row_2", Quadrant.Q4),
 #                 make_row("row_3", Quadrant.Q4),
 #             ][-window:]
+#             for row in rows:
+#                 for mechanism_id, q_label in row.q_label_per_mechanism.items():
+#                     if q_label is not None:
+#                         yield row, mechanism_id, q_label
 
 #     validator = QuadrantValidator()
 

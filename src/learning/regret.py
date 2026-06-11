@@ -1,101 +1,129 @@
-"""
-Mechanism regret tracks progress using Q1 rate rather than noisy outcome regret.
-Outcome regret is high-variance because workload jitter, neighbor noise, and
-allocator drift affect J. Mechanism regret is more stable because Q1 is measured
-as a frequency over many deployments.
+"""Mechanism regret based on Q1 rate over (row, mechanism) pairs.
+
+Mechanism regret tracks progress via Q1 rate rather than noisy outcome
+regret. Outcome regret is high-variance because workload jitter, neighbor
+noise, and allocator drift all affect J. Mechanism regret is more stable
+because Q1 is measured as a frequency over many (row, mechanism) pairs.
+
     R_mech = sum_t (Q1_star - Q1_rate_t)
-The regret slope drives slow-loop control: higher slope increases EIG exploration
-weight beta_t, swap budget B_t, and the target swap rate rho*_swit. Default Q1_star = 1.0.
+
+The regret slope drives slow-loop control: a higher slope raises the EIG
+exploration weight, the swap budget, and the target swap rate. Default
+Q1_star is 1.0.
+
+EvidenceRow carries q_label_per_mechanism: dict[mid, Optional[Quadrant]]
+because a single rank is interpretable through multiple applicable
+mechanisms. Cluster-level Q1 rate is denominated in (row, mechanism)
+pairs, not rows. Every applicable mechanism contributes one count
+regardless of which mechanism the agent committed to.
+
+The flattening is done by evidence_store.iter_decided_per_mechanism,
+which yields (row, mid, q) triples skipping None Q-labels. A None Q
+means the row is undecided for that mechanism because at least one edge
+in the mechanism's bundle had ICP=UNDECIDED.
 """
 
 from collections.abc import Iterable
 
 import numpy as np
-from src.config.hyperparameters import DEFAULT_Q1_STAR
+from src.validation.quadrants import Quadrant
+
+DEFAULT_Q1_STAR: float = 1.0
 
 
 class RegretCalculator:
+    """Q1-rate-based mechanism regret calculator."""
+
     def compute_q1_rate(
         self,
         evidence_store,
         tick: int,
         window: int = 20,
     ) -> float | None:
+        """Compute rolling cluster Q1 fraction over a tick window.
+
+        Counts Q1 events across all decided (row, mechanism) pairs in the
+        last `window` ticks. A row with five applicable mechanisms
+        contributes five events to the denominator.
+
+        Args:
+            evidence_store: EvidenceStore exposing
+                iter_decided_per_mechanism(window, tick).
+            tick: Current tick (inclusive upper bound).
+            window: Look-back window in ticks.
+
+        Returns:
+            Q1 rate in [0, 1], or None if no decided pairs are in window.
         """
-        Definition: Rolling Q1 fraction over the last `window` ticks,
-                    counting only decided deployments.
-        Usage:  agent; SlowLoop signals; regret-slope building block.
-        Inputs:
-            evidence_store : EvidenceStore with get_rows_in_window(t0, t1)
-            tick           : current tick (inclusive upper bound)
-            window         : look-back window in ticks (default 20)
-        Outputs: float in [0, 1] or None if no decided rows in window.
-        """
-        start = max(0, tick - window)
-        rows = [
-            r
-            for r in evidence_store.get_rows_in_window(start, tick)
-            if r.quadrant is not None and r.quadrant != "undecided"
-        ]
-        if not rows:
+        triples = list(evidence_store.iter_decided_per_mechanism(window, tick))
+        if not triples:
             return None
-        q1 = sum(1 for r in rows if r.quadrant == "Q1")
-        return q1 / len(rows)
+        q1_count = sum(1 for _, _, q in triples if q == Quadrant.Q1)
+        return q1_count / len(triples)
 
     def compute_q1_rate_per_mechanism(
         self,
         evidence_store,
         mechanism_id: str,
         window: int,
+        tick: int | None = None,
     ) -> float | None:
+        """Compute Q1 rate restricted to one mechanism over a window.
+
+        Diagnostic helper to flag mechanisms whose confidence is high but
+        whose recent Q1 rate is degrading (scope drift detection).
+
+        Args:
+            evidence_store: EvidenceStore.
+            mechanism_id: The mechanism to restrict to.
+            window: Look-back window in ticks.
+            tick: Current tick. Defaults to evidence_store.current_tick().
+
+        Returns:
+            Q1 rate in [0, 1], or None if no decided rows for this mechanism.
         """
-        Definition: Q1 rate restricted to deployments using `mechanism_id`,
-                    over the last `window` ticks.
-        Usage:  Diagnostic - flag mechanisms whose c(M) is high but
-                whose recent Q1 rate is degrading (early scope drift).
-        Inputs:
-            evidence_store : EvidenceStore with get_rows_for_mechanism(id) and current_tick()
-            mechanism_id   : str
-            window         : ticks
-        Outputs: float in [0, 1] or None.
-        """
-        cur = evidence_store.current_tick()
-        cutoff = cur - window
-        rows = [
-            r
-            for r in evidence_store.get_rows_for_mechanism(mechanism_id)
-            if r.tick > cutoff and r.quadrant is not None and r.quadrant != "undecided"
+        current = evidence_store.current_tick() if tick is None else int(tick)
+        triples = [
+            (row, mid, q)
+            for row, mid, q in evidence_store.iter_decided_per_mechanism(window, current)
+            if mid == mechanism_id
         ]
-        if not rows:
+        if not triples:
             return None
-        return sum(1 for r in rows if r.quadrant == "Q1") / len(rows)
+        q1_count = sum(1 for _, _, q in triples if q == Quadrant.Q1)
+        return q1_count / len(triples)
 
     def compute_q1_rate_per_env(
         self,
         evidence_store,
-        env: str,
+        env: tuple,
         window: int,
+        tick: int | None = None,
     ) -> float | None:
+        """Compute Q1 rate restricted to one ICP environment.
+
+        Diagnostic helper to surface envs where mechanisms degrade
+        (engine regression, driver issue, hardware quirk).
+
+        Args:
+            evidence_store: EvidenceStore.
+            env: env_label tuple (cloud, region, market, gpu_type).
+            window: Look-back window in ticks.
+            tick: Current tick. Defaults to evidence_store.current_tick().
+
+        Returns:
+            Q1 rate in [0, 1], or None if no decided pairs in this env.
         """
-        Definition: Q1 rate restricted to one ICP env, over `window` ticks.
-        Usage:      Diagnostic - surface envs where mechanisms degrade
-                    (engine regression, driver issue, hardware quirk).
-        Inputs:
-            evidence_store : EvidenceStore with get_rows_for_environment(env)
-            env            : env_label (cloud, region, market, gpu)
-            window         : ticks
-        Outputs: float in [0, 1] or None.
-        """
-        cur = evidence_store.current_tick()
-        cutoff = cur - window
-        rows = [
-            r
-            for r in evidence_store.get_rows_for_environment(env)
-            if r.tick > cutoff and r.quadrant is not None and r.quadrant != "undecided"
+        current = evidence_store.current_tick() if tick is None else int(tick)
+        triples = [
+            (row, mid, q)
+            for row, mid, q in evidence_store.iter_decided_per_mechanism(window, current)
+            if row.env_label == env
         ]
-        if not rows:
+        if not triples:
             return None
-        return sum(1 for r in rows if r.quadrant == "Q1") / len(rows)
+        q1_count = sum(1 for _, _, q in triples if q == Quadrant.Q1)
+        return q1_count / len(triples)
 
     def compute_inst_regret(
         self,
@@ -104,17 +132,20 @@ class RegretCalculator:
         window: int = 20,
         q1_star: float = DEFAULT_Q1_STAR,
     ) -> float:
-        """
-        Definition: Instantaneous mechanism regret at tick t.
-                        inst_regret_t = max(0, Q1* - Q1_rate_t)
-                    Default Q1* = 1.0.
-        Usage:      Building block for cumulative regret and regret slope.
-        Inputs:
-            tick           : current tick
-            evidence_store : EvidenceStore
-            window         : Q1-rate window (default 20)
-            q1_star        : oracle target (default 1.0)
-        Outputs: float in [0, q1_star]
+        """Compute instantaneous mechanism regret at one tick.
+
+        inst_regret_t = max(0, q1_star - q1_rate_t). Returns 0 when Q1
+        rate is None (no decided pairs in window) so we do not claim a
+        gap without evidence.
+
+        Args:
+            tick: Current tick.
+            evidence_store: EvidenceStore.
+            window: Q1-rate window.
+            q1_star: Oracle target.
+
+        Returns:
+            Regret in [0, q1_star].
         """
         q1 = self.compute_q1_rate(evidence_store, tick, window)
         if q1 is None:
@@ -128,16 +159,18 @@ class RegretCalculator:
         window: int = 20,
         q1_star: float = DEFAULT_Q1_STAR,
     ) -> float:
-        """
-        Definition: Cumulative mechanism regret over a tick range.
-                        R^mech_T = sum_t inst_regret_t
-        Usage:      Theoretical-bound tracking; dashboards.
-        Inputs:
-            ticks          : iterable of ticks to sum across
-            evidence_store : EvidenceStore
-            window         : Q1-rate window
-            q1_star        : oracle target
-        Outputs: float >= 0
+        """Compute cumulative mechanism regret over a tick range.
+
+        R_mech_T = sum_t inst_regret_t.
+
+        Args:
+            ticks: Iterable of ticks to sum across.
+            evidence_store: EvidenceStore.
+            window: Q1-rate window.
+            q1_star: Oracle target.
+
+        Returns:
+            Non-negative cumulative regret.
         """
         return float(
             sum(self.compute_inst_regret(t, evidence_store, window, q1_star) for t in ticks)
@@ -150,24 +183,26 @@ class RegretCalculator:
         window: int = 20,
         q1_star: float = DEFAULT_Q1_STAR,
     ) -> float:
+        """Compute the slow-loop operational signal.
+
+        Average of recent instantaneous regrets over the last `window`
+        ticks. Small means converged; large means still learning. Despite
+        the name, this is an average of recent regrets, not a
+        time-derivative.
+
+        Args:
+            tick: Current tick.
+            evidence_store: EvidenceStore.
+            window: Ticks to average over.
+            q1_star: Oracle target.
+
+        Returns:
+            Non-negative slope.
         """
-        Definition: Operational signal driving beta_t, B_t, rho*_swit.
-                        rho_hat_slope^(t) = mean_{s in [t-W+1, t]} inst_regret_s
-                    Equivalent to "average gap to Q1* over recent ticks".
-        Usage:      SlowLoop.compute_eig_incentive_t, compute_swap_budget_t.
-        Inputs:
-            tick           : current tick
-            evidence_store : EvidenceStore
-            window         : ticks to average over (default 20)
-            q1_star        : oracle target (default 1.0)
-        Outputs: float >= 0   (small ~= converged; large ~= still learning)
-        Notes:
-            This is an average of recent instantaneous regrets, not a time-derivative. "Slope" reflects "how steeply
-            we're still accruing regret per tick".
-        """
+        start = max(0, tick - window + 1)
         gaps = [
             self.compute_inst_regret(t, evidence_store, window, q1_star)
-            for t in range(tick - window + 1, tick + 1)
+            for t in range(start, tick + 1)
         ]
         if not gaps:
             return 0.0
@@ -178,16 +213,19 @@ class RegretCalculator:
         evidence_store,
         ticks: Iterable[int],
     ) -> float:
-        """
-        Definition: Cumulative outcome regret over `ticks`. Uses the best
-                    observed cluster J as the J* proxy.
-                        R^out = sum_t (J* - J^cluster_t)
-        Usage:      Dashboards / reporting only. NOT used to drive
-                    slow-loop knobs (too noisy).
-        Inputs:
-            evidence_store : EvidenceStore exposing cluster_J_at(tick)
-            ticks          : iterable of ticks
-        Outputs: float >= 0
+        """Compute cumulative outcome regret over a tick range.
+
+        Uses the best observed cluster J as the J_star proxy:
+        R_out = sum_t (J_star - J_cluster_t). Used for dashboards and
+        reporting only; not used to drive slow-loop knobs because it is
+        too noisy.
+
+        Args:
+            evidence_store: EvidenceStore exposing cluster_J_at(tick).
+            ticks: Iterable of ticks.
+
+        Returns:
+            Non-negative cumulative outcome regret.
         """
         history = [evidence_store.cluster_J_at(t) for t in ticks]
         history = [j for j in history if j is not None]

@@ -1,99 +1,126 @@
-"""
-EIG proxy for causal expected information gain.
-Exact Bayesian EIG needs outcome distributions and mechanism posteriors, which
-we do not have. This deterministic proxy keeps the same purpose: favor candidates
-that test uncertain and under-sampled edges/mechanisms.
-    alpha(L') = sum_e a_e*beta_uncertainty(e) + kappa*sum_M a_M*beta_uncertainty(M)
-beta_uncertainty = 4*c*(1-c)/(alpha+beta+1), where c = alpha/(alpha+beta).
-Eligibility masks a_e and a_M decide what is tested. alpha is the exploration
-term in sigma, weighted by annealed beta_t. Cluster EIG uses saturation
-aggregation to avoid double-counting the same edge in one plan.
+"""EIG proxy for causal expected information gain.
+
+Exact Bayesian EIG needs outcome distributions and mechanism posteriors,
+neither of which we have. This deterministic proxy keeps the same purpose:
+favor candidates that test uncertain and under-sampled edges and mechanisms.
+
+    eig(L_prime) = sum_e a_e * u(c_e) * w_rare(n_e)
+                 + mechanism_weight * sum_M a_M * u(c_M) * w_rare(n_M)
+
+u(c) = 4*c*(1-c) peaks at uncertainty c=0.5. w_rare(n) = 1/sqrt(1+n) rewards
+less-tested structures. Eligibility masks a_e and a_M decide what is tested.
+The eig value is the exploration term in sigma, weighted by the annealed
+exploration weight. Cluster EIG uses saturation aggregation to avoid
+double-counting an edge tested by multiple ranks in one plan.
+
+Resolution conventions:
+    Mechanism.edge_ids is the canonical bundle representation (list[str]).
+    Edges resolve via candidate_graph.edge_table[edge_id] -> Edge.
+    Confidences and visit counts come from confidence_service, not from a
+    separate edge_table. Eligibility gates read from evidence_store.
+
+v0 scope: EIG iterates over each rank's committed mechanism_id. A rank may
+also accrue Beta updates to other applicable mechanisms post-deploy via the
+EvidenceStore fan-out in S3, but EIG conservatively counts only
+committed-mechanism evidence at scoring time. v1 may extend to the
+predicted-applicable-set.
 """
 
 from collections.abc import Sequence
 
 import numpy as np
-from src.config.hyperparameters import KAPPA
 
-# Gate defaults
-DEFAULT_N_B = 15  # min samples per env for ICP statistical power
-DEFAULT_N_ENV_MIN = 3  # min envs required for ICP
+DEFAULT_N_B = 15
+DEFAULT_N_ENV_MIN = 3
 
 
 def compute_eig(
     L_prime,
+    candidate_graph,
+    mechanism_registry,
     confidence_service,
     evidence_store,
-    n: int | None = None,
+    mechanism_weight: float = 1.0,
+    visit_cap: int | None = None,
 ) -> float:
-    """
-    Definition: Proxy Causal-EIG for one candidate ladder.
-                    alpha(L') = sum_e a_e*beta_uncertainty(e)
-                          + kappa*sum_M a_M*beta_uncertainty(M)
-                Sums over edges/mechanisms touched by L'.
-    Usage:      The alpha term in sigma(L') = J + beta*alpha - lambda*Pr_DRO - lambda*SwitchCost.
-                Called by agent.tools.compute_eig per (config, mechanism)
-    Inputs:
-        L_prime            : Ladder with .ranks; each rank has .mechanism_id,
-                             .config, .n_replicas
-        confidence_service : ConfidenceService with candidate_graph and
-                             mechanism_registry references
-        evidence_store     : EvidenceStore (for eligibility-gate lookups)
-        n                  : optional evidence-count cap
-    Outputs:
-        alpha : float >= 0
+    """Compute the proxy Causal-EIG for one candidate ladder.
+
+    Sums over edges and mechanisms touched by L_prime's committed
+    mechanisms. This is the exploration term in
+    sigma(L_prime) = J + beta * eig - gamma * Pr_DRO - lambda * SwitchCost.
+
+    Args:
+        L_prime: Ladder with .ranks; each rank carries .mechanism_id
+            (committed), .config, .n_replicas.
+        candidate_graph: CandidateGraph; resolves edge_id to Edge.
+        mechanism_registry: MechanismRegistry exposing get_mechanism(id).
+        confidence_service: ConfidenceService for confidence and visit
+            count lookups.
+        evidence_store: EvidenceStore for eligibility-gate inputs.
+        mechanism_weight: Edge-vs-mechanism term weighting.
+        visit_cap: Optional cap on visit count used in the rarity bonus.
+
+    Returns:
+        Non-negative EIG value.
     """
     if not L_prime.ranks:
         return 0.0
-
-    candidate_graph = confidence_service.candidate_graph
-    mechanism_registry = confidence_service.mechanism_registry
 
     deployed_mids = {r.mechanism_id for r in L_prime.ranks}
     if not deployed_mids:
         return 0.0
 
-    # Union of edges across all deployed mechanisms
-    touched_edge_ids = set()
+    touched_edge_ids: set[str] = set()
     for mid in deployed_mids:
-        touched_edge_ids.update(mechanism_registry.get_mechanism(mid).edge_ids)
+        mech = mechanism_registry.get_mechanism(mid)
+        touched_edge_ids |= set(mech.edge_ids)
 
-    # Edge term
     edge_sum = 0.0
     for edge_id in touched_edge_ids:
         edge = candidate_graph.edge_table[edge_id]
         if not _edge_eligible(edge, L_prime, evidence_store):
             continue
-        edge_metadata = candidate_graph.edge_metadata_table[edge_id]
         c_e = confidence_service.get_edge_confidence(edge_id)
-        edge_sum += _beta_uncertainty(c_e, edge_metadata.alpha + edge_metadata.beta, n)
+        n_e = confidence_service.get_edge_visit_count(edge_id)
+        if visit_cap is not None:
+            n_e = min(n_e, visit_cap)
+        edge_sum += _bernoulli_variance(c_e) * _rarity(n_e)
 
-    # Mechanism term
     mech_sum = 0.0
     for mid in deployed_mids:
-        mechanism = mechanism_registry.get_mechanism(mid)
-        if not check_mechanism_eligibility(mechanism, L_prime, (candidate_graph, evidence_store)):
+        mech = mechanism_registry.get_mechanism(mid)
+        if not check_mechanism_eligibility(mech, L_prime, candidate_graph, evidence_store):
             continue
-        mechanism_metadata = mechanism_registry.mechanism_metadata_table[mid]
         c_m = confidence_service.get_mechanism_confidence(mid)
-        mech_sum += _beta_uncertainty(c_m, mechanism_metadata.alpha + mechanism_metadata.beta, n)
+        n_m = confidence_service.get_mechanism_visit_count(mid)
+        if visit_cap is not None:
+            n_m = min(n_m, visit_cap)
+        mech_sum += _bernoulli_variance(c_m) * _rarity(n_m)
 
-    return edge_sum + KAPPA * mech_sum
+    return edge_sum + mechanism_weight * mech_sum
 
 
-def check_mechanism_eligibility(mechanism, L_prime, state) -> bool:
+def check_mechanism_eligibility(
+    mechanism,
+    L_prime,
+    candidate_graph,
+    evidence_store,
+) -> bool:
+    """Return True iff at least one X->V->Y path in the mechanism is eligible.
+
+    a_M(L_prime) = 1 iff at least one X->V->Y path through M has both of
+    its edges eligible. Ensures the mechanism is testable by L_prime:
+    the ladder actually exercises some causal path through the bundle.
+
+    Args:
+        mechanism: Mechanism with .edge_ids.
+        L_prime: Ladder.
+        candidate_graph: CandidateGraph.
+        evidence_store: EvidenceStore for the validator-support gate.
+
+    Returns:
+        True if any X->V->Y path is fully eligible.
     """
-    Definition: a_M(L') = 1 iff at least one X->V->Y path through M has
-                BOTH edges eligible. Ensures mechanism is testable by L'.
-    Usage:      Inner gate for compute_eig and aggregate_cluster_eig.
-    Inputs:
-        mechanism : Mechanism with .edge_ids
-        L_prime   : Ladder
-        state     : tuple (candidate_graph, evidence_store) - bundled context
-    Outputs:
-        bool
-    """
-    candidate_graph, evidence_store = state
     for xv_edge, vy_edge in find_eligible_paths(mechanism, candidate_graph):
         if _edge_eligible(xv_edge, L_prime, evidence_store) and _edge_eligible(
             vy_edge, L_prime, evidence_store
@@ -105,94 +132,97 @@ def check_mechanism_eligibility(mechanism, L_prime, state) -> bool:
 def aggregate_cluster_eig(
     cluster_plan,
     ranks: Sequence,
+    candidate_graph,
+    mechanism_registry,
     confidence_service,
+    evidence_store,
+    mechanism_weight: float = 1.0,
 ) -> float:
-    """
-    Definition: Cluster-level EIG with saturation aggregation.
-                    A_e(P) = 1 - prod_i(1 - a_e(L_i'))
-                    alpha_cluster(P) = sum_e beta_uncertainty(e)*A_e
-                                     + kappa*sum_M beta_uncertainty(M)*A_M
-                Saturation prevents double-counting an edge tested by
-                multiple ranks across the cluster's plan P.
-    Usage:      agent.phase_4 cluster scoring; budget-reallocation delta-sigma check.
-    Inputs:
-        cluster_plan       : Plan (Dict[job_id -> Action]) - for logging/audit
-        ranks              : flat List[Rank] across all ladders in the plan
-        confidence_service : ConfidenceService with candidate_graph and
-                             mechanism_registry references
-    Outputs:
-        alpha_cluster : float >= 0
+    """Compute cluster-level EIG with saturation aggregation.
+
+    A_e(P) = 1 - product_i(1 - a_e(L_i_prime)).
+    eig_cluster(P) = sum_e u(c_e) * A_e + mechanism_weight * sum_M u(c_M) * A_M.
+
+    Saturation prevents double-counting an edge tested by multiple ranks
+    across the cluster's plan.
+
+    Args:
+        cluster_plan: Plan dict[job_id -> Action], retained for audit/logging.
+        ranks: Flat list of ranks across all ladders in the plan.
+        candidate_graph: CandidateGraph.
+        mechanism_registry: MechanismRegistry.
+        confidence_service: ConfidenceService.
+        evidence_store: EvidenceStore.
+        mechanism_weight: Edge-vs-mechanism term weighting.
+
+    Returns:
+        Non-negative cluster-level EIG.
     """
     if not ranks:
         return 0.0
 
-    candidate_graph = confidence_service.candidate_graph
-    mechanism_registry = confidence_service.mechanism_registry
-
     edges_to_ranks: dict[str, list] = {}
     mechs_to_ranks: dict[str, list] = {}
     for r in ranks:
-        mechanism = mechanism_registry.get_mechanism(r.mechanism_id)
-        for edge_id in mechanism.edge_ids:
+        mech = mechanism_registry.get_mechanism(r.mechanism_id)
+        for edge_id in mech.edge_ids:
             edges_to_ranks.setdefault(edge_id, []).append(r)
         mechs_to_ranks.setdefault(r.mechanism_id, []).append(r)
 
-    # Edge saturation
     edge_term = 0.0
     for edge_id, rank_list in edges_to_ranks.items():
-        edge_metadata = candidate_graph.edge_metadata_table[edge_id]
+        edge = candidate_graph.edge_table[edge_id]
         c_e = confidence_service.get_edge_confidence(edge_id)
         a_values = [
-            1.0
-            if _edge_eligible_by_id(edge_id, r.ladder, r.evidence_store, candidate_graph)
-            else 0.0
-            for r in rank_list
+            1.0 if _edge_eligible(edge, r.ladder, evidence_store) else 0.0 for r in rank_list
         ]
-        A = 1.0 - float(np.prod([1.0 - a for a in a_values]))
-        edge_term += _beta_uncertainty(c_e, edge_metadata.alpha + edge_metadata.beta) * A
+        saturation = 1.0 - float(np.prod([1.0 - a for a in a_values]))
+        edge_term += _bernoulli_variance(c_e) * saturation
 
-    # Mechanism saturation
     mech_term = 0.0
-    for m_id, rank_list in mechs_to_ranks.items():
-        mechanism = mechanism_registry.get_mechanism(m_id)
-        mechanism_metadata = mechanism_registry.mechanism_metadata_table[m_id]
-        c_m = confidence_service.get_mechanism_confidence(m_id)
+    for mid, rank_list in mechs_to_ranks.items():
+        mech = mechanism_registry.get_mechanism(mid)
+        c_m = confidence_service.get_mechanism_confidence(mid)
         a_values = [
             1.0
-            if check_mechanism_eligibility(mechanism, r.ladder, (candidate_graph, r.evidence_store))
+            if check_mechanism_eligibility(mech, r.ladder, candidate_graph, evidence_store)
             else 0.0
             for r in rank_list
         ]
-        A = 1.0 - float(np.prod([1.0 - a for a in a_values]))
-        mech_term += _beta_uncertainty(c_m, mechanism_metadata.alpha + mechanism_metadata.beta) * A
+        saturation = 1.0 - float(np.prod([1.0 - a for a in a_values]))
+        mech_term += _bernoulli_variance(c_m) * saturation
 
-    return edge_term + KAPPA * mech_term
+    return edge_term + mechanism_weight * mech_term
 
 
 def find_eligible_paths(mechanism, candidate_graph) -> list[tuple]:
+    """Enumerate full X->V->Y paths through a mechanism's bundle.
+
+    Args:
+        mechanism: Mechanism with .edge_ids.
+        candidate_graph: CandidateGraph.
+
+    Returns:
+        List of (xv_edge, vy_edge) pairs forming X->V->Y paths.
     """
-    Definition: Enumerate (X->V edge, V->Y edge) path pairs through the
-                mechanism's sub-DAG that share a common V node.
-    Usage:      Inner helper for check_mechanism_eligibility.
-    Inputs:
-        mechanism : Mechanism with .edge_ids
-    Outputs:
-        List[(xv_edge, vy_edge)] - full X->V->Y paths through the bundle
-    """
-    edges = [candidate_graph.edge_table[edge_id] for edge_id in mechanism.edge_ids]
-    xv = [e for e in edges if e.src_type == "X" and e.dst_type == "V"]
-    vy = [e for e in edges if e.src_type == "V" and e.dst_type == "Y"]
-    return [(a, b) for a in xv for b in vy if a.dst == b.src]
+    edges = [candidate_graph.edge_table[eid] for eid in mechanism.edge_ids]
+    xv_edges = [e for e in edges if e.src_type == "X" and e.dst_type == "V"]
+    vy_edges = [e for e in edges if e.src_type == "V" and e.dst_type == "Y"]
+    return [(a, b) for a in xv_edges for b in vy_edges if a.dst == b.src]
 
 
-def _beta_uncertainty(confidence: float, evidence_count: float, n: int | None = None) -> float:
-    if n is not None:
-        evidence_count = min(evidence_count, n)
-    return 4.0 * confidence * (1.0 - confidence) / (evidence_count + 1.0)
+def _bernoulli_variance(c: float) -> float:
+    """Return 4*c*(1-c). Peaks at c=0.5, zero at c in {0, 1}."""
+    return 4.0 * float(c) * (1.0 - float(c))
+
+
+def _rarity(n: int) -> float:
+    """Return 1 / sqrt(1 + n) as a UCB-style rarity bonus on visit count."""
+    return 1.0 / np.sqrt(1.0 + float(n))
 
 
 def _edge_eligible(edge, L_prime, evidence_store) -> bool:
-    """All six gates must pass"""
+    """Return True iff all six eligibility gates pass for this edge."""
     return (
         _gate_selected(edge, L_prime)
         and _gate_valid_contrast(edge, L_prime)
@@ -203,35 +233,29 @@ def _edge_eligible(edge, L_prime, evidence_store) -> bool:
     )
 
 
-def _edge_eligible_by_id(edge_id, L_prime, evidence_store, candidate_graph) -> bool:
-    """Resolve edge_id to Edge, then evaluate gates."""
-    edge = candidate_graph.edge_table.get(edge_id)
-    if edge is None:
-        return False
-    return _edge_eligible(edge, L_prime, evidence_store)
-
-
 def _gate_selected(edge, L_prime) -> bool:
-    # X-side of edge is set / varied somewhere in the ladder.
+    """Return True iff the X-side of edge is set or varied in the ladder."""
     return any(edge.src in r.config for r in L_prime.ranks)
 
 
 def _gate_valid_contrast(edge, L_prime) -> bool:
-    """The ladder produces variation in edge.src across its ranks.
-    X->V edges: need at least 1 distinct value of edge.src.
-    V->Y edges: V variation is mediated by upstream X-variation
-    in the same ladder (validated structurally elsewhere)."""
+    """Return True iff the ladder produces variation in edge.src.
+
+    X->V edges need at least one distinct value of edge.src. V->Y edges
+    have V variation mediated by upstream X-variation in the same ladder,
+    which is validated structurally elsewhere.
+    """
     values = {r.config.get(edge.src) for r in L_prime.ranks if edge.src in r.config}
     return len(values) >= 1
 
 
 def _gate_child_observed(edge) -> bool:
-    """V or Y on dst side is in our telemetry catalog."""
+    """Return True iff the V or Y on the dst side is in the telemetry catalog."""
     return getattr(edge, "dst_observable", True)
 
 
 def _gate_enough_samples(edge, L_prime, n_b: int = DEFAULT_N_B) -> bool:
-    """Deployment provides at least n_b samples per env."""
+    """Return True iff the deployment provides at least n_b samples per env."""
     n_envs = max(1, len(L_prime.envs()))
     total = L_prime.duration_minutes * sum(r.n_replicas for r in L_prime.ranks)
     return total >= n_b * n_envs
@@ -242,13 +266,13 @@ def _gate_validator_support(
     evidence_store,
     n_env_min: int = DEFAULT_N_ENV_MIN,
 ) -> bool:
-    """After this deployment, edge will have at least n_env_min envs tested."""
+    """Return True iff the edge will have >= n_env_min envs tested post-deploy."""
     return len(evidence_store.envs_for_edge(edge.edge_id)) + 1 >= n_env_min
 
 
 def _gate_relevance(edge, L_prime) -> bool:
-    """Edge belongs to at least one mechanism applicable to L_prime's job."""
-    return any(edge.edge_id in mechanism.edge_ids for mechanism in L_prime.applicable_mechanisms)
+    """Return True iff the edge belongs to a mechanism applicable to L_prime."""
+    return any(edge.edge_id in M.edge_ids for M in L_prime.applicable_mechanisms)
 
 
 # if __name__ == "__main__":
@@ -367,12 +391,14 @@ def _gate_relevance(edge, L_prime) -> bool:
 #         )
 #         confidence_service = ConfidenceService(graph, registry)
 
-#         return ladder, confidence_service, evidence_store, [rank_1, rank_2]
+#         return ladder, graph, registry, confidence_service, evidence_store, [rank_1, rank_2]
 
-#     ladder, confidence_service, evidence_store, ranks = build_test_case()
+#     ladder, graph, registry, confidence_service, evidence_store, ranks = build_test_case()
 
 #     alpha = compute_eig(
 #         L_prime=ladder,
+#         candidate_graph=graph,
+#         mechanism_registry=registry,
 #         confidence_service=confidence_service,
 #         evidence_store=evidence_store,
 #     )
@@ -380,16 +406,21 @@ def _gate_relevance(edge, L_prime) -> bool:
 
 #     alpha_capped = compute_eig(
 #         L_prime=ladder,
+#         candidate_graph=graph,
+#         mechanism_registry=registry,
 #         confidence_service=confidence_service,
 #         evidence_store=evidence_store,
-#         n=2,
+#         visit_cap=2,
 #     )
 #     print("compute_eig alpha with evidence cap n=2:", alpha_capped)
 
 #     alpha_cluster = aggregate_cluster_eig(
 #         cluster_plan={"job_1": "fake_action"},
 #         ranks=ranks,
+#         candidate_graph=graph,
+#         mechanism_registry=registry,
 #         confidence_service=confidence_service,
+#         evidence_store=evidence_store,
 #     )
 #     print("aggregate_cluster_eig alpha_cluster:", alpha_cluster)
 

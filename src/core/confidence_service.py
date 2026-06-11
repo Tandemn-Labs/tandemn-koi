@@ -77,7 +77,7 @@ class ConfidenceService:
         edge_metadata.q_histogram[q_key] = edge_metadata.q_histogram.get(q_key, 0) + 1
         return self.get_edge_confidence(edge_id), True
 
-    def apply_delta_c_confidence(self, mechanism_id, q_label):
+    def apply_delta_c_mechanism(self, mechanism_id, q_label):
         mechanism_metadata = self.mechanism_registry.mechanism_metadata_table[mechanism_id]
         delta_alpha, delta_beta = self.get_delta_c_mechanism(q_label)
 
@@ -176,8 +176,8 @@ class ConfidenceService:
 #     print("edge_q_histogram:", service.get_edge_q_histogram(edge_id))
 
 #     print(
-#         "apply_delta_c_confidence(Q4):",
-#         service.apply_delta_c_confidence(mechanism_id, Quadrant.Q4),
+#         "apply_delta_c_mechanism(Q4):",
+#         service.apply_delta_c_mechanism(mechanism_id, Quadrant.Q4),
 #     )
 #     print(
 #         "mechanism_alpha_beta:",
