@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+import numpy as np
+
 
 @dataclass
 class Node:
@@ -67,3 +69,32 @@ class EdgeConfidenceRecord:
 class MechanismConfidenceRecord:
     mechanism: Mechanism
     metadata: MechanismMetadata
+
+
+@dataclass
+class EvidenceRow:
+    row_id: str  # f"{tick}_{job_id}_{rank_id}"
+    tick: int  # integer FSM tick id
+    job_id: str
+    rank_id: str
+    env_label: tuple[str, str, str, str]  # (cloud, region, market, gpu_type) - ICP env
+    mechanism_id: str  # the ONE mechanism the agent committed to
+    X: dict[str, object]  # ~60 decision variables (deploy snapshot)
+    W_observed: dict[str, float]  # 22 workload features at deploy time
+    V_observed_trajectory: dict[str, np.ndarray]  # sub-tick samples per V in bundle
+    V_predicted_trajectory: dict[str, np.ndarray]  # surrogate-predicted V (or broadcast scalar)
+    y_observed_trajectory: dict[str, np.ndarray]  # sub-tick Y samples - needed for Y-CUSUM
+    y_predicted: dict[str, float]  # surrogate y_hat per Y, constant during tick
+    residuals_per_v: dict[str, np.ndarray]  # precomputed observed - predicted for ICP
+    residuals_per_y: dict[str, np.ndarray]  # ditto, per-objective
+    v_cusum_result: object  # MATCHED / DIVERGED on V bundle
+    y_cusum_result: object  # MATCHED / DIVERGED on Y bundle
+    icp_result_per_edge: dict[str, object]  # ACCEPT / REJECT / UNDECIDED per edge_id
+    q_label: object | None  # None if any ICP UNDECIDED -> excluded from Q1 rate
+    w_t_snapshot: dict[str, float]  # Tchebycheff weights at deploy time
+    z_star_snapshot: dict[str, float]  # Pareto reference at deploy time
+    J_realized: float  # Tchebycheff scalar actually achieved
+    sigma_realized: float  # per-candidate sigma achieved
+    cusum_params_v: dict[str, tuple[float, float]]  # (delta, h) per V used this tick
+    cusum_params_y: dict[str, tuple[float, float]]  # (delta, h) per Y used this tick
+    theory_blob: str | None = None  # NL retrospective from agent
