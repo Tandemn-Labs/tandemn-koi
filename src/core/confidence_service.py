@@ -65,25 +65,34 @@ class ConfidenceService:
             )
         return records
 
-    def apply_delta_c_edge(self, edge_id, q_label, icp_result):
+    def apply_delta_c_edge(self, edge_id, q_label, icp_result, env_label=None, tick=None):
         edge_metadata = self.candidate_graph.edge_metadata_table[edge_id]
         delta_alpha, delta_beta = self.get_delta_c_edge(q_label, icp_result)
 
         edge_metadata.alpha += delta_alpha
         edge_metadata.beta += delta_beta
         edge_metadata.visit_count += 1
+        # single-writer invariant: env coverage and recency live here too
+        if env_label is not None:
+            edge_metadata.envs_seen.add(env_label)
+        if tick is not None:
+            edge_metadata.last_touched_tick = int(tick)
 
         q_key = _key(q_label)
         edge_metadata.q_histogram[q_key] = edge_metadata.q_histogram.get(q_key, 0) + 1
         return self.get_edge_confidence(edge_id), True
 
-    def apply_delta_c_mechanism(self, mechanism_id, q_label):
+    def apply_delta_c_mechanism(self, mechanism_id, q_label, env_label=None, tick=None):
         mechanism_metadata = self.mechanism_registry.mechanism_metadata_table[mechanism_id]
         delta_alpha, delta_beta = self.get_delta_c_mechanism(q_label)
 
         mechanism_metadata.alpha += delta_alpha
         mechanism_metadata.beta += delta_beta
         mechanism_metadata.visit_count += 1
+        if env_label is not None:
+            mechanism_metadata.envs_seen.add(env_label)
+        if tick is not None:
+            mechanism_metadata.last_touched_tick = int(tick)
 
         q_key = _key(q_label)
         mechanism_metadata.q_histogram[q_key] = mechanism_metadata.q_histogram.get(q_key, 0) + 1
@@ -127,7 +136,7 @@ class ConfidenceService:
 #             edge_id=edge_id,
 #             alpha=1.4,
 #             beta=0.6,
-#             envs_seen={"h200_sxm"},
+#             envs_seen={("aws", "us-east-1", "on_demand", "H100")},
 #         )
 #     }
 #     graph = CandidateGraph(
@@ -149,7 +158,7 @@ class ConfidenceService:
 #                 mechanism_id=mechanism_id,
 #                 alpha=1.0,
 #                 beta=1.0,
-#                 envs_seen={"h200_sxm"},
+#                 envs_seen={("aws", "us-east-1", "on_demand", "H100")},
 #             )
 #         },
 #     )

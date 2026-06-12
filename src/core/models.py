@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+EnvLabel = tuple[str, str, str, str]
+
 
 @dataclass
 class Node:
@@ -31,7 +33,7 @@ class EdgeMetadata:
     q_histogram: dict[str, int] = field(
         default_factory=lambda: {"Q1": 0, "Q2": 0, "Q3": 0, "Q4": 0}
     )
-    envs_seen: set[str] = field(default_factory=set)
+    envs_seen: set[EnvLabel] = field(default_factory=set)
     q3_frequency: float = 0.0
 
 
@@ -51,7 +53,7 @@ class MechanismMetadata:
     alpha: float = 1.0
     beta: float = 1.0
     visit_count: int = 0
-    envs_seen: set[str] = field(default_factory=set)
+    envs_seen: set[EnvLabel] = field(default_factory=set)
     last_touched_tick: int | None = None
     q_histogram: dict[str, int] = field(
         default_factory=lambda: {"Q1": 0, "Q2": 0, "Q3": 0, "Q4": 0}
@@ -107,7 +109,7 @@ class EvidenceRow:
     deploy_timestamp_utc: float  # forensics; replay anchoring
     job_id: str
     rank_id: str
-    env_label: tuple[str, str, str, str]  # (cloud, region, market, gpu_type)
+    env_label: EnvLabel  # (cloud, region, market, gpu_type)
     X: dict[str, object]  # ~60 decision variables
     W_observed: dict[str, float]  # 22 workload features
     V_observed_trajectory: dict[str, np.ndarray]  # sub-tick V samples (all measured V's)
@@ -118,8 +120,11 @@ class EvidenceRow:
     residuals_per_v: dict[str, np.ndarray]  # V_obs - V_pred — ICP + CUSUM recalibration
     residuals_per_y: dict[str, np.ndarray]  # y_obs - y_hat — ICP + DRO coverage tracking
     mechanism_ids: list[str]  # all whose scope matched (includes committed)
-    cusum_per_mechanism: dict[str, tuple[object, object]]
-    q_label_per_mechanism: dict[str, object | None]  # None where any ICP=UNDECIDED
+    cusum_per_mechanism: dict[str, tuple[object, object]]  # mid -> (v_verdict, y_verdict)
+    q_label_per_mechanism: dict[str, object | None]  # None = bundle not observable this rank.
+    # Q comes from the two CUSUM axes only; ICP modulates EDGE update magnitude
+    # via EDGE_BETA_UPDATE's "undecided" row and never nulls the Q (nulling on
+    # undecided ICP would freeze all learning until n_env_min envs exist).
     icp_result_per_edge: dict[str, object]
     w_t_snapshot: dict[str, float]  # Tchebycheff weights
     z_star_snapshot: dict[str, float]  #

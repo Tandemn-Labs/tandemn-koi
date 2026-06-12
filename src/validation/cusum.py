@@ -152,14 +152,14 @@ class Cusum:
         Inputs:
             observed  : np.ndarray of sub-tick samples
             predicted : scalar (broadcast) or np.ndarray matching observed.shape
-            delta     : drift tolerance delta
-            h         : fire threshold h
+            delta     : drift tolerance
+            h         : fire threshold
         Outputs:
             (direction: CusumDirection, fired: bool, fire_tick: int|None)
         """
         obs = np.asarray(observed, dtype=float)
 
-        if isinstance(predicted, (float, int)):
+        if isinstance(predicted, (int, float)):
             pred = np.full_like(obs, float(predicted))
         else:
             pred = np.asarray(predicted, dtype=float)
@@ -186,8 +186,8 @@ class Cusum:
         Usage:      Inner numerical primitive for cusum_per_v.
         Inputs:
             residuals : np.ndarray of residual time series
-            delta     : drift tolerance delta
-            h         : fire threshold h
+            delta     : drift tolerance
+            h         : fire threshold
         Outputs:
             (S_plus_array, S_minus_array, (direction, fired, fire_tick))
         """
@@ -270,7 +270,6 @@ class Cusum:
         return 0.5 * sigma, 4.0 * sigma
 
 
-# added smoke test below
 # if __name__ == "__main__":
 #     from src.core.candidate_graph import CandidateGraph
 #     from src.core.models import Edge, Mechanism, Node
