@@ -266,7 +266,7 @@ def _gate_validator_support(
     evidence_store,
     n_env_min: int = DEFAULT_N_ENV_MIN,
 ) -> bool:
-    """Return True iff the edge will have >= n_env_min envs tested post-deploy."""
+    """Return True if the edge will have >= n_env_min envs tested post-deploy."""
     return len(evidence_store.envs_for_edge(edge.edge_id)) + 1 >= n_env_min
 
 
