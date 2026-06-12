@@ -1,6 +1,7 @@
 from collections import defaultdict
 from collections.abc import Iterator
 
+import numpy as np
 from src.core.models import EvidenceRow
 
 # TODO - Will have to modify this to work with TandemnStore
@@ -85,9 +86,36 @@ class EvidenceService:
     def count_visits_per_edge(self, edge_id) -> int:
         return len(self._by_edge.get(edge_id, []))
 
+    def envs_for_edge(self, edge_id) -> set:
+        # eig.py gate_validator_support needs the env set itself, not just the count
+        return {self._row_by_id[row_id].env_label for row_id in self._by_edge.get(edge_id, [])}
+
     def count_envs_per_edge(self, edge_id) -> int:
-        envs = {self._row_by_id[row_id].env_label for row_id in self._by_edge.get(edge_id, [])}
-        return len(envs)
+        return len(self.envs_for_edge(edge_id))
+
+    def current_tick(self) -> int:
+        # regret.py and agent tools read the store's notion of "now"
+        return self._current_tick
+
+    def get_residual_history_per_v(self, v_name, window) -> np.ndarray:
+        # concatenated residuals for one V over the last `window` ticks;
+        # feeds slow_loop.recalibrate_cusum_params (delta, h) calibration
+        return self._residual_history(v_name, window, "residuals_per_v")
+
+    def get_residual_history_per_y(self, y_name, window) -> np.ndarray:
+        return self._residual_history(y_name, window, "residuals_per_y")
+
+    def _residual_history(self, name, window, field) -> np.ndarray:
+        cutoff = max(0, self._current_tick - int(window))
+        chunks = []
+        for tick in range(cutoff, self._current_tick + 1):
+            for row_id in self._by_tick.get(tick, ()):
+                arr = getattr(self._row_by_id[row_id], field, {}).get(name)
+                if arr is not None and len(arr) > 0:
+                    chunks.append(np.asarray(arr, dtype=float))
+        if not chunks:
+            return np.array([], dtype=float)
+        return np.concatenate(chunks)
 
     def last_touched_per_edge(self, edge_id) -> int | None:
         row_ids = self._by_edge.get(edge_id, [])
@@ -127,10 +155,12 @@ class EvidenceService:
     #     pass
 
     def iter_decided_per_mechanism(
-        self, window: int, tick: int
+        self, window: int, tick: int | None = None
     ) -> Iterator[tuple[EvidenceRow, str, object]]:
-        cutoff = max(0, tick - window)
-        for t in range(cutoff, tick + 1):
+        # tick=None means "as of now" - the store substitutes its own current tick
+        upper = self._current_tick if tick is None else int(tick)
+        cutoff = max(0, upper - window)
+        for t in range(cutoff, upper + 1):
             for row_id in self._by_tick.get(t, ()):
                 row = self._row_by_id[row_id]
                 for mid, q in row.q_label_per_mechanism.items():
