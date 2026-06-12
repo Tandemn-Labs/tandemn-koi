@@ -5,6 +5,7 @@ import numpy as np
 from src.core.models import EvidenceRow
 
 # TODO - Will have to modify this to work with TandemnStore
+DEFAULT_ROW_READ_LIMIT = 200
 
 
 class EvidenceService:
@@ -16,6 +17,7 @@ class EvidenceService:
         self._by_mechanism = defaultdict(list)
         self._by_edge = defaultdict(list)
         self._by_env = defaultdict(list)
+        self._by_workload_type = defaultdict(list)
         self._current_tick = 0
 
     def append_row(self, row: EvidenceRow):
@@ -29,6 +31,9 @@ class EvidenceService:
         self._by_job[row.job_id].append(row.row_id)
         self._by_rank[(row.job_id, row.rank_id)].append(row.row_id)
         self._by_env[row.env_label].append(row.row_id)
+        workload_type = self._workload_type(row.W_observed)
+        if workload_type is not None:
+            self._by_workload_type[workload_type].append(row.row_id)
         for mechanism_id in row.mechanism_ids:
             self._by_mechanism[mechanism_id].append(row.row_id)
         for edge_id in row.icp_result_per_edge:
@@ -51,6 +56,53 @@ class EvidenceService:
             for row_id in row_ids:
                 rows.append(self._row_by_id[row_id])
         return rows
+
+    def get_all_rows(self, limit=DEFAULT_ROW_READ_LIMIT) -> list[EvidenceRow]:
+        if limit is not None:
+            row_ids = self._latest_row_ids(int(limit))
+            return [self._row_by_id[row_id] for row_id in row_ids]
+
+        row_ids = []
+        for tick in sorted(self._by_tick):
+            row_ids.extend(self._by_tick[tick])
+        return [self._row_by_id[row_id] for row_id in row_ids]
+
+    def retrieve_similar_rows(self, job_features, top_k=200) -> list[EvidenceRow]:
+        # TODO: Replace this type-only in-memory filter with KNN over TandemnStore
+        # components (EvidenceRow, profiling DB, etc.) once TandemnStore is integrated.
+        top_k = int(top_k)
+        if top_k <= 0:
+            return []
+
+        workload_type = self._workload_type(job_features)
+        if workload_type is None:
+            row_ids = self._latest_row_ids(top_k)
+            return [self._row_by_id[row_id] for row_id in row_ids]
+
+        row_ids = self._by_workload_type.get(workload_type, [])[-top_k:]
+        if not row_ids:
+            row_ids = self._latest_row_ids(top_k)
+        return [self._row_by_id[row_id] for row_id in row_ids]
+
+    def _latest_row_ids(self, limit) -> list[str]:
+        limit = int(limit)
+        if limit <= 0:
+            return []
+
+        row_ids = []
+        for tick in sorted(self._by_tick, reverse=True):
+            for row_id in reversed(self._by_tick[tick]):
+                row_ids.append(row_id)
+                if len(row_ids) == limit:
+                    return list(reversed(row_ids))
+        return list(reversed(row_ids))
+
+    @staticmethod
+    def _workload_type(features):
+        if not features:
+            return None
+        value = features.get("type") or features.get("workload_type")
+        return str(value).lower() if value is not None else None
 
     def get_rows_for_edge(self, edge_id, limit=None) -> list[EvidenceRow]:
         # TODO - Data type for Limit is Int
