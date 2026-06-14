@@ -3,11 +3,28 @@ class CandidateGraph:
         self.node_table = node_table
         self.edge_table = edge_table
         self.edge_metadata_table = edge_metadata_table or {}
+        self._validate_edge_metadata_table()
 
         self.edges_by_src = {}
         self.edges_by_dst = {}
         self.edge_by_pair = {}
         self.build_indexes()
+
+    def _validate_edge_metadata_table(self):
+        missing = sorted(set(self.edge_table) - set(self.edge_metadata_table))
+        extra = sorted(set(self.edge_metadata_table) - set(self.edge_table))
+        if missing:
+            raise ValueError(f"Missing EdgeMetadata for edges: {missing}")
+        if extra:
+            raise ValueError(f"EdgeMetadata references unknown edges: {extra}")
+
+        mismatched = sorted(
+            edge_id
+            for edge_id, metadata in self.edge_metadata_table.items()
+            if metadata.edge_id != edge_id
+        )
+        if mismatched:
+            raise ValueError(f"EdgeMetadata edge_id mismatch for edges: {mismatched}")
 
     def build_indexes(self):
         for edge_id, edge in self.edge_table.items():
@@ -36,6 +53,23 @@ class CandidateGraph:
     def get_edges_to(self, node_id):
         edge_ids = self.edges_by_dst.get(node_id, set())
         return [self.edge_table[edge_id] for edge_id in edge_ids]
+
+    @property
+    def x(self):
+        return self._nodes_by_type("X")
+
+    @property
+    def v(self):
+        return self._nodes_by_type("V")
+
+    @property
+    def y(self):
+        return self._nodes_by_type("Y")
+
+    def _nodes_by_type(self, node_type):
+        return sorted(
+            node_id for node_id, node in self.node_table.items() if node.node_type == node_type
+        )
 
     def val_edges(self, edge):
         if edge.src not in self.node_table:
