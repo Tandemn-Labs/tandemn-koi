@@ -67,11 +67,16 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from numbers import Real
 from typing import Any
 
 import numpy as np
-from src.core.models import EvidenceRow
+from src.core.models import (
+    SWAP_BUDGET_ACTIONS,
+    ActionType,
+    EvidenceRow,
+    Plan,
+    PlanAction,
+)
 from src.validation.icp import ICPResult
 
 log = logging.getLogger("koi.fsm")
@@ -538,7 +543,7 @@ class TickRunner:
         """Submit the validated plan and record swap bookkeeping.
 
         The executor owns A/B canary semantics and submits only changed or
-        new ladders (keep / defer / record_diagnosis are bookkeeping).
+        new ladders (keep / defer / diagnose are bookkeeping).
         The swap count recorded here feeds next tick's observed_swap_rate,
         which drives lambda_swit.
         """
@@ -595,7 +600,7 @@ class TickRunner:
             if pred is None:
                 continue
             obs_arr = np.asarray(obs, dtype=float)
-            if isinstance(pred, Real):
+            if isinstance(pred, (int, float)):
                 pred_arr = np.full_like(obs_arr, float(pred))
             else:
                 pred_arr = np.asarray(pred, dtype=float)
@@ -759,30 +764,19 @@ class TickRunner:
     # ------------------------------------------------------------------
 
     def _count_plan_swaps(self, ctx: TickContext) -> int:
-        """Active jobs whose deployed action changes their ladder.
+        """Active jobs whose deployed action churns running workload.
 
-        Pending placements (place) and bookkeeping actions (keep, defer,
-        record_diagnosis, mark_terminal_failed) do not count - matching
-        the C4 definition that only active-job churn is budgeted.
+        Counts actions in SWAP_BUDGET_ACTIONS (swap, preempt, retry) for
+        jobs that were active - matching the C4 definition that only
+        active-job churn is budgeted. PLACE/DEFER are admission, not churn.
         """
         plan = ctx.validated_plan
-        if not isinstance(plan, dict):
+        if not isinstance(plan, Plan):
             return 0
         active_ids = self._active_job_ids(ctx)
-        swap_actions = {
-            "retry_launch",
-            "replace_chain",
-            "add_capacity",
-            "remove_capacity",
-            "migrate",
-        }
-        count = 0
-        for job_id, action in plan.items():
-            if not isinstance(action, dict):
-                continue
-            if job_id in active_ids and action.get("action") in swap_actions:
-                count += 1
-        return count
+        return sum(
+            1 for a in plan.actions if a.type in SWAP_BUDGET_ACTIONS and a.job_id in active_ids
+        )
 
     def _active_job_ids(self, ctx: TickContext) -> set:
         snapshot = ctx.cluster_snapshot
@@ -793,24 +787,33 @@ class TickRunner:
     def _active_job_count(self, ctx: TickContext) -> int:
         return len(self._active_job_ids(ctx))
 
-    def _fallback_keep_all(self, ctx: TickContext):
-        """Keep every active job on its current ladder; defer every pending.
+    def _fallback_keep_all(self, ctx: TickContext) -> Plan:
+        """Keep every active job; defer every pending. Typed, tick-correct.
 
         Feasible by construction - the running cluster is the safe state.
-        Uses the resource map's builder when present, else synthesizes
-        from the snapshot summaries.
+        Built here (not via the agent) so the abort path stays correct
+        even when the tick aborted before S4 ever ran, and so a mock agent
+        in tests cannot break recovery. Prefers the resource map's typed
+        builder when present.
         """
         snapshot = ctx.cluster_snapshot
         if self.resource_map is not None and hasattr(self.resource_map, "build_keep_all_plan"):
-            return self.resource_map.build_keep_all_plan(snapshot)
+            try:
+                return Plan.from_raw(self.resource_map.build_keep_all_plan(snapshot), tick=ctx.tick)
+            except (ValueError, TypeError):
+                log.exception("resource_map keep-all plan malformed; synthesizing")
 
-        plan: dict[str, Any] = {}
+        actions: list[PlanAction] = []
         if snapshot is not None:
             for j in getattr(snapshot, "active_jobs_summary", list)() or []:
-                plan[j.get("job_id", j.get("id"))] = {"action": "keep"}
+                actions.append(
+                    PlanAction(job_id=j.get("job_id", j.get("id")), type=ActionType.KEEP)
+                )
             for j in getattr(snapshot, "pending_jobs_summary", list)() or []:
-                plan[j.get("job_id", j.get("id"))] = {"action": "defer"}
-        return plan
+                actions.append(
+                    PlanAction(job_id=j.get("job_id", j.get("id")), type=ActionType.DEFER)
+                )
+        return Plan(tick=ctx.tick, actions=actions, tick_rationale="safe keep-all fallback")
 
 
 # ----------------------------------------------------------------------
