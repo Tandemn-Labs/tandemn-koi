@@ -82,3 +82,9 @@ DEFAULT_Q1_STAR: float = 1.0  # default Q1 star value
 K_P = 1  # K_p, plan samples per tick (v0=1, v2=>1)
 K_MAX = 64  # K_max, tool calls per ReAct trajectory, range [32, 128]
 TEMPERATURE_PER_PHASE = (0.1, 0.5, 0.7, 0.2, 0.4)  # temperature per FSM phase
+
+# Ladder sizing
+# Online replicas must run below saturation so p99 TTFT holds: queue wait
+# grows ~ rho/(1-rho) of service time, so leave headroom. Batch ignores this
+# (no per-request latency SLO) and runs at ~1.0.
+UTILIZATION_TARGET_ONLINE = 0.8  # online per-replica utilization cap, range [0.6, 0.9]
