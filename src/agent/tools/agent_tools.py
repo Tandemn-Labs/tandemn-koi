@@ -52,6 +52,7 @@ Tool catalog:
         simulate_future_state       alias of simulate_allocation
         enumerate_ladder            feasible chain configs under constraints
         required_throughput_enumerator  required tokens/sec from workload + SLO
+        size_ladder                 derive n_replicas per rank from y_hat + capacity
 
     mechanism / confidence:
         get_scope                   mechanisms whose scope matches job features
@@ -82,9 +83,11 @@ Tool catalog:
 """
 
 import logging
+import math
 from typing import Any
 
-from src.config.hyperparameters import GAMMA_SLO
+from src.config.hyperparameters import GAMMA_SLO, UTILIZATION_TARGET_ONLINE
+from src.core.models import LADDER_ACTIONS, SWAP_BUDGET_ACTIONS, Plan, RankSpec
 
 log = logging.getLogger("koi.agent_tools")
 
@@ -92,50 +95,32 @@ log = logging.getLogger("koi.agent_tools")
 class _ToolContext:
     """References to every component the tools wrap. Bound once at boot."""
 
-    slow_loop: Any = None
-    dro: Any = None
-    evidence_store: Any = None
-    mechanism_registry: Any = None
-    confidence_service: Any = None
-    candidate_graph: Any = None
-    resource_map: Any = None
-    surrogate: Any = None
-    telemetry: Any = None
-    cusum: Any = None
-    icp: Any = None
-    quadrant_validator: Any = None
-    eig_module: Any = None
-    tchebycheff_module: Any = None
-    switchcost_module: Any = None
-    plan_validator: Any = None
-    regret_calculator: Any = None
-    tenant_registry: Any = None
-    specialist_runner: Any = None
+    slow_loop = None
+    dro = None
+    evidence_store = None
+    mechanism_registry = None
+    confidence_service = None
+    candidate_graph = None
+    resource_map = None
+    surrogate = None
+    telemetry = None
+    cusum = None
+    icp = None
+    quadrant_validator = None
+    eig_module = None
+    tchebycheff_module = None
+    switchcost_module = None
+    plan_validator = None
+    regret_calculator = None
+    tenant_registry = None
+    specialist_runner = None
 
     # Per-tick caches written by the budget tools.
-    tenant_envelopes: Any = None
-    validated_budget_book: Any = None
+    tenant_envelopes = None
+    validated_budget_book = None
 
 
-_CTX = _ToolContext()
-
-PLANNING_REQUIRED_BINDINGS = (
-    "slow_loop",
-    "dro",
-    "evidence_store",
-    "mechanism_registry",
-    "confidence_service",
-    "candidate_graph",
-    "resource_map",
-    "surrogate",
-    "cusum",
-    "icp",
-    "quadrant_validator",
-    "eig_module",
-    "tchebycheff_module",
-    "plan_validator",
-    "specialist_runner",
-)
+_CTX: Any = _ToolContext()
 
 
 def bind_tools(**components) -> None:
@@ -167,9 +152,44 @@ def _require(*names: str) -> None:
         raise RuntimeError(f"agent_tools needs {missing} bound. Call bind_tools(...) at boot.")
 
 
-def assert_planning_context_bound() -> None:
-    """Fail fast before an agent trajectory if exposed tools lack backends."""
-    _require(*PLANNING_REQUIRED_BINDINGS)
+# Components every planning run needs. Asserted once at the start of the S4
+# loop so a wiring gap surfaces at tick start with the full list, not one
+# tool at a time deep inside a trajectory. tenant_registry is intentionally
+# absent (a single "default" tenant is synthesized when it is unbound), and
+# plan_validator is absent (K_P pre-screen is optional; S5 is authoritative).
+_PLANNING_DEPENDENCIES = (
+    "slow_loop",
+    "dro",
+    "evidence_store",
+    "mechanism_registry",
+    "confidence_service",
+    "candidate_graph",
+    "eig_module",
+    "tchebycheff_module",
+    "switchcost_module",
+    "surrogate",
+    "resource_map",
+    "specialist_runner",
+)
+
+
+def assert_planning_ready() -> None:
+    """Fail fast if any component the S4 planner needs is unbound.
+
+    Converts a late mid-trajectory RuntimeError (raised one tool at a time
+    by _require, after the model has already burned turns) into one clear
+    error at tick start listing every missing binding.
+
+    Raises:
+        RuntimeError: If any name in _PLANNING_DEPENDENCIES is unbound.
+    """
+    missing = [n for n in _PLANNING_DEPENDENCIES if getattr(_CTX, n, None) is None]
+    if missing:
+        raise RuntimeError(
+            "agent_tools is not fully wired for planning; unbound: "
+            f"{missing}. Bind these via bind_tools(...) at boot (or pass "
+            "tool_dependencies to KoiAgentHarness) before the agent runs."
+        )
 
 
 def reset_tick_caches() -> None:
@@ -184,27 +204,33 @@ def reset_tick_caches() -> None:
     _CTX.validated_budget_book = None
 
 
-def all_callables() -> dict[str, Any]:
-    """Return every public tool as a name -> callable dict.
+# Public module functions that are NOT LLM tools (infrastructure/boot).
+_NON_TOOL_NAMES = frozenset(
+    {
+        "bind_tools",
+        "all_callables",
+        "assert_planning_ready",
+        "reset_tick_caches",
+    }
+)
 
-    The agent harness uses this to bind tools into the root REPL
-    namespace in one shot.
+
+def all_callables() -> dict[str, Any]:
+    """Return every public LLM tool as a name -> callable dict.
+
+    The harness binds these into the root REPL namespace in one shot.
+    The __module__ filter drops imported callables (e.g. the Plan class)
+    so only tool functions defined here are exposed; _NON_TOOL_NAMES drops
+    the boot/infra functions (notably reset_tick_caches, which the model
+    must never call mid-trajectory).
     """
     return {
         name: fn
         for name, fn in globals().items()
         if callable(fn)
         and not name.startswith("_")
-        and name
-        not in {
-            "bind_tools",
-            "all_callables",
-            "assert_planning_context_bound",
-            "Any",
-            "Dict",
-            "List",
-            "Optional",
-        }
+        and name not in _NON_TOOL_NAMES
+        and getattr(fn, "__module__", None) == __name__
     }
 
 
@@ -218,6 +244,73 @@ def _env_key(env) -> str:
 def _snapshot():
     _require("resource_map")
     return _CTX.resource_map.snapshot()
+
+
+def _as_plan(plan, tick: int = 0) -> Plan:
+    """Normalize whatever a plan tool receives into a typed Plan.
+
+    The harness passes an already-typed Plan; the LLM may pass the raw
+    dict it built in the REPL. Plan.from_raw handles both, so every
+    plan-level tool can call this and then work against plan.actions.
+    """
+    if isinstance(plan, Plan):
+        return plan
+    return Plan.from_raw(plan, tick=tick)
+
+
+def _ranks_as_dicts(action) -> list:
+    """A PlanAction's ladder as the dict list the EIG/switchcost adapters take."""
+    if not action.ladder:
+        return []
+    return [rank.to_dict() for rank in action.ladder]
+
+
+def _prev_ladder_for(snapshot, job_id: str) -> list:
+    """The job's current ladder from the snapshot, as a rank-dict list.
+
+    Empty when the snapshot has no such accessor or the job is new -
+    switch cost then sees an all-additions transition, which is correct
+    for a first placement.
+    """
+    if snapshot is None:
+        return []
+    if hasattr(snapshot, "current_ladder"):
+        return list(snapshot.current_ladder(job_id) or [])
+    return []
+
+
+def _slo_thresholds_for(snapshot, job_id: str) -> dict:
+    """The job's per-objective SLO thresholds from the snapshot.
+
+    Empty when unavailable - dro_chance_constraint then returns no
+    violation, which is the correct no-signal default.
+    """
+    if snapshot is None:
+        return {}
+    if hasattr(snapshot, "slo_thresholds"):
+        return dict(snapshot.slo_thresholds(job_id) or {})
+    return {}
+
+
+def _derive_y_hat(action, snapshot) -> dict:
+    """Outcome prediction for an action's ladder.
+
+    Prefers the action's advisory predicted_y (the LLM's predict_outcome
+    result) but does NOT depend on it: when absent, predicts on the
+    ladder's representative rank (the 'aggregate' rank if present, else
+    the first). Multi-rank composition into a single job outcome is a
+    surrogate concern; this is the v0 proxy.
+    """
+    if action.predicted_y:
+        return dict(action.predicted_y)
+    if not action.ladder:
+        return {}
+    rep = next((r for r in action.ladder if r.role == "aggregate"), action.ladder[0])
+    try:
+        return predict_outcome({"job_config": rep.config})["y_hat"]
+    except Exception:
+        log.exception("y_hat derivation failed for job %s", action.job_id)
+        return {}
 
 
 # ----------------------------------------------------------------------
@@ -661,7 +754,7 @@ def run_job_specialists(
         max_workers: Parallel specialist calls.
 
     Returns:
-        List of JobSpecialistResult dicts ({"job_id", "action", "ladder",
+        List of JobSpecialistResult dicts ({"job_id", "type", "ladder",
         "predicted_y", "predicted_sigma", "budget_utilization",
         "fitness", "marginal_value_of_more", "unused_capacity",
         "mechanism_ids", "new_mechanism_proposals", "reasoning"}).
@@ -690,17 +783,18 @@ def run_job_specialists(
 # ----------------------------------------------------------------------
 
 
-def simulate_allocation(plan: dict[str, Any]) -> dict[str, Any]:
+def simulate_allocation(plan) -> dict[str, Any]:
     """Return counterfactual resource state after applying a plan.
 
     Args:
-        plan: {job_id: action dict with ladder}.
+        plan: A typed Plan or any raw form Plan.from_raw accepts. Normalized
+            so the resource map always receives a typed Plan.
 
     Returns:
         Dict env_key -> {"free_now", "free_after", "delta"}.
     """
     _require("resource_map")
-    return _CTX.resource_map.simulate_resource_state_after(plan)
+    return _CTX.resource_map.simulate_resource_state_after(_as_plan(plan))
 
 
 def simulate_resource_free(job_id: str) -> dict[str, int]:
@@ -756,6 +850,177 @@ def required_throughput_enumerator(job_features: dict[str, Any]) -> float:
     rate = float(job_features.get("request_arrival_rate", 0.0))
     out_avg = float(job_features.get("output_len_tokens_avg", 0.0))
     return rate * out_avg * headroom
+
+
+def _y_value(y_hat: dict[str, Any], *keys: str) -> float:
+    """First present y_hat value across spelling variants, else 0.0."""
+    for key in keys:
+        value = y_hat.get(key)
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
+def _feature_value(features: dict[str, Any], *keys: str) -> float | None:
+    """First present feature value across spelling variants, else None."""
+    for key in keys:
+        value = features.get(key)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def size_ladder(
+    ranks: list[dict[str, Any]],
+    job_features: dict[str, Any],
+    target_tps: float | None = None,
+    utilization_target: float | None = None,
+) -> dict[str, Any]:
+    """Derive each rank's replica/dp count, regime-aware.
+
+    The LLM proposes rank CONFIGS (gpu, tp, pp, engine, quant); this
+    computes the replica/dp count rather than leaving it to a guess.
+
+    Batch (deadline-bound, no per-request SLO): size purely on throughput
+    at full utilization.
+
+        target_tps    = total_token_budget / deadline_seconds * headroom
+        per_chain_eff = per_chain_raw
+        n_replicas    = ceil(target_tps / per_chain_eff)
+
+    Online (rate-bound UNDER latency SLOs): two extra constraints.
+      1. Latency gate: a config whose predicted p99 TTFT or p99 TPOT
+         already exceeds target is INFEASIBLE for online. TPOT especially
+         cannot be fixed by adding replicas (it is per-replica decode
+         latency), so an SLO-violating config must be replaced, not scaled.
+      2. Utilization derating: per-replica throughput is multiplied by
+         utilization_target (< 1) so the replica runs below saturation and
+         queue wait stays bounded (wait ~ rho/(1-rho)), keeping p99 TTFT.
+
+        target_tps    = request_arrival_rate * output_len_tokens_avg * headroom
+        per_chain_eff = per_chain_raw * utilization_target
+        n_replicas    = ceil(target_tps / per_chain_eff)
+
+    Capped by capacity in both regimes: n_replicas = min(needed,
+    floor(free_gpus / gpus_per_chain)). A capacity-bound rank reports its
+    GPU shortfall in marginal_value (the starved-fitness signal for budget
+    reallocation). An SLO-infeasible online rank is flagged and forces
+    meets_target False.
+
+    For a disaggregated ladder each role is sized independently to
+    target_tps; achieved_tps is the bottleneck (min) across ranks.
+    Cross-role unit matching (prefill input-tps vs decode output-tps) is a
+    v1 refinement.
+
+    Args:
+        ranks: rank dicts (RankSpec.from_dict form) with role, env, config.
+        job_features: the job's W features - type ("online"/"batch"),
+            request_arrival_rate, output_len_tokens_avg, target_p99_ttft_ms,
+            target_p99_tpot_ms, total_token_budget, deadline_hours,
+            headroom_factor.
+        target_tps: override; default computed from job_features via
+            required_throughput_enumerator.
+        utilization_target: override; default UTILIZATION_TARGET_ONLINE for
+            online, 1.0 for batch.
+
+    Returns:
+        {"ranks": [sized rank dicts], "regime", "target_tps",
+         "achieved_tps", "meets_target", "per_rank": [...],
+         "marginal_value": {env_key: extra_gpus_to_meet_target}}.
+    """
+    _require("resource_map", "surrogate", "candidate_graph", "dro")
+
+    regime = str(job_features.get("type", "online")).lower()
+    is_online = regime != "batch"
+    target = (
+        float(target_tps)
+        if target_tps is not None
+        else float(required_throughput_enumerator(job_features))
+    )
+    util = (
+        float(utilization_target)
+        if utilization_target is not None
+        else (UTILIZATION_TARGET_ONLINE if is_online else 1.0)
+    )
+    ttft_target = _feature_value(job_features, "target_p99_ttft_ms", "target_p99_TTFT_ms")
+    tpot_target = _feature_value(job_features, "target_p99_tpot_ms", "target_p99_TPOT_ms")
+
+    sized: list[dict[str, Any]] = []
+    per_rank: list[dict[str, Any]] = []
+    marginal: dict[str, int] = {}
+    achieved_values: list[float] = []
+    all_slo_ok = True
+
+    for raw in ranks:
+        rank = RankSpec.from_dict(raw)
+        gpus_per_chain = rank.gpus_per_chain()
+        gpu_type = rank.env[3] if rank.env and len(rank.env) >= 4 else None
+        free = _CTX.resource_map.get_avail_capacity(rank.env, gpu_type) if gpu_type else 0
+        max_by_cap = free // gpus_per_chain if gpus_per_chain > 0 else 0
+
+        y_hat = predict_outcome({"job_config": rank.config}).get("y_hat", {})
+        per_chain_raw = _y_value(y_hat, "throughput_tokens_per_sec", "throughput_token_per_sec")
+        per_chain_eff = per_chain_raw * util
+
+        slo_violations: list[str] = []
+        if is_online:
+            ttft_pred = _y_value(y_hat, "p99_ttft_ms", "p99_TTFT_ms")
+            tpot_pred = _y_value(y_hat, "p99_tpot_ms", "p99_TPOT_ms")
+            if ttft_target is not None and ttft_pred > ttft_target:
+                slo_violations.append(f"p99_ttft {ttft_pred:.0f}ms > {ttft_target:.0f}ms target")
+            if tpot_target is not None and tpot_pred > tpot_target:
+                slo_violations.append(f"p99_tpot {tpot_pred:.1f}ms > {tpot_target:.1f}ms target")
+        slo_ok = not slo_violations
+        all_slo_ok = all_slo_ok and slo_ok
+
+        if per_chain_eff > 0:
+            needed = max(1, math.ceil(target / per_chain_eff))
+            no_prediction = False
+        else:
+            needed = max_by_cap  # no throughput signal: use what capacity allows
+            no_prediction = True
+
+        n_replicas = min(needed, max_by_cap) if max_by_cap >= 1 else 0
+        rank.n_replicas = n_replicas
+        sized.append(rank.to_dict())
+
+        achieved_values.append(n_replicas * per_chain_eff)
+        capacity_bound = needed > n_replicas
+        if capacity_bound:
+            env_key = _env_key(rank.env)
+            marginal[env_key] = marginal.get(env_key, 0) + (needed - n_replicas) * gpus_per_chain
+
+        per_rank.append(
+            {
+                "role": rank.role,
+                "env": list(rank.env) if rank.env else None,
+                "per_chain_tps_raw": per_chain_raw,
+                "per_chain_tps_effective": per_chain_eff,
+                "utilization_target": util,
+                "gpus_per_chain": gpus_per_chain,
+                "needed_replicas": needed,
+                "max_replicas_by_capacity": max_by_cap,
+                "n_replicas": n_replicas,
+                "capacity_bound": capacity_bound,
+                "slo_ok": slo_ok,
+                "slo_violations": slo_violations,
+                "no_throughput_prediction": no_prediction,
+            }
+        )
+
+    achieved_tps = min(achieved_values) if achieved_values else 0.0
+    meets_target = (
+        achieved_tps >= target and all(r["n_replicas"] >= 1 for r in per_rank) and all_slo_ok
+    )
+    return {
+        "ranks": sized,
+        "regime": regime,
+        "target_tps": target,
+        "achieved_tps": achieved_tps,
+        "meets_target": meets_target,
+        "per_rank": per_rank,
+        "marginal_value": marginal,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -1056,8 +1321,8 @@ def compute_eig(candidate_ladder: dict[str, Any]) -> float:
     and mechanisms.
 
     Args:
-        candidate_ladder: {"ranks": [{"mechanism_id", "config",
-            "n_replicas", "env"}], "duration_minutes": float}.
+        candidate_ladder: Canonical ladder list of rank dicts. Each rank
+            carries mechanism_id, config, n_replicas, and env.
 
     Returns:
         Non-negative EIG value.
@@ -1188,16 +1453,18 @@ def c_d_classification(v_cusum_matched: bool, y_cusum_matched: bool) -> str:
 # ----------------------------------------------------------------------
 
 
-def compute_sigma(plan: dict[str, Any]) -> dict[str, Any]:
+def compute_sigma(plan) -> dict[str, Any]:
     """Score a plan: per-job sigma and the cluster aggregate.
 
     sigma = J + beta_t * eig - gamma * Pr_DRO - lambda_swit * switch_cost,
-    summed over jobs whose actions carry a ladder and y_hat.
+    over every ladder-bearing action (place/swap/retry/resume). The
+    scoring inputs are DERIVED, not trusted from the LLM: prev_ladder and
+    slo_thresholds come from the snapshot, y_hat from the action's
+    advisory predicted_y or a fresh surrogate call. Non-ladder actions
+    (keep/defer/preempt/terminate/diagnose) deploy nothing new and score 0.
 
     Args:
-        plan: {job_id: {"action", "ladder", "prev_ladder", "y_hat",
-            "slo_thresholds", ...}}. Actions without ladder or y_hat
-            (keep, defer, record_diagnosis) are skipped in scoring.
+        plan: A typed Plan or any raw form Plan.from_raw accepts.
 
     Returns:
         {"per_job": dict, "aggregate_sigma": float, "swap_count": int}.
@@ -1213,6 +1480,8 @@ def compute_sigma(plan: dict[str, Any]) -> dict[str, Any]:
         "confidence_service",
         "evidence_store",
     )
+    typed = _as_plan(plan)
+    snapshot = _snapshot()
     per_job: dict[str, dict[str, float]] = {}
     aggregate = 0.0
 
@@ -1222,11 +1491,13 @@ def compute_sigma(plan: dict[str, Any]) -> dict[str, Any]:
     lam = _CTX.slow_loop.get_sss_lambda_switch()
     eps_dro = _CTX.slow_loop.get_sss_radius_dro()
 
-    for job_id, action in plan.items():
-        ladder = action.get("ladder")
-        prev = action.get("prev_ladder", [])
-        y_hat = action.get("y_hat")
-        if y_hat is None or ladder is None:
+    for action in typed.actions:
+        if action.type not in LADDER_ACTIONS or not action.ladder:
+            continue
+        job_id = action.job_id
+        ladder_dicts = _ranks_as_dicts(action)
+        y_hat = _derive_y_hat(action, snapshot)
+        if not y_hat:
             continue
 
         J = float(
@@ -1239,7 +1510,7 @@ def compute_sigma(plan: dict[str, Any]) -> dict[str, Any]:
         )
         eig_value = float(
             _CTX.eig_module.compute_eig(
-                L_prime=_materialize_ladder(ladder),
+                L_prime=_materialize_ladder(ladder_dicts),
                 candidate_graph=_CTX.candidate_graph,
                 mechanism_registry=_CTX.mechanism_registry,
                 confidence_service=_CTX.confidence_service,
@@ -1247,15 +1518,15 @@ def compute_sigma(plan: dict[str, Any]) -> dict[str, Any]:
             )
         )
         switch_bundle = _CTX.switchcost_module.compute_switch_cost(
-            L_prev=_materialize_chain_list(prev),
-            L_new=_materialize_chain_list(ladder),
+            L_prev=_materialize_chain_list(_prev_ladder_for(snapshot, job_id)),
+            L_new=_materialize_chain_list(ladder_dicts),
             residual_history=_CTX.dro,
             epsilon_dro=eps_dro,
         )
         pr_slo = float(
             _CTX.dro.dro_chance_constraint(
                 pred_y=y_hat,
-                slo_thresholds=action.get("slo_thresholds", {}),
+                slo_thresholds=_slo_thresholds_for(snapshot, job_id),
             ).get("_any_violated", 0.0)
         )
 
@@ -1272,24 +1543,23 @@ def compute_sigma(plan: dict[str, Any]) -> dict[str, Any]:
     return {
         "per_job": per_job,
         "aggregate_sigma": aggregate,
-        "swap_count": swap_counter(plan),
+        "swap_count": swap_counter(typed),
     }
 
 
-def check_feasibility(plan: dict[str, Any]) -> dict[str, Any]:
+def check_feasibility(plan) -> dict[str, Any]:
     """Validate a plan with the bound plan validator.
 
     Args:
-        plan: Candidate plan dict.
+        plan: A typed Plan or any raw form Plan.from_raw accepts.
 
     Returns:
         {"feasible": bool, "violations": List[str]}.
     """
     _require("plan_validator", "resource_map", "slow_loop")
-    snap = _snapshot()
     result = _CTX.plan_validator.val_plan(
-        plan=plan,
-        cluster_snapshot=snap,
+        plan=_as_plan(plan),
+        cluster_snapshot=_snapshot(),
         slow_state=_CTX.slow_loop.state,
     )
     return {
@@ -1298,45 +1568,46 @@ def check_feasibility(plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def swap_counter(plan: dict[str, Any]) -> int:
-    """Count active jobs whose ladder changes in the plan.
+def swap_counter(plan) -> int:
+    """Count active-job churn against the C4 swap budget B_t.
 
-    Compared against B_t for the C4 swap budget constraint.
+    Counts actions in SWAP_BUDGET_ACTIONS (swap, preempt, retry). PLACE
+    and DEFER are admission, not churn; KEEP/DIAGNOSE/TERMINATE move no
+    running workload.
 
     Args:
-        plan: {job_id: action dict}.
+        plan: A typed Plan or any raw form Plan.from_raw accepts.
 
     Returns:
-        Number of ladder-changing actions.
+        Number of churning actions.
     """
-    count = 0
-    for action in plan.values():
-        prev = action.get("prev_ladder")
-        new = action.get("ladder")
-        if prev is not None and new is not None and prev != new:
-            count += 1
-    return count
+    typed = _as_plan(plan)
+    return sum(1 for a in typed.actions if a.type in SWAP_BUDGET_ACTIONS)
 
 
-def check_coverage(plan: dict[str, Any]) -> dict[str, Any]:
+def check_coverage(plan) -> dict[str, Any]:
     """Score how close the plan's predicted outcomes sit to z_star.
 
     A rough Pareto-coverage diagnostic, not the R2 indicator itself.
 
     Args:
-        plan: Plan dict with y_hat per resource action.
+        plan: A typed Plan or any raw form Plan.from_raw accepts.
 
     Returns:
         Dict objective -> score in [0, 1] plus "aggregate".
     """
     _require("slow_loop")
+    typed = _as_plan(plan)
+    snapshot = _snapshot()
     z_star = _CTX.slow_loop.get_sss_z_star_t()
     ranges = _CTX.slow_loop.typical_ranges
     objectives = list(z_star.keys())
     scores = dict.fromkeys(objectives, 0.0)
     n = 0
-    for action in plan.values():
-        y_hat = action.get("y_hat") or {}
+    for action in typed.actions:
+        if action.type not in LADDER_ACTIONS:
+            continue
+        y_hat = _derive_y_hat(action, snapshot)
         if not y_hat:
             continue
         for obj in objectives:
@@ -1351,94 +1622,96 @@ def check_coverage(plan: dict[str, Any]) -> dict[str, Any]:
     return {**scores, "aggregate": aggregate}
 
 
-def check_canary_sanity(plan: dict[str, Any]) -> dict[str, Any]:
-    """Run heuristic sanity checks on canary sizes and risk.
+def check_canary_sanity(plan) -> dict[str, Any]:
+    """Heuristic canary-size check on each ladder-bearing action.
+
+    A swap/place launches the new ladder's ranks as canaries alongside
+    production; flag any whose total replica count looks large.
 
     Args:
-        plan: Plan dict; actions may carry delta_l_plus and switch_cost.
+        plan: A typed Plan or any raw form Plan.from_raw accepts.
 
     Returns:
         {"ok": bool, "warnings": List[str]}.
     """
+    typed = _as_plan(plan)
     warnings: list[str] = []
-    for job_id, action in plan.items():
-        canary = action.get("delta_l_plus", [])
-        if isinstance(canary, list):
-            total = sum(int(ce.get("n_replicas", 0)) for ce in canary)
-            if total > 10:
-                warnings.append(f"job {job_id}: canary size {total} > 10 chains")
-        c_risk = (action.get("switch_cost") or {}).get("c_risk", 0.0)
-        if c_risk > 50.0:
-            warnings.append(f"job {job_id}: c_risk {c_risk:.2f} > $50")
+    for action in typed.actions:
+        if action.type not in LADDER_ACTIONS or not action.ladder:
+            continue
+        total = sum(rank.n_replicas for rank in action.ladder)
+        if total > 10:
+            warnings.append(
+                f"job {action.job_id}: ladder launches {total} chains (> 10 canary heuristic)"
+            )
     return {"ok": len(warnings) == 0, "warnings": warnings}
 
 
-def check_past_failure(plan: dict[str, Any], window: int = 20) -> dict[str, Any]:
+def check_past_failure(plan, window: int = 20) -> dict[str, Any]:
     """Match plan (mechanism, env) choices against recent Q3/Q4 evidence.
 
     Args:
-        plan: Plan dict; resource actions carry mechanism_id and env.
+        plan: A typed Plan or any raw form Plan.from_raw accepts.
         window: Ticks to look back.
 
     Returns:
         {"matched_failures": List[dict], "warnings": List[str]}.
     """
     _require("evidence_store")
+    typed = _as_plan(plan)
     store = _CTX.evidence_store
-    current = store.current_tick()
-    cutoff = current - int(window)
+    cutoff = store.current_tick() - int(window)
     failures: list[dict[str, Any]] = []
     warnings: list[str] = []
 
-    for job_id, action in plan.items():
-        mech_id = action.get("mechanism_id")
-        env = action.get("env")
-        if mech_id is None:
-            continue
-        bad = 0
-        for row in store.get_rows_for_mechanism(mech_id, limit=200):
-            if row.tick <= cutoff:
+    for action in typed.actions:
+        for rank in action.ladder or []:
+            mech_id = rank.mechanism_id or action.mechanism_id
+            if mech_id is None:
                 continue
-            if env is not None and _env_key(row.env_label) != _env_key(env):
-                continue
-            q = row.q_label_per_mechanism.get(mech_id)
-            q_text = q.value if hasattr(q, "value") else q
-            if q_text in ("Q3", "Q4"):
-                bad += 1
-        if bad:
-            failures.append(
-                {
-                    "job_id": job_id,
-                    "mechanism_id": mech_id,
-                    "env": env,
-                    "n": bad,
-                }
-            )
-            warnings.append(
-                f"job {job_id}: {bad} recent Q3/Q4 rows for mechanism {mech_id} in {env}"
-            )
+            bad = 0
+            for row in store.get_rows_for_mechanism(mech_id, limit=200):
+                if row.tick <= cutoff:
+                    continue
+                if rank.env is not None and _env_key(row.env_label) != _env_key(rank.env):
+                    continue
+                q = row.q_label_per_mechanism.get(mech_id)
+                q_text = q.value if hasattr(q, "value") else q
+                if q_text in ("Q3", "Q4"):
+                    bad += 1
+            if bad:
+                failures.append(
+                    {
+                        "job_id": action.job_id,
+                        "mechanism_id": mech_id,
+                        "env": list(rank.env) if rank.env else None,
+                        "n": bad,
+                    }
+                )
+                warnings.append(
+                    f"job {action.job_id}: {bad} recent Q3/Q4 rows for "
+                    f"mechanism {mech_id} in {rank.env}"
+                )
     return {"matched_failures": failures, "warnings": warnings}
 
 
-def simulate_outcome_trajectory(plan: dict[str, Any]) -> dict[str, Any]:
-    """Predict outcomes for each resource action in the plan.
+def simulate_outcome_trajectory(plan) -> dict[str, Any]:
+    """Predict outcomes for each ladder-bearing action in the plan.
 
     Args:
-        plan: Plan dict; actions with a ladder get a prediction.
+        plan: A typed Plan or any raw form Plan.from_raw accepts.
 
     Returns:
-        Dict job_id -> {"y_hat", "v_hat", "dro_band"}.
+        Dict job_id -> {"y_hat", "v_hat", "dro_band"} for the ladder's
+        representative rank (aggregate rank if present, else the first).
     """
+    typed = _as_plan(plan)
     out: dict[str, Any] = {}
-    for job_id, action in plan.items():
-        if "ladder" not in action or action.get("ladder") is None:
+    for action in typed.actions:
+        if action.type not in LADDER_ACTIONS or not action.ladder:
             continue
-        out[job_id] = predict_outcome(
-            {
-                "job_config": action.get("config", {}),
-                "job_features": action.get("job_features", {}),
-            }
-        )
+        rep = next((r for r in action.ladder if r.role == "aggregate"), action.ladder[0])
+        out[action.job_id] = predict_outcome({"job_config": rep.config})
     return out
 
 
@@ -1447,8 +1720,8 @@ def simulate_outcome_trajectory(plan: dict[str, Any]) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
-def _materialize_ladder(ladder_dict_or_obj):
-    """Adapt a ladder dict into the object shape eig.py consumes.
+def _materialize_ladder(ladder_ranks):
+    """Adapt a canonical rank-list ladder into the object shape eig.py consumes.
 
     eig.py expects .ranks (each .mechanism_id, .config, .n_replicas),
     .envs(), .duration_minutes, and .applicable_mechanisms. The
@@ -1457,10 +1730,6 @@ def _materialize_ladder(ladder_dict_or_obj):
     An empty applicable set would zero the relevance gate and silently
     kill EIG, so committed mechanisms are always included.
     """
-    if hasattr(ladder_dict_or_obj, "ranks"):
-        return ladder_dict_or_obj
-    if not isinstance(ladder_dict_or_obj, dict):
-        raise TypeError("ladder must be a dict with a ranks list or an object with .ranks")
 
     class _Ladder:
         pass
@@ -1470,16 +1739,21 @@ def _materialize_ladder(ladder_dict_or_obj):
 
     ladder = _Ladder()
     ladder.ranks = []
-    ladder.duration_minutes = float(ladder_dict_or_obj.get("duration_minutes", 5.0))
+    ladder.duration_minutes = 5.0
     config_keys: set = set()
 
-    for r in ladder_dict_or_obj.get("ranks", []):
+    for r in ladder_ranks:
+        if hasattr(r, "to_dict"):
+            r = r.to_dict()
         rank = _Rank()
         rank.mechanism_id = r.get("mechanism_id")
         rank.config = r.get("config", {})
         rank.n_replicas = int(r.get("n_replicas", 1))
         rank.is_canary = bool(r.get("is_canary", False))
-        rank.env = r.get("env")
+        env = r.get("env")
+        # env arrives as a list from RankSpec.to_dict; envs() puts these in
+        # a set, so coerce to a hashable tuple here.
+        rank.env = tuple(env) if isinstance(env, (list, tuple)) else env
         ladder.ranks.append(rank)
         config_keys |= set(rank.config.keys())
 
@@ -1503,19 +1777,38 @@ def _materialize_ladder(ladder_dict_or_obj):
 
 
 def _materialize_chain_list(chain_list):
-    """Adapt chain dicts into ChainEntry objects for switchcost.py."""
+    """Adapt rank dicts into ChainEntry objects for switchcost.py.
+
+    Synthesizes a stable chain_id when one is absent (role + env +
+    sorted config), because switch cost matches ΔL+/ΔL- by chain_id -
+    None ids would collapse every distinct rank into one and break the
+    add/kill diff. env is coerced to a hashable tuple for pricing lookups.
+    """
     if not chain_list:
         return []
     if hasattr(chain_list[0], "chain_id"):
         return list(chain_list)
-    from src.cost.switch_cost import ChainEntry
+    from src.cost.switchcost import ChainEntry  # type: ignore[import-not-found]
 
-    return [
-        ChainEntry(
-            chain_id=c.get("chain_id", ""),
-            config=c.get("config", {}),
-            env=c.get("env", ""),
-            n_replicas=int(c.get("n_replicas", 1)),
+    out = []
+    for c in chain_list:
+        env = c.get("env")
+        env = tuple(env) if isinstance(env, (list, tuple)) else env
+        config = c.get("config", {})
+        chain_id = c.get("chain_id")
+        if not chain_id:
+            # repr over key-sorted config tolerates unhashable values
+            # (nested lists/dicts) while staying deterministic per tick.
+            fingerprint = repr(
+                (c.get("role", ""), env, sorted(config.items(), key=lambda kv: kv[0]))
+            )
+            chain_id = "auto_" + str(abs(hash(fingerprint)))
+        out.append(
+            ChainEntry(
+                chain_id=chain_id,
+                config=config,
+                env=env,
+                n_replicas=int(c.get("n_replicas", 1)),
+            )
         )
-        for c in chain_list
-    ]
+    return out

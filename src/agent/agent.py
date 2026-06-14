@@ -48,36 +48,21 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from src.agent.tools import agent_tools
+import src.agent.tools.agent_tools as agent_tools
 from src.config.hyperparameters import K_MAX, K_P
+from src.core.models import (
+    LADDER_ACTIONS,
+    REQUIRED_JOB_STATE,
+    ActionType,
+    Plan,
+    PlanAction,
+)
 
 log = logging.getLogger("koi.agent")
 
-ALLOWED_ACTIONS = frozenset(
-    {
-        "place",
-        "retry_launch",
-        "replace_chain",
-        "add_capacity",
-        "remove_capacity",
-        "migrate",
-        "keep",
-        "defer",
-        "mark_terminal_failed",
-        "record_diagnosis",
-    }
-)
-
-RESOURCE_ACTIONS = frozenset(
-    {
-        "place",
-        "retry_launch",
-        "replace_chain",
-        "add_capacity",
-        "remove_capacity",
-        "migrate",
-    }
-)
+# Specialist actions a single job may propose (a subset is meaningful per job;
+# DIAGNOSE/TERMINATE are root-only cluster decisions).
+SPECIALIST_ACTIONS = frozenset(a.value for a in ActionType)
 
 ALLOWED_FITNESS = frozenset({"starved", "happy", "overprovisioned", "blocked"})
 
@@ -234,7 +219,7 @@ class SpecialistRunner:
             "or cluster tradeoffs - that is the root's job, and you cannot "
             "see the information needed to do it.\n\n"
             "Output a single JSON object with keys: job_id, tenant_id, "
-            "action, ladder, predicted_y, predicted_sigma, "
+            "type, ladder, predicted_y, predicted_sigma, "
             "budget_utilization, used_capacity, fitness, "
             "marginal_value_of_more, unused_capacity, mechanism_ids, "
             "new_mechanism_proposals, reasoning. No prose outside the JSON."
@@ -288,18 +273,15 @@ class SpecialistRunner:
                 log.exception("specialist LLM call failed for %s", job_id)
                 break
             result = self._parse_json(response)
-            violations = (
-                ["output was not parseable JSON"]
-                if result is None
-                else self._validate(result, job_id, slice_)
-            )
+            violations = self._validate(result, job_id, slice_)
             self.trace.add(
                 "specialist_result",
                 job_id=job_id,
                 attempt=attempt,
                 violations=violations,
             )
-            if result is not None and not violations:
+            if not violations:
+                assert result is not None
                 return result
             messages.append({"role": "assistant", "content": response})
             messages.append(
@@ -317,7 +299,7 @@ class SpecialistRunner:
         return {
             "job_id": job_id,
             "tenant_id": slice_.get("tenant_id", "default"),
-            "action": "keep" if is_active else "defer",
+            "type": "keep" if is_active else "defer",
             "ladder": None,
             "predicted_y": {},
             "predicted_sigma": 0.0,
@@ -349,18 +331,21 @@ class SpecialistRunner:
 
     @staticmethod
     def _validate(
-        result: dict[str, Any],
+        result: dict[str, Any] | None,
         job_id: str,
         slice_: dict[str, Any],
     ) -> list[str]:
         """Deterministic checks on a specialist result."""
+        if result is None:
+            return ["output was not parseable JSON"]
         violations: list[str] = []
         if result.get("job_id") != job_id:
             violations.append(f"job_id mismatch: expected {job_id}")
         if result.get("fitness") not in ALLOWED_FITNESS:
             violations.append(f"fitness must be one of {sorted(ALLOWED_FITNESS)}")
-        if result.get("action") not in ALLOWED_ACTIONS:
-            violations.append(f"action must be one of {sorted(ALLOWED_ACTIONS)}")
+        action = result.get("type")
+        if action is None or str(action).lower() not in SPECIALIST_ACTIONS:
+            violations.append(f"type must be one of {sorted(SPECIALIST_ACTIONS)}")
 
         budget = {
             agent_tools._env_key(env): int(n) for env, n in (slice_.get("env_budget") or {}).items()
@@ -406,9 +391,15 @@ class KoiAgentHarness:
         plan_validator: Optional validator with val_plan(...) used to
             pre-screen K_P candidates before scoring. S5 still runs the
             authoritative validation.
-        shared tool deps: Optional service singletons bound into
-            agent_tools when boot passes them; missing required services
-            fail fast at run_agent_loop.
+        tool_dependencies: Optional dict of the shared math/state singletons
+            the tools need (slow_loop, dro, evidence_store,
+            mechanism_registry, confidence_service, candidate_graph,
+            eig_module, tchebycheff_module, switchcost_module, surrogate).
+            Forwarded verbatim to agent_tools.bind_tools. Pass it here for a
+            self-contained harness (tests, simple boot); omit it if a boot
+            script already bound them - bind_tools is additive, and
+            run_agent_loop asserts the full surface is wired before planning
+            either way.
         config: Optional overrides: k_p, k_max, wall_clock_sec,
             stdout_limit, consecutive_error_limit, max_history_messages.
             max_history_messages bounds the transcript for small-context
@@ -422,23 +413,8 @@ class KoiAgentHarness:
         resource_map=None,
         tenant_registry=None,
         plan_validator=None,
+        tool_dependencies: dict[str, Any] | None = None,
         config: dict[str, Any] | None = None,
-        *,
-        slow_loop=None,
-        dro=None,
-        evidence_store=None,
-        mechanism_registry=None,
-        confidence_service=None,
-        candidate_graph=None,
-        surrogate=None,
-        telemetry=None,
-        cusum=None,
-        icp=None,
-        quadrant_validator=None,
-        eig_module=None,
-        tchebycheff_module=None,
-        switchcost_module=None,
-        regret_calculator=None,
     ):
         cfg = config or {}
         self.llm = llm_client
@@ -458,27 +434,19 @@ class KoiAgentHarness:
             specialist_llm_client or llm_client, trace=self.trace
         )
         self._pending_violations: list[str] = []
+        self._current_tick: int = 0
 
+        # Bind in two layers, both additive. Shared singletons come from the
+        # boot script OR tool_dependencies here; the harness owns binding the
+        # specialist_runner it just created plus the agent-flow services it
+        # received. assert_planning_ready() in run_agent_loop catches any gap.
+        if tool_dependencies:
+            agent_tools.bind_tools(**tool_dependencies)
         agent_tools.bind_tools(
             specialist_runner=self.specialist_runner,
             tenant_registry=tenant_registry,
             resource_map=resource_map,
             plan_validator=plan_validator,
-            slow_loop=slow_loop,
-            dro=dro,
-            evidence_store=evidence_store,
-            mechanism_registry=mechanism_registry,
-            confidence_service=confidence_service,
-            candidate_graph=candidate_graph,
-            surrogate=surrogate,
-            telemetry=telemetry,
-            cusum=cusum,
-            icp=icp,
-            quadrant_validator=quadrant_validator,
-            eig_module=eig_module,
-            tchebycheff_module=tchebycheff_module,
-            switchcost_module=switchcost_module,
-            regret_calculator=regret_calculator,
         )
 
     # ------------------------------------------------------------------
@@ -513,11 +481,17 @@ class KoiAgentHarness:
         Returns:
             A materialized plan dict {job_id: action}, or the fallback.
         """
+        # Rebind this tick's evidence_store and mechanism_registry so the
+        # tools (which read _CTX) and the REPL namespace (bound in
+        # one_trajectory) see the SAME objects - never a boot-bound instance
+        # diverging from the one the FSM passes. Then fail fast if any
+        # planning dependency is still unbound, before burning trajectory turns.
         agent_tools.bind_tools(
             evidence_store=evidence_store,
             mechanism_registry=mechanism_registry,
         )
-        agent_tools.assert_planning_context_bound()
+        agent_tools.assert_planning_ready()
+        self._current_tick = tick
 
         violations = self._pending_violations
         self._pending_violations = []
@@ -604,8 +578,9 @@ class KoiAgentHarness:
             repair_violations: S5 violations when in repair mode.
 
         Returns:
-            A materialized plan dict, or None.
+            A materialized Plan, or None.
         """
+        self._current_tick = tick
         runtime = RLMRuntime(stdout_limit=self.stdout_limit, trace=self.trace)
         runtime.bind(
             cluster_snapshot=cluster_snapshot,
@@ -652,7 +627,7 @@ class KoiAgentHarness:
             if not blocks:
                 final = runtime.extract_final_from_text(response)
                 if final is not None:
-                    return self._try_materialize(final)
+                    return self._try_materialize(final, cluster_snapshot)
                 history.append(
                     {
                         "role": "user",
@@ -672,7 +647,7 @@ class KoiAgentHarness:
                 if "ERROR:" in shown:
                     turn_had_error = True
                 if runtime.final_value is not None:
-                    return self._try_materialize(runtime.final_value)
+                    return self._try_materialize(runtime.final_value, cluster_snapshot)
 
             consecutive_errors = consecutive_errors + 1 if turn_had_error else 0
             if consecutive_errors >= self.consecutive_error_limit:
@@ -689,7 +664,7 @@ class KoiAgentHarness:
 
         leftover = runtime.namespace.get("plan")
         if leftover is not None:
-            return self._try_materialize(leftover)
+            return self._try_materialize(leftover, cluster_snapshot)
         return None
 
     def _compact_history(self, history: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -720,93 +695,170 @@ class KoiAgentHarness:
     # Plan materialization and fallback
     # ------------------------------------------------------------------
 
-    def _try_materialize(self, raw_plan) -> dict[str, Any] | None:
-        """Materialize a raw plan, returning None when malformed."""
+    def _try_materialize(self, raw_plan, cluster_snapshot) -> Plan | None:
+        """Materialize a raw plan into a typed Plan, None when malformed."""
         try:
-            return self.materialize_plan(raw_plan)
-        except PlanMaterializationError as exc:
+            return self.materialize_plan(raw_plan, cluster_snapshot)
+        except (PlanMaterializationError, ValueError) as exc:
             self.trace.add("plan_materialization_failed", reason=str(exc))
             log.warning("plan materialization failed: %s", exc)
             return None
 
-    def materialize_plan(self, raw_plan) -> dict[str, Any]:
-        """Shape-check a raw plan into the typed plan dict S5 expects.
+    def materialize_plan(self, raw_plan, cluster_snapshot) -> Plan:
+        """Parse and validate the LLM's committed plan into a typed Plan.
 
-        Checks per action: known action type, resource actions carry a
-        ladder dict with a non-empty ranks list, each rank has
-        n_replicas, and a budget reference is present for resource
-        actions whenever a validated BudgetBook exists this tick.
+        Parsing (Plan.from_raw) accepts the Plan-shaped dict, a plain
+        actions list, or a job_id->action dict. This method then adds the
+        contextual checks that need the snapshot:
+
+            - No duplicate job_ids (one action per job).
+            - Job exists in the snapshot (when the snapshot exposes ids).
+            - Action is legal for the job's current state (PLACE only on
+              waiting, PREEMPT only on running, ...).
+            - Ladder actions carry a non-empty ladder; every rank has a
+              4-tuple env (launch target + ICP key) and >= 1 replica;
+              missing per-rank mechanism_id falls back to the action's,
+              and a missing mechanism_id is a warning (evidence degrades)
+              not a rejection.
+            - budget_ref present on ladder actions when a BudgetBook was
+              validated this tick.
+            - Coverage: jobs in the snapshot with no action are auto-filled
+              (active -> KEEP, pending -> DEFER) with a warning, so a
+              partial plan from a weak model still covers the cluster.
 
         Args:
-            raw_plan: The object the LLM committed via FINAL_VAR(plan).
+            raw_plan: Whatever the LLM committed via FINAL_VAR(plan).
+            cluster_snapshot: This tick's snapshot, for existence/state.
 
         Returns:
-            {job_id: action dict}.
+            A validated Plan.
 
         Raises:
-            PlanMaterializationError: On any shape violation.
+            PlanMaterializationError: On any unrecoverable shape/semantic
+                violation.
         """
-        if not isinstance(raw_plan, dict) or not raw_plan:
-            raise PlanMaterializationError("plan must be a non-empty dict of job_id -> action")
-
+        try:
+            plan = Plan.from_raw(raw_plan, tick=self._current_tick)
+        except ValueError as exc:
+            raise PlanMaterializationError(str(exc)) from exc
+        states = self._job_states(cluster_snapshot)
         book = agent_tools._CTX.validated_budget_book
-        plan: dict[str, Any] = {}
-        for job_id, action in raw_plan.items():
-            if not isinstance(action, dict):
-                raise PlanMaterializationError(f"job {job_id}: action must be a dict")
-            action_type = action.get("action")
-            if action_type not in ALLOWED_ACTIONS:
-                raise PlanMaterializationError(f"job {job_id}: unknown action {action_type!r}")
-            if action_type in RESOURCE_ACTIONS:
-                ladder = action.get("ladder")
-                if not isinstance(ladder, dict):
+
+        seen: set = set()
+        for action in plan.actions:
+            jid = action.job_id
+            if jid in seen:
+                raise PlanMaterializationError(f"duplicate action for job {jid}")
+            seen.add(jid)
+
+            if states is not None and jid not in states:
+                raise PlanMaterializationError(f"job {jid} not in this tick's snapshot")
+
+            required = REQUIRED_JOB_STATE.get(action.type)
+            if states is not None and required is not None:
+                actual = states.get(jid)
+                if actual is not None and actual != required:
                     raise PlanMaterializationError(
-                        f"job {job_id}: action {action_type} requires a ladder dict"
+                        f"job {jid}: {action.type.value} needs state "
+                        f"{required!r}, job is {actual!r}"
                     )
-                try:
-                    float(ladder.get("duration_minutes", 5.0))
-                except (TypeError, ValueError) as exc:
-                    raise PlanMaterializationError(
-                        f"job {job_id}: ladder duration_minutes must be numeric"
-                    ) from exc
-                ranks = ladder.get("ranks")
-                if not isinstance(ranks, list) or not ranks:
-                    raise PlanMaterializationError(
-                        f"job {job_id}: ladder requires a non-empty ranks list"
-                    )
-                for idx, rank in enumerate(ranks):
-                    if not isinstance(rank, dict):
-                        raise PlanMaterializationError(
-                            f"job {job_id}: ladder rank {idx} must be a dict"
-                        )
-                    for field in ("mechanism_id", "config", "env", "n_replicas"):
-                        if field not in rank:
-                            raise PlanMaterializationError(
-                                f"job {job_id}: ladder rank {idx} needs {field}"
-                            )
-                    if not isinstance(rank["config"], dict):
-                        raise PlanMaterializationError(
-                            f"job {job_id}: ladder rank {idx} config must be a dict"
-                        )
-                    try:
-                        replicas = int(rank["n_replicas"])
-                    except (TypeError, ValueError) as exc:
-                        raise PlanMaterializationError(
-                            f"job {job_id}: ladder rank {idx} n_replicas must be an int"
-                        ) from exc
-                    if replicas <= 0:
-                        raise PlanMaterializationError(
-                            f"job {job_id}: ladder rank {idx} n_replicas must be positive"
-                        )
-                if book is not None and not action.get("budget_ref"):
-                    raise PlanMaterializationError(
-                        f"job {job_id}: resource action needs budget_ref when a "
-                        "BudgetBook was validated this tick"
-                    )
-            plan[str(job_id)] = dict(action)
+
+            if action.type in LADDER_ACTIONS:
+                self._validate_ladder(action, book)
+
+        if states is not None:
+            self._autofill_coverage(plan, states)
+
+        # An empty commit is "keep everything" when the snapshot has jobs
+        # (auto-fill covers them). It is only malformed when nothing at all
+        # could be derived.
+        if not plan.actions:
+            raise PlanMaterializationError("plan has no actions and no jobs to cover")
+
         return plan
 
-    def _score_plan(self, plan: dict[str, Any]) -> float:
+    def _validate_ladder(self, action: PlanAction, book) -> None:
+        """Validate a ladder-bearing action; raise on hard violations."""
+        jid = action.job_id
+        # RESUME may relaunch on the pre-preemption ladder (None allowed).
+        if action.ladder is None:
+            if action.type is ActionType.RESUME:
+                return
+            raise PlanMaterializationError(f"job {jid}: {action.type.value} requires a ladder")
+        if not action.ladder:
+            raise PlanMaterializationError(f"job {jid}: ladder is empty")
+
+        for i, rank in enumerate(action.ladder):
+            if rank.env is None or len(rank.env) != 4:
+                raise PlanMaterializationError(
+                    f"job {jid} rank {i}: env must be a 4-tuple "
+                    "(cloud, region, market, gpu_type) to be launchable"
+                )
+            if rank.n_replicas < 1:
+                raise PlanMaterializationError(f"job {jid} rank {i}: n_replicas must be >= 1")
+            if rank.mechanism_id is None:
+                rank.mechanism_id = action.mechanism_id
+            if rank.mechanism_id is None:
+                log.warning(
+                    "job %s rank %d has no mechanism_id; evidence loop "
+                    "cannot attribute its CUSUM/Q",
+                    jid,
+                    i,
+                )
+
+        if book is not None and not action.budget_ref:
+            raise PlanMaterializationError(
+                f"job {jid}: ladder action needs budget_ref when a "
+                "BudgetBook was validated this tick"
+            )
+
+    def _autofill_coverage(self, plan: Plan, states: dict[str, str]) -> None:
+        """Add conservative no-op actions for jobs the plan omitted.
+
+        Active/running -> KEEP, waiting -> DEFER. Lets a weak model emit
+        only the jobs it wants to change while the cluster stays fully
+        covered. Logged so silent omissions are visible.
+        """
+        covered = plan.job_ids()
+        for job_id, state in states.items():
+            if job_id in covered:
+                continue
+            if state == "waiting":
+                plan.actions.append(PlanAction(job_id=job_id, type=ActionType.DEFER))
+            else:
+                plan.actions.append(PlanAction(job_id=job_id, type=ActionType.KEEP))
+            log.warning(
+                "job %s omitted from plan; auto-filled %s",
+                job_id,
+                "DEFER" if state == "waiting" else "KEEP",
+            )
+
+    @staticmethod
+    def _job_states(cluster_snapshot) -> dict[str, str] | None:
+        """Map job_id -> state from the snapshot, or None if unavailable.
+
+        Prefers an explicit job_states() method; else infers from the
+        active/pending summaries (active -> running, pending -> waiting).
+        None means the snapshot exposes no job inventory, so existence,
+        state, and coverage checks are skipped.
+        """
+        if cluster_snapshot is None:
+            return None
+        if hasattr(cluster_snapshot, "job_states"):
+            return dict(cluster_snapshot.job_states())
+        states: dict[str, str] = {}
+        has_any = False
+        if hasattr(cluster_snapshot, "active_jobs_summary"):
+            has_any = True
+            for j in cluster_snapshot.active_jobs_summary():
+                states[j.get("job_id", j.get("id"))] = j.get("state", "running")
+        if hasattr(cluster_snapshot, "pending_jobs_summary"):
+            has_any = True
+            for j in cluster_snapshot.pending_jobs_summary():
+                states[j.get("job_id", j.get("id"))] = j.get("state", "waiting")
+        return states if has_any else None
+
+    def _score_plan(self, plan: Plan) -> float:
         """Score a plan by aggregate sigma; 0.0 when scoring fails."""
         try:
             return float(agent_tools.compute_sigma(plan)["aggregate_sigma"])
@@ -814,32 +866,28 @@ class KoiAgentHarness:
             log.exception("compute_sigma failed during K_P scoring")
             return 0.0
 
-    def _fallback_plan(self, cluster_snapshot) -> dict[str, Any]:
-        """Build the keep-all/defer-pending fallback plan.
+    def _fallback_plan(self, cluster_snapshot) -> Plan:
+        """Build the typed keep-all / defer-pending fallback Plan.
 
-        Uses the resource map's builder when present; otherwise
-        synthesizes directly from the snapshot summaries. Keeping the
-        running cluster untouched is always feasible by construction.
+        Uses the resource map's builder when present (normalized through
+        Plan.from_raw); otherwise synthesizes from the snapshot summaries.
+        Keeping the running cluster untouched is feasible by construction.
         """
         if self.resource_map is not None and hasattr(self.resource_map, "build_keep_all_plan"):
-            return self.resource_map.build_keep_all_plan(cluster_snapshot)
+            raw = self.resource_map.build_keep_all_plan(cluster_snapshot)
+            try:
+                return Plan.from_raw(raw, tick=self._current_tick)
+            except ValueError:
+                log.exception("resource_map keep-all plan was malformed")
 
-        plan: dict[str, Any] = {}
-        active = (
-            cluster_snapshot.active_jobs_summary()
-            if hasattr(cluster_snapshot, "active_jobs_summary")
-            else []
+        actions: list[PlanAction] = []
+        states = self._job_states(cluster_snapshot) or {}
+        for job_id, state in states.items():
+            kind = ActionType.DEFER if state == "waiting" else ActionType.KEEP
+            actions.append(PlanAction(job_id=job_id, type=kind))
+        return Plan(
+            tick=self._current_tick, actions=actions, tick_rationale="safe keep-all fallback"
         )
-        pending = (
-            cluster_snapshot.pending_jobs_summary()
-            if hasattr(cluster_snapshot, "pending_jobs_summary")
-            else []
-        )
-        for j in active:
-            plan[j.get("job_id", j.get("id"))] = {"action": "keep"}
-        for j in pending:
-            plan[j.get("job_id", j.get("id"))] = {"action": "defer"}
-        return plan
 
     # ------------------------------------------------------------------
     # Prompt
@@ -892,14 +940,7 @@ class KoiAgentHarness:
             "rescore with compute_sigma. Reallocate from fitness signals "
             "when the sigma gain is positive, rerun only affected "
             "specialists, then commit.\n\n"
-            "Plan format: {job_id: {action, ladder, prev_ladder, y_hat, "
-            "mechanism_id, env, slo_thresholds, budget_ref, theory_blob}}. "
-            "Resource-action ladder is {duration_minutes, ranks}, where "
-            "ranks is a non-empty list of {mechanism_id, config, env, "
-            "n_replicas}. "
-            "Action types: place, retry_launch, replace_chain, add_capacity, "
-            "remove_capacity, migrate, keep, defer, mark_terminal_failed, "
-            "record_diagnosis. keep/defer/record_diagnosis need no ladder.\n\n"
+            f"{self._plan_schema_section()}"
             "Markets are reserved/on-demand only this version; do not plan "
             "spot capacity.\n\n"
             "Write Python in ```repl blocks. Print what you need to see. "
@@ -908,4 +949,63 @@ class KoiAgentHarness:
             "You never deploy anything - the executor runs only after "
             "validation. Call FINAL_VAR(plan) exactly once, when the plan "
             "is coherent and feasible."
+        )
+
+    @staticmethod
+    def _plan_schema_section() -> str:
+        """The exact plan schema the LLM must build, with field-by-field shape.
+
+        Spelling out the dict shape (not just naming fields) is what lets a
+        weak open model emit a parseable plan on the first try. The
+        materializer accepts this Plan-shaped dict, a bare actions list, or
+        a job_id->action dict, and auto-fills any omitted job with KEEP
+        (active) or DEFER (waiting) - so a partial plan is safe.
+        """
+        return (
+            "Commit `plan` as a dict with this shape:\n"
+            "  plan = {\n"
+            "    'tick_rationale': '<1-3 paragraphs of cluster-wide reasoning>',\n"
+            "    'actions': [ <one action dict per job you decide> ],\n"
+            "  }\n"
+            "Action dict:\n"
+            "  {'job_id': str, 'type': <action>, 'tenant_id': str,\n"
+            "   'ladder': [<rank>, ...],            # only for place/swap/retry/resume\n"
+            "   'target_tps': float,                # required throughput for place/swap\n"
+            "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"
+            "   'swap_reason': 'scale_up|scale_down|migrate|replace|retune',  # swap only\n"
+            "   'budget_ref': '<BudgetSlice id>',   # required if a BudgetBook was validated\n"
+            "   'rationale': str}\n"
+            "Rank dict (each entry of ladder):\n"
+            "  {'role': 'prefill|decode|aggregate',\n"
+            "   'env': [cloud, region, market, gpu_type],   # REQUIRED - launch target + ICP key\n"
+            "   'config': {tp, pp, dp, ep, gpu_count, engine_name, ...},\n"
+            "   'n_replicas': int,\n"
+            "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
+            "Action types and the job state each needs:\n"
+            "  place    waiting->running   (needs ladder, target_tps)\n"
+            "  keep     running->running   (no ladder)\n"
+            "  swap     running->running   (needs ladder; scale/migrate/retune/replace)\n"
+            "  defer    waiting->waiting    (no ladder)\n"
+            "  preempt  running->paused     (no ladder; frees resources for other jobs)\n"
+            "  resume   paused->running     (ladder optional; defaults to prior ladder)\n"
+            "  retry    launch_failed->running (needs ladder)\n"
+            "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
+            "  diagnose  no change          (no ladder; record a theory only)\n"
+            "Every ladder rank MUST carry a 4-element env and should carry a "
+            "mechanism_id; a rank without env is rejected (not launchable). "
+            "Jobs you omit are auto-kept (running) or auto-deferred (waiting), "
+            "so list only the jobs you actually decide.\n"
+            "Do NOT guess n_replicas. Call size_ladder(ranks, job_features): "
+            "it derives n_replicas per rank from the surrogate's per-replica "
+            "throughput and free capacity, regime-aware. For batch jobs it "
+            "sizes on throughput vs deadline at full utilization. For online "
+            "jobs it also (a) rejects any config whose predicted p99 TTFT or "
+            "p99 TPOT exceeds the job's target - that config is not viable "
+            "for online no matter how many replicas, pick another - and "
+            "(b) derates per-replica throughput by a utilization target so "
+            "queue wait stays bounded and p99 TTFT holds. Use it as: "
+            "sized = size_ladder(ranks, job_features); action['ladder'] = "
+            "sized['ranks']. The other returned fields (meets_target, "
+            "per-rank slo_violations, marginal_value) are diagnostics and "
+            "should not be copied into ladder.\n\n"
         )
