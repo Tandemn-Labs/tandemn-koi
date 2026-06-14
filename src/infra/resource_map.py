@@ -4,6 +4,8 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
+from src.core.models import Plan
+
 ACTIVE_CHAIN_STATUSES = ("pending", "launching", "running")
 WAITING_JOB_STATUSES = ("submitted", "planning")
 
@@ -229,9 +231,9 @@ class ResourceMapManager:
     def build_keep_all_plan(self, snapshot: ClusterResourceSnapshot) -> dict[str, dict[str, str]]:
         plan: dict[str, dict[str, str]] = {}
         for job in snapshot.active_jobs_summary():
-            plan[job["job_id"]] = {"action": "keep"}
+            plan[job["job_id"]] = {"type": "keep"}
         for job in snapshot.pending_jobs_summary():
-            plan[job["job_id"]] = {"action": "defer"}
+            plan[job["job_id"]] = {"type": "defer"}
         return plan
 
     def _latest_resource_map_json(self, user_id: str | None = None) -> dict[str, Any]:
@@ -298,14 +300,18 @@ class ResourceMapManager:
 
     @staticmethod
     def _requested_gpus_by_env(plan) -> dict[str, int]:
+        """GPUs requested per env by a Plan's ladder-bearing actions.
+
+        Accepts a typed Plan or any raw form Plan.from_raw accepts. Counts
+        each rank's full GPU footprint (n_replicas * tp * pp), not just its
+        replica count.
+        """
+        typed = plan if isinstance(plan, Plan) else Plan.from_raw(plan, tick=0)
         requested: dict[str, int] = {}
-        for action in plan.values():
-            ladder = action.get("ladder") if isinstance(action, dict) else None
-            if not isinstance(ladder, dict):
-                continue
-            for rank in ladder.get("ranks", []):
-                env = ResourceMapManager._env_key(rank.get("env"))
-                requested[env] = requested.get(env, 0) + int(rank.get("n_replicas", 1))
+        for action in typed.actions:
+            for rank in action.ladder or []:
+                env = ResourceMapManager._env_key(rank.env)
+                requested[env] = requested.get(env, 0) + rank.total_gpus()
         return requested
 
     @staticmethod
@@ -330,14 +336,14 @@ class ResourceMapManager:
 # }
 # SMOKE_OK_PLAN = {
 #     "job_ok": {
-#         "action": "place",
-#         "ladder": {"ranks": [{"env": SMOKE_ENV, "n_replicas": 2}]},
+#         "type": "place",
+#         "ladder": [{"role": "aggregate", "env": SMOKE_ENV.split("|"), "n_replicas": 2}],
 #     }
 # }
 # SMOKE_BAD_PLAN = {
 #     "job_bad": {
-#         "action": "place",
-#         "ladder": {"ranks": [{"env": SMOKE_ENV, "n_replicas": 5}]},
+#         "type": "place",
+#         "ladder": [{"role": "aggregate", "env": SMOKE_ENV.split("|"), "n_replicas": 5}],
 #     }
 # }
 
