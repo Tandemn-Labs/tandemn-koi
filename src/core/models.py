@@ -44,6 +44,7 @@ class Mechanism:
     scope: dict
     narrative: str
     status: str = "active"
+    name: str | None = None
     mechanism_id: str | None = None
     archived_reason: str | None = None
 
