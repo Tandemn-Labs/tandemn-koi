@@ -1,13 +1,17 @@
 [project]
-name = "your-project-name"
+name = "tandemn-intelligence"
 version = "0.1.0"
-description = "Your project description"
-requires-python = ">=3.11"
+description = "Koi — cluster scheduling and learning"
+requires-python = ">=3.12"
 dependencies = [
     "huggingface_hub>=0.23.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
+    "tandemn-store",
 ]
+
+[tool.uv.sources]
+tandemn-store = { path = "../tandemn-store", editable = true }
 
 [dependency-groups]
 dev = [
@@ -18,7 +22,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 src = ["src"]
 
 [tool.ruff.format]
@@ -42,7 +46,7 @@ ignore = [
 ]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 files = ["src"]
 warn_unused_configs = true
 warn_redundant_casts = true

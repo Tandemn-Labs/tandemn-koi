@@ -13,9 +13,10 @@ def init_slow_state(config):
     pass
 
 
-def init_resource_map(TandemnStore):
-    # Placeholder: initialize and return ResourceMap from TandemnStore
-    pass
+def init_resource_map(user_id: str, postgres_client=None):
+    from src.infra.resource_map import ResourceMapManager
+
+    return ResourceMapManager(user_id=user_id, postgres_client=postgres_client)
 
 
 def init_seed_mechanisms_priors(LLM, CandidateGraph, NodeDescription):
