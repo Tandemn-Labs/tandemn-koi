@@ -30,6 +30,11 @@ class ConfidenceService:
         beta = self.candidate_graph.edge_metadata_table[edge_id].beta
         return alpha / (alpha + beta)
 
+    def get_edge_alpha_beta(self, edge_id: str) -> tuple[float, float]:
+        """Return the Beta posterior parameters for one edge."""
+        metadata = self.candidate_graph.edge_metadata_table[edge_id]
+        return float(metadata.alpha), float(metadata.beta)
+
     def get_edge_visit_count(self, edge_id: str) -> int:
         """Return how many S3 confidence updates touched the edge."""
         return self.candidate_graph.edge_metadata_table[edge_id].visit_count
@@ -59,6 +64,11 @@ class ConfidenceService:
         alpha = self.mechanism_registry.mechanism_metadata_table[mechanism_id].alpha
         beta = self.mechanism_registry.mechanism_metadata_table[mechanism_id].beta
         return alpha / (alpha + beta)
+
+    def get_mechanism_alpha_beta(self, mechanism_id: str) -> tuple[float, float]:
+        """Return the Beta posterior parameters for one mechanism."""
+        metadata = self.mechanism_registry.mechanism_metadata_table[mechanism_id]
+        return float(metadata.alpha), float(metadata.beta)
 
     def get_mechanism_visit_count(self, mechanism_id: str) -> int:
         """Return how many S3 confidence updates touched the mechanism."""

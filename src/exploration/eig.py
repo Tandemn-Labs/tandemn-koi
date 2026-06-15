@@ -4,20 +4,22 @@ Exact Bayesian EIG needs outcome distributions and mechanism posteriors,
 neither of which we have. This deterministic proxy keeps the same purpose:
 favor candidates that test uncertain and under-sampled edges and mechanisms.
 
-    eig(L_prime) = sum_e a_e * u(c_e) * w_rare(n_e)
-                 + mechanism_weight * sum_M a_M * u(c_M) * w_rare(n_M)
+    eig(L_prime) = sum_e a_e * U(alpha_e, beta_e)
+                 + mechanism_weight * sum_M a_M * U(alpha_M, beta_M)
 
-u(c) = 4*c*(1-c) peaks at uncertainty c=0.5. w_rare(n) = 1/sqrt(1+n) rewards
-less-tested structures. Eligibility masks a_e and a_M decide what is tested.
-The eig value is the exploration term in sigma, weighted by the annealed
-exploration weight. Cluster EIG uses saturation aggregation to avoid
-double-counting an edge tested by multiple ranks in one plan.
+U(alpha, beta) is the Beta posterior variance normalized so Beta(1,1)
+has uncertainty 1.0. This uses both the posterior mean and the evidence
+strength alpha+beta; visit_count remains audit/debug metadata. Eligibility
+masks a_e and a_M decide what is tested. The eig value is the exploration
+term in sigma, weighted by the annealed exploration weight. Cluster EIG
+uses saturation aggregation to avoid double-counting an edge tested by
+multiple ranks in one plan.
 
 Resolution conventions:
     Mechanism.edge_ids is the canonical bundle representation (list[str]).
     Edges resolve via candidate_graph.edge_table[edge_id] -> Edge.
-    Confidences and visit counts come from confidence_service, not from a
-    separate edge_table. Eligibility gates read from evidence_store.
+    Alpha/beta posteriors come from confidence_service, not from a separate
+    edge_table. Eligibility gates read from evidence_store.
 
 v0 scope: EIG iterates over each rank's committed mechanism_id. A rank may
 also accrue Beta updates to other applicable mechanisms post-deploy via the
@@ -41,7 +43,6 @@ def compute_eig(
     confidence_service,
     evidence_store,
     mechanism_weight: float = 1.0,
-    visit_cap: int | None = None,
 ) -> float:
     """Compute the proxy Causal-EIG for one candidate ladder.
 
@@ -54,11 +55,9 @@ def compute_eig(
             (committed), .config, .n_replicas.
         candidate_graph: CandidateGraph; resolves edge_id to Edge.
         mechanism_registry: MechanismRegistry exposing get_mechanism(id).
-        confidence_service: ConfidenceService for confidence and visit
-            count lookups.
+        confidence_service: ConfidenceService for alpha/beta lookups.
         evidence_store: EvidenceStore for eligibility-gate inputs.
         mechanism_weight: Edge-vs-mechanism term weighting.
-        visit_cap: Optional cap on visit count used in the rarity bonus.
 
     Returns:
         Non-negative EIG value.
@@ -80,22 +79,16 @@ def compute_eig(
         edge = candidate_graph.edge_table[edge_id]
         if not _edge_eligible(edge, L_prime, evidence_store):
             continue
-        c_e = confidence_service.get_edge_confidence(edge_id)
-        n_e = confidence_service.get_edge_visit_count(edge_id)
-        if visit_cap is not None:
-            n_e = min(n_e, visit_cap)
-        edge_sum += _bernoulli_variance(c_e) * _rarity(n_e)
+        alpha_e, beta_e = confidence_service.get_edge_alpha_beta(edge_id)
+        edge_sum += _beta_uncertainty(alpha_e, beta_e)
 
     mech_sum = 0.0
     for mid in deployed_mids:
         mech = mechanism_registry.get_mechanism(mid)
         if not check_mechanism_eligibility(mech, L_prime, candidate_graph, evidence_store):
             continue
-        c_m = confidence_service.get_mechanism_confidence(mid)
-        n_m = confidence_service.get_mechanism_visit_count(mid)
-        if visit_cap is not None:
-            n_m = min(n_m, visit_cap)
-        mech_sum += _bernoulli_variance(c_m) * _rarity(n_m)
+        alpha_m, beta_m = confidence_service.get_mechanism_alpha_beta(mid)
+        mech_sum += _beta_uncertainty(alpha_m, beta_m)
 
     return edge_sum + mechanism_weight * mech_sum
 
@@ -172,17 +165,17 @@ def aggregate_cluster_eig(
     edge_term = 0.0
     for edge_id, rank_list in edges_to_ranks.items():
         edge = candidate_graph.edge_table[edge_id]
-        c_e = confidence_service.get_edge_confidence(edge_id)
+        alpha_e, beta_e = confidence_service.get_edge_alpha_beta(edge_id)
         a_values = [
             1.0 if _edge_eligible(edge, r.ladder, evidence_store) else 0.0 for r in rank_list
         ]
         saturation = 1.0 - float(np.prod([1.0 - a for a in a_values]))
-        edge_term += _bernoulli_variance(c_e) * saturation
+        edge_term += _beta_uncertainty(alpha_e, beta_e) * saturation
 
     mech_term = 0.0
     for mid, rank_list in mechs_to_ranks.items():
         mech = mechanism_registry.get_mechanism(mid)
-        c_m = confidence_service.get_mechanism_confidence(mid)
+        alpha_m, beta_m = confidence_service.get_mechanism_alpha_beta(mid)
         a_values = [
             1.0
             if check_mechanism_eligibility(mech, r.ladder, candidate_graph, evidence_store)
@@ -190,7 +183,7 @@ def aggregate_cluster_eig(
             for r in rank_list
         ]
         saturation = 1.0 - float(np.prod([1.0 - a for a in a_values]))
-        mech_term += _bernoulli_variance(c_m) * saturation
+        mech_term += _beta_uncertainty(alpha_m, beta_m) * saturation
 
     return edge_term + mechanism_weight * mech_term
 
@@ -211,14 +204,18 @@ def find_eligible_paths(mechanism, candidate_graph) -> list[tuple]:
     return [(a, b) for a in xv_edges for b in vy_edges if a.dst == b.src]
 
 
-def _bernoulli_variance(c: float) -> float:
-    """Return 4*c*(1-c). Peaks at c=0.5, zero at c in {0, 1}."""
-    return 4.0 * float(c) * (1.0 - float(c))
+def _beta_uncertainty(alpha: float, beta: float) -> float:
+    """Return normalized Beta posterior variance in [0, 1].
 
-
-def _rarity(n: int) -> float:
-    """Return 1 / sqrt(1 + n) as a UCB-style rarity bonus on visit count."""
-    return 1.0 / np.sqrt(1.0 + float(n))
+    Var[p] = alpha*beta / ((alpha+beta)^2 * (alpha+beta+1)). Multiplying
+    by 12 makes the neutral prior Beta(1,1) equal 1.0, preserving the old
+    EIG scale while letting alpha+beta directly express prior/evidence
+    strength.
+    """
+    strength = float(alpha) + float(beta)
+    if strength <= 0.0:
+        return 0.0
+    return 12.0 * float(alpha) * float(beta) / (strength * strength * (strength + 1.0))
 
 
 def _edge_eligible(edge, L_prime, evidence_store) -> bool:
