@@ -1,0 +1,2002 @@
+{
+  "_meta": {
+    "description": "Initial mechanism seeds for the Koi MechanismRegistry. Each mechanism is a connected X->V->Y sub-DAG (its edge_ids are all present in edgeconfidencetable.json) plus a scope (when it applies) and a narrative (the causal story). These are the prior 'theories' the LLM proposer chooses among and that ICP/CUSUM/four-quadrant test against reality.",
+    "scope_semantics": "MechanismRegistry.percentage_scope_match serializes scope to JSON text and substring-matches requested (subset_x, subset_v) terms, so the x[] and v[] keyword lists drive applicability (>25% term match). workload_type / model_type / conditions are extra qualifiers (also serialized; the LLM reads conditions to decide quantitative applicability).",
+    "loader_contract": "For each entry build models.Mechanism(edge_ids=edge_ids, scope=scope, narrative=narrative, status=status) and call MechanismRegistry.add_mechanism(m); it computes mechanism_id = make_mechanism_id (SHA1 of sorted edge_ids + scope) and seeds MechanismMetadata(alpha=1, beta=1). mechanism_id is intentionally omitted here.",
+    "conditions_format": "list of {feature, op, value}; op in {>, <, >=, <=, ==}; advisory thresholds for the LLM, not enforced by the substring matcher.",
+    "model_type_values": ["dense_small", "dense_large", "moe", "any"],
+    "workload_type_values": ["online", "batch", "any"],
+    "confidence_bins_note": "c(M) is assigned by BIN, not a unique float: a Beta-Binomial prior with INTEGER (alpha, beta) pseudo-counts. alpha = pseudo-successes, beta = pseudo-failures; mean = alpha/(alpha+beta); strength = alpha+beta (pseudo-deployments of conviction = how sticky). Binning avoids false precision - 0.78 vs 0.74 is not an a-priori distinction. Bins are monotone in BOTH mean and strength (more confident => stickier, so noise erodes a textbook prior slowly but flips an uncertain one fast). Runtime four-quadrant Beta updates move (alpha, beta) from this prior."
+  },
+  "confidence_bins": {
+    "CERTAIN": [9, 1],
+    "STRONG": [4, 1],
+    "LIKELY": [3, 1],
+    "PLAUSIBLE": [2, 1],
+    "EVEN": [1, 1]
+  },
+  "mechanism_confidence_bins": {
+    "prefix_cache_shared_prefix_online": "CERTAIN",
+    "multiturn_session_kv_reuse": "STRONG",
+    "tp_comm_overhead_intranode": "CERTAIN",
+    "crossnode_parallelism_penalty": "CERTAIN",
+    "weight_quant_decode_bandwidth_large": "CERTAIN",
+    "moe_expert_imbalance": "STRONG",
+    "moe_expert_offload_memory": "PLAUSIBLE",
+    "pipeline_bubbles_deep_model": "CERTAIN",
+    "chunked_prefill_ttft_long_input": "STRONG",
+    "speculative_decoding_tpot": "LIKELY",
+    "pd_disaggregation_balance": "STRONG",
+    "pd_kv_transfer_coupling": "PLAUSIBLE",
+    "batch_throughput_latency_tradeoff": "CERTAIN",
+    "queueing_under_burst": "CERTAIN",
+    "kv_pressure_long_context": "STRONG",
+    "sliding_window_kv_relief": "PLAUSIBLE",
+    "kv_quant_capacity": "LIKELY",
+    "weight_quant_memory_fit": "CERTAIN",
+    "tp_pp_memory_sharding_fit": "STRONG",
+    "cuda_graphs_small_model_dispatch": "LIKELY",
+    "torch_compile_kernel_fusion": "PLAUSIBLE",
+    "cost_via_batching_utilization_batch": "STRONG",
+    "batch_deadline_throughput": "STRONG",
+    "attention_backend_kernel_choice": "PLAUSIBLE",
+    "activation_memory_chunked_prefill": "LIKELY",
+    "sequence_parallel_long_context_activation": "PLAUSIBLE",
+    "decode_bandwidth_small_batch": "STRONG",
+    "hardware_tier_ceiling": "STRONG",
+    "block_size_paging_efficiency": "PLAUSIBLE",
+    "scheduling_policy_batch_queue": "PLAUSIBLE",
+    "priority_preemption_fairness": "PLAUSIBLE",
+    "moe_expert_parallel_alltoall": "LIKELY",
+    "per_token_comm_volume_tp_large_hidden": "LIKELY",
+    "input_length_prefill_ttft": "CERTAIN",
+    "output_length_cost_amortization": "EVEN",
+    "gpu_memory_utilization_packing": "LIKELY",
+    "swap_offload_spillover": "PLAUSIBLE",
+    "engine_version_overhead_regression": "EVEN",
+    "dp_replica_scaleout_online": "STRONG",
+    "concurrent_streaming_cap": "PLAUSIBLE",
+    "gqa_kv_head_reduction": "STRONG",
+    "sparse_attention_long_context": "PLAUSIBLE",
+    "context_parallel_ultralong": "PLAUSIBLE",
+    "activation_quant_memory": "PLAUSIBLE",
+    "model_depth_memory": "STRONG",
+    "model_width_bandwidth": "STRONG",
+    "vocab_embedding_memory": "EVEN",
+    "speculative_draft_quality": "PLAUSIBLE",
+    "moe_capacity_factor_memory": "PLAUSIBLE",
+    "kv_fp8_decode_bandwidth": "LIKELY",
+    "compile_warmup_tradeoff": "PLAUSIBLE",
+    "chunk_steps_scheduling": "EVEN",
+    "arrival_pattern_batching": "PLAUSIBLE",
+    "length_variance_batching": "PLAUSIBLE",
+    "preemption_recompute_under_pressure": "PLAUSIBLE",
+    "interconnect_topology": "LIKELY",
+    "node_count_pipeline_bubbles": "LIKELY",
+    "prefill_worker_scaling_disagg": "LIKELY",
+    "decode_worker_scaling_disagg": "LIKELY",
+    "quant_method_cost_efficiency": "PLAUSIBLE",
+    "long_output_kv_growth": "STRONG",
+    "session_affinity_routing": "PLAUSIBLE",
+    "lmcache_external_kv_offload": "PLAUSIBLE",
+    "high_rate_small_model_compute": "PLAUSIBLE",
+    "cheap_gpu_via_quant": "LIKELY",
+    "moe_active_experts_compute": "PLAUSIBLE",
+    "flop_intensity_compute_bound": "LIKELY",
+    "hardware_kernel_generation": "PLAUSIBLE",
+    "context_length_capacity_limit": "STRONG",
+    "load_saturation_slo_collapse": "STRONG",
+    "gpu_sharing_fraction_packing": "PLAUSIBLE",
+    "hardware_bandwidth_vs_model": "STRONG",
+    "swap_space_oom_safety_valve": "PLAUSIBLE",
+    "tp_degree_sweet_spot": "STRONG",
+    "token_budget_vs_seq_cap": "LIKELY",
+    "prefill_decode_interference_chunked": "PLAUSIBLE",
+    "rag_prefill_heavy_workload": "STRONG",
+    "agentic_reasoning_decode_heavy": "STRONG",
+    "embedding_prefill_only_workload": "STRONG",
+    "code_completion_ultralow_latency": "LIKELY",
+    "ngram_speculative_repetitive": "PLAUSIBLE",
+    "moe_tp_vs_ep_placement": "PLAUSIBLE",
+    "tail_latency_burst_p99": "STRONG",
+    "right_size_gpu_for_cost": "LIKELY",
+    "kv_block_fragmentation": "PLAUSIBLE",
+    "max_model_len_overallocation_waste": "PLAUSIBLE",
+    "draft_model_size_tradeoff": "PLAUSIBLE",
+    "mixed_precision_weight_activation": "PLAUSIBLE",
+    "prefix_cache_memory_contention": "EVEN",
+    "cold_start_ephemeral_chain": "PLAUSIBLE",
+    "summarization_long_in_medium_out": "LIKELY",
+    "chat_balanced_multiturn": "STRONG",
+    "high_concurrency_kv_thrash": "STRONG",
+    "compute_vs_memory_bottleneck": "STRONG",
+    "spec_token_overshoot": "PLAUSIBLE",
+    "attention_backend_hardware_match": "PLAUSIBLE",
+    "long_context_chunked_prefill_mandatory": "LIKELY",
+    "dp_cost_vs_latency_tradeoff": "PLAUSIBLE",
+    "utilization_target_burst_safety": "PLAUSIBLE",
+    "quant_kernel_hardware_feasibility": "PLAUSIBLE"
+  },
+  "mechanisms": [
+    {
+      "name": "prefix_cache_shared_prefix_online",
+      "edge_ids": [
+        "prefix_cache_enabled->kvcache_hit_rate",
+        "shared_prefix_length_avg->kvcache_hit_rate",
+        "workload_prefix_concentration->kvcache_hit_rate",
+        "kvcache_hit_rate->p99_ttft_ms",
+        "kvcache_hit_rate->throughput_token_per_sec",
+        "kvcache_hit_rate->cost_per_token"
+      ],
+      "scope": {
+        "x": ["prefix_cache_enabled", "shared_prefix_length_avg", "workload_prefix_concentration"],
+        "v": ["kvcache_hit_rate"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "shared_prefix_length_avg", "op": ">", "value": 256}]
+      },
+      "narrative": "When the workload has long, concentrated shared prefixes, enabling prefix caching drives a high KV hit rate, which skips prefill work: TTFT and cost per token fall and throughput rises. Hit rate collapses if prefixes are short or diffuse.",
+      "status": "active"
+    },
+    {
+      "name": "multiturn_session_kv_reuse",
+      "edge_ids": [
+        "multi_turn_ratio->kvcache_hit_rate",
+        "is_session_affinity->kvcache_hit_rate",
+        "lmcache_enabled->kvcache_hit_rate",
+        "kvcache_hit_rate->p99_ttft_ms",
+        "kvcache_hit_rate->cost_per_token"
+      ],
+      "scope": {
+        "x": ["multi_turn_ratio", "is_session_affinity", "lmcache_enabled"],
+        "v": ["kvcache_hit_rate"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "multi_turn_ratio", "op": ">", "value": 0.3}]
+      },
+      "narrative": "Multi-turn conversations reuse prior-turn KV when requests are routed back to the cached node (session affinity) and persisted (LMCache). High reuse cuts repeated prefill, lowering TTFT and cost. Requires affinity routing or it degrades to no reuse.",
+      "status": "active"
+    },
+    {
+      "name": "tp_comm_overhead_intranode",
+      "edge_ids": [
+        "tp->comm_overhead_pct",
+        "tp->nvlink_tput_observed",
+        "nvlink_bandwidth_gbps->comm_overhead_pct",
+        "comm_overhead_pct->throughput_token_per_sec",
+        "comm_overhead_pct->p99_tpot_ms",
+        "nvlink_tput_observed->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["tp", "nvlink_bandwidth_gbps"],
+        "v": ["comm_overhead_pct", "nvlink_tput_observed"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "tp", "op": ">", "value": 1}]
+      },
+      "narrative": "Tensor parallelism all-reduces every layer over NVLink. As TP grows, comm overhead rises, capping throughput and inflating TPOT. NVLink bandwidth sets how steep the penalty is; on PCIe-only topologies the penalty is much worse.",
+      "status": "active"
+    },
+    {
+      "name": "crossnode_parallelism_penalty",
+      "edge_ids": [
+        "num_nodes_per_chain->comm_overhead_pct",
+        "internode_bandwidth_gbps->comm_overhead_pct",
+        "pp->comm_overhead_pct",
+        "comm_overhead_pct->throughput_token_per_sec",
+        "comm_overhead_pct->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["num_nodes_per_chain", "internode_bandwidth_gbps", "pp"],
+        "v": ["comm_overhead_pct"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "num_nodes_per_chain", "op": ">", "value": 1}]
+      },
+      "narrative": "Crossing node boundaries replaces NVLink with slower inter-node links, sharply raising comm overhead. Keep tensor-parallel groups within a node and reserve cross-node links for pipeline stages, which tolerate latency better.",
+      "status": "active"
+    },
+    {
+      "name": "weight_quant_decode_bandwidth_large",
+      "edge_ids": [
+        "weight_quantization_bits->mem_bandwidth_utilization",
+        "model_size_gb->mem_bandwidth_utilization",
+        "weight_quantization_bits->decode_itr_counts_per_second",
+        "mem_bandwidth_utilization->p99_tpot_ms",
+        "decode_itr_counts_per_second->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["weight_quantization_bits", "weight_quantization_method", "model_size_gb"],
+        "v": ["mem_bandwidth_utilization", "decode_itr_counts_per_second"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "model_size_gb", "op": ">", "value": 40}]
+      },
+      "narrative": "Decode on a large dense model is memory-bandwidth bound: every token reads all weights. Lower-bit weights cut weight traffic, raising the decode iteration rate and lowering TPOT. Gains saturate once decode becomes compute-bound at very low precision.",
+      "status": "active"
+    },
+    {
+      "name": "moe_expert_imbalance",
+      "edge_ids": [
+        "is_moe->expert_inbalance",
+        "router_policy->expert_inbalance",
+        "ep->expert_inbalance",
+        "num_routed_experts->expert_inbalance",
+        "expert_inbalance->throughput_token_per_sec",
+        "expert_inbalance->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["is_moe", "router_policy", "ep", "num_routed_experts"],
+        "v": ["expert_inbalance"],
+        "workload_type": "any",
+        "model_type": "moe",
+        "conditions": [{"feature": "is_moe", "op": "==", "value": true}]
+      },
+      "narrative": "In MoE models, token routing skew overloads some experts and starves others; the straggler expert bounds each step, capping throughput and inflating TPOT. Router policy (load-balancing loss, capacity factor) and expert-parallel placement modulate the imbalance.",
+      "status": "active"
+    },
+    {
+      "name": "moe_expert_offload_memory",
+      "edge_ids": [
+        "is_moe->gpu_mem_used_fraction",
+        "num_routed_experts->gpu_mem_used_fraction",
+        "expert_offload_enabled->gpu_mem_used_fraction",
+        "expert_offload_enabled->pcie_tput_observed",
+        "gpu_mem_used_fraction->slo_margin",
+        "pcie_tput_observed->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["is_moe", "num_routed_experts", "expert_offload_enabled"],
+        "v": ["gpu_mem_used_fraction", "pcie_tput_observed"],
+        "workload_type": "any",
+        "model_type": "moe",
+        "conditions": [{"feature": "expert_offload_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "MoE param stores are huge. Offloading idle experts to host memory frees VRAM (improving SLO headroom) but moves hot experts over PCIe on demand, which can stall decode. Worth it only when expert reuse is high or VRAM would otherwise OOM.",
+      "status": "active"
+    },
+    {
+      "name": "pipeline_bubbles_deep_model",
+      "edge_ids": [
+        "pp->pipeline_bubble_fraction",
+        "max_num_batched_tokens->pipeline_bubble_fraction",
+        "num_hidden_layers->pipeline_bubble_fraction",
+        "pipeline_bubble_fraction->throughput_token_per_sec",
+        "pipeline_bubble_fraction->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["pp", "max_num_batched_tokens", "num_hidden_layers"],
+        "v": ["pipeline_bubble_fraction"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "pp", "op": ">", "value": 1}]
+      },
+      "narrative": "Pipeline parallelism leaves fill/drain bubbles. Without enough in-flight micro-batches the bubble fraction stays high, wasting GPU-hours and cutting throughput. More batched tokens fill the pipeline; too few stages-per-GPU makes bubbles unavoidable.",
+      "status": "active"
+    },
+    {
+      "name": "chunked_prefill_ttft_long_input",
+      "edge_ids": [
+        "chunked_prefill_enable->prefill_iteration_counts_per_second",
+        "chunk_size->prefill_iteration_counts_per_second",
+        "isl_token_avg->prefill_iteration_counts_per_second",
+        "chunked_prefill_enable->live_batch_size",
+        "prefill_iteration_counts_per_second->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["chunked_prefill_enable", "chunk_size", "isl_token_avg"],
+        "v": ["prefill_iteration_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "isl_token_avg", "op": ">", "value": 2048}]
+      },
+      "narrative": "Long-input online serving uses chunked prefill to interleave prefill with ongoing decode, pacing prefill steps so a single long prompt does not monopolize the engine and blow up TTFT for concurrent requests. Chunk size trades TTFT smoothness vs prefill efficiency.",
+      "status": "active"
+    },
+    {
+      "name": "speculative_decoding_tpot",
+      "edge_ids": [
+        "spec_decoding_enabled->decode_itr_counts_per_second",
+        "num_speculative_tokens->decode_itr_counts_per_second",
+        "spec_acceptance_threshold->decode_itr_counts_per_second",
+        "decode_itr_counts_per_second->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["spec_decoding_enabled", "num_speculative_tokens", "spec_acceptance_threshold", "draft_model_id"],
+        "v": ["decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "spec_decoding_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "Speculative decoding emits several draft tokens per target step; when acceptance is high it multiplies effective tokens/step, lowering TPOT. Benefit is gated by draft-model acceptance: low acceptance wastes verify compute and can be net-negative.",
+      "status": "active"
+    },
+    {
+      "name": "pd_disaggregation_balance",
+      "edge_ids": [
+        "pd_enabled->pd_inbalance",
+        "prefill_worker_count->pd_inbalance",
+        "decode_worker_count->pd_inbalance",
+        "pd_ratio->pd_inbalance",
+        "pd_inbalance->p99_ttft_ms",
+        "pd_inbalance->p99_tpot_ms",
+        "pd_inbalance->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["pd_enabled", "prefill_worker_count", "decode_worker_count", "pd_ratio"],
+        "v": ["pd_inbalance"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "pd_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "Disaggregated prefill/decode must size the prefill:decode worker ratio to the workload's input:output token ratio. Mismatch starves one pool: too few prefill workers spikes TTFT, too few decode workers spikes TPOT, and either wastes the idle pool's GPUs.",
+      "status": "active"
+    },
+    {
+      "name": "pd_kv_transfer_coupling",
+      "edge_ids": [
+        "pd_enabled->pcie_tput_observed",
+        "kv_transfer_method->pcie_tput_observed",
+        "kv_transfer_method->pd_inbalance",
+        "pcie_tput_observed->p99_tpot_ms",
+        "pd_inbalance->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["pd_enabled", "kv_transfer_method"],
+        "v": ["pcie_tput_observed", "pd_inbalance"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "pd_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "In PD disaggregation the prefill KV must move to decode workers. The transfer method (NVLink/RDMA/PCIe) sets the handoff latency that couples the two stages; a slow path serializes prefill and decode and re-introduces the imbalance disaggregation was meant to remove.",
+      "status": "active"
+    },
+    {
+      "name": "batch_throughput_latency_tradeoff",
+      "edge_ids": [
+        "max_num_seq->live_batch_size",
+        "max_num_batched_tokens->live_batch_size",
+        "request_arrival_rate->live_batch_size",
+        "live_batch_size->throughput_token_per_sec",
+        "live_batch_size->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["max_num_seq", "max_num_batched_tokens"],
+        "v": ["live_batch_size"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "The central serving knob: larger running batches amortize weight reads and raise throughput, but lengthen each decode step and inflate TPOT. The right batch size is the largest that still meets the TPOT SLO; batch jobs push it to the memory limit.",
+      "status": "active"
+    },
+    {
+      "name": "queueing_under_burst",
+      "edge_ids": [
+        "request_arrival_rate->depth_req_q",
+        "peak_to_mean_ratio->depth_req_q",
+        "max_num_seq->depth_req_q",
+        "depth_req_q->p99_ttft_ms",
+        "depth_req_q->slo_margin"
+      ],
+      "scope": {
+        "x": ["request_arrival_rate", "peak_to_mean_ratio", "max_num_seq"],
+        "v": ["depth_req_q"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 2.0}]
+      },
+      "narrative": "Bursty arrivals build a request queue whose wait time dominates p99 TTFT (queue grows as utilization approaches 1). Capacity headroom or more replicas drain the queue; running near saturation is what blows the TTFT SLO during peaks.",
+      "status": "active"
+    },
+    {
+      "name": "kv_pressure_long_context",
+      "edge_ids": [
+        "max_num_seq->kv_pressure_score",
+        "max_model_len->kv_pressure_score",
+        "isl_token_avg->kv_pressure_score",
+        "kv_pressure_score->p99_tpot_ms",
+        "kv_pressure_score->slo_margin"
+      ],
+      "scope": {
+        "x": ["max_num_seq", "max_model_len", "isl_token_avg"],
+        "v": ["kv_pressure_score"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "max_model_len", "op": ">", "value": 8192}]
+      },
+      "narrative": "Long contexts at high concurrency drive KV-cache pressure; when blocks run short the engine preempts/recomputes sequences, eroding SLO margin and spiking TPOT. Reduce concurrency, shorten context, or relieve KV via quantization/windowing.",
+      "status": "active"
+    },
+    {
+      "name": "sliding_window_kv_relief",
+      "edge_ids": [
+        "sliding_window_size->kv_cache_util",
+        "sliding_window_size->kv_pressure_score",
+        "max_model_len->kv_pressure_score",
+        "kv_pressure_score->p99_tpot_ms",
+        "kv_cache_util->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["sliding_window_size", "max_model_len"],
+        "v": ["kv_cache_util", "kv_pressure_score"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "max_model_len", "op": ">", "value": 16384}]
+      },
+      "narrative": "Sliding-window attention caps retained KV per sequence, bounding KV growth for very long contexts and relieving pressure so larger batches fit. Only valid for models/workloads where bounded attention does not hurt quality.",
+      "status": "active"
+    },
+    {
+      "name": "kv_quant_capacity",
+      "edge_ids": [
+        "kvcache_quantization->gpu_mem_used_fraction",
+        "kvcache_dtype->gpu_mem_used_fraction",
+        "kvcache_quantization->kv_pressure_score",
+        "gpu_mem_used_fraction->slo_margin",
+        "kv_pressure_score->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["kvcache_quantization", "kvcache_dtype"],
+        "v": ["gpu_mem_used_fraction", "kv_pressure_score"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Quantizing the KV cache (e.g., fp8) halves KV bytes, relieving memory pressure and freeing blocks for more batch/context. Quality impact is usually small for fp8 KV; aggressive int4 KV can degrade long-context accuracy.",
+      "status": "active"
+    },
+    {
+      "name": "weight_quant_memory_fit",
+      "edge_ids": [
+        "weight_quantization_bits->gpu_mem_used_fraction",
+        "weight_dtype->gpu_mem_used_fraction",
+        "model_size_gb->gpu_mem_used_fraction",
+        "weight_quantization_bits->vram_headroom_gb",
+        "gpu_mem_used_fraction->slo_margin",
+        "vram_headroom_gb->slo_margin"
+      ],
+      "scope": {
+        "x": ["weight_quantization_bits", "weight_quantization_method", "weight_dtype", "model_size_gb"],
+        "v": ["gpu_mem_used_fraction", "vram_headroom_gb"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Weight quantization shrinks the resident model, fitting larger models on fewer/smaller GPUs and leaving VRAM headroom that reduces OOM/preemption risk. Trades a small accuracy hit for feasibility and cost; the primary lever for fitting on cheaper hardware.",
+      "status": "active"
+    },
+    {
+      "name": "tp_pp_memory_sharding_fit",
+      "edge_ids": [
+        "tp->gpu_mem_used_fraction",
+        "pp->gpu_mem_used_fraction",
+        "model_size_gb->gpu_mem_used_fraction",
+        "gpu_mem_gb->vram_headroom_gb",
+        "tp->vram_headroom_gb",
+        "vram_headroom_gb->slo_margin"
+      ],
+      "scope": {
+        "x": ["tp", "pp", "model_size_gb", "gpu_mem_gb"],
+        "v": ["gpu_mem_used_fraction", "vram_headroom_gb"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "model_size_gb", "op": ">", "value": 80}]
+      },
+      "narrative": "TP and PP shard weights across GPUs to fit models too large for one device. Over-sharding wastes GPUs and adds comm; under-sharding OOMs. The minimal sharding that fits with safe headroom is usually best (then scale replicas, not shards).",
+      "status": "active"
+    },
+    {
+      "name": "cuda_graphs_small_model_dispatch",
+      "edge_ids": [
+        "cuda_graph_enabled->dispatch_overhead_ms",
+        "cuda_graph_enabled->sm_utilization",
+        "cuda_graph_enabled->decode_itr_counts_per_second",
+        "dispatch_overhead_ms->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["cuda_graph_enabled", "torch_compile_enabled"],
+        "v": ["dispatch_overhead_ms", "sm_utilization"],
+        "workload_type": "online",
+        "model_type": "dense_small",
+        "conditions": []
+      },
+      "narrative": "For small models at high request rate, per-step kernel-launch overhead dominates decode time. CUDA graphs replay a captured launch sequence, cutting dispatch overhead and raising SM utilization and decode rate. Larger models hide launch overhead behind compute, so the gain shrinks.",
+      "status": "active"
+    },
+    {
+      "name": "torch_compile_kernel_fusion",
+      "edge_ids": [
+        "torch_compile_enabled->sm_utilization",
+        "torch_compile_enabled->dispatch_overhead_ms",
+        "compile_mode->dispatch_overhead_ms",
+        "sm_utilization->throughput_token_per_sec",
+        "dispatch_overhead_ms->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["torch_compile_enabled", "compile_mode", "num_jit_warmup_steps"],
+        "v": ["sm_utilization", "dispatch_overhead_ms"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "torch.compile fuses kernels and removes Python dispatch overhead, raising occupancy and throughput. Compile mode trades warmup time vs steady-state speed; only worth it for long-lived chains where warmup amortizes.",
+      "status": "active"
+    },
+    {
+      "name": "cost_via_batching_utilization_batch",
+      "edge_ids": [
+        "max_num_seq->live_batch_size",
+        "live_batch_size->cost_per_token",
+        "live_batch_size->throughput_token_per_sec",
+        "max_num_batched_tokens->sm_utilization",
+        "sm_utilization->cost_per_token"
+      ],
+      "scope": {
+        "x": ["max_num_seq", "max_num_batched_tokens"],
+        "v": ["live_batch_size", "sm_utilization"],
+        "workload_type": "batch",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Batch (offline) jobs have no per-request latency SLO, so cost per token is minimized by maximizing batch amortization and SM utilization: run the largest batch that fits memory and push utilization to ~1. Latency is irrelevant; only deadline matters.",
+      "status": "active"
+    },
+    {
+      "name": "batch_deadline_throughput",
+      "edge_ids": [
+        "max_num_batched_tokens->prefill_iteration_counts_per_second",
+        "max_num_seq->decode_itr_counts_per_second",
+        "decode_itr_counts_per_second->throughput_token_per_sec",
+        "prefill_iteration_counts_per_second->throughput_token_per_sec",
+        "live_batch_size->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["max_num_batched_tokens", "max_num_seq", "total_token_budget", "deadline_hrs"],
+        "v": ["prefill_iteration_counts_per_second", "decode_itr_counts_per_second", "live_batch_size"],
+        "workload_type": "batch",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "For deadline-bound batch jobs the objective is aggregate tokens/sec to finish by the deadline. Maximize both prefill and decode batch sizes; replica count is then total_token_budget/deadline divided by per-replica throughput.",
+      "status": "active"
+    },
+    {
+      "name": "attention_backend_kernel_choice",
+      "edge_ids": [
+        "attn_backend->prefill_iteration_counts_per_second",
+        "attn_backend->decode_itr_counts_per_second",
+        "attn_backend->sm_utilization",
+        "prefill_iteration_counts_per_second->p99_ttft_ms",
+        "decode_itr_counts_per_second->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["attn_backend", "engine_name"],
+        "v": ["prefill_iteration_counts_per_second", "decode_itr_counts_per_second", "sm_utilization"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "The attention backend (FlashAttention, FlashInfer, xFormers, Triton) sets kernel efficiency for both prefill and decode and interacts with head dims, GPU generation, and dtype. The best backend is hardware- and shape-specific, which is exactly what evidence should reveal.",
+      "status": "active"
+    },
+    {
+      "name": "activation_memory_chunked_prefill",
+      "edge_ids": [
+        "max_num_batched_tokens->activation_mem_pressure",
+        "chunk_size->activation_mem_pressure",
+        "chunked_prefill_enable->activation_mem_pressure",
+        "activation_mem_pressure->slo_margin",
+        "activation_mem_pressure->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["max_num_batched_tokens", "chunk_size", "chunked_prefill_enable", "isl_token_avg"],
+        "v": ["activation_mem_pressure"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "isl_token_avg", "op": ">", "value": 4096}]
+      },
+      "narrative": "Long prefills spike transient activation memory (proportional to batched tokens x hidden). Chunked prefill caps the per-step token count, bounding the activation peak so the job does not OOM mid-prefill or trigger preemption.",
+      "status": "active"
+    },
+    {
+      "name": "sequence_parallel_long_context_activation",
+      "edge_ids": [
+        "sp->activation_mem_pressure",
+        "tp->activation_mem_pressure",
+        "sp->comm_overhead_pct",
+        "activation_mem_pressure->slo_margin",
+        "comm_overhead_pct->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["sp", "tp", "cp"],
+        "v": ["activation_mem_pressure", "comm_overhead_pct"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "max_model_len", "op": ">", "value": 32768}]
+      },
+      "narrative": "Sequence/context parallelism shards activation memory along the sequence dimension, enabling very long contexts that would otherwise OOM, at the cost of extra communication. Worth it only when context length is the binding constraint.",
+      "status": "active"
+    },
+    {
+      "name": "decode_bandwidth_small_batch",
+      "edge_ids": [
+        "max_num_seq->mem_bandwidth_utilization",
+        "model_size_gb->mem_bandwidth_utilization",
+        "gpu_bandwidth_gbps->decode_itr_counts_per_second",
+        "mem_bandwidth_utilization->p99_tpot_ms",
+        "decode_itr_counts_per_second->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["max_num_seq", "model_size_gb", "gpu_bandwidth_gbps", "gpu_type"],
+        "v": ["mem_bandwidth_utilization", "decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "At small batch, decode is purely memory-bandwidth bound: TPOT is roughly model_bytes / GPU_bandwidth. Batching amortizes the weight read across sequences; a higher-bandwidth GPU (or quantized weights) directly lowers TPOT.",
+      "status": "active"
+    },
+    {
+      "name": "hardware_tier_ceiling",
+      "edge_ids": [
+        "gpu_tflops_fp16->sm_utilization",
+        "gpu_bandwidth_gbps->decode_itr_counts_per_second",
+        "gpu_bandwidth_gbps->mem_bandwidth_utilization",
+        "sm_utilization->throughput_token_per_sec",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["gpu_type", "gpu_generation", "gpu_tflops_fp16", "gpu_bandwidth_gbps", "cuda_compute_capability"],
+        "v": ["sm_utilization", "decode_itr_counts_per_second", "mem_bandwidth_utilization"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "GPU tier sets the compute (TFLOPs, prefill) and bandwidth (decode) ceilings. Newer generations raise both, so the cost-optimal placement is often a newer GPU at higher per-hour price but lower cost per token. Evidence should rank GPU types per workload shape.",
+      "status": "active"
+    },
+    {
+      "name": "block_size_paging_efficiency",
+      "edge_ids": [
+        "block_size->kv_cache_util",
+        "block_size->gpu_mem_used_fraction",
+        "block_size->kvcache_hit_rate",
+        "kv_cache_util->throughput_token_per_sec",
+        "kvcache_hit_rate->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["block_size"],
+        "v": ["kv_cache_util", "kvcache_hit_rate", "gpu_mem_used_fraction"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "KV block size trades internal fragmentation (large blocks waste partial pages) against prefix-reuse granularity (small blocks reuse more). Optimal block size depends on the prefix-sharing pattern and average sequence length.",
+      "status": "active"
+    },
+    {
+      "name": "scheduling_policy_batch_queue",
+      "edge_ids": [
+        "scheduling_policy->live_batch_size",
+        "scheduling_policy->depth_req_q",
+        "scheduling_policy->dispatch_overhead_ms",
+        "depth_req_q->p99_ttft_ms",
+        "live_batch_size->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["scheduling_policy", "preemption_policy"],
+        "v": ["live_batch_size", "depth_req_q", "dispatch_overhead_ms"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "The scheduler decides which requests batch together and when prefills preempt decodes. Prefill-prioritizing policies cut TTFT but choppy decode (worse TPOT); decode-prioritizing policies do the reverse. The right policy depends on which SLO is binding.",
+      "status": "active"
+    },
+    {
+      "name": "priority_preemption_fairness",
+      "edge_ids": [
+        "priority_class->depth_req_q",
+        "preemption_policy->depth_req_q",
+        "preemption_policy->live_batch_size",
+        "depth_req_q->p99_ttft_ms",
+        "depth_req_q->slo_margin"
+      ],
+      "scope": {
+        "x": ["priority_class", "preemption_policy"],
+        "v": ["depth_req_q"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "In a shared engine, priority class and preemption reorder the queue so high-priority traffic gets TTFT headroom at the expense of lower-priority jobs' queue depth and SLO margin. The mechanism quantifies the fairness/latency tradeoff under contention.",
+      "status": "active"
+    },
+    {
+      "name": "moe_expert_parallel_alltoall",
+      "edge_ids": [
+        "ep->comm_overhead_pct",
+        "ep->per_tok_comm_bytes",
+        "ep->nvlink_tput_observed",
+        "comm_overhead_pct->throughput_token_per_sec",
+        "per_tok_comm_bytes->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["ep", "is_moe"],
+        "v": ["comm_overhead_pct", "per_tok_comm_bytes", "nvlink_tput_observed"],
+        "workload_type": "any",
+        "model_type": "moe",
+        "conditions": [{"feature": "ep", "op": ">", "value": 1}]
+      },
+      "narrative": "Expert parallelism dispatches each token's hidden state to its experts via all-to-all, adding per-token communication bytes that inflate TPOT and comm overhead. EP degree must balance memory savings against this all-to-all tax; keep EP within the NVLink domain.",
+      "status": "active"
+    },
+    {
+      "name": "per_token_comm_volume_tp_large_hidden",
+      "edge_ids": [
+        "tp->per_tok_comm_bytes",
+        "hidden_size->per_tok_comm_bytes",
+        "pp->per_tok_comm_bytes",
+        "per_tok_comm_bytes->p99_tpot_ms",
+        "tp->comm_overhead_pct",
+        "comm_overhead_pct->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["tp", "hidden_size", "pp"],
+        "v": ["per_tok_comm_bytes", "comm_overhead_pct"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "tp", "op": ">", "value": 2}]
+      },
+      "narrative": "TP communication volume per token scales with hidden size, so wide large models pay more all-reduce bytes per decode step. High TP on a wide model can become comm-bound; quantized comm or fewer TP shards mitigates.",
+      "status": "active"
+    },
+    {
+      "name": "input_length_prefill_ttft",
+      "edge_ids": [
+        "isl_token_avg->input_length_observed",
+        "isl_token_avg->prefill_iteration_counts_per_second",
+        "input_length_observed->p99_ttft_ms",
+        "prefill_iteration_counts_per_second->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["isl_token_avg", "isl_token_max", "isl_distribution_type"],
+        "v": ["input_length_observed", "prefill_iteration_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Prefill cost is roughly linear in input length, so TTFT grows with prompt size. Long-tail inputs (high isl_token_max) blow p99 TTFT even if the average is fine; the prefill path must scale with the tail, not the mean.",
+      "status": "active"
+    },
+    {
+      "name": "output_length_cost_amortization",
+      "edge_ids": [
+        "osl_token_avg->output_length_observed",
+        "osl_token_avg->kv_cache_util",
+        "output_length_observed->cost_per_token",
+        "kv_cache_util->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["osl_token_avg", "osl_token_max", "osl_distribution_type"],
+        "v": ["output_length_observed", "kv_cache_util"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Long generations amortize the one-time prefill cost over more output tokens, lowering cost per token, but they hold KV for longer and raise occupancy. Beyond a point KV pressure caps concurrency and the cost benefit reverses.",
+      "status": "active"
+    },
+    {
+      "name": "gpu_memory_utilization_packing",
+      "edge_ids": [
+        "gpu_mem_util->gpu_mem_used_fraction",
+        "gpu_mem_util->kv_cache_util",
+        "gpu_mem_util->kv_pressure_score",
+        "gpu_mem_used_fraction->throughput_token_per_sec",
+        "kv_pressure_score->slo_margin"
+      ],
+      "scope": {
+        "x": ["gpu_mem_util"],
+        "v": ["gpu_mem_used_fraction", "kv_cache_util", "kv_pressure_score"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Raising gpu_memory_utilization grants the engine more KV blocks, enabling larger batch/context and higher throughput, but cuts the safety headroom that absorbs spikes. Too high a target trades throughput for OOM/preemption risk under bursts.",
+      "status": "active"
+    },
+    {
+      "name": "swap_offload_spillover",
+      "edge_ids": [
+        "swap_space_gb->gpu_mem_used_fraction",
+        "swap_space_gb->pcie_tput_observed",
+        "swap_space_gb->vram_headroom_gb",
+        "pcie_tput_observed->p99_tpot_ms",
+        "vram_headroom_gb->slo_margin"
+      ],
+      "scope": {
+        "x": ["swap_space_gb"],
+        "v": ["gpu_mem_used_fraction", "pcie_tput_observed", "vram_headroom_gb"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "CPU swap space lets the engine offload KV under pressure instead of preempting, improving SLO survivability, but swapped blocks travel over PCIe and stall decode when accessed. A safety valve, not a throughput lever.",
+      "status": "active"
+    },
+    {
+      "name": "engine_version_overhead_regression",
+      "edge_ids": [
+        "engine_name->dispatch_overhead_ms",
+        "engine_version->dispatch_overhead_ms",
+        "dispatch_overhead_ms->p99_tpot_ms",
+        "dispatch_overhead_ms->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["engine_name", "engine_version", "runtime_image"],
+        "v": ["dispatch_overhead_ms"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "The engine and exact version set scheduler efficiency. A version bump can silently regress per-step overhead (the class of bug where a point release adds latency); this mechanism makes engine_version a first-class causal suspect that ICP can flag across environments.",
+      "status": "active"
+    },
+    {
+      "name": "dp_replica_scaleout_online",
+      "edge_ids": [
+        "dp->depth_req_q",
+        "dp->live_batch_size",
+        "depth_req_q->p99_ttft_ms",
+        "depth_req_q->slo_margin"
+      ],
+      "scope": {
+        "x": ["dp"],
+        "v": ["depth_req_q", "live_batch_size"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Data-parallel replicas split the request stream, draining the queue and protecting p99 TTFT under high arrival rate. This is the horizontal scale lever for online SLO: add replicas (dp) rather than enlarging a single overloaded engine.",
+      "status": "active"
+    },
+    {
+      "name": "concurrent_streaming_cap",
+      "edge_ids": [
+        "max_concurrent_streaming->live_batch_size",
+        "max_concurrent_streaming->depth_req_q",
+        "live_batch_size->p99_tpot_ms",
+        "depth_req_q->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["max_concurrent_streaming"],
+        "v": ["live_batch_size", "depth_req_q"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Capping concurrent streams bounds the active decode batch (protecting TPOT for admitted requests) but pushes excess load into the queue (raising TTFT). The cap is an admission-control knob trading per-stream latency against wait time.",
+      "status": "active"
+    },
+    {
+      "name": "gqa_kv_head_reduction",
+      "edge_ids": [
+        "num_kv_heads->kv_cache_util",
+        "num_kv_heads->gpu_mem_used_fraction",
+        "num_kv_heads->kv_pressure_score",
+        "attn_heads_per_kv_head->kv_cache_util",
+        "kv_pressure_score->p99_tpot_ms",
+        "kv_cache_util->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["num_kv_heads", "attn_heads_per_kv_head"],
+        "v": ["kv_cache_util", "kv_pressure_score"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "attn_heads_per_kv_head", "op": ">", "value": 1}]
+      },
+      "narrative": "Grouped-query attention shares KV across query heads, so fewer KV heads shrink the KV cache. This is a model-architecture fact that relieves KV pressure and enables larger batch/context; the higher the grouping ratio, the larger the saving.",
+      "status": "active"
+    },
+    {
+      "name": "sparse_attention_long_context",
+      "edge_ids": [
+        "sparse_attn_pattern->sm_utilization",
+        "sparse_attn_pattern->mem_bandwidth_utilization",
+        "sparse_attn_pattern->kv_pressure_score",
+        "sm_utilization->throughput_token_per_sec",
+        "kv_pressure_score->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["sparse_attn_pattern", "max_model_len"],
+        "v": ["sm_utilization", "mem_bandwidth_utilization", "kv_pressure_score"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "max_model_len", "op": ">", "value": 16384}]
+      },
+      "narrative": "Sparse attention patterns cut the quadratic attention cost for long contexts, reducing FLOPs and KV reads, which raises throughput and relieves KV pressure. Valid only where the model supports the pattern without quality loss.",
+      "status": "active"
+    },
+    {
+      "name": "context_parallel_ultralong",
+      "edge_ids": [
+        "cp->activation_mem_pressure",
+        "cp->comm_overhead_pct",
+        "activation_mem_pressure->slo_margin",
+        "comm_overhead_pct->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["cp", "max_model_len"],
+        "v": ["activation_mem_pressure", "comm_overhead_pct"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "max_model_len", "op": ">", "value": 65536}]
+      },
+      "narrative": "Context parallelism shards the sequence dimension across GPUs, making ultra-long contexts feasible by spreading activation memory, at the cost of cross-GPU communication. Reserved for context lengths that no single GPU can hold.",
+      "status": "active"
+    },
+    {
+      "name": "activation_quant_memory",
+      "edge_ids": [
+        "activation_quantization_method->activation_mem_pressure",
+        "activation_dtype->activation_mem_pressure",
+        "activation_quantization_method->sm_utilization",
+        "activation_mem_pressure->slo_margin",
+        "activation_mem_pressure->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["activation_quantization_method", "activation_dtype"],
+        "v": ["activation_mem_pressure", "sm_utilization"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Quantizing activations (e.g., fp8) shrinks transient activation buffers and can use faster low-precision kernels, relieving activation memory pressure during large prefills. Accuracy impact must stay within tolerance.",
+      "status": "active"
+    },
+    {
+      "name": "model_depth_memory",
+      "edge_ids": [
+        "num_hidden_layers->gpu_mem_used_fraction",
+        "num_hidden_layers->mem_bandwidth_utilization",
+        "gpu_mem_used_fraction->slo_margin",
+        "mem_bandwidth_utilization->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["num_hidden_layers", "model_size_gb"],
+        "v": ["gpu_mem_used_fraction", "mem_bandwidth_utilization"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Model depth scales both weight memory and the per-token weight reads in decode; deeper models need more VRAM and more bandwidth, raising OOM risk and TPOT on bandwidth-limited GPUs.",
+      "status": "active"
+    },
+    {
+      "name": "model_width_bandwidth",
+      "edge_ids": [
+        "hidden_size->gpu_mem_used_fraction",
+        "hidden_size->mem_bandwidth_utilization",
+        "hidden_size->per_tok_comm_bytes",
+        "mem_bandwidth_utilization->p99_tpot_ms",
+        "per_tok_comm_bytes->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["hidden_size", "intermediate_size"],
+        "v": ["gpu_mem_used_fraction", "mem_bandwidth_utilization", "per_tok_comm_bytes"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": []
+      },
+      "narrative": "Model width drives weight memory, decode bandwidth, and TP communication volume per token simultaneously. Wide models are both bandwidth- and comm-bound, so width interacts strongly with quantization and TP degree.",
+      "status": "active"
+    },
+    {
+      "name": "vocab_embedding_memory",
+      "edge_ids": [
+        "vocab_size->gpu_mem_used_fraction",
+        "gpu_mem_used_fraction->slo_margin",
+        "gpu_mem_used_fraction->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["vocab_size"],
+        "v": ["gpu_mem_used_fraction"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "vocab_size", "op": ">", "value": 128000}]
+      },
+      "narrative": "Large vocabularies inflate embedding and LM-head memory (and the logits buffer), eating VRAM that would otherwise hold KV. Matters most for multilingual models with very large vocab.",
+      "status": "active"
+    },
+    {
+      "name": "speculative_draft_quality",
+      "edge_ids": [
+        "spec_decoding_method->decode_itr_counts_per_second",
+        "draft_model_id->decode_itr_counts_per_second",
+        "num_speculative_tokens->decode_itr_counts_per_second",
+        "decode_itr_counts_per_second->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["spec_decoding_method", "draft_model_id", "num_speculative_tokens"],
+        "v": ["decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "spec_decoding_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "The speculative method (draft model, Medusa, EAGLE, n-gram) and draft choice set the acceptance rate that determines realized speedup. A well-matched draft on a predictable workload yields large TPOT cuts; a poor draft wastes verify compute.",
+      "status": "active"
+    },
+    {
+      "name": "moe_capacity_factor_memory",
+      "edge_ids": [
+        "router_policy->expert_inbalance",
+        "num_active_experts->expert_inbalance",
+        "num_routed_experts->gpu_mem_used_fraction",
+        "expert_inbalance->throughput_token_per_sec",
+        "gpu_mem_used_fraction->slo_margin"
+      ],
+      "scope": {
+        "x": ["router_policy", "num_active_experts", "num_routed_experts"],
+        "v": ["expert_inbalance", "gpu_mem_used_fraction"],
+        "workload_type": "any",
+        "model_type": "moe",
+        "conditions": [{"feature": "is_moe", "op": "==", "value": true}]
+      },
+      "narrative": "MoE capacity factor and router policy trade dropped tokens vs memory: a higher capacity factor reduces imbalance/drops but reserves more buffer memory. The right setting depends on routing skew of the actual workload.",
+      "status": "active"
+    },
+    {
+      "name": "kv_fp8_decode_bandwidth",
+      "edge_ids": [
+        "kvcache_dtype->mem_bandwidth_utilization",
+        "kvcache_dtype->gpu_mem_used_fraction",
+        "kvcache_dtype->kv_pressure_score",
+        "mem_bandwidth_utilization->p99_tpot_ms",
+        "kv_pressure_score->slo_margin"
+      ],
+      "scope": {
+        "x": ["kvcache_dtype"],
+        "v": ["mem_bandwidth_utilization", "gpu_mem_used_fraction", "kv_pressure_score"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "An fp8 KV cache halves KV bytes read per decode step (lowering bandwidth pressure and TPOT) and KV memory (relieving pressure). Distinct from KV quantization method; dtype is the cheap, usually accuracy-safe lever.",
+      "status": "active"
+    },
+    {
+      "name": "compile_warmup_tradeoff",
+      "edge_ids": [
+        "compile_mode->dispatch_overhead_ms",
+        "num_jit_warmup_steps->dispatch_overhead_ms",
+        "torch_compile_enabled->sm_utilization",
+        "dispatch_overhead_ms->p99_tpot_ms",
+        "sm_utilization->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["compile_mode", "num_jit_warmup_steps", "torch_compile_enabled", "min_chain_warmup_time"],
+        "v": ["dispatch_overhead_ms", "sm_utilization"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Aggressive compile modes lower steady-state overhead but cost more warmup; the breakeven depends on chain lifetime. Long-lived serving chains amortize warmup; short-lived or frequently-swapped chains do not.",
+      "status": "active"
+    },
+    {
+      "name": "chunk_steps_scheduling",
+      "edge_ids": [
+        "max_chunked_steps_per_request->dispatch_overhead_ms",
+        "max_chunked_steps_per_request->live_batch_size",
+        "dispatch_overhead_ms->p99_tpot_ms",
+        "live_batch_size->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["max_chunked_steps_per_request", "scheduling_policy"],
+        "v": ["dispatch_overhead_ms", "live_batch_size"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "How many chunked steps a request takes per schedule cycle trades scheduling overhead against batch mixing; too-fine chunking adds per-step overhead, too-coarse hurts fairness and TTFT.",
+      "status": "active"
+    },
+    {
+      "name": "arrival_pattern_batching",
+      "edge_ids": [
+        "request_arrival_pattern->depth_req_q",
+        "request_arrival_pattern->live_batch_size",
+        "request_arrival_pattern->kv_cache_util",
+        "depth_req_q->p99_ttft_ms",
+        "live_batch_size->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["request_arrival_pattern", "peak_to_mean_ratio"],
+        "v": ["depth_req_q", "live_batch_size"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "The arrival shape (Poisson, bursty, diurnal) sets how full batches get and how the queue behaves; bursty patterns leave batches underfilled between spikes then overflow during them, so steady-state sizing mis-serves both.",
+      "status": "active"
+    },
+    {
+      "name": "length_variance_batching",
+      "edge_ids": [
+        "isl_distribution_type->input_length_observed",
+        "isl_distribution_type->live_batch_size",
+        "osl_distribution_type->live_batch_size",
+        "live_batch_size->p99_tpot_ms",
+        "live_batch_size->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["isl_distribution_type", "osl_distribution_type", "isl_token_max", "osl_token_max"],
+        "v": ["input_length_observed", "live_batch_size"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "High variance in input/output lengths causes ragged batches: long sequences hold slots and stall short ones (head-of-line), so high-variance workloads need length-aware batching or they waste batch capacity.",
+      "status": "active"
+    },
+    {
+      "name": "preemption_recompute_under_pressure",
+      "edge_ids": [
+        "preemption_policy->live_batch_size",
+        "preemption_policy->depth_req_q",
+        "preemption_policy->dispatch_overhead_ms",
+        "depth_req_q->p99_ttft_ms",
+        "live_batch_size->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["preemption_policy", "swap_space_gb"],
+        "v": ["live_batch_size", "depth_req_q", "dispatch_overhead_ms"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Under KV pressure the engine either recomputes preempted sequences (compute cost) or swaps them (PCIe cost). The preemption policy sets which, shaping the latency tail when the cache is contended.",
+      "status": "active"
+    },
+    {
+      "name": "interconnect_topology",
+      "edge_ids": [
+        "interconnect_type->comm_overhead_pct",
+        "interconnect_type->nvlink_tput_observed",
+        "interconnect_type->pcie_tput_observed",
+        "comm_overhead_pct->throughput_token_per_sec",
+        "nvlink_tput_observed->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["interconnect_type", "gpu_per_node", "nvlink_bandwidth_gbps"],
+        "v": ["comm_overhead_pct", "nvlink_tput_observed", "pcie_tput_observed"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "tp", "op": ">", "value": 1}]
+      },
+      "narrative": "The interconnect (NVLink vs PCIe vs NVSwitch) decides how cheaply TP/EP collectives run. The same parallel config that is comm-light on NVSwitch becomes comm-bound on PCIe-only nodes; topology must match the parallelism plan.",
+      "status": "active"
+    },
+    {
+      "name": "node_count_pipeline_bubbles",
+      "edge_ids": [
+        "num_nodes_per_chain->pipeline_bubble_fraction",
+        "num_nodes_per_chain->comm_overhead_pct",
+        "pp->pipeline_bubble_fraction",
+        "pipeline_bubble_fraction->throughput_token_per_sec",
+        "comm_overhead_pct->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["num_nodes_per_chain", "pp"],
+        "v": ["pipeline_bubble_fraction", "comm_overhead_pct"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "num_nodes_per_chain", "op": ">", "value": 1}]
+      },
+      "narrative": "Spreading pipeline stages across nodes lengthens stage-to-stage latency, deepening bubbles and adding cross-node comm. Multi-node pipelines need larger micro-batch counts to stay efficient.",
+      "status": "active"
+    },
+    {
+      "name": "prefill_worker_scaling_disagg",
+      "edge_ids": [
+        "prefill_worker_count->prefill_iteration_counts_per_second",
+        "prefill_worker_count->pd_inbalance",
+        "prefill_iteration_counts_per_second->p99_ttft_ms",
+        "pd_inbalance->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["prefill_worker_count", "pd_enabled"],
+        "v": ["prefill_iteration_counts_per_second", "pd_inbalance"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "pd_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "In disaggregation, adding prefill workers raises prefill throughput and rebalances toward the prefill side; the right count tracks the input-token rate. Under-provisioning prefill is the usual TTFT culprit for input-heavy workloads.",
+      "status": "active"
+    },
+    {
+      "name": "decode_worker_scaling_disagg",
+      "edge_ids": [
+        "decode_worker_count->decode_itr_counts_per_second",
+        "decode_worker_count->pd_inbalance",
+        "decode_itr_counts_per_second->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["decode_worker_count", "pd_enabled"],
+        "v": ["decode_itr_counts_per_second", "pd_inbalance"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "pd_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "Decode workers carry the sustained token generation; their count tracks the output-token rate. Under-provisioning decode spikes TPOT for long generations even when prefill is fast.",
+      "status": "active"
+    },
+    {
+      "name": "quant_method_cost_efficiency",
+      "edge_ids": [
+        "weight_quantization_method->gpu_mem_used_fraction",
+        "weight_quantization_bits->mem_bandwidth_utilization",
+        "mem_bandwidth_utilization->cost_per_token",
+        "gpu_mem_used_fraction->cost_per_token"
+      ],
+      "scope": {
+        "x": ["weight_quantization_method", "weight_quantization_bits"],
+        "v": ["gpu_mem_used_fraction", "mem_bandwidth_utilization"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Quantization method (GPTQ/AWQ/fp8/int4) at a given bit-width sets both the memory footprint (packing efficiency) and the decode bandwidth, which jointly drive cost per token. Methods differ in kernel support per GPU generation.",
+      "status": "active"
+    },
+    {
+      "name": "long_output_kv_growth",
+      "edge_ids": [
+        "osl_token_avg->kv_cache_util",
+        "osl_token_avg->kv_pressure_score",
+        "osl_token_avg->output_length_observed",
+        "kv_pressure_score->p99_tpot_ms",
+        "kv_cache_util->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["osl_token_avg", "osl_token_max"],
+        "v": ["kv_cache_util", "kv_pressure_score", "output_length_observed"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "osl_token_avg", "op": ">", "value": 1024}]
+      },
+      "narrative": "Long generations grow KV monotonically per step, so late in a long decode the cache is fullest and TPOT degrades. Reasoning/agentic workloads with long outputs need KV headroom budgeted for end-of-generation, not start.",
+      "status": "active"
+    },
+    {
+      "name": "session_affinity_routing",
+      "edge_ids": [
+        "is_session_affinity->kvcache_hit_rate",
+        "kvcache_hit_rate->p99_ttft_ms",
+        "kvcache_hit_rate->cost_per_token"
+      ],
+      "scope": {
+        "x": ["is_session_affinity", "multi_turn_ratio"],
+        "v": ["kvcache_hit_rate"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "is_session_affinity", "op": "==", "value": true}]
+      },
+      "narrative": "Routing a user's follow-up requests back to the replica holding their KV turns a cache miss into a hit. Affinity is what makes multi-turn KV reuse actually realize; round-robin routing throws the reuse away.",
+      "status": "active"
+    },
+    {
+      "name": "lmcache_external_kv_offload",
+      "edge_ids": [
+        "lmcache_enabled->kvcache_hit_rate",
+        "lmcache_enabled->pcie_tput_observed",
+        "kvcache_hit_rate->p99_ttft_ms",
+        "pcie_tput_observed->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["lmcache_enabled"],
+        "v": ["kvcache_hit_rate", "pcie_tput_observed"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "LMCache spills KV to host/remote tiers, extending the effective cache so more prefixes hit (lower TTFT) at the cost of fetch traffic over PCIe/network on a miss-to-warm. Net win when reuse is high and the tier is fast.",
+      "status": "active"
+    },
+    {
+      "name": "high_rate_small_model_compute",
+      "edge_ids": [
+        "request_arrival_rate->sm_utilization",
+        "request_arrival_rate->depth_req_q",
+        "request_arrival_rate->live_batch_size",
+        "sm_utilization->throughput_token_per_sec",
+        "depth_req_q->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["request_arrival_rate", "max_num_seq"],
+        "v": ["sm_utilization", "depth_req_q", "live_batch_size"],
+        "workload_type": "online",
+        "model_type": "dense_small",
+        "conditions": [{"feature": "request_arrival_rate", "op": ">", "value": 50}]
+      },
+      "narrative": "Small models at high request rate become scheduling/throughput bound rather than memory bound; the lever is enough batch and replicas to keep SMs busy and the queue drained, not parallelism.",
+      "status": "active"
+    },
+    {
+      "name": "cheap_gpu_via_quant",
+      "edge_ids": [
+        "weight_quantization_bits->gpu_mem_used_fraction",
+        "weight_quantization_bits->decode_itr_counts_per_second",
+        "decode_itr_counts_per_second->cost_per_token",
+        "gpu_mem_used_fraction->cost_per_token"
+      ],
+      "scope": {
+        "x": ["weight_quantization_bits", "gpu_type", "model_size_gb"],
+        "v": ["gpu_mem_used_fraction", "decode_itr_counts_per_second"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Quantizing weights lets a model fit and decode acceptably on cheaper/smaller GPUs, lowering cost per token even if raw tput drops, because the hourly rate drops more. The classic cost play: match the cheapest GPU the quantized model still meets SLO on.",
+      "status": "active"
+    },
+    {
+      "name": "moe_active_experts_compute",
+      "edge_ids": [
+        "num_active_experts->sm_utilization",
+        "num_active_experts->per_tok_comm_bytes",
+        "num_active_experts->expert_inbalance",
+        "sm_utilization->throughput_token_per_sec",
+        "per_tok_comm_bytes->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["num_active_experts", "ep"],
+        "v": ["sm_utilization", "per_tok_comm_bytes", "expert_inbalance"],
+        "workload_type": "any",
+        "model_type": "moe",
+        "conditions": [{"feature": "is_moe", "op": "==", "value": true}]
+      },
+      "narrative": "The top-k active experts set the per-token compute and the dispatch bytes. More active experts raise quality and compute but also all-to-all volume; the cost/quality knob specific to MoE serving.",
+      "status": "active"
+    },
+    {
+      "name": "flop_intensity_compute_bound",
+      "edge_ids": [
+        "flops_per_param->sm_utilization",
+        "num_attn_heads->sm_utilization",
+        "intermediate_size->sm_utilization",
+        "sm_utilization->throughput_token_per_sec",
+        "sm_utilization->cost_per_token"
+      ],
+      "scope": {
+        "x": ["flops_per_param", "num_attn_heads", "intermediate_size", "gpu_tflops_fp16"],
+        "v": ["sm_utilization"],
+        "workload_type": "batch",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "In compute-bound regimes (large prefill batches, high arithmetic intensity), throughput tracks SM utilization against the GPU FLOP ceiling. Architecture FLOP intensity sets how close to peak the model can run.",
+      "status": "active"
+    },
+    {
+      "name": "hardware_kernel_generation",
+      "edge_ids": [
+        "cuda_compute_capability->sm_utilization",
+        "cuda_compute_capability->decode_itr_counts_per_second",
+        "gpu_generation->decode_itr_counts_per_second",
+        "decode_itr_counts_per_second->throughput_token_per_sec",
+        "sm_utilization->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["cuda_compute_capability", "gpu_generation", "gpu_type"],
+        "v": ["sm_utilization", "decode_itr_counts_per_second"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Newer compute capability unlocks faster kernels (fp8 tensor cores, better attention) and higher bandwidth, raising decode rate and utilization. Some quant/attention paths only exist above a capability threshold, so hardware gates which configs are even runnable.",
+      "status": "active"
+    },
+    {
+      "name": "context_length_capacity_limit",
+      "edge_ids": [
+        "max_pos_embeddings->kv_pressure_score",
+        "max_model_len->kv_pressure_score",
+        "kv_pressure_score->slo_margin",
+        "kv_pressure_score->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["max_pos_embeddings", "max_model_len"],
+        "v": ["kv_pressure_score"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "max_model_len", "op": ">", "value": 32768}]
+      },
+      "narrative": "Allowing very long contexts (high max_model_len up to the model's positional limit) reserves KV budget per slot, capping concurrency. Setting max_model_len to the actual workload tail rather than the model max recovers batch capacity.",
+      "status": "active"
+    },
+    {
+      "name": "load_saturation_slo_collapse",
+      "edge_ids": [
+        "request_arrival_rate->depth_req_q",
+        "max_num_seq->kv_pressure_score",
+        "depth_req_q->slo_margin",
+        "kv_pressure_score->slo_margin",
+        "decode_itr_counts_per_second->slo_margin"
+      ],
+      "scope": {
+        "x": ["request_arrival_rate", "max_num_seq", "peak_to_mean_ratio"],
+        "v": ["depth_req_q", "kv_pressure_score", "decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "request_arrival_rate", "op": ">", "value": 0}]
+      },
+      "narrative": "As load approaches capacity, queue depth and KV pressure both rise nonlinearly and SLO margin collapses sharply (the knee of the curve). This mechanism is the saturation detector: it explains why a config fine at 70 percent load fails at 90 percent.",
+      "status": "active"
+    },
+    {
+      "name": "gpu_sharing_fraction_packing",
+      "edge_ids": [
+        "gpu_shared_fraction->gpu_mem_used_fraction",
+        "gpu_shared_fraction->sm_utilization",
+        "gpu_mem_used_fraction->slo_margin",
+        "sm_utilization->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["gpu_shared_fraction"],
+        "v": ["gpu_mem_used_fraction", "sm_utilization"],
+        "workload_type": "any",
+        "model_type": "dense_small",
+        "conditions": [{"feature": "gpu_shared_fraction", "op": "<", "value": 1.0}]
+      },
+      "narrative": "MPS/MIG GPU sharing packs several small models on one GPU, raising aggregate utilization and cutting cost, but the memory/compute fraction caps each tenant and risks interference. Worth it only for small models that cannot fill a GPU alone.",
+      "status": "active"
+    },
+    {
+      "name": "hardware_bandwidth_vs_model",
+      "edge_ids": [
+        "bandwidth_per_param->mem_bandwidth_utilization",
+        "bandwidth_per_param->decode_itr_counts_per_second",
+        "gpu_bandwidth_gbps->decode_itr_counts_per_second",
+        "mem_bandwidth_utilization->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["bandwidth_per_param", "gpu_bandwidth_gbps", "model_size_gb"],
+        "v": ["mem_bandwidth_utilization", "decode_itr_counts_per_second"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Decode TPOT is roughly model bytes divided by GPU memory bandwidth, so the ratio of model size to GPU bandwidth predicts decode rate directly. This is the first-principles check on whether a GPU can serve a model at the target TPOT at all.",
+      "status": "active"
+    },
+    {
+      "name": "swap_space_oom_safety_valve",
+      "edge_ids": [
+        "swap_space_gb->vram_headroom_gb",
+        "swap_space_gb->pcie_tput_observed",
+        "vram_headroom_gb->slo_margin",
+        "pcie_tput_observed->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["swap_space_gb", "gpu_mem_util"],
+        "v": ["vram_headroom_gb", "pcie_tput_observed"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Swap space lets a high gpu_memory_utilization target survive transient spikes by offloading instead of OOM-killing, trading a PCIe-induced TPOT bump for SLO survivability. Pairs with aggressive memory packing.",
+      "status": "active"
+    },
+    {
+      "name": "tp_degree_sweet_spot",
+      "edge_ids": [
+        "tp->comm_overhead_pct",
+        "tp->gpu_mem_used_fraction",
+        "tp->vram_headroom_gb",
+        "comm_overhead_pct->throughput_token_per_sec",
+        "vram_headroom_gb->slo_margin"
+      ],
+      "scope": {
+        "x": ["tp", "model_size_gb", "nvlink_bandwidth_gbps"],
+        "v": ["comm_overhead_pct", "gpu_mem_used_fraction", "vram_headroom_gb"],
+        "workload_type": "any",
+        "model_type": "dense_large",
+        "conditions": [{"feature": "tp", "op": ">", "value": 1}]
+      },
+      "narrative": "TP degree has a sweet spot: too low OOMs or leaves no KV headroom, too high pays comm overhead that erodes throughput. The optimum is the smallest TP that fits the model with safe headroom on the given NVLink bandwidth.",
+      "status": "active"
+    },
+    {
+      "name": "token_budget_vs_seq_cap",
+      "edge_ids": [
+        "max_num_batched_tokens->live_batch_size",
+        "max_num_seq->live_batch_size",
+        "isl_token_avg->live_batch_size",
+        "live_batch_size->throughput_token_per_sec",
+        "live_batch_size->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["max_num_batched_tokens", "max_num_seq", "isl_token_avg"],
+        "v": ["live_batch_size"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Two batch caps bind alternately: with long inputs the token budget (max_num_batched_tokens) binds first; with short inputs the sequence cap (max_num_seq) binds. Tuning only one leaves the other limiting, so both must be set to the workload's length profile.",
+      "status": "active"
+    },
+    {
+      "name": "prefill_decode_interference_chunked",
+      "edge_ids": [
+        "chunked_prefill_enable->live_batch_size",
+        "chunk_size->prefill_iteration_counts_per_second",
+        "prefill_iteration_counts_per_second->p99_ttft_ms",
+        "live_batch_size->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["chunked_prefill_enable", "chunk_size"],
+        "v": ["prefill_iteration_counts_per_second", "live_batch_size"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Unified batching mixes prefill chunks into the decode batch: it smooths TTFT (prefill makes steady progress) but each chunk steals decode slots, nudging up TPOT for in-flight generations. Chunk size sets the TTFT/TPOT split; the binding SLO decides the direction.",
+      "status": "active"
+    },
+    {
+      "name": "rag_prefill_heavy_workload",
+      "edge_ids": [
+        "isl_token_avg->prefill_iteration_counts_per_second",
+        "isl_token_avg->input_length_observed",
+        "prefix_cache_enabled->kvcache_hit_rate",
+        "prefill_iteration_counts_per_second->p99_ttft_ms",
+        "input_length_observed->p99_ttft_ms",
+        "kvcache_hit_rate->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["isl_token_avg", "prefix_cache_enabled", "chunked_prefill_enable"],
+        "v": ["prefill_iteration_counts_per_second", "input_length_observed", "kvcache_hit_rate"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "isl_token_avg", "op": ">", "value": 4096}, {"feature": "osl_token_avg", "op": "<", "value": 256}]
+      },
+      "narrative": "RAG is prefill-dominated: huge retrieved context, short answer. TTFT is everything, and it is set by prefill speed on the long input. Cache the retrieved-document prefixes (often reused across queries) and chunk the prefill; decode capacity barely matters here.",
+      "status": "active"
+    },
+    {
+      "name": "agentic_reasoning_decode_heavy",
+      "edge_ids": [
+        "osl_token_avg->kv_cache_util",
+        "osl_token_avg->kv_pressure_score",
+        "decode_itr_counts_per_second->p99_tpot_ms",
+        "kv_pressure_score->p99_tpot_ms",
+        "kv_cache_util->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["osl_token_avg", "max_model_len", "spec_decoding_enabled"],
+        "v": ["kv_cache_util", "kv_pressure_score", "decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "osl_token_avg", "op": ">", "value": 2048}]
+      },
+      "narrative": "Chain-of-thought / agentic workloads are decode-dominated: long generations grow KV every step and TPOT is the binding SLO. Speculative decoding and decode-side capacity matter most; KV headroom must be budgeted for the end of long generations, not the start.",
+      "status": "active"
+    },
+    {
+      "name": "embedding_prefill_only_workload",
+      "edge_ids": [
+        "isl_token_avg->prefill_iteration_counts_per_second",
+        "max_num_batched_tokens->prefill_iteration_counts_per_second",
+        "max_num_batched_tokens->sm_utilization",
+        "prefill_iteration_counts_per_second->throughput_token_per_sec",
+        "sm_utilization->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["isl_token_avg", "max_num_batched_tokens"],
+        "v": ["prefill_iteration_counts_per_second", "sm_utilization"],
+        "workload_type": "batch",
+        "model_type": "any",
+        "conditions": [{"feature": "osl_token_avg", "op": "<", "value": 2}]
+      },
+      "narrative": "Embedding / classification / reranking workloads are prefill-only (no autoregressive decode). Throughput is pure prefill batch efficiency: maximize batched tokens to saturate SMs. KV cache, decode knobs, and TPOT are irrelevant.",
+      "status": "active"
+    },
+    {
+      "name": "code_completion_ultralow_latency",
+      "edge_ids": [
+        "depth_req_q->p99_ttft_ms",
+        "prefill_iteration_counts_per_second->p99_ttft_ms",
+        "cuda_graph_enabled->dispatch_overhead_ms",
+        "dispatch_overhead_ms->p99_tpot_ms",
+        "decode_itr_counts_per_second->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["cuda_graph_enabled", "max_num_seq", "target_p99_ttft_ms"],
+        "v": ["depth_req_q", "prefill_iteration_counts_per_second", "dispatch_overhead_ms"],
+        "workload_type": "online",
+        "model_type": "dense_small",
+        "conditions": [{"feature": "target_p99_ttft_ms", "op": "<", "value": 200}]
+      },
+      "narrative": "Code/autocomplete needs sub-200ms TTFT on short prompts; at that scale queue wait and kernel-launch overhead dominate, not model compute. Keep utilization low (drain the queue) and use CUDA graphs to strip dispatch overhead.",
+      "status": "active"
+    },
+    {
+      "name": "ngram_speculative_repetitive",
+      "edge_ids": [
+        "spec_decoding_method->decode_itr_counts_per_second",
+        "num_speculative_tokens->decode_itr_counts_per_second",
+        "decode_itr_counts_per_second->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["spec_decoding_method", "num_speculative_tokens"],
+        "v": ["decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "spec_decoding_enabled", "op": "==", "value": true}, {"feature": "workload_prefix_concentration", "op": ">", "value": 0.5}]
+      },
+      "narrative": "N-gram / prompt-lookup speculation needs no draft model and wins big on repetitive or copy-heavy outputs (code, structured data, retrieval echoes) where next tokens are guessable from context. On creative text its acceptance is low and it adds little.",
+      "status": "active"
+    },
+    {
+      "name": "moe_tp_vs_ep_placement",
+      "edge_ids": [
+        "ep->comm_overhead_pct",
+        "tp->comm_overhead_pct",
+        "ep->per_tok_comm_bytes",
+        "comm_overhead_pct->throughput_token_per_sec",
+        "per_tok_comm_bytes->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["ep", "tp", "is_moe"],
+        "v": ["comm_overhead_pct", "per_tok_comm_bytes"],
+        "workload_type": "any",
+        "model_type": "moe",
+        "conditions": [{"feature": "is_moe", "op": "==", "value": true}]
+      },
+      "narrative": "For MoE, sharding experts by EP (all-to-all dispatch) vs TP (all-reduce within expert) trades different comm patterns. EP scales experts but adds token-routing bytes; TP adds per-layer reduces. The right mix depends on expert count and interconnect.",
+      "status": "active"
+    },
+    {
+      "name": "tail_latency_burst_p99",
+      "edge_ids": [
+        "peak_to_mean_ratio->depth_req_q",
+        "request_arrival_pattern->depth_req_q",
+        "depth_req_q->p99_ttft_ms",
+        "depth_req_q->slo_margin"
+      ],
+      "scope": {
+        "x": ["peak_to_mean_ratio", "request_arrival_pattern"],
+        "v": ["depth_req_q"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 3.0}]
+      },
+      "narrative": "p99 (not p50) TTFT is set by the burst tail: even at modest mean utilization, a high peak-to-mean ratio produces transient queues that blow the tail. Sizing to the mean fails p99; the tail needs reserved burst headroom or fast scale-out.",
+      "status": "active"
+    },
+    {
+      "name": "right_size_gpu_for_cost",
+      "edge_ids": [
+        "model_size_gb->gpu_mem_used_fraction",
+        "weight_quantization_bits->gpu_mem_used_fraction",
+        "gpu_mem_used_fraction->cost_per_token",
+        "decode_itr_counts_per_second->cost_per_token"
+      ],
+      "scope": {
+        "x": ["model_size_gb", "weight_quantization_bits", "gpu_type", "gpu_mem_gb"],
+        "v": ["gpu_mem_used_fraction", "decode_itr_counts_per_second"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Cost per token is minimized by the smallest/cheapest GPU on which the (possibly quantized) model fits with safe headroom and still meets SLO. Over-provisioning GPU memory wastes the per-hour rate; the cost play is tight packing on the cheapest sufficient tier.",
+      "status": "active"
+    },
+    {
+      "name": "kv_block_fragmentation",
+      "edge_ids": [
+        "block_size->gpu_mem_used_fraction",
+        "block_size->kv_cache_util",
+        "max_model_len->kv_pressure_score",
+        "gpu_mem_used_fraction->slo_margin",
+        "kv_cache_util->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["block_size", "max_model_len", "osl_token_avg"],
+        "v": ["gpu_mem_used_fraction", "kv_cache_util"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Large KV blocks waste memory on partial final pages (internal fragmentation), worse with many short sequences; small blocks reduce waste but add bookkeeping and hurt prefix reuse. The optimal block size tracks the sequence-length distribution.",
+      "status": "active"
+    },
+    {
+      "name": "max_model_len_overallocation_waste",
+      "edge_ids": [
+        "max_model_len->kv_pressure_score",
+        "max_model_len->gpu_mem_used_fraction",
+        "max_model_len->kv_cache_util",
+        "kv_pressure_score->slo_margin"
+      ],
+      "scope": {
+        "x": ["max_model_len", "isl_token_max", "osl_token_max"],
+        "v": ["kv_pressure_score", "gpu_mem_used_fraction"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Setting max_model_len to the model maximum rather than the workload's actual length tail reserves KV budget per slot that is never used, capping concurrency far below what the real lengths would allow. Right-size max_model_len to the observed tail to recover batch capacity.",
+      "status": "active"
+    },
+    {
+      "name": "draft_model_size_tradeoff",
+      "edge_ids": [
+        "draft_model_id->decode_itr_counts_per_second",
+        "num_speculative_tokens->decode_itr_counts_per_second",
+        "decode_itr_counts_per_second->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["draft_model_id", "num_speculative_tokens", "spec_decoding_method"],
+        "v": ["decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "spec_decoding_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "Draft model size trades acceptance vs draft cost: a bigger draft accepts more tokens per step (higher speedup ceiling) but costs more per draft, while a tiny draft is cheap but rarely accepted. The optimum balances acceptance rate against draft latency for the target model.",
+      "status": "active"
+    },
+    {
+      "name": "mixed_precision_weight_activation",
+      "edge_ids": [
+        "weight_quantization_bits->mem_bandwidth_utilization",
+        "activation_quantization_method->sm_utilization",
+        "activation_quantization_method->activation_mem_pressure",
+        "mem_bandwidth_utilization->p99_tpot_ms",
+        "sm_utilization->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["weight_quantization_bits", "activation_quantization_method", "activation_dtype"],
+        "v": ["mem_bandwidth_utilization", "sm_utilization", "activation_mem_pressure"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Weight and activation quantization attack different bottlenecks: low-bit weights cut decode bandwidth (TPOT), low-bit activations cut prefill compute and activation memory. Combining them (e.g., W8A8, W4A16) is the lever when both phases are constrained, at compounding accuracy risk.",
+      "status": "active"
+    },
+    {
+      "name": "prefix_cache_memory_contention",
+      "edge_ids": [
+        "prefix_cache_enabled->kvcache_hit_rate",
+        "prefix_cache_enabled->kv_cache_util",
+        "kvcache_hit_rate->p99_ttft_ms",
+        "kv_cache_util->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["prefix_cache_enabled", "workload_prefix_concentration", "request_arrival_rate"],
+        "v": ["kvcache_hit_rate", "kv_cache_util"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Prefix caching is not free: cached blocks occupy KV that active sequences also need. With low prefix concentration the cache mostly holds soon-evicted blocks, raising occupancy without raising hit rate. Caching wins only when reuse density exceeds the memory it costs.",
+      "status": "active"
+    },
+    {
+      "name": "cold_start_ephemeral_chain",
+      "edge_ids": [
+        "min_chain_warmup_time->dispatch_overhead_ms",
+        "num_jit_warmup_steps->dispatch_overhead_ms",
+        "dispatch_overhead_ms->p99_ttft_ms",
+        "dispatch_overhead_ms->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["min_chain_warmup_time", "num_jit_warmup_steps", "cuda_graph_enabled", "torch_compile_enabled"],
+        "v": ["dispatch_overhead_ms"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Short-lived or frequently-swapped chains pay warmup (graph capture, JIT compile, autotuning) that never amortizes, so their early requests see inflated latency. For ephemeral chains, minimize warmup steps and skip aggressive compilation; the opposite of the long-lived-serving recipe.",
+      "status": "active"
+    },
+    {
+      "name": "summarization_long_in_medium_out",
+      "edge_ids": [
+        "isl_token_avg->prefill_iteration_counts_per_second",
+        "osl_token_avg->kv_cache_util",
+        "prefill_iteration_counts_per_second->p99_ttft_ms",
+        "decode_itr_counts_per_second->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["isl_token_avg", "osl_token_avg", "chunked_prefill_enable"],
+        "v": ["prefill_iteration_counts_per_second", "kv_cache_util", "decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "isl_token_avg", "op": ">", "value": 4096}, {"feature": "osl_token_avg", "op": ">", "value": 256}]
+      },
+      "narrative": "Summarization is balanced-but-prefill-leaning: long documents in, medium summaries out. Both TTFT (long prefill) and TPOT (medium decode) bind, so it needs chunked prefill for TTFT AND adequate decode capacity; pure prefill or pure decode tuning under-serves it.",
+      "status": "active"
+    },
+    {
+      "name": "chat_balanced_multiturn",
+      "edge_ids": [
+        "multi_turn_ratio->kvcache_hit_rate",
+        "is_session_affinity->kvcache_hit_rate",
+        "kvcache_hit_rate->p99_ttft_ms",
+        "decode_itr_counts_per_second->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["multi_turn_ratio", "is_session_affinity", "shared_prefix_length_avg"],
+        "v": ["kvcache_hit_rate", "decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "multi_turn_ratio", "op": ">", "value": 0.4}]
+      },
+      "narrative": "Interactive chat is multi-turn with a growing shared history: prior-turn KV reuse (via session affinity) cuts TTFT, while decode rate sets the streaming TPOT users feel. Both the cache-hit path and decode capacity must be tuned; it is the canonical balanced online workload.",
+      "status": "active"
+    },
+    {
+      "name": "high_concurrency_kv_thrash",
+      "edge_ids": [
+        "max_num_seq->kv_pressure_score",
+        "max_num_seq->kv_cache_util",
+        "request_arrival_rate->kv_pressure_score",
+        "kv_pressure_score->p99_tpot_ms",
+        "kv_pressure_score->slo_margin"
+      ],
+      "scope": {
+        "x": ["max_num_seq", "request_arrival_rate", "gpu_mem_util"],
+        "v": ["kv_pressure_score", "kv_cache_util"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "max_num_seq", "op": ">", "value": 256}]
+      },
+      "narrative": "Admitting too many concurrent sequences relative to KV capacity causes thrash: the engine constantly preempts/recomputes, and TPOT and SLO collapse even though aggregate throughput looks busy. The fix is admission control (lower max_num_seq) or more KV, not more compute.",
+      "status": "active"
+    },
+    {
+      "name": "compute_vs_memory_bottleneck",
+      "edge_ids": [
+        "max_num_batched_tokens->sm_utilization",
+        "max_num_seq->mem_bandwidth_utilization",
+        "sm_utilization->throughput_token_per_sec",
+        "mem_bandwidth_utilization->throughput_token_per_sec",
+        "mem_bandwidth_utilization->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["max_num_batched_tokens", "max_num_seq", "model_size_gb", "gpu_tflops_fp16", "gpu_bandwidth_gbps"],
+        "v": ["sm_utilization", "mem_bandwidth_utilization"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Prefill is compute-bound (SM utilization vs TFLOPs), decode is memory-bound (bandwidth utilization). Knowing which is saturated decides the lever: if SMs are pegged, quantize/parallelize compute; if bandwidth is pegged, quantize weights/KV. The same config is optimal for one phase and wasteful for the other.",
+      "status": "active"
+    },
+    {
+      "name": "spec_token_overshoot",
+      "edge_ids": [
+        "num_speculative_tokens->decode_itr_counts_per_second",
+        "spec_acceptance_threshold->decode_itr_counts_per_second",
+        "decode_itr_counts_per_second->p99_tpot_ms",
+        "decode_itr_counts_per_second->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["num_speculative_tokens", "spec_acceptance_threshold"],
+        "v": ["decode_itr_counts_per_second"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "spec_decoding_enabled", "op": "==", "value": true}]
+      },
+      "narrative": "Drafting too many speculative tokens past the point of diminishing acceptance wastes verify compute and can make speculation net-negative under load. There is an optimal draft length per workload acceptance curve; more is not better.",
+      "status": "active"
+    },
+    {
+      "name": "attention_backend_hardware_match",
+      "edge_ids": [
+        "attn_backend->prefill_iteration_counts_per_second",
+        "attn_backend->decode_itr_counts_per_second",
+        "cuda_compute_capability->decode_itr_counts_per_second",
+        "prefill_iteration_counts_per_second->p99_ttft_ms",
+        "decode_itr_counts_per_second->p99_tpot_ms"
+      ],
+      "scope": {
+        "x": ["attn_backend", "cuda_compute_capability", "gpu_generation"],
+        "v": ["prefill_iteration_counts_per_second", "decode_itr_counts_per_second"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "The best attention backend is hardware-specific: FlashAttention variants need certain compute capabilities, FlashInfer favors decode on newer GPUs, and some backends regress on older arch or specific head dims. Backend choice must be matched to the GPU generation, not fixed globally.",
+      "status": "active"
+    },
+    {
+      "name": "long_context_chunked_prefill_mandatory",
+      "edge_ids": [
+        "chunked_prefill_enable->activation_mem_pressure",
+        "chunk_size->activation_mem_pressure",
+        "isl_token_avg->prefill_iteration_counts_per_second",
+        "activation_mem_pressure->slo_margin",
+        "prefill_iteration_counts_per_second->p99_ttft_ms"
+      ],
+      "scope": {
+        "x": ["chunked_prefill_enable", "chunk_size", "isl_token_avg", "max_model_len"],
+        "v": ["activation_mem_pressure", "prefill_iteration_counts_per_second"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": [{"feature": "isl_token_avg", "op": ">", "value": 32768}]
+      },
+      "narrative": "At extreme input lengths the single-shot prefill activation peak exceeds VRAM, so chunked prefill is not an optimization but a feasibility requirement: without it the job OOMs on the first long prompt. Chunk size then trades the activation ceiling against prefill efficiency.",
+      "status": "active"
+    },
+    {
+      "name": "dp_cost_vs_latency_tradeoff",
+      "edge_ids": [
+        "dp->depth_req_q",
+        "dp->live_batch_size",
+        "depth_req_q->p99_ttft_ms",
+        "live_batch_size->cost_per_token"
+      ],
+      "scope": {
+        "x": ["dp", "request_arrival_rate", "priority_class"],
+        "v": ["depth_req_q", "live_batch_size"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "Adding data-parallel replicas drains the queue and protects TTFT but splits load into smaller per-replica batches, raising cost per token (less amortization). Scale out for latency-critical traffic; consolidate replicas for cost-critical traffic. The replica count is the cost/latency dial.",
+      "status": "active"
+    },
+    {
+      "name": "utilization_target_burst_safety",
+      "edge_ids": [
+        "gpu_mem_util->kv_pressure_score",
+        "gpu_mem_util->gpu_mem_used_fraction",
+        "peak_to_mean_ratio->depth_req_q",
+        "kv_pressure_score->slo_margin",
+        "gpu_mem_used_fraction->throughput_token_per_sec"
+      ],
+      "scope": {
+        "x": ["gpu_mem_util", "peak_to_mean_ratio", "swap_space_gb"],
+        "v": ["kv_pressure_score", "gpu_mem_used_fraction"],
+        "workload_type": "online",
+        "model_type": "any",
+        "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 2.0}]
+      },
+      "narrative": "A high gpu_memory_utilization target maximizes steady-state throughput but leaves no KV slack for bursts; under a spike it triggers preemption and SLO loss. Bursty workloads need a lower utilization target (or swap headroom) than the steady-state optimum.",
+      "status": "active"
+    },
+    {
+      "name": "quant_kernel_hardware_feasibility",
+      "edge_ids": [
+        "weight_quantization_method->gpu_mem_used_fraction",
+        "cuda_compute_capability->decode_itr_counts_per_second",
+        "cuda_compute_capability->sm_utilization",
+        "decode_itr_counts_per_second->throughput_token_per_sec",
+        "gpu_mem_used_fraction->cost_per_token"
+      ],
+      "scope": {
+        "x": ["weight_quantization_method", "cuda_compute_capability", "gpu_generation", "gpu_type"],
+        "v": ["gpu_mem_used_fraction", "decode_itr_counts_per_second", "sm_utilization"],
+        "workload_type": "any",
+        "model_type": "any",
+        "conditions": []
+      },
+      "narrative": "A quantization method only pays off where the GPU has the kernels for it: fp8 needs Hopper-class tensor cores, certain int4 paths need specific compute capability. On older hardware the same method falls back to slow dequant, so quant choice is gated by GPU generation, not free.",
+      "status": "active"
+    }
+  ]
+}
