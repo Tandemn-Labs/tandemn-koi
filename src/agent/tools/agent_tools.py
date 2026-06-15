@@ -49,7 +49,6 @@ Tool catalog:
     resource simulation:
         simulate_allocation         counterfactual resources after a plan
         simulate_resource_free      counterfactual resources if a job released
-        simulate_future_state       alias of simulate_allocation
         enumerate_ladder            feasible chain configs under constraints
         required_throughput_enumerator  required tokens/sec from workload + SLO
         size_ladder                 derive n_replicas per rank from y_hat + capacity
@@ -58,19 +57,19 @@ Tool catalog:
         get_scope                   mechanisms whose scope matches job features
         get_edge_confidence         c(e) + counters for one or many edges
         get_mechanism_confidence    c(M) + counters for one or many mechanisms
+        get_influencing_knobs       X knobs that drive an objective, by confidence
         get_similar_deployments     kNN-ish briefs over EvidenceStore
         set_new_mechanisms          validate + admit a mechanism proposal
         val_new_mechanisms          pre-admission validation only
 
     prediction / scoring:
-        predict_outcome             surrogate prediction + DRO band
+        predict_outcome             calibrated surrogate prediction + DRO band
+        get_z_star                  current ideal-point reference (z_star_t)
         compute_tchebycheff         augmented Tchebycheff J
+        optimize_config             LLM-steered coordinate descent over candidates
         compute_eig                 proxy causal EIG for a ladder
         compute_switching_cost      4-component switch cost bundle
         compute_slo_dro             DRO-bounded SLO violation probabilities
-        compute_cusum               two-sided CUSUM on one variable
-        compute_icp                 ICP invariance test on one edge
-        c_d_classification          (v_verdict, y_verdict) -> Q1..Q4
 
     plan-level:
         compute_sigma               per-job and aggregate sigma for a plan
@@ -86,8 +85,24 @@ import logging
 import math
 from typing import Any
 
+import numpy as np
 from src.config.hyperparameters import GAMMA_SLO, UTILIZATION_TARGET_ONLINE
 from src.core.models import LADDER_ACTIONS, SWAP_BUDGET_ACTIONS, Plan, RankSpec
+
+# Residual calibration: debias the surrogate with observed (observed-predicted)
+# residuals from similar past deployments, so scoring uses reality-corrected
+# predictions as the performance database grows.
+CALIBRATION_WINDOW = 50  # ticks of evidence to draw similar rows from
+CALIBRATION_MIN_SAMPLES = 5  # below this, leave the objective uncorrected
+_NONNEGATIVE_Y = frozenset(
+    {
+        "throughput_tokens_per_sec",
+        "throughput_token_per_sec",
+        "p99_ttft_ms",
+        "p99_tpot_ms",
+        "cost_per_token",
+    }
+)
 
 log = logging.getLogger("koi.agent_tools")
 
@@ -805,11 +820,6 @@ def simulate_resource_free(job_id: str) -> dict[str, int]:
     return {}
 
 
-def simulate_future_state(plan: dict[str, Any]) -> dict[str, Any]:
-    """Alias of simulate_allocation for prompt readability."""
-    return simulate_allocation(plan)
-
-
 def enumerate_ladder(constraints: dict[str, Any]) -> list[dict[str, Any]]:
     """Enumerate feasible chain configs under structural constraints.
 
@@ -1029,23 +1039,29 @@ def size_ladder(
 
 
 def get_edge_confidence(edge_or_list) -> Any:
-    """Return c(e) and counters for one edge id or a list of them.
+    """Confidence record(s) for one edge id or a list of them.
+
+    ConfidenceService owns the numeric state access; this tool builds the
+    JSON-friendly record shape exposed to the planner.
 
     Args:
         edge_or_list: edge_id string or list of edge_id strings.
 
     Returns:
-        For one id: {"c", "visit_count", "envs_seen", "q_histogram"}.
-        For a list: dict edge_id -> that shape.
+        One id -> the confidence record dict; a list -> {edge_id: record}.
     """
     _require("confidence_service")
     cs = _CTX.confidence_service
 
     def one(edge_id: str) -> dict[str, Any]:
+        alpha, beta = cs.get_edge_alpha_beta(edge_id)
         return {
             "c": cs.get_edge_confidence(edge_id),
+            "alpha": alpha,
+            "beta": beta,
             "visit_count": cs.get_edge_visit_count(edge_id),
             "envs_seen": sorted(_env_key(e) for e in cs.get_edge_environment_seen(edge_id)),
+            "last_touched_tick": cs.get_edge_last_touched(edge_id),
             "q_histogram": dict(cs.get_edge_q_histogram(edge_id)),
         }
 
@@ -1055,29 +1071,108 @@ def get_edge_confidence(edge_or_list) -> Any:
 
 
 def get_mechanism_confidence(m_id) -> Any:
-    """Return c(M) and counters for one mechanism id or a list of them.
+    """Confidence record(s) for one mechanism id or a list of them.
+
+    ConfidenceService owns the numeric state access; this tool builds the
+    JSON-friendly record shape exposed to the planner.
 
     Args:
         m_id: mechanism_id string or list of mechanism_id strings.
 
     Returns:
-        For one id: {"c", "visit_count", "envs_seen", "q_histogram"}.
-        For a list: dict mechanism_id -> that shape.
+        One id -> the confidence record dict; a list -> {mid: record}.
     """
     _require("confidence_service")
     cs = _CTX.confidence_service
 
     def one(mid: str) -> dict[str, Any]:
+        alpha, beta = cs.get_mechanism_alpha_beta(mid)
         return {
             "c": cs.get_mechanism_confidence(mid),
+            "alpha": alpha,
+            "beta": beta,
             "visit_count": cs.get_mechanism_visit_count(mid),
             "envs_seen": sorted(_env_key(e) for e in cs.get_mechanism_environment_seen(mid)),
+            "last_touched_tick": cs.get_mechanism_last_touched(mid),
             "q_histogram": dict(cs.get_mechanism_q_histogram(mid)),
         }
 
     if isinstance(m_id, list):
         return {mid: one(mid) for mid in m_id}
     return one(str(m_id))
+
+
+def get_influencing_knobs(
+    job_features: dict[str, Any],
+    objective: str | None = None,
+    top_k: int = 12,
+) -> list[dict[str, Any]]:
+    """Reverse lookup: which X knobs drive an objective, by path confidence.
+
+    The closed-world graph holds every X->V and V->Y edge. This walks
+    BACKWARD from the objective Y, through each mediator V that feeds it,
+    to the X knobs that feed those mediators, scoring each knob by the
+    strongest causal path confidence c(X->V) * c(V->Y). It answers the
+    planner's question "to move this objective, which knobs are worth
+    tuning and how sure are we?" - the input side of optimize_config.
+
+    Mechanisms applicable to the job's scope are attached per knob so the
+    planner can cite a mechanism_id on the RankSpec it ends up tuning.
+    Confidence comes straight from ConfidenceService (single owner); this
+    tool only traverses and ranks.
+
+    Args:
+        job_features: feature dict; subset_x / subset_v scope the
+            applicable-mechanism annotation. Does not restrict which knobs
+            are returned (the graph is closed-world).
+        objective: a Y variable name to trace. None traces every Y node.
+        top_k: max knobs to return, highest path confidence first.
+
+    Returns:
+        List of {"knob", "score", "paths": [{"v","y","c_xv","c_vy",
+        "path_c"}...], "mechanisms": [mechanism_id...]} sorted by score.
+    """
+    _require("candidate_graph", "confidence_service")
+    cg = _CTX.candidate_graph
+    cs = _CTX.confidence_service
+
+    if objective is not None:
+        objectives = [objective]
+    else:
+        objectives = [n for n, node in cg.node_table.items() if node.node_type == "Y"]
+
+    edge_to_mechs: dict[str, set] = {}
+    if _CTX.mechanism_registry is not None and isinstance(job_features, dict):
+        mechs = _CTX.mechanism_registry.filter_by_scope(
+            job_features.get("subset_x", []), job_features.get("subset_v", [])
+        )
+        for m in mechs:
+            if m.status == "active":
+                for eid in m.edge_ids:
+                    edge_to_mechs.setdefault(eid, set()).add(m.mechanism_id)
+
+    knobs: dict[str, dict[str, Any]] = {}
+    for y in objectives:
+        for vy in cg.get_edges_to(y):  # V -> Y edges into the objective
+            c_vy = cs.get_edge_confidence(vy.edge_id)
+            for xv in cg.get_edges_to(vy.src):  # X -> V edges into that mediator
+                c_xv = cs.get_edge_confidence(xv.edge_id)
+                path_c = c_xv * c_vy
+                rec = knobs.setdefault(
+                    xv.src, {"knob": xv.src, "score": 0.0, "paths": [], "mechanisms": set()}
+                )
+                rec["score"] = max(rec["score"], path_c)
+                rec["paths"].append(
+                    {"v": vy.src, "y": y, "c_xv": c_xv, "c_vy": c_vy, "path_c": path_c}
+                )
+                rec["mechanisms"].update(edge_to_mechs.get(xv.edge_id, ()))
+
+    ranked = sorted(knobs.values(), key=lambda r: r["score"], reverse=True)[: int(top_k)]
+    for rec in ranked:
+        rec["paths"].sort(key=lambda p: p["path_c"], reverse=True)
+        rec["paths"] = rec["paths"][:5]
+        rec["mechanisms"] = sorted(rec["mechanisms"])
+    return ranked
 
 
 def get_scope(job_features: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1131,8 +1226,6 @@ def get_similar_deployments(
 
     if hasattr(store, "retrieve_similar_rows"):
         rows = store.retrieve_similar_rows(job_features, top_k=int(top_k))
-    elif hasattr(store, "rag_retrieve_similar"):
-        rows = store.rag_retrieve_similar(job_features, top_k=int(top_k))
     else:
         current = store.current_tick()
         rows = store.get_rows_in_window((max(0, current - 50), current))
@@ -1180,6 +1273,12 @@ def set_new_mechanisms(
     admits the mechanism only when every edge exists, the topology is
     legal, and the proposal is not a duplicate.
 
+    The proposer does NOT set the mechanism's confidence. On admission the
+    mechanism is seeded NEUTRAL (Beta(1,1), c=0.5) by ConfidenceService -
+    an unproven theory starts agnostic and earns confidence only from
+    evidence. An offline seeding pass may later assign it a deliberate bin
+    and promote it into the seed table.
+
     Args:
         edges: edge_id strings, all present in CandidateGraph.
         applicable_to: Scope dict, e.g. {"x": [...], "v": [...],
@@ -1187,9 +1286,10 @@ def set_new_mechanisms(
         llm_blurb: One-paragraph narrative for the mechanism.
 
     Returns:
-        {"ok": bool, "mechanism_id": str | None, "violations": list}.
+        {"ok": bool, "mechanism_id": str | None, "seed_confidence": float,
+         "violations": list}.
     """
-    _require("mechanism_registry", "candidate_graph")
+    _require("mechanism_registry", "candidate_graph", "confidence_service")
     from src.core.models import Mechanism
 
     candidate = Mechanism(
@@ -1199,9 +1299,16 @@ def set_new_mechanisms(
     )
     check = val_new_mechanisms(candidate)
     if not check["ok"]:
-        return {"ok": False, "mechanism_id": None, "violations": check["violations"]}
+        return {
+            "ok": False,
+            "mechanism_id": None,
+            "seed_confidence": None,
+            "violations": check["violations"],
+        }
     mid = _CTX.mechanism_registry.add_mechanism(candidate)
-    return {"ok": True, "mechanism_id": mid, "violations": []}
+    # Confidence is set by the single writer, not the proposer: neutral prior.
+    c0 = _CTX.confidence_service.seed_new_mechanism_confidence(mid)
+    return {"ok": True, "mechanism_id": mid, "seed_confidence": c0, "violations": []}
 
 
 def val_new_mechanisms(m_new) -> dict[str, Any]:
@@ -1251,20 +1358,99 @@ def val_new_mechanisms(m_new) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+def _similar_rows(
+    job_features: dict[str, Any], window: int = CALIBRATION_WINDOW, top_k: int = 80
+) -> list:
+    """Evidence rows from deployments similar to this job (for calibration).
+
+    Prefers the store's retrieval helper when present;
+    otherwise scans the recent window and filters by gpu_type / workload
+    type. Returns raw EvidenceRow objects (so callers can read residuals).
+    """
+    store = _CTX.evidence_store
+    if store is None:
+        return []
+    if hasattr(store, "retrieve_similar_rows"):
+        try:
+            return list(store.retrieve_similar_rows(job_features, top_k=top_k))
+        except Exception:
+            log.exception("retrieve_similar_rows failed; falling back to scan")
+    if not (hasattr(store, "get_rows_in_window") and hasattr(store, "current_tick")):
+        return []
+    current = store.current_tick()
+    rows = store.get_rows_in_window((max(0, current - window), current))
+    gpu = job_features.get("gpu_type")
+    typ = job_features.get("type")
+    if gpu or typ:
+        rows = [
+            r
+            for r in rows
+            if (gpu is None or (len(r.env_label) > 3 and r.env_label[3] == gpu))
+            and (typ is None or r.W_observed.get("type") == typ)
+        ]
+    return rows[-top_k:]
+
+
+def _residual_offsets(job_features: dict[str, Any], objectives) -> dict[str, float]:
+    """Mean observed residual (observed - predicted) per objective over
+    similar deployments. Objectives with < CALIBRATION_MIN_SAMPLES are
+    omitted (too noisy to correct)."""
+    rows = _similar_rows(job_features)
+    offsets: dict[str, float] = {}
+    for obj in objectives:
+        samples = []
+        for r in rows:
+            arr = getattr(r, "residuals_per_y", {}).get(obj)
+            if arr is not None and len(arr) > 0:
+                samples.append(float(np.mean(np.asarray(arr, dtype=float))))
+        if len(samples) >= CALIBRATION_MIN_SAMPLES:
+            offsets[obj] = float(np.mean(samples))
+    return offsets
+
+
+def _calibrate_y_hat(y_hat: dict[str, float], job_features: dict[str, Any]):
+    """Debias the surrogate's y_hat with empirical residual offsets.
+
+    calibrated = surrogate + mean(observed - predicted over similar rows),
+    clamped >= 0 for physically non-negative objectives. Returns
+    (calibrated_y_hat, offsets_applied).
+    """
+    offsets = _residual_offsets(job_features, list(y_hat.keys()))
+    calibrated: dict[str, float] = {}
+    for obj, val in y_hat.items():
+        if val is None:
+            calibrated[obj] = val
+            continue
+        corrected = float(val) + offsets.get(obj, 0.0)
+        if obj in _NONNEGATIVE_Y:
+            corrected = max(0.0, corrected)
+        calibrated[obj] = corrected
+    return calibrated, offsets
+
+
 def predict_outcome(
     config: dict[str, Any],
     mechanism: dict[str, Any] | None = None,
+    calibrate: bool = True,
 ) -> dict[str, Any]:
-    """Run the surrogate and attach the DRO uncertainty band.
+    """Run the surrogate, debias it with evidence, attach the DRO band.
+
+    The mechanistic surrogate (Calculon/DynoSim) is kept pure; the
+    empirical residual correction is applied HERE as a thin calibration
+    layer so every scoring path (compute_sigma, size_ladder,
+    optimize_config) optimizes against reality-corrected numbers. As the
+    evidence database grows the surrogate's systematic error is learned
+    away. Cold start (no similar residuals) returns the raw surrogate.
 
     Args:
         config: X variables for the candidate. May embed job_config and
-            job_features sub-dicts; otherwise the whole dict is treated
-            as job_config.
+            job_features sub-dicts; otherwise the whole dict is job_config.
         mechanism: Optional mechanism context, informational only.
+        calibrate: Apply the residual correction (default True).
 
     Returns:
-        {"y_hat": dict, "v_hat": dict, "dro_band": dict}.
+        {"y_hat": calibrated dict, "y_hat_raw": surrogate dict,
+         "calibration_offsets": dict, "v_hat": dict, "dro_band": dict}.
     """
     _require("candidate_graph", "dro", "surrogate")
     job_features = dict(config.get("job_features", {}))
@@ -1276,12 +1462,52 @@ def predict_outcome(
         method=("AIC_DynoSim",),
     )
     if isinstance(result, tuple) and len(result) == 2:
-        y_hat, v_hat = result
+        y_hat_raw, v_hat = result
     else:
-        y_hat = getattr(result, "y_hat", {}) or {}
+        y_hat_raw = getattr(result, "y_hat", {}) or {}
         v_hat = getattr(result, "v_hat", {}) or {}
+    y_hat_raw = y_hat_raw or {}
+
+    if calibrate and y_hat_raw:
+        y_hat, offsets = _calibrate_y_hat(y_hat_raw, job_features)
+    else:
+        y_hat, offsets = dict(y_hat_raw), {}
+
     dro_band = _CTX.dro.compute_dro_band(y_hat or {})
-    return {"y_hat": y_hat or {}, "v_hat": v_hat or {}, "dro_band": dro_band}
+    return {
+        "y_hat": y_hat or {},
+        "y_hat_raw": y_hat_raw,
+        "calibration_offsets": offsets,
+        "v_hat": v_hat or {},
+        "dro_band": dro_band,
+    }
+
+
+def get_z_star(job_features: dict[str, Any] | None = None) -> dict[str, float]:
+    """Current ideal-point reference z_star_t for Tchebycheff scoring.
+
+    z_star_t is the slow loop's running best-achievable value per
+    objective, maintained in the slow loop from the performance database
+    (the kNN/quantile-of-observed-bests reference, updated each tick). It
+    is what compute_tchebycheff measures distance FROM, so "good" for an
+    objective means "close to z_star_t". Exposed read-only so the planner
+    can see the current target per objective before it scores configs.
+
+    The slow loop is the single owner of z_star_t; this tool never
+    recomputes it (residual calibration lives in predict_outcome, the
+    reference point lives in the slow loop - they are separate concerns).
+
+    Args:
+        job_features: accepted for a future per-scope reference; today the
+            cluster-level z_star_t is returned regardless.
+
+    Returns:
+        Dict objective -> reference value.
+    """
+    _require("slow_loop")
+    if job_features is not None and hasattr(_CTX.slow_loop, "get_sss_z_star_t_for_scope"):
+        return dict(_CTX.slow_loop.get_sss_z_star_t_for_scope(job_features))
+    return dict(_CTX.slow_loop.get_sss_z_star_t())
 
 
 def compute_tchebycheff(
@@ -1312,6 +1538,93 @@ def compute_tchebycheff(
             normalization_range=_CTX.slow_loop.typical_ranges,
         )
     )
+
+
+def optimize_config(
+    base_config: dict[str, Any],
+    candidates: dict[str, list],
+    job_features: dict[str, Any] | None = None,
+    objective_weights: dict[str, float] | None = None,
+    max_passes: int = 2,
+) -> dict[str, Any]:
+    """LLM-steered coordinate descent over candidate knob values.
+
+    An OPTIONAL inner optimizer. The planner reasons its way to a config
+    and a small set of values worth trying per knob (from
+    get_influencing_knobs / enumerate_ladder); this does the mechanical
+    local refinement the planner would otherwise do by hand - try each
+    candidate value for one knob, keep whichever maximizes the calibrated
+    Tchebycheff J, sweep again until a pass makes no improvement or
+    max_passes is hit. It does NOT replace the planner's search or pick the
+    knob domains; it only polishes within the box the planner hands it, so
+    the LLM's free reasoning stays in charge of WHAT to explore.
+
+    Scoring uses predict_outcome (calibrated against the evidence database)
+    and the slow loop's current w_t / z_star_t, so the local optimum chases
+    reality-corrected outcomes rather than raw surrogate numbers.
+
+    Args:
+        base_config: starting config. May embed job_config / job_features
+            sub-dicts, or be a flat X config; the flat dict is the config.
+        candidates: {knob_name: [value, ...]}. Only these knobs vary;
+            everything else in base_config stays fixed.
+        job_features: W features for calibration and weighting. Defaults to
+            base_config["job_features"] when present.
+        objective_weights: override w_t; defaults to the slow loop's w_t.
+        max_passes: coordinate-descent sweeps over the knob set.
+
+    Returns:
+        {"config": best config, "j": best J, "y_hat": calibrated
+         prediction, "improved": bool, "n_evaluated": int,
+         "trace": [{"knob","chosen","j"}...]}.
+    """
+    _require("surrogate", "tchebycheff_module", "slow_loop")
+    features = dict(
+        job_features if job_features is not None else base_config.get("job_features", {})
+    )
+    weights = objective_weights if objective_weights is not None else _CTX.slow_loop.get_sss_wt()
+    reference = _CTX.slow_loop.get_sss_z_star_t()
+    core = dict(base_config.get("job_config", base_config))
+    core.pop("job_features", None)
+
+    def _score(cfg: dict[str, Any]):
+        pred = predict_outcome({"job_config": cfg, "job_features": features})
+        j = compute_tchebycheff(pred["y_hat"], weights, reference)
+        return j, pred
+
+    best_cfg = dict(core)
+    best_j, best_pred = _score(best_cfg)
+    n_eval = 1
+    trace: list[dict[str, Any]] = []
+
+    for _ in range(max(1, int(max_passes))):
+        improved_pass = False
+        for knob, values in candidates.items():
+            local_best = None
+            for value in values:
+                if best_cfg.get(knob) == value:
+                    continue
+                trial = dict(best_cfg)
+                trial[knob] = value
+                j, pred = _score(trial)
+                n_eval += 1
+                if j > best_j:
+                    best_j, best_pred, best_cfg = j, pred, trial
+                    local_best = value
+                    improved_pass = True
+            if local_best is not None:
+                trace.append({"knob": knob, "chosen": local_best, "j": best_j})
+        if not improved_pass:
+            break
+
+    return {
+        "config": best_cfg,
+        "j": best_j,
+        "y_hat": best_pred["y_hat"],
+        "improved": bool(trace),
+        "n_evaluated": n_eval,
+        "trace": trace,
+    }
 
 
 def compute_eig(candidate_ladder: dict[str, Any]) -> float:
@@ -1385,67 +1698,13 @@ def compute_slo_dro(
     return _CTX.dro.dro_chance_constraint(pred_y=y_hat, slo_thresholds=slo_thresholds)
 
 
-def compute_cusum(
-    observed: list[float],
-    predicted,
-    delta: float,
-    h: float,
-) -> dict[str, Any]:
-    """Run two-sided CUSUM on one variable's residual sequence.
-
-    Args:
-        observed: Observed sub-tick samples.
-        predicted: Predicted scalar (broadcast) or same-length series.
-        delta: Drift tolerance.
-        h: Fire threshold.
-
-    Returns:
-        {"direction": str, "fired": bool, "fire_tick": int | None}.
-    """
-    _require("cusum")
-    direction, fired, fire_tick = _CTX.cusum.cusum_per_v(
-        observed=observed, predicted=predicted, delta=float(delta), h=float(h)
-    )
-    return {
-        "direction": direction.value if hasattr(direction, "value") else str(direction),
-        "fired": bool(fired),
-        "fire_tick": int(fire_tick) if fire_tick is not None else None,
-    }
-
-
-def compute_icp(edge_id: str) -> str:
-    """Run the ICP invariance test on one edge.
-
-    Args:
-        edge_id: Edge to test.
-
-    Returns:
-        "accept", "reject", or "undecided".
-    """
-    _require("icp", "candidate_graph", "evidence_store")
-    edge = _CTX.candidate_graph.edge_table.get(edge_id)
-    if edge is None:
-        return "undecided"
-    result = _CTX.icp.compute_icp_per_edge(edge=edge, evidence_store=_CTX.evidence_store)
-    return result.value if hasattr(result, "value") else str(result)
-
-
-def c_d_classification(v_cusum_matched: bool, y_cusum_matched: bool) -> str:
-    """Map V and Y CUSUM verdicts to a quadrant label.
-
-    Args:
-        v_cusum_matched: True iff the V bundle CUSUM said matched.
-        y_cusum_matched: True iff the Y bundle CUSUM said matched.
-
-    Returns:
-        "Q1", "Q2", "Q3", or "Q4".
-    """
-    _require("quadrant_validator")
-    label = _CTX.quadrant_validator.classify_quadrant(
-        "matched" if v_cusum_matched else "diverged",
-        "matched" if y_cusum_matched else "diverged",
-    )
-    return label.value if hasattr(label, "value") else str(label)
+# NOTE: compute_cusum / compute_icp / c_d_classification were intentionally
+# removed from the agent tool surface. They are evidence-time VALIDATION
+# primitives that the FSM runs in S2 via the cusum / icp / quadrant_validator
+# modules directly. The planning agent consumes their RESULTS (via
+# get_edge_confidence / get_mechanism_confidence / get_recent_q_histogram) and
+# cannot meaningfully run them on a hypothetical config that has no observed
+# trajectory yet, so exposing them here was dead weight.
 
 
 # ----------------------------------------------------------------------

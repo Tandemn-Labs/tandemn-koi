@@ -163,9 +163,34 @@ class ConfidenceService:
         mechanism_metadata.q_histogram[q_key] = mechanism_metadata.q_histogram.get(q_key, 0) + 1
         return self.get_mechanism_confidence(mechanism_id), True
 
-    def seed_new_mechanism_confidence(self, edges) -> None:
-        """Reserved hook for LLM- or prior-seeded mechanism confidence."""
-        pass  # TODO - an LLM should do it for now.
+    def seed_new_mechanism_confidence(
+        self,
+        mechanism_id: str,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+    ) -> float:
+        """Single-writer seeding of a newly-admitted mechanism's prior.
+
+        The default is the neutral EVEN prior Beta(1, 1) (c = 0.5): a
+        runtime agent-proposed theory starts UNPROVEN, never at a
+        confidence the proposer chose - the agent does not grade its own
+        work. Confidence then moves only via evidence
+        (apply_delta_c_mechanism). An offline seeding pass (an LLM
+        reviewing accumulated proposals) may call this with a deliberate
+        bin's (alpha, beta) when it promotes a mechanism.
+
+        Args:
+            mechanism_id: The newly-admitted mechanism.
+            alpha: Prior pseudo-successes (default 1).
+            beta: Prior pseudo-failures (default 1).
+
+        Returns:
+            The seeded c(M).
+        """
+        meta = self.mechanism_registry.mechanism_metadata_table[mechanism_id]
+        meta.alpha = float(alpha)
+        meta.beta = float(beta)
+        return self.get_mechanism_confidence(mechanism_id)
 
     def get_delta_c_edge(self, q_label: Any, icp_result: Any) -> tuple[float, float]:
         """Return configured edge alpha/beta increment."""
@@ -204,7 +229,7 @@ class ConfidenceService:
 #             edge_id=edge_id,
 #             alpha=1.4,
 #             beta=0.6,
-#             envs_seen={("aws", "us-east-1", "on_demand", "H100")},
+#             envs_seen={"h200_sxm"},
 #         )
 #     }
 #     graph = CandidateGraph(
@@ -226,7 +251,7 @@ class ConfidenceService:
 #                 mechanism_id=mechanism_id,
 #                 alpha=1.0,
 #                 beta=1.0,
-#                 envs_seen={("aws", "us-east-1", "on_demand", "H100")},
+#                 envs_seen={"h200_sxm"},
 #             )
 #         },
 #     )
@@ -253,8 +278,8 @@ class ConfidenceService:
 #     print("edge_q_histogram:", service.get_edge_q_histogram(edge_id))
 
 #     print(
-#         "apply_delta_c_mechanism(Q4):",
-#         service.apply_delta_c_mechanism(mechanism_id, Quadrant.Q4),
+#         "apply_delta_c_confidence(Q4):",
+#         service.apply_delta_c_confidence(mechanism_id, Quadrant.Q4),
 #     )
 #     print(
 #         "mechanism_alpha_beta:",
