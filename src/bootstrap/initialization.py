@@ -19,6 +19,16 @@ def init_resource_map(user_id: str, postgres_client=None):
     return ResourceMapManager(user_id=user_id, postgres_client=postgres_client)
 
 
+def init_causal_graph(user_id: str, postgres_client=None):
+    from src.infra.causal_graph import CausalGraphManager
+
+    manager = CausalGraphManager(user_id=user_id, postgres_client=postgres_client)
+    if manager.store.is_empty():
+        return manager
+    manager.load()
+    return manager
+
+
 def init_seed_mechanisms_priors(LLM, CandidateGraph, NodeDescription):
     # Placeholder: seed Mechanisms
     pass
