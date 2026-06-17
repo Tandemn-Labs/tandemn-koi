@@ -141,7 +141,7 @@ class QuadrantValidator:
 #             deploy_timestamp_utc=0.0,
 #             job_id="job_1",
 #             rank_id="rank_1",
-#             env_label=("aws", "us-east-1", "on_demand", "H100"),
+#             env_label=("reserved", "aws", "us-east-1", "use1-az1", "H100"),
 #             mechanism_ids=["M_demo"],
 #             X={},
 #             W_observed={},

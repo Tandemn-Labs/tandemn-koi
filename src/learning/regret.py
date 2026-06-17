@@ -107,7 +107,7 @@ class RegretCalculator:
 
         Args:
             evidence_store: EvidenceStore.
-            env: env_label tuple (cloud, region, market, gpu_type).
+            env: env_label tuple (market, cloud, region, zone, gpu_type).
             window: Look-back window in ticks.
             tick: Current tick. Defaults to evidence_store.current_tick().
 

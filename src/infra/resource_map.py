@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-import importlib
+import argparse
+import json
 from dataclasses import dataclass
 from typing import Any
 
-from src.core.models import Plan
+from src.core.models import Plan, env_gpu_type
+from tandemn_system_data.clients import (  # type: ignore[import-untyped]
+    JobStore,
+    PostgresClient,
+    ResourceMapStore,
+)
 
-ACTIVE_CHAIN_STATUSES = ("pending", "launching", "running")
-WAITING_JOB_STATUSES = ("submitted", "planning")
+ACTIVE_CHAIN_STATUSES = ("launching", "running")
+WAITING_JOB_STATUSES = ("waiting",)
 
 
 @dataclass
@@ -28,12 +34,7 @@ class ClusterResourceSnapshot:
 
 
 class ResourceMapManager:
-    """Read Koi resource/job state from Tandemn Store.
-
-    This first slice only implements read-only job/chain queries. Resource
-    capacity simulation remains TODO until the resource-map JSON convention
-    is finalized.
-    """
+    """Read Koi resource/job state from Tandemn Store public clients."""
 
     def __init__(self, user_id: str | None = None, postgres_client=None):
         self.user_id = user_id
@@ -45,169 +46,105 @@ class ResourceMapManager:
 
     def _client(self):
         if self._postgres_client is None:
-            module = importlib.import_module("tandemn_system_data.clients.postgres")
-            PostgresClient = module.PostgresClient
             self._postgres_client = PostgresClient()
         return self._postgres_client
 
-    def _execute(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        from sqlalchemy import text
+    def _effective_user_id(self, user_id: str | None = None) -> str:
+        effective = user_id or self.user_id
+        if not effective:
+            raise ValueError("user_id is required for Tandemn Store resource map access")
+        return effective
 
-        with self._client().session() as session:
-            rows = session.execute(text(sql), params or {}).mappings().all()
-        return [dict(row) for row in rows]
+    def _resource_map_store(self, user_id: str | None = None):
+        return ResourceMapStore(self._client(), user_id=self._effective_user_id(user_id))
 
-    @staticmethod
-    def _user_clause(user_id: str | None, table_alias: str = "j") -> str:
-        return f"and {table_alias}.user_id = :user_id" if user_id else ""
-
-    @staticmethod
-    def _user_params(user_id: str | None) -> dict[str, str]:
-        return {"user_id": user_id} if user_id else {}
+    def _job_store(self):
+        return JobStore(self._client())
 
     # ------------------------------------------------------------------
     # Jobs and chains
     # ------------------------------------------------------------------
 
     def get_submitted_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return jobs whose canonical job status is submitted."""
-        effective_user_id = user_id or self.user_id
-        sql = f"""
-            select
-                j.job_id,
-                j.user_id,
-                j.kind,
-                j.status,
-                j.created_at,
-                j.completed_at,
-                j.spec_json,
-                j.input_source,
-                j.output_target
-            from jobs j
-            where j.status = 'submitted'
-            {self._user_clause(effective_user_id)}
-            order by j.created_at desc
-        """
-        return self._execute(sql, self._user_params(effective_user_id))
+        """Return waiting jobs for compatibility with the old submitted name."""
+        return self.get_waiting_jobs(user_id=user_id)
 
     def get_running_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return jobs with at least one active chain."""
-        effective_user_id = user_id or self.user_id
-        sql = f"""
-            select
-                j.job_id,
-                j.user_id,
-                j.kind,
-                j.status as job_status,
-                j.created_at as job_created_at,
-                j.spec_json,
-                pj.plan_id,
-                r.rank_id,
-                r.rank_index,
-                r.status as rank_status,
-                c.chain_id,
-                c.role,
-                c.status as chain_status,
-                c.target_node,
-                c.shape_json,
-                c.parallelism_json
-            from jobs j
-            join plan_jobs pj on pj.job_id = j.job_id
-            join ranks r on r.plan_id = pj.plan_id
-            join chains c on c.rank_id = r.rank_id
-            where c.status in ('pending', 'launching', 'running')
-            {self._user_clause(effective_user_id)}
-            order by j.created_at desc, r.rank_index, c.created_at
-        """
-        return self._group_job_chain_rows(self._execute(sql, self._user_params(effective_user_id)))
+        """Return running jobs plus active chain allocations."""
+        effective_user_id = self._effective_user_id(user_id)
+        return [
+            self._running_job_to_summary(running_job)
+            for running_job in self._job_store().running_jobs(effective_user_id)
+        ]
 
     def get_waiting_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return submitted/planning jobs that do not have active chains."""
-        effective_user_id = user_id or self.user_id
-        sql = f"""
-            select
-                j.job_id,
-                j.user_id,
-                j.kind,
-                j.status,
-                j.created_at,
-                j.completed_at,
-                j.spec_json,
-                j.input_source,
-                j.output_target
-            from jobs j
-            where j.status in ('submitted', 'planning')
-            {self._user_clause(effective_user_id)}
-            and not exists (
-                select 1
-                from plan_jobs pj
-                join ranks r on r.plan_id = pj.plan_id
-                join chains c on c.rank_id = r.rank_id
-                where pj.job_id = j.job_id
-                and c.status in ('pending', 'launching', 'running')
-            )
-            order by j.created_at desc
-        """
-        return self._execute(sql, self._user_params(effective_user_id))
+        """Return jobs waiting for placement."""
+        effective_user_id = self._effective_user_id(user_id)
+        return [
+            self._job_to_summary(job) for job in self._job_store().waiting_jobs(effective_user_id)
+        ]
+
+    def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Return paused jobs that may be resumed by a later plan."""
+        effective_user_id = self._effective_user_id(user_id)
+        return [
+            self._job_to_summary(job) for job in self._job_store().paused_jobs(effective_user_id)
+        ]
 
     def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return active chain rows with their owning job/plan/rank context."""
-        effective_user_id = user_id or self.user_id
-        sql = f"""
-            select
-                j.job_id,
-                j.user_id,
-                pj.plan_id,
-                r.rank_id,
-                r.rank_index,
-                c.chain_id,
-                c.role,
-                c.status,
-                c.target_node,
-                c.shape_json,
-                c.parallelism_json,
-                c.created_at
-            from jobs j
-            join plan_jobs pj on pj.job_id = j.job_id
-            join ranks r on r.plan_id = pj.plan_id
-            join chains c on c.rank_id = r.rank_id
-            where c.status in ('pending', 'launching', 'running')
-            {self._user_clause(effective_user_id)}
-            order by j.created_at desc, r.rank_index, c.created_at
-        """
-        return self._execute(sql, self._user_params(effective_user_id))
+        """Return active chains with owning job context."""
+        chains: list[dict[str, Any]] = []
+        for job in self.get_running_jobs(user_id=user_id):
+            for chain in job.get("active_chains", []):
+                chains.append({"job_id": job["job_id"], "user_id": job["user_id"], **chain})
+        return chains
 
     @staticmethod
-    def _group_job_chain_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        jobs: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            job = jobs.setdefault(
-                row["job_id"],
-                {
-                    "job_id": row["job_id"],
-                    "user_id": row["user_id"],
-                    "kind": row["kind"],
-                    "status": row["job_status"],
-                    "created_at": row["job_created_at"],
-                    "spec_json": row["spec_json"],
-                    "active_chains": [],
-                },
-            )
-            job["active_chains"].append(
-                {
-                    "plan_id": row["plan_id"],
-                    "rank_id": row["rank_id"],
-                    "rank_index": row["rank_index"],
-                    "rank_status": row["rank_status"],
-                    "chain_id": row["chain_id"],
-                    "role": row["role"],
-                    "chain_status": row["chain_status"],
-                    "target_node": row["target_node"],
-                    "shape_json": row["shape_json"],
-                    "parallelism_json": row["parallelism_json"],
-                }
-            )
-        return list(jobs.values())
+    def _model_dump(model) -> dict[str, Any]:
+        dump = getattr(model, "model_dump", None)
+        if callable(dump):
+            return dump(mode="json")
+        return dict(model)
+
+    @classmethod
+    def _job_to_summary(cls, job) -> dict[str, Any]:
+        raw = cls._model_dump(job)
+        spec = dict(raw.get("spec_json") or {})
+        job_features = dict(spec.get("job_features") or spec.get("features") or spec)
+        return {
+            "job_id": raw.get("job_id"),
+            "user_id": raw.get("user_id"),
+            "tenant_id": spec.get("tenant_id", "default"),
+            "kind": raw.get("kind"),
+            "status": raw.get("status"),
+            "created_at": raw.get("created_at"),
+            "finished_at": raw.get("finished_at"),
+            "finish_reason": raw.get("finish_reason"),
+            "job_features": job_features,
+            "spec_json": spec,
+            "input_source": raw.get("input_source") or {},
+            "output_target": raw.get("output_target") or {},
+        }
+
+    @classmethod
+    def _chain_to_summary(cls, chain) -> dict[str, Any]:
+        raw = cls._model_dump(chain)
+        return {
+            "chain_id": raw.get("chain_id"),
+            "plan_id": raw.get("plan_id"),
+            "role": raw.get("role"),
+            "chain_status": raw.get("status"),
+            "shape_json": raw.get("shape_json") or {},
+            "target_node": raw.get("target_node"),
+        }
+
+    @classmethod
+    def _running_job_to_summary(cls, running_job) -> dict[str, Any]:
+        job = cls._job_to_summary(running_job.job)
+        chains = [cls._chain_to_summary(chain) for chain in running_job.chains]
+        job["active_chains"] = chains
+        job["current_ladder"] = chains
+        return job
 
     # ------------------------------------------------------------------
     # Koi-facing snapshot API
@@ -225,8 +162,51 @@ class ResourceMapManager:
         )
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
-        snapshot_json = self._latest_resource_map_json(user_id=user_id)
-        return dict(snapshot_json.get("capacity_by_env", {}))
+        return self._normalized_scheduling_summary(self.get_resource_map(user_id=user_id))
+
+    @classmethod
+    def _normalized_scheduling_summary(cls, resource_map) -> dict[str, dict[str, Any]]:
+        raw = dict(resource_map.scheduling_summary())
+        market = cls._default_market(resource_map)
+        out: dict[str, dict[str, Any]] = {}
+        for key, info in raw.items():
+            body = dict(info)
+            parts = str(key).split("|")
+            if len(parts) == 5:
+                body.setdefault("market", parts[0])
+                out[str(key)] = body
+                continue
+            if len(parts) == 4:
+                env_key = "|".join([market, *parts])
+                body.setdefault("market", market)
+                out[env_key] = body
+                continue
+            out[str(key)] = body
+        return out
+
+    @staticmethod
+    def _default_market(resource_map) -> str:
+        markets = getattr(resource_map, "market", None)
+        if markets is None:
+            markets = getattr(resource_map, "capacity_type", None)
+        if isinstance(markets, (list, tuple)) and markets:
+            return str(markets[0])
+        if markets:
+            return str(markets)
+        return "reserved"
+
+    def dynamic_view(self, user_id: str | None = None) -> dict[str, Any]:
+        resource_map = self.get_resource_map(user_id=user_id)
+        resources = self._normalized_scheduling_summary(resource_map)
+        return {
+            "resource_map_version": resource_map.version,
+            "updated_at": resource_map.updated_at,
+            "resources": resources,
+            "running_jobs": self.get_running_jobs(user_id=user_id),
+            "waiting_jobs": self.get_waiting_jobs(user_id=user_id),
+            "paused_jobs": self.get_paused_jobs(user_id=user_id),
+            "running_chains": self.get_running_chains(user_id=user_id),
+        }
 
     def build_keep_all_plan(self, snapshot: ClusterResourceSnapshot) -> dict[str, dict[str, str]]:
         plan: dict[str, dict[str, str]] = {}
@@ -236,35 +216,22 @@ class ResourceMapManager:
             plan[job["job_id"]] = {"type": "defer"}
         return plan
 
-    def _latest_resource_map_json(self, user_id: str | None = None) -> dict[str, Any]:
-        effective_user_id = user_id or self.user_id
-        sql = f"""
-            select rm.snapshot_json
-            from resource_maps rm
-            where 1 = 1
-            {self._user_clause(effective_user_id, table_alias="rm")}
-            order by rm.captured_at desc
-            limit 1
-        """
-        rows = self._execute(sql, self._user_params(effective_user_id))
-        return rows[0]["snapshot_json"] if rows else {}
-
     # ------------------------------------------------------------------
-    # Resource-map placeholders
+    # Resource-map access and simulation
     # ------------------------------------------------------------------
 
-    def get_resource_map(self, TandemnStore=None):
-        return self._latest_resource_map_json()
+    def get_resource_map(self, user_id: str | None = None):
+        return self._resource_map_store(user_id=user_id).get()
 
-    def refresh_resource_map(self, TandemnStore):
-        # Placeholder: refresh the resource map in place from TandemnStore
-        pass
+    def refresh_resource_map(self, TandemnStore=None):
+        return self.get_resource_map()
 
     def get_avail_capacity(self, env, gpu_type):
         env_key = self._env_key(env)
+        requested_gpu = gpu_type or env_gpu_type(env)
         resources = self.resources_summary()
         info = resources.get(env_key)
-        if info is None or info.get("gpu_type") != gpu_type:
+        if info is None or (requested_gpu is not None and info.get("gpu_type") != requested_gpu):
             return 0
         return int(info.get("free", 0))
 
@@ -321,100 +288,144 @@ class ResourceMapManager:
         return str(env)
 
 
-# SMOKE_ENV = "aws|us-east-1|on_demand|H100"
-# SMOKE_SNAPSHOT_JSON = {
-#     "capacity_by_env": {
-#         SMOKE_ENV: {
-#             "cloud": "aws",
-#             "region": "us-east-1",
-#             "market": "on_demand",
-#             "gpu_type": "H100",
-#             "free": 4,
-#             "total": 8,
-#         }
-#     }
-# }
-# SMOKE_OK_PLAN = {
-#     "job_ok": {
-#         "type": "place",
-#         "ladder": [{"role": "aggregate", "env": SMOKE_ENV.split("|"), "n_replicas": 2}],
-#     }
-# }
-# SMOKE_BAD_PLAN = {
-#     "job_bad": {
-#         "type": "place",
-#         "ladder": [{"role": "aggregate", "env": SMOKE_ENV.split("|"), "n_replicas": 5}],
-#     }
-# }
+def _smoke_resource_map():
+    from tandemn_system_data.models import (  # type: ignore[import-untyped]
+        Cloud,
+        IntraMachineInterconnect,
+        MachinePool,
+        NetworkFabric,
+        Region,
+        ResourceMap,
+        Zone,
+    )
+
+    pool_fields = getattr(MachinePool, "model_fields", {})
+    pool_values = {
+        "instance_family": "p4d",
+        "gpu_type": "A100",
+        "gpu_memory_gb": 40,
+        "gpus_per_instance": 8,
+        "total_instances": 2,
+        "intra_machine_interconnect": IntraMachineInterconnect(type="nvlink_nvswitch"),
+    }
+    if "available_instances" in pool_fields:
+        pool_values["available_instances"] = 1
+
+    resource_fields = getattr(ResourceMap, "model_fields", {})
+    resource_values = {
+        "clouds": {
+            "aws": Cloud(
+                regions={
+                    "us-east-2": Region(
+                        zones={
+                            "use2-az3": Zone(
+                                network_fabrics={
+                                    "efa-cluster-a": NetworkFabric(
+                                        fabric_type="efa",
+                                        gpu_direct_rdma=True,
+                                        machine_pools={
+                                            "p4d.24xlarge": MachinePool(**pool_values),
+                                        },
+                                    )
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+        }
+    }
+    if "market" in resource_fields:
+        resource_values["market"] = ["reserved"]
+    elif "capacity_type" in resource_fields:
+        resource_values["capacity_type"] = ["reserved"]
+    return ResourceMap(**resource_values)
 
 
-# class _SmokeResourceMapManager(ResourceMapManager):
-#     def _latest_resource_map_json(self, user_id: str | None = None) -> dict[str, Any]:
-#         return SMOKE_SNAPSHOT_JSON
+class _SmokeResourceMapManager(ResourceMapManager):
+    def __init__(self):
+        super().__init__(user_id="usr_resource_map_smoke")
+
+    def get_resource_map(self, user_id: str | None = None):
+        return _smoke_resource_map()
+
+    def get_running_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+    def get_waiting_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+    def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+    def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        return []
 
 
-# def _run_capacity_smoke(manager: ResourceMapManager, label: str) -> None:
-#     print(f"[{label}] Initial resources summary:", manager.resources_summary())
-#     assert manager.resources_summary()[SMOKE_ENV]["free"] == 4
-#     print(f"[{label}] Available capacity (get_avail_capacity):", manager.get_avail_capacity(SMOKE_ENV, "H100"))
-#     assert manager.get_avail_capacity(SMOKE_ENV, "H100") == 4
-#     print(f"[{label}] Simulating future resources (SMOKE_OK_PLAN)...")
-#     simulated = manager.simulate_future_resources(SMOKE_OK_PLAN)
-#     print(f"[{label}] simulate_future_resources:", simulated)
-#     assert simulated[SMOKE_ENV]["free_after"] == 2
+def _run_smoke(manager: ResourceMapManager, label: str) -> dict[str, Any]:
+    resources = manager.resources_summary()
+    if not resources:
+        raise RuntimeError(f"{label}: resource map is empty")
 
-#     print(f"[{label}] Checking resource feasibility for OK plan...")
-#     ok, violations = manager.check_resource_feasibility(SMOKE_OK_PLAN)
-#     print(f"[{label}] check_resource_feasibility (OK): ok={ok}, violations={violations}")
-#     assert ok and not violations
+    env_key, info = next(iter(sorted(resources.items())))
+    env_parts = env_key.split("|")
+    if len(env_parts) != 5:
+        raise AssertionError(f"{label}: env key must have 5 parts, got {env_key!r}")
+    for required in ("free", "total", "gpu_type", "cloud", "region", "zone", "market"):
+        if required not in info:
+            raise AssertionError(f"{label}: env {env_key!r} missing {required!r}")
 
-#     print(f"[{label}] Checking resource feasibility for BAD plan...")
-#     ok, violations = manager.check_resource_feasibility(SMOKE_BAD_PLAN)
-#     print(f"[{label}] check_resource_feasibility (BAD): ok={ok}, violations={violations}")
-#     assert not ok and violations
-#     print(f"resource_map {label} smoke passed")
+    free = int(info["free"])
+    assert manager.get_avail_capacity(env_parts, info["gpu_type"]) == free
 
+    plan = {
+        "actions": [
+            {
+                "job_id": "job_resource_map_smoke",
+                "type": "place",
+                "ladder": [
+                    {
+                        "role": "aggregate",
+                        "env": env_parts,
+                        "config": {"gpu_count": 1, "gpu_type": info["gpu_type"]},
+                        "n_replicas": 1,
+                    }
+                ],
+            }
+        ]
+    }
+    simulated = manager.simulate_future_resources(plan)
+    if simulated[env_key]["free_after"] != free - 1:
+        raise AssertionError(f"{label}: expected free_after={free - 1}, got {simulated[env_key]}")
+    ok, violations = manager.check_resource_feasibility(plan)
+    if not ok:
+        raise AssertionError(f"{label}: feasible smoke plan failed: {violations}")
 
-# def _run_db_smoke() -> None:
-#     from datetime import UTC, datetime
-#     from uuid import uuid4
-
-#     from sqlalchemy import text
-#     from tandemn_system_data.db import ResourceMapRow, UserRow
-
-#     user_id = f"usr_koi_smoke_{uuid4().hex[:8]}"
-#     resource_map_id = f"rmap_koi_smoke_{uuid4().hex[:8]}"
-#     manager = ResourceMapManager(user_id=user_id)
-
-#     print(f"[db smoke] Creating test user {user_id} and resource_map {resource_map_id}...")
-#     with manager._client().begin() as session:
-#         session.add(UserRow(user_id=user_id, name="koi smoke", created_at=datetime.now(UTC)))
-#         session.flush()
-#         session.add(
-#             ResourceMapRow(
-#                 resource_map_id=resource_map_id,
-#                 user_id=user_id,
-#                 snapshot_json=SMOKE_SNAPSHOT_JSON,
-#                 captured_at=datetime.now(UTC),
-#             )
-#         )
-
-#     try:
-#         print("[db smoke] Running capacity smoke tests...")
-#         _run_capacity_smoke(manager, "sql")
-#     finally:
-#         print(f"[db smoke] Cleaning up test user {user_id}...")
-#         with manager._client().begin() as session:
-#             session.execute(
-#                 text("delete from users where user_id = :user_id"), {"user_id": user_id}
-#             )
+    snapshot = manager.snapshot_cluster_state(tick=0)
+    dynamic = manager.dynamic_view()
+    result = {
+        "label": label,
+        "env_key": env_key,
+        "free": free,
+        "total": int(info["total"]),
+        "active_jobs": len(snapshot.active_jobs_summary()),
+        "pending_jobs": len(snapshot.pending_jobs_summary()),
+        "dynamic_view_keys": sorted(dynamic.keys()),
+    }
+    print(json.dumps(result, indent=2, default=str))
+    return result
 
 
-# if __name__ == "__main__":
-#     import sys
+def _main() -> None:
+    parser = argparse.ArgumentParser(description="Smoke-test Koi ResourceMapManager")
+    parser.add_argument("--user-id", help="Run against Tandemn Store for this user_id")
+    args = parser.parse_args()
 
-#     print("[main] Running in-memory smoke test...")
-#     _run_capacity_smoke(_SmokeResourceMapManager(), "in-memory")
-#     if "--db" in sys.argv:
-#         print("[main] Running database-backed smoke test...")
-#         _run_db_smoke()
+    if args.user_id:
+        _run_smoke(ResourceMapManager(user_id=args.user_id), "tandemn-store")
+    else:
+        _run_smoke(_SmokeResourceMapManager(), "in-memory")
+
+
+if __name__ == "__main__":
+    _main()

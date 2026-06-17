@@ -34,7 +34,7 @@ Safety invariants enforced here, not in the prompt:
     - Trajectories are bounded by K_MAX turns, a wall-clock timeout, and
       a consecutive REPL-error limit.
 
-v0 scope: reserved/on-demand markets only; K_P = 1 (code supports more).
+v0 scope: reserved market only; K_P = 1 (code supports more).
 """
 
 import contextlib
@@ -786,11 +786,11 @@ class KoiAgentHarness:
         if states is not None:
             self._autofill_coverage(plan, states)
 
-        # An empty commit is "keep everything" when the snapshot has jobs
-        # (auto-fill covers them). It is only malformed when nothing at all
-        # could be derived.
-        if not plan.actions:
-            raise PlanMaterializationError("plan has no actions and no jobs to cover")
+        # Empty is valid only when the snapshot explicitly exposes an empty
+        # job inventory. If inventory is unavailable, an empty commit gives us
+        # no way to distinguish "no work" from an incomplete plan.
+        if not plan.actions and states is None:
+            raise PlanMaterializationError("plan has no actions and no job inventory to cover")
 
         return plan
 
@@ -806,10 +806,10 @@ class KoiAgentHarness:
             raise PlanMaterializationError(f"job {jid}: ladder is empty")
 
         for i, rank in enumerate(action.ladder):
-            if rank.env is None or len(rank.env) != 4:
+            if rank.env is None or len(rank.env) != 5:
                 raise PlanMaterializationError(
-                    f"job {jid} rank {i}: env must be a 4-tuple "
-                    "(cloud, region, market, gpu_type) to be launchable"
+                    f"job {jid} rank {i}: env must be a 5-tuple "
+                    "(market, cloud, region, zone, gpu_type) to be launchable"
                 )
             if rank.n_replicas < 1:
                 raise PlanMaterializationError(f"job {jid} rank {i}: n_replicas must be >= 1")
@@ -973,8 +973,8 @@ class KoiAgentHarness:
             "config you reasoned to; you stay free to propose configs "
             "directly, and they never replace cluster-level reconciliation.\n\n"
             f"{self._plan_schema_section()}"
-            "Markets are reserved/on-demand only this version; do not plan "
-            "spot capacity.\n\n"
+            "Only the reserved market is valid this version; do not plan "
+            "spot or on-demand capacity.\n\n"
             "Write Python in ```repl blocks. Print what you need to see. "
             "Think and inspect as much as the turn budget allows; you have "
             f"{self.k_max} turns and {int(self.wall_clock_sec)} seconds. "
@@ -1009,7 +1009,7 @@ class KoiAgentHarness:
             "   'rationale': str}\n"
             "Rank dict (each entry of ladder):\n"
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
-            "   'env': [cloud, region, market, gpu_type],   # REQUIRED - launch target + ICP key\n"
+            "   'env': [market, cloud, region, zone, gpu_type],   # REQUIRED - launch target + ICP key\n"
             "   'config': {tp, pp, dp, ep, gpu_count, engine_name, ...},\n"
             "   'n_replicas': int,\n"
             "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"

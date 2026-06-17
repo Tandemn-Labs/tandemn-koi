@@ -3,7 +3,12 @@ from enum import Enum
 
 import numpy as np
 
-EnvLabel = tuple[str, str, str, str]
+EnvLabel = tuple[str, str, str, str, str]
+ENV_MARKET_INDEX = 0
+ENV_CLOUD_INDEX = 1
+ENV_REGION_INDEX = 2
+ENV_ZONE_INDEX = 3
+ENV_GPU_TYPE_INDEX = 4
 
 
 @dataclass
@@ -82,7 +87,7 @@ class EvidenceRow:
     deploy_timestamp_utc: float  # forensics; replay anchoring
     job_id: str
     rank_id: str
-    env_label: EnvLabel  # (cloud, region, market, gpu_type)
+    env_label: EnvLabel  # (market, cloud, region, zone, gpu_type)
     X: dict[str, object]  # ~60 decision variables
     W_observed: dict[str, float]  # 22 workload features
     V_observed_trajectory: dict[str, np.ndarray]  # sub-tick V samples (all measured V's)
@@ -199,6 +204,14 @@ def _as_env_tuple(env) -> tuple | None:
     return (text,)
 
 
+def env_gpu_type(env) -> str | None:
+    """Return gpu_type from a canonical env label, if present."""
+    env_tuple = _as_env_tuple(env)
+    if env_tuple is None or len(env_tuple) <= ENV_GPU_TYPE_INDEX:
+        return None
+    return str(env_tuple[ENV_GPU_TYPE_INDEX])
+
+
 @dataclass
 class RankSpec:
     """One rank in a ladder: a role-tagged chain config in one environment.
@@ -215,7 +228,7 @@ class RankSpec:
     """
 
     role: str  # v0: "aggregate" only ("prefill"/"decode" disabled, see KNOWN_ROLES)
-    env: tuple | None  # (cloud, region, market, gpu_type)
+    env: tuple | None  # (market, cloud, region, zone, gpu_type)
     config: dict  # X decision variables for this chain
     n_replicas: int = 1  # "chains" in the shorthand
     mechanism_id: str | None = None

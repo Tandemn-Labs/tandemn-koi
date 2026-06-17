@@ -94,6 +94,7 @@ class SurrogatePrediction:
         env_vector = {
             "cloud": job_features.get("cloud"),
             "region": job_features.get("region"),
+            "zone": job_features.get("zone"),
             "market": job_features.get("market"),
             "gpu_type": job_features.get("gpu_type"),
             "instance_type": job_features.get("instance_type"),
@@ -199,6 +200,7 @@ class SurrogatePrediction:
                 "derive_x": {
                     "cloud",
                     "region",
+                    "zone",
                     "market",
                     "instance_type",
                     "interconnect_type",
@@ -744,7 +746,8 @@ class SurrogatePrediction:
 #     job_features = {
 #         "cloud": "aws",
 #         "region": "us-east-1",
-#         "market": "on_demand",
+#         "market": "reserved",
+#         "zone": "use1-az1",
 #         "gpu_type": "H200",
 #         "instance_type": "p5e.48xlarge",
 #         "num_nodes_per_chain": 1,

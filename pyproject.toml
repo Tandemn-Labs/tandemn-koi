@@ -2,7 +2,7 @@
 name = "your-project-name"
 version = "0.1.0"
 description = "Your project description"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "ai-dynamo[mocker]==1.2.1",
     "huggingface_hub>=0.23.0",
@@ -11,6 +11,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "scipy>=1.11.0",
     "sqlalchemy>=2.0",
+    "tandemn-store"
 ]
 
 [dependency-groups]
@@ -22,7 +23,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 src = ["src"]
 
 [tool.ruff.format]
@@ -46,7 +47,7 @@ ignore = [
 ]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 files = ["src"]
 warn_unused_configs = true
 warn_redundant_casts = true
@@ -57,3 +58,6 @@ warn_unused_ignores = true
 no_implicit_optional = true
 strict_equality = true
 show_error_codes = true
+
+[tool.uv.sources]
+tandemn-store = { path = "../tandemn-store", editable = true }

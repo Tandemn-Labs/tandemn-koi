@@ -1,7 +1,7 @@
 """
 ICP tests whether an edge is stable across environments.
 
-A causal edge should have invariant residuals across cloud, region, market, or GPU.
+A causal edge should have invariant residuals across market, cloud, region, zone, or GPU.
 A spurious edge often shows env-specific residual shifts.
 
     residual = observed_value - surrogate_predicted_value
@@ -289,9 +289,9 @@ class ICP:
 #     )
 
 #     envs = [
-#         ("aws", "us-east-1", "on_demand", "H100"),
-#         ("aws", "us-west-2", "on_demand", "H100"),
-#         ("gcp", "us-central1", "reserved", "H100"),
+#         ("reserved", "aws", "us-east-1", "use1-az1", "H100"),
+#         ("reserved", "aws", "us-west-2", "usw2-az1", "H100"),
+#         ("reserved", "gcp", "us-central1", "us-central1-a", "H100"),
 #     ]
 #     base = np.linspace(-0.2, 0.2, 15)
 #     stable_v = {env: base.copy() for env in envs}

@@ -20,9 +20,8 @@ Design rules (from realactualopencodeagentic.md):
       LLM works in a REPL, so tuples are fine; nothing opaque crosses the
       boundary.
 
-v0 market scope: reserved/on-demand instances only. Resource summaries may
-carry spot fields (spot_preemption_rate, beta_launch_success) for later;
-no tool branches on them yet.
+v0 market scope: reserved instances only. Resource summaries carry
+market|cloud|region|zone|gpu_type env keys.
 
 Tool catalog:
 
@@ -87,7 +86,7 @@ from typing import Any
 
 import numpy as np
 from src.config.hyperparameters import GAMMA_SLO, UTILIZATION_TARGET_ONLINE
-from src.core.models import LADDER_ACTIONS, SWAP_BUDGET_ACTIONS, Plan, RankSpec
+from src.core.models import LADDER_ACTIONS, SWAP_BUDGET_ACTIONS, Plan, RankSpec, env_gpu_type
 
 # Residual calibration: debias the surrogate with observed (observed-predicted)
 # residuals from similar past deployments, so scoring uses reality-corrected
@@ -408,8 +407,7 @@ def get_resource_map() -> dict[str, Any]:
 
     Returns:
         Dict env_key -> {"free": int, "total": int, "gpu_type": str, ...}.
-        May include reserve fields (reserved_recovery_gpus,
-        reserved_canary_gpus) and spot fields for later market support.
+        Env keys use market|cloud|region|zone|gpu_type.
     """
     snap = _snapshot()
     return snap.resources_summary() if hasattr(snap, "resources_summary") else {}
@@ -1007,7 +1005,7 @@ def size_ladder(
     for raw in ranks:
         rank = RankSpec.from_dict(raw)
         gpus_per_chain = rank.gpus_per_chain()
-        gpu_type = rank.env[3] if rank.env and len(rank.env) >= 4 else None
+        gpu_type = env_gpu_type(rank.env)
         free = _CTX.resource_map.get_avail_capacity(rank.env, gpu_type) if gpu_type else 0
         max_by_cap = free // gpus_per_chain if gpus_per_chain > 0 else 0
 
@@ -1296,7 +1294,7 @@ def get_similar_deployments(
             rows = [
                 r
                 for r in rows
-                if (wanted_gpu is None or r.env_label[3] == wanted_gpu)
+                if (wanted_gpu is None or env_gpu_type(r.env_label) == wanted_gpu)
                 and (
                     wanted_type is None
                     or str(r.W_observed.get("type") or r.W_observed.get("workload_type")).lower()
@@ -1445,7 +1443,7 @@ def _similar_rows(
         rows = [
             r
             for r in rows
-            if (gpu is None or (len(r.env_label) > 3 and r.env_label[3] == gpu))
+            if (gpu is None or env_gpu_type(r.env_label) == gpu)
             and (typ is None or r.W_observed.get("type") == typ)
         ]
     return rows[-top_k:]
