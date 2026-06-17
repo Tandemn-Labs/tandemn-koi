@@ -75,7 +75,7 @@ class OpenAICompatClient:
         model: str,
         api_key: str = "EMPTY",
         fold_system: bool = False,
-        temperature: float = 0.4,
+        temperature: float | None = 0.4,
         max_tokens: int = 4096,
         timeout_sec: float = 120.0,
         extra: dict | None = None,
@@ -89,21 +89,30 @@ class OpenAICompatClient:
         self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout_sec)
         self.model = model
         self.fold_system = bool(fold_system)
-        self.temperature = float(temperature)
+        self.temperature = None if temperature is None else float(temperature)
         self.max_tokens = int(max_tokens)
         self.extra = dict(extra or {})
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         """Run one chat completion and return the assistant text."""
         payload = self._fold(messages) if self.fold_system else list(messages)
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=cast(Any, payload),
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            **self.extra,
-        )
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": cast(Any, payload),
+            self._token_limit_param(): self.max_tokens,
+        }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        kwargs.update(self.extra)
+        response = self._client.chat.completions.create(**kwargs)
         return response.choices[0].message.content or ""
+
+    def _token_limit_param(self) -> str:
+        """Return the token-limit parameter supported by the target model."""
+        model = self.model.lower()
+        if model.startswith(("gpt-5", "o1", "o3", "o4")):
+            return "max_completion_tokens"
+        return "max_tokens"
 
     @staticmethod
     def _fold(messages: list[dict[str, str]]) -> list[dict[str, str]]:

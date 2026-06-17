@@ -2047,7 +2047,7 @@ def _materialize_chain_list(chain_list):
         return []
     if hasattr(chain_list[0], "chain_id"):
         return list(chain_list)
-    from src.cost.switchcost import ChainEntry  # type: ignore[import-not-found]
+    from src.cost.switch_cost import ChainEntry
 
     out = []
     for c in chain_list:
