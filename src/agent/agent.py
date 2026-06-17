@@ -786,11 +786,11 @@ class KoiAgentHarness:
         if states is not None:
             self._autofill_coverage(plan, states)
 
-        # An empty commit is "keep everything" when the snapshot has jobs
-        # (auto-fill covers them). It is only malformed when nothing at all
-        # could be derived.
-        if not plan.actions:
-            raise PlanMaterializationError("plan has no actions and no jobs to cover")
+        # Empty is valid only when the snapshot explicitly exposes an empty
+        # job inventory. If inventory is unavailable, an empty commit gives us
+        # no way to distinguish "no work" from an incomplete plan.
+        if not plan.actions and states is None:
+            raise PlanMaterializationError("plan has no actions and no job inventory to cover")
 
         return plan
 
