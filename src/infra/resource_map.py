@@ -162,10 +162,20 @@ class ResourceMapManager:
         )
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
-        return self._normalized_scheduling_summary(self.get_resource_map(user_id=user_id))
+        resource_map = self.get_resource_map(user_id=user_id)
+        used = self._used_gpus_by_env(user_id=user_id)
+        return self._normalized_scheduling_summary(resource_map, used)
 
     @classmethod
-    def _normalized_scheduling_summary(cls, resource_map) -> dict[str, dict[str, Any]]:
+    def _normalized_scheduling_summary(
+        cls, resource_map, used: dict[str, int] | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """Flatten the store ResourceMap to env_key -> capacity info.
+
+        The store map carries total capacity only; ``free`` is derived here
+        as ``total`` minus GPUs consumed by running chains (``used``).
+        """
+        used = used or {}
         raw = dict(resource_map.scheduling_summary())
         market = cls._default_market(resource_map)
         out: dict[str, dict[str, Any]] = {}
@@ -173,16 +183,36 @@ class ResourceMapManager:
             body = dict(info)
             parts = str(key).split("|")
             if len(parts) == 5:
+                env_key = str(key)
                 body.setdefault("market", parts[0])
-                out[str(key)] = body
-                continue
-            if len(parts) == 4:
+            elif len(parts) == 4:
                 env_key = "|".join([market, *parts])
                 body.setdefault("market", market)
-                out[env_key] = body
-                continue
-            out[str(key)] = body
+            else:
+                env_key = str(key)
+            total = int(body.get("total", 0))
+            body["free"] = max(0, total - int(used.get(env_key, 0)))
+            out[env_key] = body
         return out
+
+    def _used_gpus_by_env(self, user_id: str | None = None) -> dict[str, int]:
+        """GPUs currently consumed by running chains, bucketed by env_key.
+
+        Free capacity is not stored on the resource map (total-only); it is
+        inferred by subtracting this from each env's total.
+        """
+        used: dict[str, int] = {}
+        for chain in self.get_running_chains(user_id=user_id):
+            shape = chain.get("shape_json") or {}
+            env = shape.get("env")
+            if env is None:
+                continue
+            env_key = self._env_key(env)
+            gpus = shape.get("gpu_count", shape.get("count"))
+            if gpus is None:
+                gpus = int(shape.get("tp", 1)) * int(shape.get("pp", 1))
+            used[env_key] = used.get(env_key, 0) + max(1, int(gpus))
+        return used
 
     @staticmethod
     def _default_market(resource_map) -> str:
@@ -197,7 +227,8 @@ class ResourceMapManager:
 
     def dynamic_view(self, user_id: str | None = None) -> dict[str, Any]:
         resource_map = self.get_resource_map(user_id=user_id)
-        resources = self._normalized_scheduling_summary(resource_map)
+        used = self._used_gpus_by_env(user_id=user_id)
+        resources = self._normalized_scheduling_summary(resource_map, used)
         return {
             "resource_map_version": resource_map.version,
             "updated_at": resource_map.updated_at,
@@ -308,8 +339,8 @@ def _smoke_resource_map():
         "total_instances": 2,
         "intra_machine_interconnect": IntraMachineInterconnect(type="nvlink_nvswitch"),
     }
-    if "available_instances" in pool_fields:
-        pool_values["available_instances"] = 1
+    if "price_per_instance_hour" in pool_fields:
+        pool_values["price_per_instance_hour"] = 32.77
 
     resource_fields = getattr(ResourceMap, "model_fields", {})
     resource_values = {
