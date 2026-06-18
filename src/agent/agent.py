@@ -91,6 +91,7 @@ class PlanMaterializationError(ValueError):
 
 
 class AgentTrace:
+    # TODO - Comment this for production
     """Append-only event log for one agent invocation.
 
     Every trajectory turn, REPL execution, specialist call, and fallback
@@ -238,7 +239,7 @@ class SpecialistRunner:
             "Output a single JSON object with keys: job_id, tenant_id, "
             "type, ladder, predicted_y, predicted_sigma, "
             "budget_utilization, used_capacity, fitness, "
-            "marginal_value_of_more, unused_capacity, mechanism_ids, "
+            "marginal_value_of_more, unused_capacity, mechanism_ids (multiple mechanisms are allowed), "
             "new_mechanism_proposals, reasoning. No prose outside the JSON."
         )
 
