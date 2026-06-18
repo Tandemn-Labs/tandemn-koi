@@ -163,7 +163,7 @@ class ResourceMapManager:
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
         resource_map = self.get_resource_map(user_id=user_id)
-        used = self._used_gpus_by_env(user_id=user_id)
+        used = self._used_gpus_by_env(resource_map, user_id=user_id)
         return self._normalized_scheduling_summary(resource_map, used)
 
     @classmethod
@@ -195,19 +195,33 @@ class ResourceMapManager:
             out[env_key] = body
         return out
 
-    def _used_gpus_by_env(self, user_id: str | None = None) -> dict[str, int]:
+    def _used_gpus_by_env(self, resource_map, user_id: str | None = None) -> dict[str, int]:
         """GPUs currently consumed by running chains, bucketed by env_key.
 
         Free capacity is not stored on the resource map (total-only); it is
-        inferred by subtracting this from each env's total.
+        inferred by subtracting this from each env's total. One chain row is
+        one launched serving unit, so its GPU footprint is exactly
+        ``shape_json["count"]`` (no replica multiplier).
+
+        The chain's placement env is resolved with precedence
+        ``target_node`` -> ``shape_json["env"]`` -> ``shape_json["pool_id"]``;
+        the store writes the env key into the first-class ``target_node``
+        field. A 4-part legacy env is normalized to 5 parts with the map's
+        default market.
         """
+        default_market = self._default_market(resource_map)
         used: dict[str, int] = {}
         for chain in self.get_running_chains(user_id=user_id):
             shape = chain.get("shape_json") or {}
-            env = shape.get("env")
-            if env is None:
+            raw_env = (
+                chain.get("target_node")
+                or shape.get("env")
+                or shape.get("pool_id")
+                or shape.get("target_node")
+            )
+            if raw_env is None:
                 continue
-            env_key = self._env_key(env)
+            env_key = self._normalize_env_key(raw_env, default_market)
             # tandemn-store guarantees a positive int 'count' at launch; read
             # it directly with no parallelism-derived fallback.
             count = shape.get("count")
@@ -218,6 +232,19 @@ class ResourceMapManager:
                 )
             used[env_key] = used.get(env_key, 0) + count
         return used
+
+    @classmethod
+    def _normalize_env_key(cls, env, default_market: str) -> str:
+        """Normalize an env (list/tuple or pipe string) to a 5-part key.
+
+        A 4-part key (``cloud|region|zone|gpu_type``) is prefixed with the
+        default market so it matches scheduling_summary's 5-part keys.
+        """
+        key = cls._env_key(env)
+        parts = key.split("|")
+        if len(parts) == 4:
+            return "|".join([default_market, *parts])
+        return key
 
     @staticmethod
     def _default_market(resource_map) -> str:
@@ -232,7 +259,7 @@ class ResourceMapManager:
 
     def dynamic_view(self, user_id: str | None = None) -> dict[str, Any]:
         resource_map = self.get_resource_map(user_id=user_id)
-        used = self._used_gpus_by_env(user_id=user_id)
+        used = self._used_gpus_by_env(resource_map, user_id=user_id)
         resources = self._normalized_scheduling_summary(resource_map, used)
         return {
             "resource_map_version": resource_map.version,
@@ -452,6 +479,79 @@ def _run_smoke(manager: ResourceMapManager, label: str) -> dict[str, Any]:
     return result
 
 
+class _UsedCapacitySmokeManager(ResourceMapManager):
+    """80 total A100 GPUs with one running 8-GPU chain placed via target_node.
+
+    Pins the used-capacity contract: free = total - count = 80 - 8 = 72.
+    The chain carries its env in the first-class ``target_node`` field (not
+    ``shape_json['env']``), exercising the resolution precedence.
+    """
+
+    _ENV = "reserved|aws|us-east-2|use2-az3|A100"
+
+    def __init__(self):
+        super().__init__(user_id="usr_used_capacity_smoke")
+
+    def get_resource_map(self, user_id: str | None = None):
+        from tandemn_system_data.models import (
+            Cloud,
+            MachinePool,
+            NetworkFabric,
+            Region,
+            ResourceMap,
+            Zone,
+        )
+
+        pool = MachinePool(
+            instance_family="p4d",
+            gpu_type="A100",
+            gpus_per_instance=8,
+            total_instances=10,  # 10 * 8 = 80 total GPUs
+        )
+        clouds = {
+            "aws": Cloud(
+                regions={
+                    "us-east-2": Region(
+                        zones={
+                            "use2-az3": Zone(
+                                network_fabrics={
+                                    "efa-cluster-a": NetworkFabric(
+                                        fabric_type="efa",
+                                        machine_pools={"p4d.24xlarge": pool},
+                                    )
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+        }
+        return ResourceMap(market=["reserved"], clouds=clouds)
+
+    def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        return [
+            {
+                "chain_id": "chain_used_capacity_smoke",
+                "target_node": self._ENV,
+                "shape_json": {"gpu_count": 8, "count": 8},
+            }
+        ]
+
+
+def _run_used_capacity_check() -> dict[str, Any]:
+    manager = _UsedCapacitySmokeManager()
+    resources = manager.resources_summary()
+    env = _UsedCapacitySmokeManager._ENV
+    info = resources[env]
+    if int(info["total"]) != 80:
+        raise AssertionError(f"used-capacity: expected total=80, got {info['total']}")
+    if int(info["free"]) != 72:
+        raise AssertionError(f"used-capacity: expected free=72 (80-8), got {info['free']}")
+    result = {"label": "used-capacity", "env_key": env, "total": 80, "free": int(info["free"])}
+    print(json.dumps(result, indent=2, default=str))
+    return result
+
+
 def _main() -> None:
     parser = argparse.ArgumentParser(description="Smoke-test Koi ResourceMapManager")
     parser.add_argument("--user-id", help="Run against Tandemn Store for this user_id")
@@ -461,6 +561,7 @@ def _main() -> None:
         _run_smoke(ResourceMapManager(user_id=args.user_id), "tandemn-store")
     else:
         _run_smoke(_SmokeResourceMapManager(), "in-memory")
+        _run_used_capacity_check()
 
 
 if __name__ == "__main__":
