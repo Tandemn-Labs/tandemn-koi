@@ -734,7 +734,7 @@ class KoiAgentHarness:
             - Action is legal for the job's current state (PLACE only on
               waiting, PREEMPT only on running, ...).
             - Ladder actions carry a non-empty ladder; every rank has a
-              4-tuple env (launch target + ICP key) and >= 1 replica;
+              5-tuple env (launch target + ICP key) and >= 1 replica;
               missing per-rank mechanism_id falls back to the action's,
               and a missing mechanism_id is a warning (evidence degrades)
               not a rejection.
@@ -947,6 +947,17 @@ class KoiAgentHarness:
             "subject to tenant policy, resource capacity, physical chain "
             "feasibility, SLO chance under DRO, the swap budget B_t, and "
             "admission control.\n\n"
+            "Before committing P_t, explore multiple candidate allocation "
+            "sketches psi_t. These are internal scratch reasoning frames, "
+            "not physical cluster state, not deployable objects, and not "
+            "part of the final schema. Use them only to avoid local minima. "
+            "For non-trivial ticks, compare several angles: "
+            "feasibility/SLO-first, aggregate sigma-first, "
+            "churn/B_t-minimizing, and scarce-resource or tenant-fair "
+            "allocation. For each serious candidate, use tools to size "
+            "ladders, simulate resources, compute_sigma, and "
+            "check_feasibility. Keep compact summaries. Then choose "
+            "exactly one final Plan P_t and call FINAL_VAR(plan).\n\n"
             "Mandatory order: allocate budgets before per-job specialists. "
             "Build tenant envelopes, build a job priority table, allocate a "
             "BudgetBook, validate it with validate_budget_book, and only "
@@ -1035,7 +1046,7 @@ class KoiAgentHarness:
             "  retry    launch_failed->running (needs ladder)\n"
             "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
             "  diagnose  no change          (no ladder; record a theory only)\n"
-            "Every ladder rank MUST carry a 4-element env and should carry a "
+            "Every ladder rank MUST carry a 5-element env and should carry a "
             "mechanism_id; a rank without env is rejected (not launchable). "
             "Jobs you omit are auto-kept (running) or auto-deferred (waiting), "
             "so list only the jobs you actually decide.\n"
@@ -1047,10 +1058,11 @@ class KoiAgentHarness:
             "whose predicted p99 TTFT/TPOT exceeds target (latency is "
             "per-replica - replicas cannot fix it) and spills its share to the "
             "others, and it derates per-replica throughput so queue wait stays "
-            "bounded. Scoring composes your ranks the same way: compute_sigma "
-            "sums throughput, takes the worst-case latency, and blends cost "
-            "across ranks, so a heterogeneous ladder is scored as the whole "
-            "job, not one rank. Use it as: sized = size_ladder(ranks, "
+            "bounded. size_ladder sums achieved throughput across ranks to "
+            "meet target_tps. compute_sigma scores the composed job-level "
+            "y_hat using worst-case latency, throughput/cost rollups, DRO "
+            "risk, EIG, and switch cost, so a heterogeneous ladder is scored "
+            "as the whole job, not one rank. Use it as: sized = size_ladder(ranks, "
             "job_features); action['ladder'] = sized['ranks']. The other fields "
             "(meets_target, unmet_tps, per-rank slo_violations, marginal_value) "
             "are diagnostics.\n\n"
