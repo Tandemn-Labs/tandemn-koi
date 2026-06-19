@@ -44,7 +44,7 @@ _EXISTENCE_REQUIRED = frozenset(
     {ActionType.KEEP, ActionType.SWAP, ActionType.PREEMPT, ActionType.RESUME, ActionType.RETRY}
 )
 
-_KNOWN_WORKLOAD_TYPES = frozenset({"online", "batch", "batched", "offline"})
+_KNOWN_WORKLOAD_TYPES = frozenset({"any", "online", "batch", "batched", "offline"})
 
 
 @dataclass
@@ -76,6 +76,8 @@ class Validator:
             a job's predicted DRO SLO-breach probability. When present, C7 runs.
         slo_breach_threshold: C7 fails an action whose predicted breach
             probability exceeds this (default 0.5).
+        resource_map: Optional resource service; when present it owns allocation
+            footprint semantics for C5/C6.
     """
 
     def __init__(
@@ -85,10 +87,12 @@ class Validator:
         tenant_registry=None,
         slo_predictor=None,
         slo_breach_threshold: float = 0.5,
+        resource_map=None,
     ):
         self.candidate_graph = candidate_graph
         self.mechanism_registry = mechanism_registry
         self.tenant_registry = tenant_registry
+        self.resource_map = resource_map
         self.slo_predictor = slo_predictor
         self.slo_breach_threshold = float(slo_breach_threshold)
 
@@ -296,7 +300,11 @@ class Validator:
                     violations.append(
                         f"C6 physics: job {action.job_id} rank {i} n_replicas must be >= 1"
                     )
-                per_chain = rank.gpus_per_chain()
+                per_chain, gpu_error = self._rank_engine_gpus(rank)
+                if gpu_error:
+                    violations.append(f"C6 physics: job {action.job_id} rank {i} {gpu_error}")
+                    continue
+                assert per_chain is not None
                 if per_chain < 1:
                     violations.append(
                         f"C6 physics: job {action.job_id} rank {i} resolves to < 1 GPU per chain"
@@ -304,15 +312,17 @@ class Validator:
                 if resources is not None:
                     info = resources.get(self._env_key(rank.env))
                     if info is not None:
-                        pool, pool_error = self._select_pool(info, rank)
-                        if pool_error:
+                        allocation, allocation_error = self._rank_allocation_summary(
+                            rank, resources
+                        )
+                        if allocation_error:
                             violations.append(
-                                f"C6 physics: job {action.job_id} rank {i}: {pool_error}"
+                                f"C6 physics: job {action.job_id} rank {i}: {allocation_error}"
                             )
                             continue
-                        unit_gpus = self._pool_gpus_per_unit(pool) if pool else per_chain
-                        if pool and self._pool_kind(pool) != "gpu" and per_chain > unit_gpus:
-                            inst = pool.get("instance_type")
+                        unit_gpus = int(allocation.get("gpus_per_unit", per_chain))
+                        if allocation.get("allocation_kind") != "gpu" and per_chain > unit_gpus:
+                            inst = allocation.get("instance_type")
                             violations.append(
                                 f"C6 physics: job {action.job_id} rank {i} needs {per_chain} "
                                 f"engine GPUs but {inst} has {unit_gpus}"
@@ -369,7 +379,10 @@ class Validator:
         Returns:
             (ok, violations).
         """
-        mechanism = self._as_mechanism(proposal)
+        try:
+            mechanism = self._as_mechanism(proposal)
+        except (TypeError, ValueError) as exc:
+            return False, [f"mechanism: proposal does not parse ({exc})"]
         violations: list[str] = []
 
         if not mechanism.edge_ids:
@@ -411,7 +424,7 @@ class Validator:
 
         Args:
             scope: the proposal's scope dict, e.g.
-                {"x": [...], "v": [...], "workload_type": "online"}.
+                {"x" or "subset_x": [...], "v" or "subset_v": [...]}.
 
         Returns:
             (ok, violations).
@@ -419,9 +432,9 @@ class Validator:
         if not isinstance(scope, dict):
             return False, ["scope: must be a dict"]
 
-        x_vars = list(scope.get("x", []) or [])
-        v_vars = list(scope.get("v", []) or [])
-        violations: list[str] = []
+        x_vars, x_violations = self._scope_vars(scope, "x", "subset_x")
+        v_vars, v_violations = self._scope_vars(scope, "v", "subset_v")
+        violations: list[str] = [*x_violations, *v_violations]
         if not x_vars and not v_vars:
             violations.append("scope: must name at least one X or V variable")
 
@@ -476,6 +489,8 @@ class Validator:
             return proposal
         if isinstance(proposal, dict):
             scope = proposal.get("scope") or proposal.get("applicable_to") or {}
+            if not isinstance(scope, dict):
+                raise ValueError("scope must be a dict")
             return Mechanism(
                 edge_ids=list(proposal.get("edge_ids", [])),
                 scope=dict(scope),
@@ -484,6 +499,17 @@ class Validator:
         raise ValueError(
             f"mechanism proposal must be a Mechanism or dict, got {type(proposal).__name__}"
         )
+
+    @staticmethod
+    def _scope_vars(scope: dict, key: str, alias: str) -> tuple[list[str], list[str]]:
+        value = scope.get(key, scope.get(alias, []))
+        if value is None:
+            return [], []
+        if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+            return [], [f"scope: {key}/{alias} must be a list of strings"]
+        if not all(isinstance(var, str) for var in value):
+            return [], [f"scope: {key}/{alias} must be a list of strings"]
+        return list(value), []
 
     @staticmethod
     def _job_states(snapshot) -> dict[str, str] | None:
@@ -524,57 +550,68 @@ class Validator:
             return snapshot.resources_summary()
         return getattr(snapshot, "resources", None)
 
-    @classmethod
     def _requested_gpus_by_env(
-        cls,
+        self,
         typed: Plan,
         resources: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         """Reserved GPU footprint per env for ladder-bearing actions."""
         requested: dict[str, int] = {}
         for action in typed.actions:
+            if action.type not in LADDER_ACTIONS:
+                continue
             for rank in action.ladder or []:
-                env_key = cls._env_key(rank.env)
-                requested[env_key] = requested.get(env_key, 0) + cls._rank_footprint(
+                env_key = self._env_key(rank.env)
+                requested[env_key] = requested.get(env_key, 0) + self._rank_footprint(
                     rank, resources
                 )
         return requested
 
-    @classmethod
-    def _rank_footprint(cls, rank, resources: dict[str, Any] | None) -> int:
-        if resources is None:
-            return rank.total_gpus()
-        info = resources.get(cls._env_key(rank.env))
-        if info is None:
-            return rank.total_gpus()
-        pool, error = cls._select_pool(info, rank)
-        if error or pool is None or cls._pool_kind(pool) == "gpu":
-            return rank.total_gpus()
-        return int(rank.n_replicas) * cls._pool_gpus_per_unit(pool)
+    def _rank_footprint(self, rank, resources: dict[str, Any] | None) -> int:
+        engine_gpus, _ = self._rank_engine_gpus(rank)
+        if engine_gpus is None:
+            return 0
+        resource_map = self.resource_map
+        if resource_map is not None and hasattr(resource_map, "rank_capacity_footprint"):
+            try:
+                return int(resource_map.rank_capacity_footprint(rank, resources))
+            except (TypeError, ValueError):
+                pass
+        return int(rank.n_replicas) * engine_gpus
 
-    @classmethod
-    def _select_pool(cls, info: dict[str, Any], rank) -> tuple[dict[str, Any] | None, str | None]:
-        pools = list(info.get("pools") or [])
-        if not pools:
-            return None, None
-        instance_type = rank.config.get("instance_type")
-        if instance_type:
-            for pool in pools:
-                if pool.get("instance_type") == instance_type:
-                    return pool, None
-            return None, f"instance_type {instance_type!r} is not available in env"
-        if len(pools) == 1:
-            return pools[0], None
-        choices = ", ".join(str(p.get("instance_type")) for p in pools)
-        return None, f"env has multiple pools; choose instance_type: {choices}"
+    def _rank_allocation_summary(
+        self,
+        rank,
+        resources: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        resource_map = self.resource_map
+        if resource_map is not None and hasattr(resource_map, "rank_allocation_summary"):
+            try:
+                return dict(resource_map.rank_allocation_summary(rank, resources)), None
+            except (TypeError, ValueError) as exc:
+                return {}, str(exc)
+        engine_gpus, error = self._rank_engine_gpus(rank)
+        if error or engine_gpus is None:
+            return {}, error
+        return {
+            "allocation_kind": "gpu",
+            "instance_type": None,
+            "gpus_per_unit": engine_gpus,
+            "capacity_per_replica": engine_gpus,
+            "engine_gpus": engine_gpus,
+        }, None
 
     @staticmethod
-    def _pool_kind(pool: dict[str, Any]) -> str:
-        return str(pool.get("allocation_kind") or pool.get("allocation_unit") or "instance").lower()
-
-    @staticmethod
-    def _pool_gpus_per_unit(pool: dict[str, Any]) -> int:
-        return int(pool.get("gpus_per_instance") or pool.get("gpus_per_unit") or 1)
+    def _rank_engine_gpus(rank) -> tuple[int | None, str | None]:
+        try:
+            return rank.gpus_per_chain(), None
+        except (TypeError, ValueError):
+            cfg = rank.config or {}
+            if cfg.get("gpu_count") is not None:
+                return None, "gpu_count must be a positive integer"
+            if cfg.get("count") is not None:
+                return None, "count must be a positive integer"
+            return None, "tp and pp must be positive integers"
 
     @staticmethod
     def _env_key(env) -> str:
