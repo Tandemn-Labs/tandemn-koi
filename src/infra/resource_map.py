@@ -32,6 +32,12 @@ class ClusterResourceSnapshot:
     def pending_jobs_summary(self) -> list[dict[str, Any]]:
         return self.pending_jobs
 
+    def current_ladder(self, job_id: str) -> list[dict[str, Any]]:
+        for job in self.active_jobs:
+            if job.get("job_id", job.get("id")) == job_id:
+                return list(job.get("current_ladder") or job.get("active_chains") or [])
+        return []
+
 
 @dataclass(frozen=True)
 class AllocationUnit:
@@ -391,7 +397,7 @@ class ResourceMapManager:
                     by_instance[str(inst)] = float(price)
                     prices.append(float(price))
             if by_instance:
-                pricing[env] = {"by_instance_type": by_instance, "default": min(prices)}
+                pricing[env] = {"by_instance_type": by_instance, "default": max(prices)}
         return pricing
 
     def check_resource_feasibility(self, plan):
