@@ -61,12 +61,8 @@ from src.core.models import (
 log = logging.getLogger("koi.agent")
 
 # A specialist optimizes ONE job inside its BudgetSlice, so it may only
-# propose place/keep/swap/defer. The lifecycle and cross-job transitions
-# (preempt, resume, retry, terminate, diagnose) are root-only: preempt is a
-# cross-job tradeoff, resume/retry/terminate are scheduling/repair-budget
-# decisions, diagnose is a cluster-plan annotation. The root still uses the
-# specialist's sized ladder when it issues a resume/retry - it just owns the
-# lifecycle semantics. A specialist proposing a root-only action is rejected.
+# propose place/keep/swap/defer. Root-only actions remain retry, terminate,
+# and diagnose. TODO(v0): restore preempt/resume with paused-job support.
 SPECIALIST_ACTIONS = frozenset(
     {
         ActionType.PLACE.value,
@@ -232,8 +228,8 @@ class SpecialistRunner:
             "or cluster tradeoffs - that is the root's job, and you cannot "
             "see the information needed to do it.\n\n"
             "type must be one of: place, keep, swap, defer. You CANNOT "
-            "preempt, resume, retry, terminate, or diagnose - those are "
-            "cross-job and lifecycle decisions only the root makes. If no "
+            "retry, terminate, or diagnose - those are root-only. "
+            "Preempt/resume are disabled in MVP v0. If no "
             "safe ladder fits the budget, return keep (running job) or "
             "defer (waiting job) and report fitness=starved or blocked.\n\n"
             "Output a single JSON object with keys: job_id, tenant_id, "
@@ -732,7 +728,7 @@ class KoiAgentHarness:
             - No duplicate job_ids (one action per job).
             - Job exists in the snapshot (when the snapshot exposes ids).
             - Action is legal for the job's current state (PLACE only on
-              waiting, PREEMPT only on running, ...).
+              waiting, SWAP only on running, ...).
             - Ladder actions carry a non-empty ladder; every rank has a
               5-tuple env (launch target + ICP key) and >= 1 replica;
               missing per-rank mechanism_id falls back to the action's,
@@ -798,10 +794,7 @@ class KoiAgentHarness:
     def _validate_ladder(self, action: PlanAction, book) -> None:
         """Validate a ladder-bearing action; raise on hard violations."""
         jid = action.job_id
-        # RESUME may relaunch on the pre-preemption ladder (None allowed).
         if action.ladder is None:
-            if action.type is ActionType.RESUME:
-                return
             raise PlanMaterializationError(f"job {jid}: {action.type.value} requires a ladder")
         if not action.ladder:
             raise PlanMaterializationError(f"job {jid}: ladder is empty")
@@ -1013,7 +1006,7 @@ class KoiAgentHarness:
             "  }\n"
             "Action dict:\n"
             "  {'job_id': str, 'type': <action>, 'tenant_id': str,\n"
-            "   'ladder': [<rank>, ...],            # only for place/swap/retry/resume\n"
+            "   'ladder': [<rank>, ...],            # only for place/swap/retry\n"
             "   'target_tps': float,                # required throughput for place/swap\n"
             "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"
             "   'swap_reason': 'scale_up|scale_down|migrate|replace|retune',  # swap only\n"
@@ -1041,8 +1034,6 @@ class KoiAgentHarness:
             "  keep     running->running   (no ladder)\n"
             "  swap     running->running   (needs ladder; scale/migrate/retune/replace)\n"
             "  defer    waiting->waiting    (no ladder)\n"
-            "  preempt  running->paused     (no ladder; frees resources for other jobs)\n"
-            "  resume   paused->running     (ladder optional; defaults to prior ladder)\n"
             "  retry    launch_failed->running (needs ladder)\n"
             "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
             "  diagnose  no change          (no ladder; record a theory only)\n"
