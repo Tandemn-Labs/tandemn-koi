@@ -39,10 +39,8 @@ from src.core.models import (
 # Actions whose target job must already exist in the cluster snapshot. PLACE and
 # DEFER admit waiting jobs; DIAGNOSE/TERMINATE may reference jobs outside the
 # running/waiting inventory (post-mortems, cleanup), so existence is not enforced
-# for them.
-_EXISTENCE_REQUIRED = frozenset(
-    {ActionType.KEEP, ActionType.SWAP, ActionType.PREEMPT, ActionType.RESUME, ActionType.RETRY}
-)
+# for them. TODO(v0): add preempt/resume when paused jobs are in the snapshot.
+_EXISTENCE_REQUIRED = frozenset({ActionType.KEEP, ActionType.SWAP, ActionType.RETRY})
 
 _KNOWN_WORKLOAD_TYPES = frozenset({"any", "online", "batch", "batched", "offline"})
 
@@ -164,9 +162,7 @@ class Validator:
 
         Existence is only enforced for actions that must target a live job
         (see _EXISTENCE_REQUIRED). State legality is enforced only when the
-        job's state is known and a required state is defined - so paused /
-        launch_failed jobs (which the v0 snapshot does not surface) are not
-        falsely rejected.
+        job's state is known and a required state is defined.
         """
         if states is None:
             return []
@@ -218,7 +214,7 @@ class Validator:
     def _check_swap_budget(self, typed: Plan, snapshot, slow_state) -> list[str]:
         """Active-job churn must not exceed the slow loop's swap budget B_t.
 
-        Counts actions in SWAP_BUDGET_ACTIONS (swap, preempt, retry) on jobs
+        Counts actions in SWAP_BUDGET_ACTIONS (swap, retry) on jobs
         that are currently active - matching the C4 definition that only
         running-workload churn is budgeted.
         """
@@ -283,11 +279,9 @@ class Validator:
             if action.type not in LADDER_ACTIONS:
                 continue
             if not action.ladder:
-                # RESUME may relaunch on the prior ladder; others need one.
-                if action.type is not ActionType.RESUME:
-                    violations.append(
-                        f"C6 physics: job {action.job_id} {action.type.value} has no ladder"
-                    )
+                violations.append(
+                    f"C6 physics: job {action.job_id} {action.type.value} has no ladder"
+                )
                 continue
             for i, rank in enumerate(action.ladder):
                 if rank.env is None or len(rank.env) != 5:

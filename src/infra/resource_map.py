@@ -97,7 +97,7 @@ class ResourceMapManager:
         ]
 
     def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return paused jobs that may be resumed by a later plan."""
+        """Return paused jobs for future preempt/resume support."""
         effective_user_id = self._effective_user_id(user_id)
         return [
             self._job_to_summary(job) for job in self._job_store().paused_jobs(effective_user_id)

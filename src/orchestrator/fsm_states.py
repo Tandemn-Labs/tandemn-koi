@@ -766,7 +766,7 @@ class TickRunner:
     def _count_plan_swaps(self, ctx: TickContext) -> int:
         """Active jobs whose deployed action churns running workload.
 
-        Counts actions in SWAP_BUDGET_ACTIONS (swap, preempt, retry) for
+        Counts actions in SWAP_BUDGET_ACTIONS (swap, retry) for
         jobs that were active - matching the C4 definition that only
         active-job churn is budgeted. PLACE/DEFER are admission, not churn.
         """
