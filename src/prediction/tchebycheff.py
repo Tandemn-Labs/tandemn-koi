@@ -160,32 +160,3 @@ def compute_tchebycheff_dro(
             y_worst[obj] = band["upper"]
 
     return compute_tchebycheff(y_worst, w_t, z_star_t, normalization_range, rho, maximize_objs)
-
-
-# if __name__ == "__main__":
-#     y_hat = {
-#         "throughput_tokens_per_sec": 1000,
-#         "slo_margin": 100,
-#     }
-#     w_t = {
-#         "throughput_tokens_per_sec": 0.5,
-#         "slo_margin": 0.5,
-#     }
-#     z_star_t = {
-#         "throughput_tokens_per_sec": 1000,
-#         "slo_margin": 100,
-#     }
-#     normalization_range = {
-#         "throughput_tokens_per_sec": 1000,
-#         "slo_margin": 100,
-#     }
-#     dro_band = {
-#         "throughput_tokens_per_sec": {"upper": 1100, "lower": 900},
-#         "slo_margin": {"upper": 110, "lower": 90},
-#     }
-#     rho = 1e-3
-#     maximize_objs = DEFAULT_MAXIMIZE
-#     j = compute_tchebycheff(y_hat, w_t, z_star_t, normalization_range, rho, maximize_objs)
-#     print(j)
-#     j_dro = compute_tchebycheff_dro(y_hat, dro_band, w_t, z_star_t, normalization_range, rho, maximize_objs)
-#     print(j_dro)
