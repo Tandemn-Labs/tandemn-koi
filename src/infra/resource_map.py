@@ -33,6 +33,18 @@ class ClusterResourceSnapshot:
         return self.pending_jobs
 
 
+@dataclass(frozen=True)
+class AllocationUnit:
+    """What one rank replica reserves and pays for."""
+
+    env_key: str
+    allocation_kind: str
+    instance_type: str | None
+    gpu_type: str | None
+    gpus_per_unit: int
+    price_per_unit_hour: float | None = None
+
+
 class ResourceMapManager:
     """Read Koi resource/job state from Tandemn Store public clients."""
 
@@ -298,6 +310,90 @@ class ResourceMapManager:
             return 0
         return int(info.get("free", 0))
 
+    def resolve_allocation_unit(
+        self,
+        env,
+        config: dict[str, Any],
+        resources: dict[str, dict[str, Any]] | None = None,
+    ) -> AllocationUnit:
+        """Resolve one rank replica to the pool Koi reserves.
+
+        Cloud pools are instance-atomic. A config may use fewer GPUs than the
+        instance has, but the full instance capacity and price are reserved.
+        Pools marked allocation_kind="gpu" remain discrete-GPU pools.
+        """
+        resources = resources if resources is not None else self.resources_summary()
+        env_key = self._env_key(env)
+        info = resources.get(env_key)
+        if info is None:
+            raise ValueError(f"env {env_key!r} is not in the resource map")
+
+        pool = self._select_pool(env_key, info, config)
+        if pool is None:
+            return AllocationUnit(env_key, "gpu", None, info.get("gpu_type"), 1, None)
+
+        kind = str(pool.get("allocation_kind") or pool.get("allocation_unit") or "instance")
+        kind = kind.lower()
+        instance_type = pool.get("instance_type")
+        gpu_type = pool.get("gpu_type") or info.get("gpu_type")
+        if kind == "gpu":
+            price = pool.get("price_per_gpu_hour") or pool.get("price_per_unit_hour")
+            return AllocationUnit(env_key, "gpu", instance_type, gpu_type, 1, _float_or_none(price))
+
+        gpus = int(pool.get("gpus_per_instance") or pool.get("gpus_per_unit") or 1)
+        price = pool.get("price_per_instance_hour") or pool.get("price_per_unit_hour")
+        return AllocationUnit(
+            env_key, "instance", instance_type, gpu_type, gpus, _float_or_none(price)
+        )
+
+    def rank_capacity_per_replica(
+        self,
+        rank,
+        resources: dict[str, dict[str, Any]] | None = None,
+    ) -> int:
+        return int(self.rank_allocation_summary(rank, resources)["capacity_per_replica"])
+
+    def rank_capacity_footprint(
+        self,
+        rank,
+        resources: dict[str, dict[str, Any]] | None = None,
+    ) -> int:
+        return int(rank.n_replicas) * self.rank_capacity_per_replica(rank, resources)
+
+    def rank_allocation_summary(
+        self,
+        rank,
+        resources: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Return engine demand plus reserved capacity for one rank replica."""
+        engine_gpus = rank.gpus_per_chain()
+        unit = self.resolve_allocation_unit(rank.env, rank.config, resources)
+        capacity = engine_gpus if unit.allocation_kind == "gpu" else unit.gpus_per_unit
+        return {
+            "allocation_kind": unit.allocation_kind,
+            "instance_type": unit.instance_type,
+            "gpus_per_unit": unit.gpus_per_unit,
+            "price_per_unit_hour": unit.price_per_unit_hour,
+            "capacity_per_replica": capacity,
+            "engine_gpus": engine_gpus,
+        }
+
+    def switch_pricing_map(self, resources: dict[str, dict[str, Any]] | None = None) -> dict:
+        resources = resources if resources is not None else self.resources_summary()
+        pricing: dict[str, dict[str, Any]] = {}
+        for env, info in resources.items():
+            by_instance = {}
+            prices = []
+            for pool in info.get("pools") or []:
+                inst = pool.get("instance_type")
+                price = pool.get("price_per_instance_hour") or pool.get("price_per_unit_hour")
+                if inst and price is not None:
+                    by_instance[str(inst)] = float(price)
+                    prices.append(float(price))
+            if by_instance:
+                pricing[env] = {"by_instance_type": by_instance, "default": min(prices)}
+        return pricing
+
     def check_resource_feasibility(self, plan):
         future = self.simulate_future_resources(plan)
         violations = [
@@ -309,7 +405,7 @@ class ResourceMapManager:
 
     def simulate_future_resources(self, plan):
         resources = self.resources_summary()
-        requested = self._requested_gpus_by_env(plan)
+        requested = self._requested_gpus_by_env(plan, resources)
         out = {}
         for env, info in resources.items():
             free_now = int(info.get("free", 0))
@@ -328,8 +424,11 @@ class ResourceMapManager:
     def simulate_resource_state_after(self, plan):
         return self.simulate_future_resources(plan)
 
-    @staticmethod
-    def _requested_gpus_by_env(plan) -> dict[str, int]:
+    def _requested_gpus_by_env(
+        self,
+        plan,
+        resources: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
         """GPUs requested per env by a Plan's ladder-bearing actions.
 
         Accepts a typed Plan or any raw form Plan.from_raw accepts. Counts
@@ -341,14 +440,36 @@ class ResourceMapManager:
         for action in typed.actions:
             for rank in action.ladder or []:
                 env = ResourceMapManager._env_key(rank.env)
-                requested[env] = requested.get(env, 0) + rank.total_gpus()
+                requested[env] = requested.get(env, 0) + self.rank_capacity_footprint(
+                    rank, resources
+                )
         return requested
+
+    @staticmethod
+    def _select_pool(env_key: str, info: dict[str, Any], config: dict[str, Any]) -> dict | None:
+        pools = list(info.get("pools") or [])
+        if not pools:
+            return None
+        instance_type = config.get("instance_type")
+        if instance_type:
+            for pool in pools:
+                if pool.get("instance_type") == instance_type:
+                    return pool
+            raise ValueError(f"instance_type {instance_type!r} is not available in env {env_key}")
+        if len(pools) == 1:
+            return pools[0]
+        choices = ", ".join(str(p.get("instance_type")) for p in pools)
+        raise ValueError(f"env {env_key} has multiple pools; choose instance_type: {choices}")
 
     @staticmethod
     def _env_key(env) -> str:
         if isinstance(env, (tuple, list)):
             return "|".join(str(part) for part in env)
         return str(env)
+
+
+def _float_or_none(value) -> float | None:
+    return None if value is None else float(value)
 
 
 def _smoke_resource_map():
@@ -440,6 +561,10 @@ def _run_smoke(manager: ResourceMapManager, label: str) -> dict[str, Any]:
 
     free = int(info["free"])
     assert manager.get_avail_capacity(env_parts, info["gpu_type"]) == free
+    pool: dict[str, Any] = next(iter(info.get("pools") or []), {})
+    config = {"gpu_count": 1, "gpu_type": info["gpu_type"]}
+    if pool.get("instance_type"):
+        config["instance_type"] = pool["instance_type"]
 
     plan = {
         "actions": [
@@ -450,7 +575,7 @@ def _run_smoke(manager: ResourceMapManager, label: str) -> dict[str, Any]:
                     {
                         "role": "aggregate",
                         "env": env_parts,
-                        "config": {"gpu_count": 1, "gpu_type": info["gpu_type"]},
+                        "config": config,
                         "n_replicas": 1,
                     }
                 ],
@@ -458,8 +583,11 @@ def _run_smoke(manager: ResourceMapManager, label: str) -> dict[str, Any]:
         ]
     }
     simulated = manager.simulate_future_resources(plan)
-    if simulated[env_key]["free_after"] != free - 1:
-        raise AssertionError(f"{label}: expected free_after={free - 1}, got {simulated[env_key]}")
+    footprint = manager._requested_gpus_by_env(plan, resources)[env_key]
+    if simulated[env_key]["free_after"] != free - footprint:
+        raise AssertionError(
+            f"{label}: expected free_after={free - footprint}, got {simulated[env_key]}"
+        )
     ok, violations = manager.check_resource_feasibility(plan)
     if not ok:
         raise AssertionError(f"{label}: feasible smoke plan failed: {violations}")

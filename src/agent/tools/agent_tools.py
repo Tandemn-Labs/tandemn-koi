@@ -928,6 +928,21 @@ def _feature_value(features: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def _rank_allocation_summary(rank, resources=None) -> dict[str, Any]:
+    resource_map = getattr(_CTX, "resource_map", None)
+    if resource_map is not None and hasattr(resource_map, "rank_allocation_summary"):
+        return resource_map.rank_allocation_summary(rank, resources)
+    engine_gpus = rank.gpus_per_chain()
+    return {
+        "allocation_kind": "gpu",
+        "instance_type": rank.config.get("instance_type"),
+        "gpus_per_unit": engine_gpus,
+        "price_per_unit_hour": None,
+        "capacity_per_replica": engine_gpus,
+        "engine_gpus": engine_gpus,
+    }
+
+
 def size_ladder(
     ranks: list[dict[str, Any]],
     job_features: dict[str, Any],
@@ -950,7 +965,8 @@ def size_ladder(
                         below saturation so queue wait ~ rho/(1-rho) and thus
                         p99 TTFT stay bounded; batch uses 1.0)
         per rank      : needed = ceil(remaining / per_chain_eff), capped by
-                        floor(free_gpus / gpus_per_chain); remaining -= achieved
+                        floor(free_gpus / reserved_capacity_per_replica);
+                        remaining -= achieved
         achieved_tps  = SUM over ranks of n_replicas * per_chain_eff
 
     Online latency gate: a rank whose predicted p99 TTFT or TPOT exceeds
@@ -998,6 +1014,11 @@ def size_ladder(
     marginal: dict[str, int] = {}
     achieved_total = 0.0
     remaining = target
+    resources = (
+        _CTX.resource_map.resources_summary()
+        if hasattr(_CTX.resource_map, "resources_summary")
+        else None
+    )
 
     # Fill ranks in the order given, each covering the REMAINING target, so a
     # heterogeneous parallel ladder shares one target and achieved throughput
@@ -1006,8 +1027,26 @@ def size_ladder(
         rank = RankSpec.from_dict(raw)
         gpus_per_chain = rank.gpus_per_chain()
         gpu_type = env_gpu_type(rank.env)
-        free = _CTX.resource_map.get_avail_capacity(rank.env, gpu_type) if gpu_type else 0
-        max_by_cap = free // gpus_per_chain if gpus_per_chain > 0 else 0
+        env_key = _env_key(rank.env)
+        if resources is not None:
+            info = resources.get(env_key)
+            free = int(info.get("free", 0)) if info and info.get("gpu_type") == gpu_type else 0
+        else:
+            free = _CTX.resource_map.get_avail_capacity(rank.env, gpu_type) if gpu_type else 0
+        allocation_error = None
+        try:
+            allocation = _rank_allocation_summary(rank, resources)
+            capacity_per_replica = int(allocation["capacity_per_replica"])
+        except Exception as exc:
+            allocation_error = str(exc)
+            allocation = {
+                "allocation_kind": None,
+                "instance_type": None,
+                "gpus_per_unit": None,
+                "price_per_unit_hour": None,
+            }
+            capacity_per_replica = max(1, gpus_per_chain)
+        max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
 
         y_hat = predict_outcome({"job_config": rank.config}).get("y_hat", {})
         per_chain_raw = _y_value(y_hat, "throughput_tokens_per_sec", "throughput_token_per_sec")
@@ -1022,11 +1061,22 @@ def size_ladder(
             if tpot_target is not None and tpot_pred > tpot_target:
                 slo_violations.append(f"p99_tpot {tpot_pred:.1f}ms > {tpot_target:.1f}ms target")
         slo_ok = not slo_violations
+        physical_violations: list[str] = []
+        if allocation_error:
+            physical_violations.append(allocation_error)
+        elif (
+            allocation["allocation_kind"] != "gpu" and gpus_per_chain > allocation["gpus_per_unit"]
+        ):
+            physical_violations.append(
+                f"engine needs {gpus_per_chain} GPUs but {allocation['instance_type']} "
+                f"has {allocation['gpus_per_unit']}"
+            )
+        physical_ok = not physical_violations
 
         # An SLO-infeasible online config is not viable at ANY replica count
         # (p99 TPOT is per-replica; replicas cannot fix it): give it 0 and let
         # its share spill to the remaining ranks.
-        excluded = is_online and not slo_ok
+        excluded = (is_online and not slo_ok) or not physical_ok
         if excluded:
             needed = 0
             n_replicas = 0
@@ -1052,8 +1102,9 @@ def size_ladder(
 
         capacity_bound = (not excluded) and needed > n_replicas
         if capacity_bound:
-            env_key = _env_key(rank.env)
-            marginal[env_key] = marginal.get(env_key, 0) + (needed - n_replicas) * gpus_per_chain
+            marginal[env_key] = (
+                marginal.get(env_key, 0) + (needed - n_replicas) * capacity_per_replica
+            )
 
         per_rank.append(
             {
@@ -1063,12 +1114,23 @@ def size_ladder(
                 "per_chain_tps_effective": per_chain_eff,
                 "utilization_target": util,
                 "gpus_per_chain": gpus_per_chain,
+                "allocation_kind": allocation["allocation_kind"] if not allocation_error else None,
+                "instance_type": allocation["instance_type"] if not allocation_error else None,
+                "gpus_per_allocation_unit": allocation["gpus_per_unit"]
+                if not allocation_error
+                else None,
+                "capacity_gpus_per_replica": capacity_per_replica,
+                "price_per_unit_hour": allocation["price_per_unit_hour"]
+                if not allocation_error
+                else None,
                 "needed_replicas": needed,
                 "max_replicas_by_capacity": max_by_cap,
                 "n_replicas": n_replicas,
                 "capacity_bound": capacity_bound,
                 "slo_ok": slo_ok,
                 "slo_violations": slo_violations,
+                "physical_ok": physical_ok,
+                "physical_violations": physical_violations,
                 "excluded_slo_infeasible": excluded,
                 "no_throughput_prediction": no_prediction,
             }
@@ -1717,6 +1779,13 @@ def compute_eig(candidate_ladder: dict[str, Any]) -> float:
     )
 
 
+def _switch_pricing_map() -> dict:
+    resource_map = getattr(_CTX, "resource_map", None)
+    if resource_map is not None and hasattr(resource_map, "switch_pricing_map"):
+        return resource_map.switch_pricing_map()
+    return {}
+
+
 def compute_switching_cost(ladder_prev: Any, ladder_new: Any) -> dict[str, float]:
     """Compute the 4-component switch cost between two ladders.
 
@@ -1735,6 +1804,7 @@ def compute_switching_cost(ladder_prev: Any, ladder_new: Any) -> dict[str, float
         L_new=L_new,
         residual_history=_CTX.dro,
         epsilon_dro=_CTX.slow_loop.get_sss_radius_dro(),
+        pricing_map=_switch_pricing_map(),
     )
     return bundle.as_dict()
 
@@ -1807,6 +1877,7 @@ def compute_sigma(plan) -> dict[str, Any]:
     beta = _CTX.slow_loop.get_sss_eig_incentive_t()
     lam = _CTX.slow_loop.get_sss_lambda_switch()
     eps_dro = _CTX.slow_loop.get_sss_radius_dro()
+    pricing_map = _switch_pricing_map()
 
     for action in typed.actions:
         if action.type not in LADDER_ACTIONS or not action.ladder:
@@ -1839,6 +1910,7 @@ def compute_sigma(plan) -> dict[str, Any]:
             L_new=_materialize_chain_list(ladder_dicts),
             residual_history=_CTX.dro,
             epsilon_dro=eps_dro,
+            pricing_map=pricing_map,
         )
         pr_slo = float(
             _CTX.dro.dro_chance_constraint(
