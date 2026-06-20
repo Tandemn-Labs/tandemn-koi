@@ -20,7 +20,10 @@ class SurrogatePrediction:
             job_features,
             env_vector,
         )
-        direct_x_values["model_id"] = job_config["model_id"]
+        model_id = job_config.get("model_id") or job_features.get("model_id")
+        if model_id is None:
+            raise ValueError("AIC_DynoSim needs model_id")
+        direct_x_values["model_id"] = model_id
         # field names -> actual values from job_config/env_vector
 
         # 3. Add simulator-only controls that are NOT in the DAG

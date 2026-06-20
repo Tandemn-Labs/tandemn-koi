@@ -279,6 +279,43 @@ def _ranks_as_dicts(action) -> list:
     return [rank.to_dict() for rank in action.ladder]
 
 
+def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
+    """Return the workload features for a job in the current snapshot."""
+    if snapshot is None:
+        return {}
+    for accessor in ("active_jobs_summary", "pending_jobs_summary"):
+        if not hasattr(snapshot, accessor):
+            continue
+        for job in getattr(snapshot, accessor)() or []:
+            if job.get("job_id", job.get("id")) == job_id:
+                return dict(job.get("job_features") or {})
+    return {}
+
+
+def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None = None) -> dict:
+    """Build the surrogate payload for one rank without mutating the rank."""
+    features = dict(job_features or {})
+    if rank.env is not None:
+        env = list(rank.env) if isinstance(rank.env, (list, tuple)) else str(rank.env).split("|")
+        if len(env) >= 5:
+            features.update(
+                {
+                    "market": env[0],
+                    "cloud": env[1],
+                    "region": env[2],
+                    "zone": env[3],
+                    "gpu_type": env[4],
+                }
+            )
+    if rank.config.get("instance_type") is not None:
+        features["instance_type"] = rank.config["instance_type"]
+
+    config = dict(rank.config)
+    if "model_id" not in config and features.get("model_id") is not None:
+        config["model_id"] = features["model_id"]
+    return {"job_config": config, "job_features": features}
+
+
 def _prev_ladder_for(snapshot, job_id: str) -> list:
     """The job's current ladder from the snapshot, as a rank-dict list.
 
@@ -322,7 +359,7 @@ _COST_OBJS = frozenset({"cost_per_token"})
 _MARGIN_OBJS = frozenset({"slo_margin"})
 
 
-def _compose_job_y_hat(action) -> dict[str, Any]:
+def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> dict[str, Any]:
     """Compose a job-level y_hat from a ladder's per-rank predictions.
 
     y_hat is predicted per rank (per config); this rolls the ranks up to the
@@ -336,7 +373,7 @@ def _compose_job_y_hat(action) -> dict[str, Any]:
     samples: list[tuple[int, dict]] = []
     for rank in action.ladder or []:
         try:
-            y = predict_outcome({"job_config": rank.config}).get("y_hat", {})
+            y = predict_outcome(_rank_prediction_payload(rank, job_features)).get("y_hat", {})
         except Exception:
             log.exception("rank y_hat failed for job %s", action.job_id)
             y = {}
@@ -1048,7 +1085,7 @@ def size_ladder(
             capacity_per_replica = max(1, gpus_per_chain)
         max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
 
-        y_hat = predict_outcome({"job_config": rank.config}).get("y_hat", {})
+        y_hat = predict_outcome(_rank_prediction_payload(rank, job_features)).get("y_hat", {})
         per_chain_raw = _y_value(y_hat, "throughput_tokens_per_sec", "throughput_token_per_sec")
         per_chain_eff = per_chain_raw * util
 
@@ -1893,7 +1930,8 @@ def compute_sigma(plan) -> dict[str, Any]:
             continue
         job_id = action.job_id
         ladder_dicts = _ranks_as_dicts(action)
-        y_hat = _compose_job_y_hat(action)
+        job_features = _job_features_for(snapshot, job_id)
+        y_hat = _compose_job_y_hat(action, job_features)
         if not y_hat:
             continue
         slo_thresholds = _slo_thresholds_for(snapshot, job_id)
@@ -1999,6 +2037,7 @@ def check_coverage(plan) -> dict[str, Any]:
     """
     _require("slow_loop")
     typed = _as_plan(plan)
+    snapshot = _snapshot() if getattr(_CTX, "resource_map", None) is not None else None
     z_star = _CTX.slow_loop.get_sss_z_star_t()
     ranges = _CTX.slow_loop.typical_ranges
     objectives = list(z_star.keys())
@@ -2007,7 +2046,7 @@ def check_coverage(plan) -> dict[str, Any]:
     for action in typed.actions:
         if action.type not in LADDER_ACTIONS:
             continue
-        y_hat = _compose_job_y_hat(action)
+        y_hat = _compose_job_y_hat(action, _job_features_for(snapshot, action.job_id))
         if not y_hat:
             continue
         for obj in objectives:
@@ -2111,13 +2150,15 @@ def simulate_outcome_trajectory(plan) -> dict[str, Any]:
         "y_hat", "v_hat", "dro_band"}, ...], "job_y_hat": composed y_hat}.
     """
     typed = _as_plan(plan)
+    snapshot = _snapshot() if getattr(_CTX, "resource_map", None) is not None else None
     out: dict[str, Any] = {}
     for action in typed.actions:
         if action.type not in LADDER_ACTIONS or not action.ladder:
             continue
+        job_features = _job_features_for(snapshot, action.job_id)
         per_rank = []
         for rank in action.ladder:
-            pred = predict_outcome({"job_config": rank.config})
+            pred = predict_outcome(_rank_prediction_payload(rank, job_features))
             per_rank.append(
                 {
                     "env": list(rank.env) if rank.env else None,
@@ -2128,7 +2169,10 @@ def simulate_outcome_trajectory(plan) -> dict[str, Any]:
                     "dro_band": pred.get("dro_band", {}),
                 }
             )
-        out[action.job_id] = {"per_rank": per_rank, "job_y_hat": _compose_job_y_hat(action)}
+        out[action.job_id] = {
+            "per_rank": per_rank,
+            "job_y_hat": _compose_job_y_hat(action, job_features),
+        }
     return out
 
 
