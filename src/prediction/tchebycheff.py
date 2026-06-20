@@ -12,7 +12,7 @@ from collections.abc import Iterable
 
 DEFAULT_MAXIMIZE: frozenset[str] = frozenset(
     {
-        "throughput_tokens_per_sec",
+        "throughput_token_per_sec",
         "slo_margin",
     }
 )
