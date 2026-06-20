@@ -5,7 +5,7 @@ Two-sided Cumulative-Sum control chart (Page 1954) on the residual sequence
 r_t = observed(t) - predicted(t) for each tracked variable in a deployed
 mechanism's bundle. Applied to BOTH:
     V bundle: mediator variables (kv_cache_util, pipeline_bubble_fraction, ...)
-    Y bundle: outcome variables (p99_TTFT_ms, throughput_tokens_per_sec, ...)
+    Y bundle: outcome variables (p99_TTFT_ms, throughput_token_per_sec, ...)
 
 Both axes use the same primitive - within a tick V_hat and y_hat are constant
 scalars (or per-timestep trajectories from the surrogate), and the observed

@@ -58,7 +58,7 @@ from src.config.hyperparameters import (
 # and Tchebycheff scoring use the same objective direction.
 _MAXIMIZE_OBJECTIVES = frozenset(
     {
-        "throughput_tokens_per_sec",
+        "throughput_token_per_sec",
         "slo_margin",
     }
 )
