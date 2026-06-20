@@ -145,19 +145,19 @@ class MockCandidateGraph:
         "cost_per_token",
         "p99_ttft_ms",
         "p99_tpot_ms",
-        "throughput_tokens_per_sec",
+        "throughput_token_per_sec",
         "slo_margin",
     )
 
 
 class PredictionSmokeTests(unittest.TestCase):
     def test_tchebycheff_and_dro_scores_are_finite(self):
-        y_hat = {"throughput_tokens_per_sec": 1000, "slo_margin": 100}
-        w_t = {"throughput_tokens_per_sec": 0.5, "slo_margin": 0.5}
-        z_star_t = {"throughput_tokens_per_sec": 1000, "slo_margin": 100}
-        normalization_range = {"throughput_tokens_per_sec": 1000, "slo_margin": 100}
+        y_hat = {"throughput_token_per_sec": 1000, "slo_margin": 100}
+        w_t = {"throughput_token_per_sec": 0.5, "slo_margin": 0.5}
+        z_star_t = {"throughput_token_per_sec": 1000, "slo_margin": 100}
+        normalization_range = {"throughput_token_per_sec": 1000, "slo_margin": 100}
         dro_band = {
-            "throughput_tokens_per_sec": {"upper": 1100, "lower": 900},
+            "throughput_token_per_sec": {"upper": 1100, "lower": 900},
             "slo_margin": {"upper": 110, "lower": 90},
         }
 
@@ -270,11 +270,11 @@ class PredictionSmokeTests(unittest.TestCase):
         v_hat = predictor.merge_outputs(v_hat_direct, v_hat_derived)
 
         self.assertIn("p99_ttft_ms", y_hat_direct)
-        self.assertIn("throughput_tokens_per_sec", y_hat_direct)
+        self.assertIn("throughput_token_per_sec", y_hat_direct)
         self.assertIn("input_length_observed", v_hat_direct)
         self.assertIn("p99_ttft_ms", y_hat)
         self.assertIn("p99_tpot_ms", y_hat)
-        self.assertIn("throughput_tokens_per_sec", y_hat)
+        self.assertIn("throughput_token_per_sec", y_hat)
         self.assertIn("cost_per_token", y_hat)
         self.assertIn("slo_margin", y_hat)
         self.assertIn("input_length_observed", v_hat)

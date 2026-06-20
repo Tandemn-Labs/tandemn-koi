@@ -95,7 +95,6 @@ CALIBRATION_WINDOW = 50  # ticks of evidence to draw similar rows from
 CALIBRATION_MIN_SAMPLES = 5  # below this, leave the objective uncorrected
 _NONNEGATIVE_Y = frozenset(
     {
-        "throughput_tokens_per_sec",
         "throughput_token_per_sec",
         "p99_ttft_ms",
         "p99_tpot_ms",
@@ -276,7 +275,14 @@ def _ranks_as_dicts(action) -> list:
     """A PlanAction's ladder as the dict list the EIG/switchcost adapters take."""
     if not action.ladder:
         return []
-    return [rank.to_dict() for rank in action.ladder]
+    ranks = []
+    for rank in action.ladder:
+        raw = rank.to_dict()
+        raw["mechanism_id"] = raw.get("mechanism_id") or action.mechanism_id
+        if raw["mechanism_id"] is None:
+            raise ValueError(f"job {action.job_id}: ladder rank requires mechanism_id")
+        ranks.append(raw)
+    return ranks
 
 
 def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
@@ -354,7 +360,7 @@ def _slo_thresholds_for(snapshot, job_id: str) -> dict:
 #   cost_per_token      -> throughput-weighted mean (= total$ / total tokens)
 #   slo_margin          -> min across ranks (worst headroom)
 _LATENCY_OBJS = frozenset({"p99_ttft_ms", "p99_tpot_ms", "p99_TTFT_ms", "p99_TPOT_ms"})
-_THROUGHPUT_OBJS = frozenset({"throughput_tokens_per_sec", "throughput_token_per_sec"})
+_THROUGHPUT_OBJ = "throughput_token_per_sec"
 _COST_OBJS = frozenset({"cost_per_token"})
 _MARGIN_OBJS = frozenset({"slo_margin"})
 
@@ -390,10 +396,7 @@ def _roll_up_ranks(samples: list[tuple[int, dict]]) -> dict[str, Any]:
     """Roll up per-rank (n_replicas, y_hat) samples into one job y_hat."""
 
     def _tput(y: dict) -> float:
-        for key in _THROUGHPUT_OBJS:
-            if y.get(key) is not None:
-                return float(y[key])
-        return 0.0
+        return float(y.get(_THROUGHPUT_OBJ) or 0.0)
 
     objectives = set().union(*[set(y) for _, y in samples])
     tput_weight_total = sum(n * _tput(y) for n, y in samples)
@@ -1086,7 +1089,7 @@ def size_ladder(
         max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
 
         y_hat = predict_outcome(_rank_prediction_payload(rank, job_features)).get("y_hat", {})
-        per_chain_raw = _y_value(y_hat, "throughput_tokens_per_sec", "throughput_token_per_sec")
+        per_chain_raw = _y_value(y_hat, "throughput_token_per_sec")
         per_chain_eff = per_chain_raw * util
 
         slo_violations: list[str] = []
@@ -1667,6 +1670,14 @@ def get_z_star(job_features: dict[str, Any] | None = None) -> dict[str, float]:
     return dict(_CTX.slow_loop.get_sss_z_star_t())
 
 
+def _scoreable_y_hat(y_hat, weights, reference, ranges) -> dict:
+    return {
+        k: v
+        for k, v in (y_hat or {}).items()
+        if v is not None and k in weights and k in reference and k in ranges
+    }
+
+
 def compute_tchebycheff(
     y_hat: dict[str, float],
     wt: dict[str, float] | None = None,
@@ -1687,9 +1698,12 @@ def compute_tchebycheff(
     _require("tchebycheff_module", "slow_loop")
     weights = wt if wt is not None else _CTX.slow_loop.get_sss_wt()
     reference = z_star if z_star is not None else _CTX.slow_loop.get_sss_z_star_t()
+    y_score = _scoreable_y_hat(y_hat, weights, reference, _CTX.slow_loop.typical_ranges)
+    if not y_score:
+        return 0.0
     return float(
         _CTX.tchebycheff_module.compute_tchebycheff(
-            y_hat=y_hat,
+            y_hat=y_score,
             w_t=weights,
             z_star_t=reference,
             normalization_range=_CTX.slow_loop.typical_ranges,
@@ -1934,11 +1948,14 @@ def compute_sigma(plan) -> dict[str, Any]:
         y_hat = _compose_job_y_hat(action, job_features)
         if not y_hat:
             continue
+        y_score = _scoreable_y_hat(y_hat, w_t, z_star, _CTX.slow_loop.typical_ranges)
+        if not y_score:
+            continue
         slo_thresholds = _slo_thresholds_for(snapshot, job_id)
 
         J = float(
             _CTX.tchebycheff_module.compute_tchebycheff(
-                y_hat=y_hat,
+                y_hat=y_score,
                 w_t=w_t,
                 z_star_t=z_star,
                 normalization_range=_CTX.slow_loop.typical_ranges,
@@ -2208,6 +2225,8 @@ def _materialize_ladder(ladder_ranks):
             r = r.to_dict()
         rank = _Rank()
         rank.mechanism_id = r.get("mechanism_id")
+        if rank.mechanism_id is None:
+            raise ValueError("ladder rank requires mechanism_id")
         rank.config = r.get("config", {})
         rank.n_replicas = int(r.get("n_replicas", 1))
         rank.is_canary = bool(r.get("is_canary", False))
@@ -2221,13 +2240,11 @@ def _materialize_ladder(ladder_ranks):
     applicable = {}
     if _CTX.mechanism_registry is not None:
         for rank in ladder.ranks:
-            if rank.mechanism_id is None:
-                continue
             try:
                 mech = _CTX.mechanism_registry.get_mechanism(rank.mechanism_id)
                 applicable[mech.mechanism_id] = mech
             except KeyError:
-                log.warning("ladder references unknown mechanism %s", rank.mechanism_id)
+                raise ValueError(f"unknown mechanism_id {rank.mechanism_id!r}") from None
         for mech in _CTX.mechanism_registry.filter_by_scope(sorted(config_keys), []):
             if mech.status == "active":
                 applicable[mech.mechanism_id] = mech

@@ -40,7 +40,7 @@ class _RecordingSurrogate:
             {
                 "p99_ttft_ms": 10.0,
                 "p99_tpot_ms": 1.0,
-                "throughput_tokens_per_sec": 1000.0,
+                "throughput_token_per_sec": 1000.0,
             },
             {},
         )

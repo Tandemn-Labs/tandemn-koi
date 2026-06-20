@@ -245,7 +245,7 @@ class SurrogatePrediction:
                     "comm_overhead_pct",
                     "pd_inbalance",
                 },
-                "direct_y": {"p99_ttft_ms", "p99_tpot_ms", "throughput_tokens_per_sec"},
+                "direct_y": {"p99_ttft_ms", "p99_tpot_ms", "throughput_token_per_sec"},
                 "derive_y": {"cost_per_token", "slo_margin"},
             }
         }
@@ -279,13 +279,16 @@ class SurrogatePrediction:
         # Inputs: objective, JobConfig, JobFeatures, direct_x_values
         # Outputs: simulator_controls
         if objective == "batched":
-            isl = direct_x_values.get("isl_token_avg")
-            osl = direct_x_values.get("osl_token_avg")
+            sources = (direct_x_values, job_features, job_config)
+            isl = self._first_positive(sources, "isl_token_avg", "input_len_tokens_avg")
+            osl = self._first_positive(sources, "osl_token_avg", "output_len_tokens_avg")
             max_num_seq = direct_x_values.get("max_num_seq")
             max_num_batched_tokens = direct_x_values.get("max_num_batched_tokens")
 
             if max_num_seq is None or max_num_batched_tokens is None:
                 raise ValueError("Batched simulation needs max_num_seq and max_num_batched_tokens")
+            if isl is None or osl is None:
+                raise ValueError("Batched simulation needs positive input/output token lengths")
 
             tokens_per_request = isl + osl
             target_concurrency = int(
@@ -305,7 +308,11 @@ class SurrogatePrediction:
             }
 
         if objective == "online":
-            request_arrival_rate = direct_x_values.get("request_arrival_rate")
+            request_arrival_rate = self._first_positive(
+                (direct_x_values, job_features, job_config), "request_arrival_rate"
+            )
+            if request_arrival_rate is None:
+                raise ValueError("Online simulation needs positive request_arrival_rate")
             sim_duration_s = 60  # TODO - hardcoded for now, need discussion
 
             return {
@@ -314,6 +321,15 @@ class SurrogatePrediction:
                 "arrival_interval_ms": 1000.0 / request_arrival_rate,
                 "replay_mode": "online",
             }
+
+    @staticmethod
+    def _first_positive(sources, *names):
+        for source in sources:
+            for name in names:
+                value = source.get(name)
+                if value is not None and float(value) > 0:
+                    return float(value)
+        return None
 
     def build_surrogate_inputs(self, direct_x_values, simulator_controls, method):
         # Translate direct X values + simulator controls into AIC/DynoSim args.
@@ -463,7 +479,7 @@ class SurrogatePrediction:
         y_hat_direct = {
             "p99_ttft_ms": raw_report.get("p99_ttft_ms"),
             "p99_tpot_ms": raw_report.get("p99_tpot_ms", raw_report.get("p99_itl_ms")),
-            "throughput_tokens_per_sec": raw_report.get("output_throughput_tok_s"),
+            "throughput_token_per_sec": raw_report.get("output_throughput_tok_s"),
         }
 
         return y_hat_direct, v_hat_direct
@@ -486,7 +502,7 @@ class SurrogatePrediction:
 
         input_tokens = v_hat_direct.get("input_length_observed")
         output_tokens = v_hat_direct.get("output_length_observed")
-        throughput = y_hat_direct.get("throughput_tokens_per_sec")
+        throughput = y_hat_direct.get("throughput_token_per_sec")
 
         if input_tokens is not None and output_tokens is not None:
             total_tokens = input_tokens + output_tokens
