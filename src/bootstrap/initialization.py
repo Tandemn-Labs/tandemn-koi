@@ -21,6 +21,15 @@ def init_resource_map(user_id: str, postgres_client=None):
     return manager
 
 
+def init_evidence_store(user_id: str, postgres_client=None):
+    from src.core.evidence_service import EvidenceService
+
+    return EvidenceService(
+        user_id=user_id,
+        postgres_client=postgres_client,
+    )
+
+
 def init_seed_mechanisms_priors(LLM, CandidateGraph, NodeDescription):
     # Placeholder: seed Mechanisms
     pass

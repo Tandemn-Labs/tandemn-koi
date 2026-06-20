@@ -1,6 +1,8 @@
 import unittest
+from datetime import UTC, datetime
 
 import numpy as np
+from sqlalchemy import text
 from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
 from src.core.evidence_service import EvidenceService
@@ -8,6 +10,9 @@ from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import Edge, EdgeMetadata, EvidenceRow, Mechanism, MechanismMetadata, Node
 from src.validation.icp import ICPResult
 from src.validation.quadrants import Quadrant
+from tandemn_system_data.clients import PostgresClient
+from tandemn_system_data.db import UserRow
+from tandemn_system_data.ids import new_user_id
 
 
 def make_row(
@@ -103,7 +108,14 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertIn(pd_id, registry.mechanisms_by_status["archived"])
 
     def test_evidence_service_indexes(self):
-        store = EvidenceService()
+        client = PostgresClient()
+        user_id = new_user_id()
+        with client.begin() as session:
+            session.add(
+                UserRow(user_id=user_id, name="koi core smoke", created_at=datetime.now(UTC))
+            )
+
+        store = EvidenceService(user_id=user_id, postgres_client=client)
         env_a = ("reserved", "aws", "us-east-1", "use1-az1", "H100")
         env_b = ("reserved", "aws", "us-west-2", "usw2-az1", "H100")
         rows = [
@@ -134,29 +146,41 @@ class CoreSmokeTests(unittest.TestCase):
                 q_label_per_mechanism={"M2": Quadrant.Q4},
             ),
         ]
-        for row in rows:
-            store.append_row(row)
+        try:
+            for row in rows:
+                store.append_row(row)
 
-        self.assertEqual([r.row_id for r in store.get_row("job_1", "rank_1")], ["row_1", "row_2"])
-        self.assertEqual([r.row_id for r in store.get_rows_in_window((1, 2))], ["row_1", "row_2"])
-        self.assertEqual([r.row_id for r in store.get_rows_for_edge("e1")], ["row_1", "row_2"])
-        self.assertEqual([r.row_id for r in store.get_rows_for_edge("e1", limit=1)], ["row_2"])
-        self.assertEqual([r.row_id for r in store.get_rows_for_mechanism("M1")], ["row_1", "row_2"])
-        self.assertEqual(
-            [r.row_id for r in store.get_rows_for_environment(env_a)], ["row_1", "row_3"]
-        )
-        self.assertEqual(store.count_visits_per_edge("e1"), 2)
-        self.assertEqual(store.count_envs_per_edge("e1"), 2)
-        self.assertEqual(store.last_touched_per_edge("e1"), 2)
-        self.assertEqual(store.q3_rate_window("e1", (1, 3)), 0.5)
-        self.assertEqual(
-            [(row.row_id, mid, q) for row, mid, q in store.iter_decided_per_mechanism(3, 3)],
-            [
-                ("row_1", "M1", Quadrant.Q1),
-                ("row_2", "M1", Quadrant.Q3),
-                ("row_3", "M2", Quadrant.Q4),
-            ],
-        )
+            self.assertEqual(
+                [r.row_id for r in store.get_row("job_1", "rank_1")], ["row_1", "row_2"]
+            )
+            self.assertEqual(
+                [r.row_id for r in store.get_rows_in_window((1, 2))], ["row_1", "row_2"]
+            )
+            self.assertEqual([r.row_id for r in store.get_rows_for_edge("e1")], ["row_1", "row_2"])
+            self.assertEqual([r.row_id for r in store.get_rows_for_edge("e1", limit=1)], ["row_2"])
+            self.assertEqual(
+                [r.row_id for r in store.get_rows_for_mechanism("M1")], ["row_1", "row_2"]
+            )
+            self.assertEqual(
+                [r.row_id for r in store.get_rows_for_environment(env_a)], ["row_1", "row_3"]
+            )
+            self.assertEqual(store.count_visits_per_edge("e1"), 2)
+            self.assertEqual(store.count_envs_per_edge("e1"), 2)
+            self.assertEqual(store.last_touched_per_edge("e1"), 2)
+            self.assertEqual(store.q3_rate_window("e1", (1, 3)), 0.5)
+            self.assertEqual(
+                [(row.row_id, mid, q) for row, mid, q in store.iter_decided_per_mechanism(3, 3)],
+                [
+                    ("row_1", "M1", Quadrant.Q1),
+                    ("row_2", "M1", Quadrant.Q3),
+                    ("row_3", "M2", Quadrant.Q4),
+                ],
+            )
+        finally:
+            with client.begin() as session:
+                session.execute(
+                    text("delete from users where user_id = :user_id"), {"user_id": user_id}
+                )
 
     def test_confidence_service_updates(self):
         edge_id = "shared_prefix_length_avg->kvcache_hit_rate"
