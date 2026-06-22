@@ -10,6 +10,7 @@ from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node
 from src.exploration.eig import aggregate_cluster_eig, compute_eig
 from src.infra.resource_map import (
+    ResourceMapManager,
     _run_smoke,
     _run_used_capacity_check,
     _SmokeResourceMapManager,
@@ -122,6 +123,80 @@ class EigResourceSmokeTests(unittest.TestCase):
         self.assertEqual(result["pending_jobs"], 0)
         self.assertEqual(used["free"], 72)
         self.assertEqual(used["total"], 80)
+
+    def test_underfilled_cloud_instances_consume_full_instance_capacity(self):
+        env = "reserved|aws|us-east-2|use2-az3|A100"
+
+        class FakeResourceMap:
+            market = ("reserved",)
+
+            def scheduling_summary(self):
+                return {
+                    env: {
+                        "market": "reserved",
+                        "cloud": "aws",
+                        "region": "us-east-2",
+                        "zone": "use2-az3",
+                        "gpu_type": "A100",
+                        "total": 16,
+                        "pools": [
+                            {
+                                "instance_type": "p4d.24xlarge",
+                                "gpu_type": "A100",
+                                "gpus_per_instance": 8,
+                                "total_instances": 2,
+                                "allocation_kind": "instance",
+                            }
+                        ],
+                    }
+                }
+
+        class SmokeManager(ResourceMapManager):
+            def __init__(self):
+                super().__init__(user_id="underfilled_instance_smoke")
+
+            def get_resource_map(self, user_id=None):
+                return FakeResourceMap()
+
+            def get_running_chains(self, user_id=None):
+                shape = {"count": 2, "gpu_count": 2, "instance_type": "p4d.24xlarge"}
+                return [
+                    {"chain_id": "chain_a", "target_node": env, "shape_json": dict(shape)},
+                    {"chain_id": "chain_b", "target_node": env, "shape_json": dict(shape)},
+                ]
+
+            def get_running_jobs(self, user_id=None):
+                return []
+
+            def get_waiting_jobs(self, user_id=None):
+                return []
+
+        manager = SmokeManager()
+        resources = manager.resources_summary()
+        self.assertEqual(resources[env]["free"], 0)
+
+        plan = {
+            "actions": [
+                {
+                    "job_id": "job_new",
+                    "type": "place",
+                    "ladder": [
+                        {
+                            "role": "aggregate",
+                            "env": env.split("|"),
+                            "config": {"gpu_count": 2, "instance_type": "p4d.24xlarge"},
+                            "n_replicas": 1,
+                        }
+                    ],
+                }
+            ]
+        }
+        ok, violations = manager.check_resource_feasibility(plan)
+        self.assertFalse(ok)
+        self.assertEqual(
+            violations,
+            ["env reserved|aws|us-east-2|use2-az3|A100: requested 8 more GPUs than available"],
+        )
 
 
 if __name__ == "__main__":

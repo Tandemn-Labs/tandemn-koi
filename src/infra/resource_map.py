@@ -218,8 +218,9 @@ class ResourceMapManager:
 
         Free capacity is not stored on the resource map (total-only); it is
         inferred by subtracting this from each env's total. One chain row is
-        one launched serving unit, so its GPU footprint is exactly
-        ``shape_json["count"]`` (no replica multiplier).
+        one launched serving unit. GPU-granular pools consume
+        ``shape_json["count"]``; instance-atomic pools consume the full
+        instance capacity that row reserved.
 
         The chain's placement env is resolved with precedence
         ``target_node`` -> ``shape_json["env"]`` -> ``shape_json["pool_id"]``;
@@ -228,6 +229,7 @@ class ResourceMapManager:
         default market.
         """
         default_market = self._default_market(resource_map)
+        resources = self._normalized_scheduling_summary(resource_map, used={})
         used: dict[str, int] = {}
         for chain in self.get_running_chains(user_id=user_id):
             shape = chain.get("shape_json") or {}
@@ -248,7 +250,9 @@ class ResourceMapManager:
                     f"chain {chain.get('chain_id')} shape_json missing positive int "
                     f"'count'; got {count!r}"
                 )
-            used[env_key] = used.get(env_key, 0) + count
+            unit = self.resolve_allocation_unit(env_key, shape, resources)
+            footprint = count if unit.allocation_kind == "gpu" else unit.gpus_per_unit
+            used[env_key] = used.get(env_key, 0) + footprint
         return used
 
     @classmethod
