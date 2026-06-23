@@ -443,6 +443,7 @@ class TickRunner:
         Part 3 - meta cadence: CUSUM (delta, h) recalibration from
         accumulated residual history every recalibrate_every ticks.
         """
+        did_confidence_update = False
         for row in ctx.evidence_rows:
             for mid, q in row.q_label_per_mechanism.items():
                 if q is None:
@@ -450,6 +451,7 @@ class TickRunner:
                 self.confidence_service.apply_delta_c_mechanism(
                     mid, q, env_label=row.env_label, tick=ctx.tick
                 )
+                did_confidence_update = True
                 try:
                     mech = self.mechanism_registry.get_mechanism(mid)
                 except KeyError:
@@ -460,6 +462,10 @@ class TickRunner:
                     self.confidence_service.apply_delta_c_edge(
                         edge_id, q, icp_result, env_label=row.env_label, tick=ctx.tick
                     )
+
+        flush_confidence = getattr(self.confidence_service, "flush", None)
+        if did_confidence_update and callable(flush_confidence):
+            flush_confidence()
 
         ctx.new_slow_state = self.slow_loop.slow_update_all(
             tick=ctx.tick,
