@@ -323,6 +323,8 @@ class PlanAction:
     tenant_id: str | None = None
     ladder: list[RankSpec] | None = None
     target_tps: float | None = None
+    target_p99_ttft_ms: float | None = None
+    target_p99_tpot_ms: float | None = None
     mechanism_id: str | None = None  # job-level committed mechanism; ranks may override
     swap_reason: str | None = None  # scale_up|scale_down|migrate|replace|retune (SWAP trace)
     budget_ref: str | None = None  # BudgetSlice reference for resource-consuming actions
@@ -370,6 +372,8 @@ class PlanAction:
             tenant_id=raw.get("tenant_id"),
             ladder=ladder,
             target_tps=raw.get("target_tps"),
+            target_p99_ttft_ms=raw.get("target_p99_ttft_ms"),
+            target_p99_tpot_ms=raw.get("target_p99_tpot_ms"),
             mechanism_id=raw.get("mechanism_id"),
             swap_reason=raw.get("swap_reason"),
             budget_ref=raw.get("budget_ref"),
@@ -384,6 +388,8 @@ class PlanAction:
             "tenant_id": self.tenant_id,
             "ladder": [r.to_dict() for r in self.ladder] if self.ladder else None,
             "target_tps": self.target_tps,
+            "target_p99_ttft_ms": self.target_p99_ttft_ms,
+            "target_p99_tpot_ms": self.target_p99_tpot_ms,
             "mechanism_id": self.mechanism_id,
             "swap_reason": self.swap_reason,
             "budget_ref": self.budget_ref,

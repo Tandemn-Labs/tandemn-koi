@@ -7,7 +7,15 @@ from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
 from src.core.evidence_service import EvidenceService
 from src.core.mechanism_registry import MechanismRegistry
-from src.core.models import Edge, EdgeMetadata, EvidenceRow, Mechanism, MechanismMetadata, Node
+from src.core.models import (
+    Edge,
+    EdgeMetadata,
+    EvidenceRow,
+    Mechanism,
+    MechanismMetadata,
+    Node,
+    Plan,
+)
 from src.validation.icp import ICPResult
 from src.validation.quadrants import Quadrant
 from tandemn_system_data.clients import PostgresClient
@@ -53,6 +61,29 @@ def make_row(
 
 
 class CoreSmokeTests(unittest.TestCase):
+    def test_plan_action_preserves_online_targets(self):
+        plan = Plan.from_raw(
+            {
+                "actions": [
+                    {
+                        "job_id": "job_online",
+                        "type": "place",
+                        "ladder": [],
+                        "target_tps": 2200.0,
+                        "target_p99_ttft_ms": 500.0,
+                        "target_p99_tpot_ms": 50.0,
+                    }
+                ]
+            },
+            tick=1,
+        )
+
+        action = plan.actions[0]
+        self.assertEqual(action.target_p99_ttft_ms, 500.0)
+        self.assertEqual(action.target_p99_tpot_ms, 50.0)
+        self.assertEqual(action.to_dict()["target_p99_ttft_ms"], 500.0)
+        self.assertEqual(action.to_dict()["target_p99_tpot_ms"], 50.0)
+
     def test_candidate_graph_indexes_and_topology(self):
         nodes = {
             "tp": Node("tp", "X"),
