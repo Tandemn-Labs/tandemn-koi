@@ -76,6 +76,15 @@ class ResourceMapManager:
     def _resource_map_store(self, user_id: str | None = None):
         return ResourceMapStore(self._client(), user_id=self._effective_user_id(user_id))
 
+    def hardware_catalog(self) -> dict[str, Any]:
+        """Return the latest Store hardware catalog, raising when absent."""
+        from tandemn_system_data.clients import HardwareCatalogStore
+
+        catalog = HardwareCatalogStore(self._client()).get()
+        if catalog is None or not catalog.catalog:
+            raise ValueError("hardware catalog is required for deployment X")
+        return dict(catalog.catalog)
+
     def _job_store(self):
         return JobStore(self._client())
 

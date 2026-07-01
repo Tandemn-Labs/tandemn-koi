@@ -77,6 +77,7 @@ from src.core.models import (
     Plan,
     PlanAction,
 )
+from src.infra.deployment_x import build_deployment_x_index
 from src.validation.icp import ICPResult
 
 log = logging.getLogger("koi.fsm")
@@ -109,6 +110,7 @@ class TickContext:
 
     cluster_snapshot: Any = None
     telemetry: Any = None
+    deployment_x: Any = None
     evidence_rows: list[Any] = field(default_factory=list)
     new_slow_state: Any = None
     candidate_plan: Any = None
@@ -152,11 +154,11 @@ class TickRunner:
 
     Construction wires every component. The telemetry adapter must yield
     per-rank bundles via iter_per_rank(telemetry); each bundle exposes:
-    job_id, rank_id, env_label, X (deploy snapshot), W_observed,
-    v_observed / v_predicted (dict name -> trajectory; predicted may be a
-    scalar), y_observed (dict name -> trajectory), y_predicted (dict name
-    -> scalar), committed_mechanism_id, and optionally
-    deploy_timestamp_utc.
+    job_id, rank_id, W_observed, v_observed / v_predicted (dict name ->
+    trajectory; predicted may be a scalar), y_observed (dict name ->
+    trajectory), y_predicted (dict name -> scalar), committed_mechanism_id,
+    and optionally deploy_timestamp_utc. Deploy-time X comes from
+    Store/catalog snapshots, not telemetry.
 
     Args:
         evidence_store: Append-only EvidenceRow ledger (EvidenceService).
@@ -313,12 +315,12 @@ class TickRunner:
         return FSMState.S1_OBSERVE
 
     def S1(self, ctx: TickContext) -> FSMState:
-        """Pull per-rank telemetry bundles for the [t-1, t] window.
+        """Pull telemetry and build deploy-time X for the [t-1, t] window.
 
-        Read-only. The bundle shape is documented on the class; S2 is the
-        only consumer.
+        Telemetry owns runtime V/Y. Store/catalog snapshots own deployment X.
         """
         ctx.telemetry = self.telemetry.collect_telemetry(tick_start=ctx.tick - 1, tick_end=ctx.tick)
+        ctx.deployment_x = self._build_deployment_x_index(ctx)
         return FSMState.S2_VALIDATE
 
     def S2(self, ctx: TickContext) -> FSMState:
@@ -339,7 +341,16 @@ class TickRunner:
         cached_v_params = self.slow_loop.get_sss_cusum_params_v()
         cached_y_params = self.slow_loop.get_sss_cusum_params_y()
 
+        if ctx.deployment_x is None:
+            ctx.deployment_x = self._build_deployment_x_index(ctx)
+
         for rank_telem in self.telemetry.iter_per_rank(ctx.telemetry):
+            job_id = str(rank_telem.job_id)
+            raw_rank_id = getattr(rank_telem, "rank_id", None)
+            deployment = ctx.deployment_x.resolve(job_id, raw_rank_id)
+            rank_id = deployment.rank_id
+            x = dict(deployment.x)
+            env_label = deployment.env_label
             v_obs = dict(rank_telem.v_observed)
             v_pred = dict(rank_telem.v_predicted)
             y_obs = dict(rank_telem.y_observed)
@@ -350,7 +361,7 @@ class TickRunner:
             y_observed_mean = {name: float(np.mean(arr)) for name, arr in y_obs.items() if len(arr)}
 
             committed = self._committed_mechanism_id(rank_telem)
-            applicable = self._applicable_mechanisms(rank_telem, committed)
+            applicable = self._applicable_mechanisms(x.keys(), v_obs.keys(), committed)
 
             v_params = self._resolve_cusum_params(residuals_per_v, cached_v_params)
             y_params = self._resolve_cusum_params(residuals_per_y, cached_y_params)
@@ -389,16 +400,16 @@ class TickRunner:
 
             j_realized = self._j_realized(y_observed_mean, w_t_snapshot, z_star_snapshot)
             row = EvidenceRow(
-                row_id=f"{ctx.tick}_{rank_telem.job_id}_{rank_telem.rank_id}",
+                row_id=f"{ctx.tick}_{job_id}_{rank_id}",
                 tick=ctx.tick,
                 deploy_timestamp_utc=float(
                     getattr(rank_telem, "deploy_timestamp_utc", time.time())
                 ),
-                job_id=rank_telem.job_id,
-                rank_id=rank_telem.rank_id,
-                env_label=rank_telem.env_label,
-                X=dict(rank_telem.X),
-                W_observed=dict(rank_telem.W_observed),
+                job_id=job_id,
+                rank_id=rank_id,
+                env_label=env_label,
+                X=x,
+                W_observed=dict(getattr(rank_telem, "W_observed", {})),
                 V_observed_trajectory=v_obs,
                 V_predicted_trajectory=v_pred,
                 y_observed_trajectory=y_obs,
@@ -597,6 +608,26 @@ class TickRunner:
     # S2 helpers
     # ------------------------------------------------------------------
 
+    def _build_deployment_x_index(self, ctx: TickContext):
+        """Rank-level deployment X, built from Store/catalog state once per tick."""
+        x_fields = getattr(self.candidate_graph, "x", None)
+        if not x_fields:
+            raise ValueError("candidate graph X fields are required for deployment X")
+        return build_deployment_x_index(
+            ctx.cluster_snapshot,
+            hardware_catalog=self._hardware_catalog(),
+            x_fields=x_fields,
+        )
+
+    def _hardware_catalog(self) -> dict[str, Any]:
+        getter = getattr(self.resource_map, "hardware_catalog", None)
+        if not callable(getter):
+            raise ValueError("resource_map must expose hardware_catalog()")
+        catalog = dict(getter() or {})
+        if not catalog:
+            raise ValueError("hardware catalog is required to build deployment X")
+        return catalog
+
     @staticmethod
     def _residuals(observed: dict[str, Any], predicted: dict[str, Any]) -> dict[str, np.ndarray]:
         """Per-variable residual arrays; scalar predictions broadcast."""
@@ -627,7 +658,12 @@ class TickRunner:
             return getattr(mech, "mechanism_id", None)
         return getattr(rank_telem, "mechanism_id", None)
 
-    def _applicable_mechanisms(self, rank_telem, committed_id: str | None) -> list[Any]:
+    def _applicable_mechanisms(
+        self,
+        x_keys,
+        v_keys,
+        committed_id: str | None,
+    ) -> list[Any]:
         """Resolve the mechanisms this rank's evidence speaks to.
 
         Active scope matches on (X keys, observed V names), plus the
@@ -636,9 +672,7 @@ class TickRunner:
         mid-flight.
         """
         applicable: dict[str, Any] = {}
-        matches = self.mechanism_registry.filter_by_scope(
-            sorted(rank_telem.X.keys()), sorted(rank_telem.v_observed.keys())
-        )
+        matches = self.mechanism_registry.filter_by_scope(sorted(x_keys), sorted(v_keys))
         for mech in matches:
             if mech.status == "active":
                 applicable[mech.mechanism_id] = mech
