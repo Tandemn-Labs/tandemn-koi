@@ -154,7 +154,7 @@ class TickRunner:
 
     Construction wires every component. The telemetry adapter must yield
     per-rank bundles via iter_per_rank(telemetry); each bundle exposes:
-    job_id, rank_id, W_observed, v_observed / v_predicted (dict name ->
+    job_id, rank_id, v_observed / v_predicted (dict name ->
     trajectory; predicted may be a scalar), y_observed (dict name ->
     trajectory), y_predicted (dict name -> scalar), committed_mechanism_id,
     and optionally deploy_timestamp_utc. Deploy-time X comes from
@@ -409,7 +409,6 @@ class TickRunner:
                 rank_id=rank_id,
                 env_label=env_label,
                 X=x,
-                W_observed=dict(getattr(rank_telem, "W_observed", {})),
                 V_observed_trajectory=v_obs,
                 V_predicted_trajectory=v_pred,
                 y_observed_trajectory=y_obs,

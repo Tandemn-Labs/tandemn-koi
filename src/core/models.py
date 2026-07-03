@@ -89,7 +89,6 @@ class EvidenceRow:
     rank_id: str
     env_label: EnvLabel  # (market, cloud, region, zone, gpu_type)
     X: dict[str, object]  # ~60 decision variables
-    W_observed: dict[str, float]  # 22 workload features
     V_observed_trajectory: dict[str, np.ndarray]  # sub-tick V samples (all measured V's)
     V_predicted_trajectory: dict[str, np.ndarray]  # surrogate's V_hat(t)
     y_observed_trajectory: dict[str, np.ndarray]  # sub-tick Y samples - Y-CUSUM input

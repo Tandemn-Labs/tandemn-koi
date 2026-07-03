@@ -17,7 +17,6 @@ def make_row(row_id, env_label, residuals_per_v=None, residuals_per_y=None, quad
         rank_id=row_id,
         env_label=env_label,
         X={},
-        W_observed={},
         V_observed_trajectory={},
         V_predicted_trajectory={},
         y_observed_trajectory={},

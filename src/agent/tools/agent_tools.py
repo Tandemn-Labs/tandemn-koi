@@ -1399,8 +1399,7 @@ def get_similar_deployments(
                 if (wanted_gpu is None or env_gpu_type(r.env_label) == wanted_gpu)
                 and (
                     wanted_type is None
-                    or str(r.W_observed.get("type") or r.W_observed.get("workload_type")).lower()
-                    == wanted_type
+                    or str(r.X.get("type") or r.X.get("workload_type")).lower() == wanted_type
                 )
             ]
         rows = rows[-int(top_k) :]
@@ -1546,7 +1545,7 @@ def _similar_rows(
             r
             for r in rows
             if (gpu is None or env_gpu_type(r.env_label) == gpu)
-            and (typ is None or r.W_observed.get("type") == typ)
+            and (typ is None or r.X.get("type") == typ or r.X.get("workload_type") == typ)
         ]
     return rows[-top_k:]
 
