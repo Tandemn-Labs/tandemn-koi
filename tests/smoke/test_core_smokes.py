@@ -83,6 +83,69 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(action.to_dict()["target_p99_ttft_ms"], 500.0)
         self.assertEqual(action.to_dict()["target_p99_tpot_ms"], 50.0)
 
+    def test_plan_action_autofills_and_preserves_rank_ids(self):
+        plan = Plan.from_raw(
+            {
+                "actions": [
+                    {
+                        "job_id": "job_online",
+                        "type": "place",
+                        "ladder": [
+                            {
+                                "role": "aggregate",
+                                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                "config": {"gpu_count": 1},
+                                "n_replicas": 1,
+                            },
+                            {
+                                "role": "aggregate",
+                                "rank_id": "latency_rank",
+                                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                "config": {"gpu_count": 1},
+                                "n_replicas": 1,
+                            },
+                        ],
+                    }
+                ]
+            },
+            tick=1,
+        )
+
+        action = plan.actions[0]
+        self.assertEqual([rank.rank_id for rank in action.ladder], ["rank_0", "latency_rank"])
+        self.assertEqual(
+            [rank["rank_id"] for rank in action.to_dict()["ladder"]],
+            ["rank_0", "latency_rank"],
+        )
+
+    def test_plan_action_rejects_duplicate_rank_ids(self):
+        with self.assertRaisesRegex(ValueError, "duplicate rank_id"):
+            Plan.from_raw(
+                {
+                    "actions": [
+                        {
+                            "job_id": "job_online",
+                            "type": "place",
+                            "ladder": [
+                                {
+                                    "role": "aggregate",
+                                    "rank_id": "rank_1",
+                                    "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                    "config": {"gpu_count": 1},
+                                },
+                                {
+                                    "role": "aggregate",
+                                    "rank_id": "rank_1",
+                                    "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                    "config": {"gpu_count": 1},
+                                },
+                            ],
+                        }
+                    ]
+                },
+                tick=1,
+            )
+
     def test_candidate_graph_indexes_and_topology(self):
         nodes = {
             "tp": Node("tp", "X"),
