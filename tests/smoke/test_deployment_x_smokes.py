@@ -236,7 +236,6 @@ class _Telemetry:
         yield SimpleNamespace(
             job_id="job_1",
             rank_id="rank_a",
-            W_observed={"type": "online"},
             v_observed={"kv_cache_util": np.array([0.2, 0.3])},
             v_predicted={"kv_cache_util": 0.1},
             y_observed={"p99_ttft_ms": np.array([100.0, 110.0])},
