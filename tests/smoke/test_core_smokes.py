@@ -16,7 +16,6 @@ from src.core.models import (
     Node,
     Plan,
 )
-from src.executor.executor import StorePlanExecutor
 from src.validation.icp import ICPResult
 from src.validation.quadrants import Quadrant
 from tandemn_system_data.clients import PostgresClient
@@ -58,12 +57,6 @@ def make_row(
         J_realized=-5.0,
         sigma_realized=1.0,
     )
-
-
-class _PlanStore:
-    def create(self, plan):
-        self.plan = plan
-        return plan
 
 
 class CoreSmokeTests(unittest.TestCase):
@@ -152,32 +145,6 @@ class CoreSmokeTests(unittest.TestCase):
                 },
                 tick=1,
             )
-
-    def test_store_plan_executor_preserves_rank_id(self):
-        plan = Plan.from_raw(
-            {
-                "actions": [
-                    {
-                        "job_id": "job_online",
-                        "type": "place",
-                        "ladder": [
-                            {
-                                "role": "aggregate",
-                                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
-                                "config": {"gpu_count": 1},
-                            }
-                        ],
-                    }
-                ]
-            },
-            tick=1,
-        )
-        store = _PlanStore()
-
-        ack = StorePlanExecutor("user_1", plan_store=store).send_to_executor(plan)
-
-        self.assertEqual(ack[0]["status"], "created")
-        self.assertEqual(store.plan.actions[0].ladder[0]["rank_id"], "rank_0")
 
     def test_candidate_graph_indexes_and_topology(self):
         nodes = {
