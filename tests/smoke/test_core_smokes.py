@@ -136,13 +136,13 @@ class CoreSmokeTests(unittest.TestCase):
                             "ladder": [
                                 {
                                     "role": "aggregate",
-                                    "rank_id": "rank_a",
+                                    "rank_id": "rank_1",
                                     "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
                                     "config": {"gpu_count": 1},
                                 },
                                 {
                                     "role": "aggregate",
-                                    "rank_id": "rank_a",
+                                    "rank_id": "rank_1",
                                     "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
                                     "config": {"gpu_count": 1},
                                 },
