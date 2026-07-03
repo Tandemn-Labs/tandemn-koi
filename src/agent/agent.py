@@ -797,6 +797,11 @@ class KoiAgentHarness:
         if not action.ladder:
             raise PlanMaterializationError(f"job {jid}: ladder is empty")
 
+        try:
+            PlanAction.assign_rank_ids(jid, action.ladder)
+        except ValueError as exc:
+            raise PlanMaterializationError(str(exc)) from exc
+
         for i, rank in enumerate(action.ladder):
             if rank.env is None or len(rank.env) != 5:
                 raise PlanMaterializationError(
@@ -1009,6 +1014,7 @@ class KoiAgentHarness:
             "   'rationale': str}\n"
             "Rank dict (each entry of ladder):\n"
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
+            "   'rank_id': 'rank_0',      # optional; Koi auto-fills rank_0, rank_1, ...\n"
             "   'env': [market, cloud, region, zone, gpu_type],   # REQUIRED - launch target + ICP key\n"
             "   'config': {instance_type, tp, pp, dp, ep, gpu_count, engine_name, ...},\n"
             "   'n_replicas': int,\n"
@@ -1031,7 +1037,8 @@ class KoiAgentHarness:
             "  defer    waiting->waiting    (no ladder)\n"
             "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
             "  diagnose  no change          (no ladder; record a theory only)\n"
-            "Every ladder rank MUST carry a 5-element env and MUST resolve a "
+            "Every ladder rank MUST carry a unique rank_id (or let Koi auto-fill one), "
+            "MUST carry a 5-element env, and MUST resolve a "
             "mechanism_id, either on the rank or inherited from the action. "
             "For cloud instance pools, config.instance_type is required when "
             "the env has multiple pools. gpu_count is engine GPU demand, not "

@@ -221,6 +221,7 @@ class RankSpec:
     env: tuple | None  # (market, cloud, region, zone, gpu_type)
     config: dict  # X decision variables for this chain
     n_replicas: int = 1  # "chains" in the shorthand
+    rank_id: str | None = None  # Koi logical rank id; Orca preserves it into chains/pods
     mechanism_id: str | None = None
     chain_id: str | None = None  # stable fingerprint for switch-cost delta matching
 
@@ -228,7 +229,7 @@ class RankSpec:
     def from_dict(cls, raw) -> "RankSpec":
         """Parse a rank from the explicit form or the role-keyed shorthand.
 
-        Explicit: {"role", "env", "config", "n_replicas", "mechanism_id"}.
+        Explicit: {"role", "rank_id", "env", "config", "n_replicas", "mechanism_id"}.
         Shorthand: {"aggregate": {"gpu":..., "count":..., "tp":..., "pp":...,
                     "chains":..., "env":..., "mechanism_id":...}}.
 
@@ -255,6 +256,7 @@ class RankSpec:
             if only_key in KNOWN_ROLES and isinstance(raw[only_key], dict):
                 inner = dict(raw[only_key])
                 env = inner.pop("env", None)
+                rank_id = inner.pop("rank_id", None)
                 mech = inner.pop("mechanism_id", None)
                 chain_id = inner.pop("chain_id", None)
                 n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1)) or 1
@@ -264,6 +266,7 @@ class RankSpec:
                     env=_as_env_tuple(env),
                     config=inner,
                     n_replicas=n_rep,
+                    rank_id=rank_id,
                     mechanism_id=mech,
                     chain_id=chain_id,
                 )
@@ -279,6 +282,7 @@ class RankSpec:
             env=_as_env_tuple(raw.get("env")),
             config=dict(raw.get("config", {})),
             n_replicas=int(n_rep_raw or 1),
+            rank_id=raw.get("rank_id"),
             mechanism_id=raw.get("mechanism_id"),
             chain_id=raw.get("chain_id"),
         )
@@ -289,6 +293,7 @@ class RankSpec:
             "env": list(self.env) if self.env else None,
             "config": dict(self.config),
             "n_replicas": self.n_replicas,
+            "rank_id": self.rank_id,
             "mechanism_id": self.mechanism_id,
             "chain_id": self.chain_id,
         }
@@ -365,6 +370,7 @@ class PlanAction:
         ladder = (
             [RankSpec.from_dict(r) for r in ladder_raw] if isinstance(ladder_raw, list) else None
         )
+        cls.assign_rank_ids(str(jid), ladder)
         return cls(
             job_id=str(jid),
             type=action_type,
@@ -379,6 +385,18 @@ class PlanAction:
             rationale=raw.get("rationale"),
             predicted_y=raw.get("predicted_y") or raw.get("y_hat"),
         )
+
+    @staticmethod
+    def assign_rank_ids(job_id: str, ladder: list[RankSpec] | None) -> None:
+        """Fill missing rank ids and reject duplicates within one job action."""
+        if not ladder:
+            return
+        seen: set[str] = set()
+        for i, rank in enumerate(ladder):
+            rank.rank_id = rank.rank_id or f"rank_{i}"
+            if rank.rank_id in seen:
+                raise ValueError(f"job {job_id}: duplicate rank_id {rank.rank_id!r}")
+            seen.add(rank.rank_id)
 
     def to_dict(self) -> dict:
         return {

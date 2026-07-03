@@ -16,6 +16,7 @@ from src.core.models import (
     Node,
     Plan,
 )
+from src.executor.executor import StorePlanExecutor
 from src.validation.icp import ICPResult
 from src.validation.quadrants import Quadrant
 from tandemn_system_data.clients import PostgresClient
@@ -59,6 +60,12 @@ def make_row(
     )
 
 
+class _PlanStore:
+    def create(self, plan):
+        self.plan = plan
+        return plan
+
+
 class CoreSmokeTests(unittest.TestCase):
     def test_plan_action_preserves_online_targets(self):
         plan = Plan.from_raw(
@@ -82,6 +89,95 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(action.target_p99_tpot_ms, 50.0)
         self.assertEqual(action.to_dict()["target_p99_ttft_ms"], 500.0)
         self.assertEqual(action.to_dict()["target_p99_tpot_ms"], 50.0)
+
+    def test_plan_action_autofills_and_preserves_rank_ids(self):
+        plan = Plan.from_raw(
+            {
+                "actions": [
+                    {
+                        "job_id": "job_online",
+                        "type": "place",
+                        "ladder": [
+                            {
+                                "role": "aggregate",
+                                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                "config": {"gpu_count": 1},
+                                "n_replicas": 1,
+                            },
+                            {
+                                "role": "aggregate",
+                                "rank_id": "latency_rank",
+                                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                "config": {"gpu_count": 1},
+                                "n_replicas": 1,
+                            },
+                        ],
+                    }
+                ]
+            },
+            tick=1,
+        )
+
+        action = plan.actions[0]
+        self.assertEqual([rank.rank_id for rank in action.ladder], ["rank_0", "latency_rank"])
+        self.assertEqual(
+            [rank["rank_id"] for rank in action.to_dict()["ladder"]],
+            ["rank_0", "latency_rank"],
+        )
+
+    def test_plan_action_rejects_duplicate_rank_ids(self):
+        with self.assertRaisesRegex(ValueError, "duplicate rank_id"):
+            Plan.from_raw(
+                {
+                    "actions": [
+                        {
+                            "job_id": "job_online",
+                            "type": "place",
+                            "ladder": [
+                                {
+                                    "role": "aggregate",
+                                    "rank_id": "rank_a",
+                                    "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                    "config": {"gpu_count": 1},
+                                },
+                                {
+                                    "role": "aggregate",
+                                    "rank_id": "rank_a",
+                                    "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                    "config": {"gpu_count": 1},
+                                },
+                            ],
+                        }
+                    ]
+                },
+                tick=1,
+            )
+
+    def test_store_plan_executor_preserves_rank_id(self):
+        plan = Plan.from_raw(
+            {
+                "actions": [
+                    {
+                        "job_id": "job_online",
+                        "type": "place",
+                        "ladder": [
+                            {
+                                "role": "aggregate",
+                                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                "config": {"gpu_count": 1},
+                            }
+                        ],
+                    }
+                ]
+            },
+            tick=1,
+        )
+        store = _PlanStore()
+
+        ack = StorePlanExecutor("user_1", plan_store=store).send_to_executor(plan)
+
+        self.assertEqual(ack[0]["status"], "created")
+        self.assertEqual(store.plan.actions[0].ladder[0]["rank_id"], "rank_0")
 
     def test_candidate_graph_indexes_and_topology(self):
         nodes = {
