@@ -1014,7 +1014,7 @@ class KoiAgentHarness:
             "   'rationale': str}\n"
             "Rank dict (each entry of ladder):\n"
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
-            "   'rank_id': 'rank_0',      # optional; Koi auto-fills rank_0, rank_1, ...\n"
+            "   'rank_id': 'rank_0',      # omit rank_id; Koi auto-fills rank_0, rank_1, ...\n"
             "   'env': [market, cloud, region, zone, gpu_type],   # REQUIRED - launch target + ICP key\n"
             "   'config': {instance_type, tp, pp, dp, ep, gpu_count, engine_name, ...},\n"
             "   'n_replicas': int,\n"
