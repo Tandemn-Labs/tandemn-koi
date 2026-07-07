@@ -551,7 +551,7 @@ class KoiAgentHarness:
         if candidates:
             candidates.sort(key=lambda pair: pair[0], reverse=True)
             self.trace.add("kp_winner_selected", score=candidates[0][0])
-            return candidates[0][1]
+            return agent_tools.stamp_plan_predictions(candidates[0][1], cluster_snapshot)
 
         self.trace.add("safe_fallback_used", tick=tick)
         return self._fallback_plan(cluster_snapshot)

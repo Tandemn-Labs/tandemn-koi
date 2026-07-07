@@ -15,7 +15,8 @@ from src.core.models import EnvLabel
 
 RankKey = tuple[str, str]
 
-_X_SKIP = {"env", "rank_id", "replica_index", "mechanism_id"}
+# ponytail: predictions ride in shape_json, but they are evidence inputs, not X.
+_X_SKIP = {"env", "rank_id", "replica_index", "mechanism_id", "predicted_y", "predicted_v"}
 _LOAD_FIELDS = ("request_arrival_rate", "total_token_budget")
 _GPU_FIELDS = (
     "gpu_bandwidth_gbps",
@@ -45,6 +46,8 @@ class RankDeployment:
     rank_id: str
     env_label: EnvLabel
     x: dict[str, object]
+    v_predicted: dict[str, float]
+    y_predicted: dict[str, float]
 
 
 @dataclass
@@ -151,6 +154,8 @@ def _rank_deployment(
         rank_id=rank_id,
         env_label=env,
         x=_project_x(x, x_fields),
+        v_predicted=dict(shape.get("predicted_v") or {}),
+        y_predicted=dict(shape.get("predicted_y") or {}),
     )
 
 
