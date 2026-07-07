@@ -224,6 +224,8 @@ class RankSpec:
     rank_id: str | None = None  # Koi logical rank id; Orca preserves it into chains/pods
     mechanism_id: str | None = None
     chain_id: str | None = None  # stable fingerprint for switch-cost delta matching
+    predicted_y: dict | None = None
+    predicted_v: dict | None = None
 
     @classmethod
     def from_dict(cls, raw) -> "RankSpec":
@@ -259,6 +261,8 @@ class RankSpec:
                 rank_id = inner.pop("rank_id", None)
                 mech = inner.pop("mechanism_id", None)
                 chain_id = inner.pop("chain_id", None)
+                predicted_y = inner.pop("predicted_y", None)
+                predicted_v = inner.pop("predicted_v", None)
                 n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1)) or 1
                 n_rep = int(n_rep_raw)
                 return cls(
@@ -269,6 +273,8 @@ class RankSpec:
                     rank_id=rank_id,
                     mechanism_id=mech,
                     chain_id=chain_id,
+                    predicted_y=predicted_y,
+                    predicted_v=predicted_v,
                 )
 
         role = raw.get("role")
@@ -285,6 +291,8 @@ class RankSpec:
             rank_id=raw.get("rank_id"),
             mechanism_id=raw.get("mechanism_id"),
             chain_id=raw.get("chain_id"),
+            predicted_y=raw.get("predicted_y"),
+            predicted_v=raw.get("predicted_v"),
         )
 
     def to_dict(self) -> dict:
@@ -296,6 +304,8 @@ class RankSpec:
             "rank_id": self.rank_id,
             "mechanism_id": self.mechanism_id,
             "chain_id": self.chain_id,
+            "predicted_y": self.predicted_y,
+            "predicted_v": self.predicted_v,
         }
 
     def gpus_per_chain(self) -> int:
