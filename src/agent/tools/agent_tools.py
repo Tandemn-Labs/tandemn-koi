@@ -374,11 +374,15 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
     composed). A single-rank ladder returns that rank's y_hat unchanged, so
     homogeneous ladders are unaffected.
     """
-    if action.predicted_y:
-        return dict(action.predicted_y)
+    # TODO - I can debate this as we don't need the LLM to pass the predicted_y
+    # we want it to CALL The SUrrogate ALWAYS
+    # so i am, for now, removing this call.
+    # if action.predicted_y:
+    #     return dict(action.predicted_y)
     samples: list[tuple[int, dict]] = []
     for rank in action.ladder or []:
         try:
+            # call the surrogate here
             y = predict_outcome(_rank_prediction_payload(rank, job_features)).get("y_hat", {})
         except Exception:
             log.exception("rank y_hat failed for job %s", action.job_id)
@@ -1640,6 +1644,21 @@ def predict_outcome(
         "v_hat": v_hat or {},
         "dro_band": dro_band,
     }
+
+
+def stamp_plan_predictions(plan, cluster_snapshot=None):
+    """Attach raw per-rank predictions to the plan that will be deployed."""
+    typed = _as_plan(plan)
+    snapshot = cluster_snapshot if cluster_snapshot is not None else _snapshot()
+    for action in typed.actions:
+        if action.type not in LADDER_ACTIONS or not action.ladder:
+            continue
+        job_features = _job_features_for(snapshot, action.job_id)
+        for rank in action.ladder:
+            pred = predict_outcome(_rank_prediction_payload(rank, job_features), calibrate=False)
+            rank.predicted_y = dict(pred.get("y_hat_raw") or pred.get("y_hat") or {})
+            rank.predicted_v = dict(pred.get("v_hat") or {})
+    return typed
 
 
 def get_z_star(job_features: dict[str, Any] | None = None) -> dict[str, float]:
