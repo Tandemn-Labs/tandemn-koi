@@ -22,7 +22,6 @@
     "crossnode_parallelism_penalty": "CERTAIN",
     "weight_quant_decode_bandwidth_large": "CERTAIN",
     "moe_expert_imbalance": "STRONG",
-    "moe_expert_offload_memory": "PLAUSIBLE",
     "pipeline_bubbles_deep_model": "CERTAIN",
     "chunked_prefill_ttft_long_input": "STRONG",
     "speculative_decoding_tpot": "LIKELY",
@@ -32,11 +31,9 @@
     "queueing_under_burst": "CERTAIN",
     "kv_pressure_long_context": "STRONG",
     "sliding_window_kv_relief": "PLAUSIBLE",
-    "kv_quant_capacity": "LIKELY",
     "weight_quant_memory_fit": "CERTAIN",
     "tp_pp_memory_sharding_fit": "STRONG",
     "cuda_graphs_small_model_dispatch": "LIKELY",
-    "torch_compile_kernel_fusion": "PLAUSIBLE",
     "cost_via_batching_utilization_batch": "STRONG",
     "batch_deadline_throughput": "STRONG",
     "attention_backend_kernel_choice": "PLAUSIBLE",
@@ -52,12 +49,10 @@
     "input_length_prefill_ttft": "CERTAIN",
     "output_length_cost_amortization": "EVEN",
     "gpu_memory_utilization_packing": "LIKELY",
-    "swap_offload_spillover": "PLAUSIBLE",
     "engine_version_overhead_regression": "EVEN",
     "dp_replica_scaleout_online": "STRONG",
     "concurrent_streaming_cap": "PLAUSIBLE",
     "gqa_kv_head_reduction": "STRONG",
-    "sparse_attention_long_context": "PLAUSIBLE",
     "context_parallel_ultralong": "PLAUSIBLE",
     "activation_quant_memory": "PLAUSIBLE",
     "model_depth_memory": "STRONG",
@@ -66,11 +61,9 @@
     "speculative_draft_quality": "PLAUSIBLE",
     "moe_capacity_factor_memory": "PLAUSIBLE",
     "kv_fp8_decode_bandwidth": "LIKELY",
-    "compile_warmup_tradeoff": "PLAUSIBLE",
     "chunk_steps_scheduling": "EVEN",
     "arrival_pattern_batching": "PLAUSIBLE",
     "length_variance_batching": "PLAUSIBLE",
-    "preemption_recompute_under_pressure": "PLAUSIBLE",
     "interconnect_topology": "LIKELY",
     "node_count_pipeline_bubbles": "LIKELY",
     "prefill_worker_scaling_disagg": "LIKELY",
@@ -86,9 +79,7 @@
     "hardware_kernel_generation": "PLAUSIBLE",
     "context_length_capacity_limit": "STRONG",
     "load_saturation_slo_collapse": "STRONG",
-    "gpu_sharing_fraction_packing": "PLAUSIBLE",
     "hardware_bandwidth_vs_model": "STRONG",
-    "swap_space_oom_safety_valve": "PLAUSIBLE",
     "tp_degree_sweet_spot": "STRONG",
     "token_budget_vs_seq_cap": "LIKELY",
     "prefill_decode_interference_chunked": "PLAUSIBLE",
@@ -105,7 +96,6 @@
     "draft_model_size_tradeoff": "PLAUSIBLE",
     "mixed_precision_weight_activation": "PLAUSIBLE",
     "prefix_cache_memory_contention": "EVEN",
-    "cold_start_ephemeral_chain": "PLAUSIBLE",
     "summarization_long_in_medium_out": "LIKELY",
     "chat_balanced_multiturn": "STRONG",
     "high_concurrency_kv_thrash": "STRONG",
@@ -114,7 +104,6 @@
     "attention_backend_hardware_match": "PLAUSIBLE",
     "long_context_chunked_prefill_mandatory": "LIKELY",
     "dp_cost_vs_latency_tradeoff": "PLAUSIBLE",
-    "utilization_target_burst_safety": "PLAUSIBLE",
     "quant_kernel_hardware_feasibility": "PLAUSIBLE"
   },
   "mechanisms": [
@@ -234,26 +223,6 @@
         "conditions": [{"feature": "is_moe", "op": "==", "value": true}]
       },
       "narrative": "In MoE models, token routing skew overloads some experts and starves others; the straggler expert bounds each step, capping throughput and inflating TPOT. Router policy (load-balancing loss, capacity factor) and expert-parallel placement modulate the imbalance.",
-      "status": "active"
-    },
-    {
-      "name": "moe_expert_offload_memory",
-      "edge_ids": [
-        "is_moe->gpu_mem_used_fraction",
-        "num_routed_experts->gpu_mem_used_fraction",
-        "expert_offload_enabled->gpu_mem_used_fraction",
-        "expert_offload_enabled->pcie_tput_observed",
-        "gpu_mem_used_fraction->slo_margin",
-        "pcie_tput_observed->p99_tpot_ms"
-      ],
-      "scope": {
-        "x": ["is_moe", "num_routed_experts", "expert_offload_enabled"],
-        "v": ["gpu_mem_used_fraction", "pcie_tput_observed"],
-        "workload_type": "any",
-        "model_type": "moe",
-        "conditions": [{"feature": "expert_offload_enabled", "op": "==", "value": true}]
-      },
-      "narrative": "MoE param stores are huge. Offloading idle experts to host memory frees VRAM (improving SLO headroom) but moves hot experts over PCIe on demand, which can stall decode. Worth it only when expert reuse is high or VRAM would otherwise OOM.",
       "status": "active"
     },
     {
@@ -430,25 +399,6 @@
       "status": "active"
     },
     {
-      "name": "kv_quant_capacity",
-      "edge_ids": [
-        "kvcache_quantization->gpu_mem_used_fraction",
-        "kvcache_dtype->gpu_mem_used_fraction",
-        "kvcache_quantization->kv_pressure_score",
-        "gpu_mem_used_fraction->slo_margin",
-        "kv_pressure_score->p99_tpot_ms"
-      ],
-      "scope": {
-        "x": ["kvcache_quantization", "kvcache_dtype"],
-        "v": ["gpu_mem_used_fraction", "kv_pressure_score"],
-        "workload_type": "any",
-        "model_type": "any",
-        "conditions": []
-      },
-      "narrative": "Quantizing the KV cache (e.g., fp8) halves KV bytes, relieving memory pressure and freeing blocks for more batch/context. Quality impact is usually small for fp8 KV; aggressive int4 KV can degrade long-context accuracy.",
-      "status": "active"
-    },
-    {
       "name": "weight_quant_memory_fit",
       "edge_ids": [
         "weight_quantization_bits->gpu_mem_used_fraction",
@@ -505,25 +455,6 @@
         "conditions": []
       },
       "narrative": "For small models at high request rate, per-step kernel-launch overhead dominates decode time. CUDA graphs replay a captured launch sequence, cutting dispatch overhead and raising SM utilization and decode rate. Larger models hide launch overhead behind compute, so the gain shrinks.",
-      "status": "active"
-    },
-    {
-      "name": "torch_compile_kernel_fusion",
-      "edge_ids": [
-        "torch_compile_enabled->sm_utilization",
-        "torch_compile_enabled->dispatch_overhead_ms",
-        "compile_mode->dispatch_overhead_ms",
-        "sm_utilization->throughput_token_per_sec",
-        "dispatch_overhead_ms->p99_tpot_ms"
-      ],
-      "scope": {
-        "x": ["torch_compile_enabled", "compile_mode", "num_jit_warmup_steps"],
-        "v": ["sm_utilization", "dispatch_overhead_ms"],
-        "workload_type": "any",
-        "model_type": "any",
-        "conditions": []
-      },
-      "narrative": "torch.compile fuses kernels and removes Python dispatch overhead, raising occupancy and throughput. Compile mode trades warmup time vs steady-state speed; only worth it for long-lived chains where warmup amortizes.",
       "status": "active"
     },
     {
@@ -811,25 +742,6 @@
       "status": "active"
     },
     {
-      "name": "swap_offload_spillover",
-      "edge_ids": [
-        "swap_space_gb->gpu_mem_used_fraction",
-        "swap_space_gb->pcie_tput_observed",
-        "swap_space_gb->vram_headroom_gb",
-        "pcie_tput_observed->p99_tpot_ms",
-        "vram_headroom_gb->slo_margin"
-      ],
-      "scope": {
-        "x": ["swap_space_gb"],
-        "v": ["gpu_mem_used_fraction", "pcie_tput_observed", "vram_headroom_gb"],
-        "workload_type": "any",
-        "model_type": "any",
-        "conditions": []
-      },
-      "narrative": "CPU swap space lets the engine offload KV under pressure instead of preempting, improving SLO survivability, but swapped blocks travel over PCIe and stall decode when accessed. A safety valve, not a throughput lever.",
-      "status": "active"
-    },
-    {
       "name": "engine_version_overhead_regression",
       "edge_ids": [
         "engine_name->dispatch_overhead_ms",
@@ -901,25 +813,6 @@
         "conditions": [{"feature": "attn_heads_per_kv_head", "op": ">", "value": 1}]
       },
       "narrative": "Grouped-query attention shares KV across query heads, so fewer KV heads shrink the KV cache. This is a model-architecture fact that relieves KV pressure and enables larger batch/context; the higher the grouping ratio, the larger the saving.",
-      "status": "active"
-    },
-    {
-      "name": "sparse_attention_long_context",
-      "edge_ids": [
-        "sparse_attn_pattern->sm_utilization",
-        "sparse_attn_pattern->mem_bandwidth_utilization",
-        "sparse_attn_pattern->kv_pressure_score",
-        "sm_utilization->throughput_token_per_sec",
-        "kv_pressure_score->p99_tpot_ms"
-      ],
-      "scope": {
-        "x": ["sparse_attn_pattern", "max_model_len"],
-        "v": ["sm_utilization", "mem_bandwidth_utilization", "kv_pressure_score"],
-        "workload_type": "any",
-        "model_type": "any",
-        "conditions": [{"feature": "max_model_len", "op": ">", "value": 16384}]
-      },
-      "narrative": "Sparse attention patterns cut the quadratic attention cost for long contexts, reducing FLOPs and KV reads, which raises throughput and relieves KV pressure. Valid only where the model supports the pattern without quality loss.",
       "status": "active"
     },
     {
@@ -1071,25 +964,6 @@
       "status": "active"
     },
     {
-      "name": "compile_warmup_tradeoff",
-      "edge_ids": [
-        "compile_mode->dispatch_overhead_ms",
-        "num_jit_warmup_steps->dispatch_overhead_ms",
-        "torch_compile_enabled->sm_utilization",
-        "dispatch_overhead_ms->p99_tpot_ms",
-        "sm_utilization->throughput_token_per_sec"
-      ],
-      "scope": {
-        "x": ["compile_mode", "num_jit_warmup_steps", "torch_compile_enabled", "min_chain_warmup_time"],
-        "v": ["dispatch_overhead_ms", "sm_utilization"],
-        "workload_type": "any",
-        "model_type": "any",
-        "conditions": []
-      },
-      "narrative": "Aggressive compile modes lower steady-state overhead but cost more warmup; the breakeven depends on chain lifetime. Long-lived serving chains amortize warmup; short-lived or frequently-swapped chains do not.",
-      "status": "active"
-    },
-    {
       "name": "chunk_steps_scheduling",
       "edge_ids": [
         "max_chunked_steps_per_request->dispatch_overhead_ms",
@@ -1143,25 +1017,6 @@
         "conditions": []
       },
       "narrative": "High variance in input/output lengths causes ragged batches: long sequences hold slots and stall short ones (head-of-line), so high-variance workloads need length-aware batching or they waste batch capacity.",
-      "status": "active"
-    },
-    {
-      "name": "preemption_recompute_under_pressure",
-      "edge_ids": [
-        "preemption_policy->live_batch_size",
-        "preemption_policy->depth_req_q",
-        "preemption_policy->dispatch_overhead_ms",
-        "depth_req_q->p99_ttft_ms",
-        "live_batch_size->p99_tpot_ms"
-      ],
-      "scope": {
-        "x": ["preemption_policy", "swap_space_gb"],
-        "v": ["live_batch_size", "depth_req_q", "dispatch_overhead_ms"],
-        "workload_type": "online",
-        "model_type": "any",
-        "conditions": []
-      },
-      "narrative": "Under KV pressure the engine either recomputes preempted sequences (compute cost) or swaps them (PCIe cost). The preemption policy sets which, shaping the latency tail when the cache is contended.",
       "status": "active"
     },
     {
@@ -1442,24 +1297,6 @@
       "status": "active"
     },
     {
-      "name": "gpu_sharing_fraction_packing",
-      "edge_ids": [
-        "gpu_shared_fraction->gpu_mem_used_fraction",
-        "gpu_shared_fraction->sm_utilization",
-        "gpu_mem_used_fraction->slo_margin",
-        "sm_utilization->throughput_token_per_sec"
-      ],
-      "scope": {
-        "x": ["gpu_shared_fraction"],
-        "v": ["gpu_mem_used_fraction", "sm_utilization"],
-        "workload_type": "any",
-        "model_type": "dense_small",
-        "conditions": [{"feature": "gpu_shared_fraction", "op": "<", "value": 1.0}]
-      },
-      "narrative": "MPS/MIG GPU sharing packs several small models on one GPU, raising aggregate utilization and cutting cost, but the memory/compute fraction caps each tenant and risks interference. Worth it only for small models that cannot fill a GPU alone.",
-      "status": "active"
-    },
-    {
       "name": "hardware_bandwidth_vs_model",
       "edge_ids": [
         "bandwidth_per_param->mem_bandwidth_utilization",
@@ -1476,24 +1313,6 @@
         "conditions": []
       },
       "narrative": "Decode TPOT is roughly model bytes divided by GPU memory bandwidth, so the ratio of model size to GPU bandwidth predicts decode rate directly. This is the first-principles check on whether a GPU can serve a model at the target TPOT at all.",
-      "status": "active"
-    },
-    {
-      "name": "swap_space_oom_safety_valve",
-      "edge_ids": [
-        "swap_space_gb->vram_headroom_gb",
-        "swap_space_gb->pcie_tput_observed",
-        "vram_headroom_gb->slo_margin",
-        "pcie_tput_observed->p99_tpot_ms"
-      ],
-      "scope": {
-        "x": ["swap_space_gb", "gpu_mem_util"],
-        "v": ["vram_headroom_gb", "pcie_tput_observed"],
-        "workload_type": "online",
-        "model_type": "any",
-        "conditions": []
-      },
-      "narrative": "Swap space lets a high gpu_memory_utilization target survive transient spikes by offloading instead of OOM-killing, trading a PCIe-induced TPOT bump for SLO survivability. Pairs with aggressive memory packing.",
       "status": "active"
     },
     {
@@ -1795,24 +1614,6 @@
       "status": "active"
     },
     {
-      "name": "cold_start_ephemeral_chain",
-      "edge_ids": [
-        "min_chain_warmup_time->dispatch_overhead_ms",
-        "num_jit_warmup_steps->dispatch_overhead_ms",
-        "dispatch_overhead_ms->p99_ttft_ms",
-        "dispatch_overhead_ms->p99_tpot_ms"
-      ],
-      "scope": {
-        "x": ["min_chain_warmup_time", "num_jit_warmup_steps", "cuda_graph_enabled", "torch_compile_enabled"],
-        "v": ["dispatch_overhead_ms"],
-        "workload_type": "any",
-        "model_type": "any",
-        "conditions": []
-      },
-      "narrative": "Short-lived or frequently-swapped chains pay warmup (graph capture, JIT compile, autotuning) that never amortizes, so their early requests see inflated latency. For ephemeral chains, minimize warmup steps and skip aggressive compilation; the opposite of the long-lived-serving recipe.",
-      "status": "active"
-    },
-    {
       "name": "summarization_long_in_medium_out",
       "edge_ids": [
         "isl_token_avg->prefill_iteration_counts_per_second",
@@ -1958,25 +1759,6 @@
         "conditions": []
       },
       "narrative": "Adding data-parallel replicas drains the queue and protects TTFT but splits load into smaller per-replica batches, raising cost per token (less amortization). Scale out for latency-critical traffic; consolidate replicas for cost-critical traffic. The replica count is the cost/latency dial.",
-      "status": "active"
-    },
-    {
-      "name": "utilization_target_burst_safety",
-      "edge_ids": [
-        "gpu_mem_util->kv_pressure_score",
-        "gpu_mem_util->gpu_mem_used_fraction",
-        "peak_to_mean_ratio->depth_req_q",
-        "kv_pressure_score->slo_margin",
-        "gpu_mem_used_fraction->throughput_token_per_sec"
-      ],
-      "scope": {
-        "x": ["gpu_mem_util", "peak_to_mean_ratio", "swap_space_gb"],
-        "v": ["kv_pressure_score", "gpu_mem_used_fraction"],
-        "workload_type": "online",
-        "model_type": "any",
-        "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 2.0}]
-      },
-      "narrative": "A high gpu_memory_utilization target maximizes steady-state throughput but leaves no KV slack for bursts; under a spike it triggers preemption and SLO loss. Bursty workloads need a lower utilization target (or swap headroom) than the steady-state optimum.",
       "status": "active"
     },
     {
