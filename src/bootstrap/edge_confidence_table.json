@@ -12,7 +12,7 @@
     },
     "method": "Curated edges carry specific domain values. Non-curated edges carry a category-based prior reflecting whether that class of X plausibly drives that V/Y; placement/identity labels (cloud, region, market, instance_type, runtime_image, gpu_watts) get the lowest priors because their only effect on runtime V/Y is mediated by hardware/workload features that are themselves nodes.",
     "beta_seeding": "alpha = c*S, beta = (1-c)*S. seed_candidate_graph uses S=16 for c>=0.92 (sticky physics), S=4 for 0.45<=c<0.92 (movable), S=2 for c<0.45 (evidence dominates fast).",
-    "counts": "103 X, 22 V, 5 Y -> 103*22 + 22*5 = 2376 edges, all seeded.",
+    "counts": "96 X, 22 V, 5 Y -> 96*22 + 22*5 = 2222 edges, all seeded.",
     "beta_prior_format": "Each edge leaf is {c, alpha, beta, strength}. c is the curated prior mean; alpha=c*strength and beta=(1-c)*strength are the Beta prior parameters used by Koi.",
     "strength_schedule": {
       "c >= 0.90": 16,
@@ -426,12 +426,6 @@
         "beta": 1.28,
         "strength": 8.0
       },
-      "swap_space_gb": {
-        "c": 0.66,
-        "alpha": 2.64,
-        "beta": 1.36,
-        "strength": 4.0
-      },
       "block_size": {
         "c": 0.6,
         "alpha": 2.4,
@@ -442,12 +436,6 @@
         "c": 0.85,
         "alpha": 6.8,
         "beta": 1.2,
-        "strength": 8.0
-      },
-      "kvcache_quantization": {
-        "c": 0.83,
-        "alpha": 6.64,
-        "beta": 1.36,
         "strength": 8.0
       },
       "weight_dtype": {
@@ -505,12 +493,6 @@
         "strength": 4.0
       },
       "lmcache_enabled": {
-        "c": 0.45,
-        "alpha": 1.8,
-        "beta": 2.2,
-        "strength": 4.0
-      },
-      "sparse_attn_pattern": {
         "c": 0.45,
         "alpha": 1.8,
         "beta": 2.2,
@@ -582,18 +564,6 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.25,
-        "alpha": 0.5,
-        "beta": 1.5,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.3,
         "alpha": 0.6,
@@ -617,18 +587,6 @@
         "alpha": 0.4,
         "beta": 1.6,
         "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.7,
-        "alpha": 2.8,
-        "beta": 1.2,
-        "strength": 4.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.7,
-        "alpha": 2.8,
-        "beta": 1.2,
-        "strength": 4.0
       },
       "max_concurrent_streaming": {
         "c": 0.45,
@@ -1046,12 +1004,6 @@
         "beta": 1.44,
         "strength": 8.0
       },
-      "swap_space_gb": {
-        "c": 0.45,
-        "alpha": 1.8,
-        "beta": 2.2,
-        "strength": 4.0
-      },
       "block_size": {
         "c": 0.66,
         "alpha": 2.64,
@@ -1062,12 +1014,6 @@
         "c": 0.5,
         "alpha": 2.0,
         "beta": 2.0,
-        "strength": 4.0
-      },
-      "kvcache_quantization": {
-        "c": 0.55,
-        "alpha": 2.2,
-        "beta": 1.8,
         "strength": 4.0
       },
       "weight_dtype": {
@@ -1125,12 +1071,6 @@
         "strength": 4.0
       },
       "lmcache_enabled": {
-        "c": 0.5,
-        "alpha": 2.0,
-        "beta": 2.0,
-        "strength": 4.0
-      },
-      "sparse_attn_pattern": {
         "c": 0.5,
         "alpha": 2.0,
         "beta": 2.0,
@@ -1202,18 +1142,6 @@
         "beta": 1.76,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.45,
         "alpha": 1.8,
@@ -1237,18 +1165,6 @@
         "alpha": 0.24,
         "beta": 1.76,
         "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.45,
-        "alpha": 1.8,
-        "beta": 2.2,
-        "strength": 4.0
       },
       "max_concurrent_streaming": {
         "c": 0.5,
@@ -1666,12 +1582,6 @@
         "beta": 2.0,
         "strength": 4.0
       },
-      "swap_space_gb": {
-        "c": 0.3,
-        "alpha": 0.6,
-        "beta": 1.4,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.2,
         "alpha": 0.4,
@@ -1679,12 +1589,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -1748,12 +1652,6 @@
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -1822,18 +1720,6 @@
         "beta": 2.2,
         "strength": 4.0
       },
-      "compile_mode": {
-        "c": 0.35,
-        "alpha": 0.7,
-        "beta": 1.3,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.3,
         "alpha": 0.6,
@@ -1856,18 +1742,6 @@
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.25,
-        "alpha": 0.5,
-        "beta": 1.5,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.35,
-        "alpha": 0.7,
-        "beta": 1.3,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -2286,12 +2160,6 @@
         "beta": 1.04,
         "strength": 4.0
       },
-      "swap_space_gb": {
-        "c": 0.62,
-        "alpha": 2.48,
-        "beta": 1.52,
-        "strength": 4.0
-      },
       "block_size": {
         "c": 0.45,
         "alpha": 1.8,
@@ -2302,12 +2170,6 @@
         "c": 0.7,
         "alpha": 2.8,
         "beta": 1.2,
-        "strength": 4.0
-      },
-      "kvcache_quantization": {
-        "c": 0.68,
-        "alpha": 2.72,
-        "beta": 1.28,
         "strength": 4.0
       },
       "weight_dtype": {
@@ -2368,12 +2230,6 @@
         "c": 0.35,
         "alpha": 0.7,
         "beta": 1.3,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -2442,18 +2298,6 @@
         "beta": 1.5,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.25,
         "alpha": 0.5,
@@ -2477,18 +2321,6 @@
         "alpha": 0.24,
         "beta": 1.76,
         "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.6,
-        "alpha": 2.4,
-        "beta": 1.6,
-        "strength": 4.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.66,
-        "alpha": 2.64,
-        "beta": 1.36,
-        "strength": 4.0
       },
       "max_concurrent_streaming": {
         "c": 0.4,
@@ -2906,12 +2738,6 @@
         "beta": 1.2,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.25,
-        "alpha": 0.5,
-        "beta": 1.5,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.25,
         "alpha": 0.5,
@@ -2922,12 +2748,6 @@
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
-        "c": 0.35,
-        "alpha": 0.7,
-        "beta": 1.3,
         "strength": 2.0
       },
       "weight_dtype": {
@@ -2988,12 +2808,6 @@
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.25,
-        "alpha": 0.5,
-        "beta": 1.5,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -3062,18 +2876,6 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.7,
         "alpha": 2.8,
@@ -3096,18 +2898,6 @@
         "c": 0.1,
         "alpha": 0.2,
         "beta": 1.8,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -3526,12 +3316,6 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.18,
         "alpha": 0.36,
@@ -3539,12 +3323,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -3605,12 +3383,6 @@
         "strength": 2.0
       },
       "lmcache_enabled": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -3682,18 +3454,6 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.66,
         "alpha": 2.64,
@@ -3716,18 +3476,6 @@
         "c": 0.1,
         "alpha": 0.2,
         "beta": 1.8,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -4146,12 +3894,6 @@
         "beta": 2.2,
         "strength": 4.0
       },
-      "swap_space_gb": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.06,
         "alpha": 0.12,
@@ -4159,12 +3901,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.05,
         "alpha": 0.1,
         "beta": 1.9,
@@ -4228,12 +3964,6 @@
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.25,
-        "alpha": 0.5,
-        "beta": 1.5,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -4302,18 +4032,6 @@
         "beta": 1.9,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.15,
         "alpha": 0.3,
@@ -4333,18 +4051,6 @@
         "strength": 2.0
       },
       "router_policy": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
         "c": 0.05,
         "alpha": 0.1,
         "beta": 1.9,
@@ -4766,12 +4472,6 @@
         "beta": 1.2,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.05,
         "alpha": 0.1,
@@ -4779,12 +4479,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.05,
         "alpha": 0.1,
         "beta": 1.9,
@@ -4848,12 +4542,6 @@
         "c": 0.08,
         "alpha": 0.16,
         "beta": 1.84,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -4922,18 +4610,6 @@
         "beta": 1.9,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.1,
         "alpha": 0.2,
@@ -4953,18 +4629,6 @@
         "strength": 2.0
       },
       "router_policy": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
         "c": 0.05,
         "alpha": 0.1,
         "beta": 1.9,
@@ -5386,12 +5050,6 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.45,
         "alpha": 1.8,
@@ -5399,12 +5057,6 @@
         "strength": 4.0
       },
       "kvcache_dtype": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -5469,12 +5121,6 @@
         "alpha": 0.3,
         "beta": 1.7,
         "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.58,
-        "alpha": 2.32,
-        "beta": 1.68,
-        "strength": 4.0
       },
       "spec_decoding_enabled": {
         "c": 0.55,
@@ -5542,18 +5188,6 @@
         "beta": 1.44,
         "strength": 4.0
       },
-      "compile_mode": {
-        "c": 0.55,
-        "alpha": 2.2,
-        "beta": 1.8,
-        "strength": 4.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.4,
         "alpha": 0.8,
@@ -5577,18 +5211,6 @@
         "alpha": 0.6,
         "beta": 1.4,
         "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.3,
-        "alpha": 0.6,
-        "beta": 1.4,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.55,
-        "alpha": 2.2,
-        "beta": 1.8,
-        "strength": 4.0
       },
       "max_concurrent_streaming": {
         "c": 0.35,
@@ -6006,12 +5628,6 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.3,
-        "alpha": 0.6,
-        "beta": 1.4,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.25,
         "alpha": 0.5,
@@ -6022,12 +5638,6 @@
         "c": 0.58,
         "alpha": 2.32,
         "beta": 1.68,
-        "strength": 4.0
-      },
-      "kvcache_quantization": {
-        "c": 0.55,
-        "alpha": 2.2,
-        "beta": 1.8,
         "strength": 4.0
       },
       "weight_dtype": {
@@ -6089,12 +5699,6 @@
         "alpha": 0.4,
         "beta": 1.6,
         "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.55,
-        "alpha": 2.2,
-        "beta": 1.8,
-        "strength": 4.0
       },
       "spec_decoding_enabled": {
         "c": 0.45,
@@ -6162,18 +5766,6 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.25,
-        "alpha": 0.5,
-        "beta": 1.5,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.25,
         "alpha": 0.5,
@@ -6196,18 +5788,6 @@
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.62,
-        "alpha": 2.48,
-        "beta": 1.52,
-        "strength": 4.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -6626,12 +6206,6 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.1,
         "alpha": 0.2,
@@ -6639,12 +6213,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -6708,12 +6276,6 @@
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -6782,18 +6344,6 @@
         "beta": 1.64,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.15,
         "alpha": 0.3,
@@ -6816,18 +6366,6 @@
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.3,
-        "alpha": 0.6,
-        "beta": 1.4,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -7246,12 +6784,6 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.68,
-        "alpha": 2.72,
-        "beta": 1.28,
-        "strength": 4.0
-      },
       "block_size": {
         "c": 0.1,
         "alpha": 0.2,
@@ -7259,12 +6791,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -7329,12 +6855,6 @@
         "alpha": 1.8,
         "beta": 2.2,
         "strength": 4.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
       },
       "spec_decoding_enabled": {
         "c": 0.15,
@@ -7402,18 +6922,6 @@
         "beta": 1.76,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.15,
         "alpha": 0.3,
@@ -7436,18 +6944,6 @@
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.72,
-        "alpha": 2.88,
-        "beta": 1.12,
-        "strength": 4.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.25,
-        "alpha": 0.5,
-        "beta": 1.5,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -7866,12 +7362,6 @@
         "beta": 2.0,
         "strength": 4.0
       },
-      "swap_space_gb": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.6,
         "alpha": 2.4,
@@ -7879,12 +7369,6 @@
         "strength": 4.0
       },
       "kvcache_dtype": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -7949,12 +7433,6 @@
         "alpha": 2.88,
         "beta": 1.12,
         "strength": 4.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
       },
       "spec_decoding_enabled": {
         "c": 0.06,
@@ -8022,18 +7500,6 @@
         "beta": 1.88,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.06,
-        "alpha": 0.12,
-        "beta": 1.88,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.05,
-        "alpha": 0.1,
-        "beta": 1.9,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.3,
         "alpha": 0.6,
@@ -8056,18 +7522,6 @@
         "c": 0.06,
         "alpha": 0.12,
         "beta": 1.88,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -8486,12 +7940,6 @@
         "beta": 1.5,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.3,
         "alpha": 0.6,
@@ -8499,12 +7947,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -8569,12 +8011,6 @@
         "alpha": 0.8,
         "beta": 1.2,
         "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.55,
-        "alpha": 2.2,
-        "beta": 1.8,
-        "strength": 4.0
       },
       "spec_decoding_enabled": {
         "c": 0.15,
@@ -8642,18 +8078,6 @@
         "beta": 2.0,
         "strength": 4.0
       },
-      "compile_mode": {
-        "c": 0.45,
-        "alpha": 1.8,
-        "beta": 2.2,
-        "strength": 4.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.4,
         "alpha": 0.8,
@@ -8676,18 +8100,6 @@
         "c": 0.25,
         "alpha": 0.5,
         "beta": 1.5,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.3,
-        "alpha": 0.6,
-        "beta": 1.4,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -9106,12 +8518,6 @@
         "beta": 1.5,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.3,
         "alpha": 0.6,
@@ -9123,12 +8529,6 @@
         "alpha": 1.8,
         "beta": 2.2,
         "strength": 4.0
-      },
-      "kvcache_quantization": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
-        "strength": 2.0
       },
       "weight_dtype": {
         "c": 0.55,
@@ -9189,12 +8589,6 @@
         "alpha": 0.4,
         "beta": 1.6,
         "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.5,
-        "alpha": 2.0,
-        "beta": 2.0,
-        "strength": 4.0
       },
       "spec_decoding_enabled": {
         "c": 0.7,
@@ -9262,18 +8656,6 @@
         "beta": 1.8,
         "strength": 4.0
       },
-      "compile_mode": {
-        "c": 0.5,
-        "alpha": 2.0,
-        "beta": 2.0,
-        "strength": 4.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.4,
         "alpha": 0.8,
@@ -9296,18 +8678,6 @@
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -9726,12 +9096,6 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.1,
         "alpha": 0.2,
@@ -9739,12 +9103,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -9808,12 +9166,6 @@
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -9882,18 +9234,6 @@
         "beta": 1.76,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.4,
         "alpha": 0.8,
@@ -9916,18 +9256,6 @@
         "c": 0.1,
         "alpha": 0.2,
         "beta": 1.8,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -10346,12 +9674,6 @@
         "beta": 1.76,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.08,
         "alpha": 0.16,
@@ -10359,12 +9681,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.08,
         "alpha": 0.16,
         "beta": 1.84,
@@ -10428,12 +9744,6 @@
         "c": 0.1,
         "alpha": 0.2,
         "beta": 1.8,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -10502,18 +9812,6 @@
         "beta": 1.76,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.2,
         "alpha": 0.4,
@@ -10537,18 +9835,6 @@
         "alpha": 6.24,
         "beta": 1.76,
         "strength": 8.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.55,
-        "alpha": 2.2,
-        "beta": 1.8,
-        "strength": 4.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
       },
       "max_concurrent_streaming": {
         "c": 0.15,
@@ -10966,12 +10252,6 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.1,
         "alpha": 0.2,
@@ -10979,12 +10259,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -11048,12 +10322,6 @@
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -11122,18 +10390,6 @@
         "beta": 1.64,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.2,
         "alpha": 0.4,
@@ -11156,18 +10412,6 @@
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.3,
-        "alpha": 0.6,
-        "beta": 1.4,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -11586,12 +10830,6 @@
         "beta": 1.7,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.1,
         "alpha": 0.2,
@@ -11599,12 +10837,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.08,
         "alpha": 0.16,
         "beta": 1.84,
@@ -11668,12 +10900,6 @@
         "c": 0.1,
         "alpha": 0.2,
         "beta": 1.8,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -11742,18 +10968,6 @@
         "beta": 1.64,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.5,
         "alpha": 2.0,
@@ -11776,18 +10990,6 @@
         "c": 0.1,
         "alpha": 0.2,
         "beta": 1.8,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -12206,12 +11408,6 @@
         "beta": 1.76,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.08,
         "alpha": 0.16,
@@ -12219,12 +11415,6 @@
         "strength": 2.0
       },
       "kvcache_dtype": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -12288,12 +11478,6 @@
         "c": 0.1,
         "alpha": 0.2,
         "beta": 1.8,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
         "strength": 2.0
       },
       "spec_decoding_enabled": {
@@ -12362,18 +11546,6 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.08,
-        "alpha": 0.16,
-        "beta": 1.84,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.06,
-        "alpha": 0.12,
-        "beta": 1.88,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.12,
         "alpha": 0.24,
@@ -12396,18 +11568,6 @@
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
@@ -12826,12 +11986,6 @@
         "beta": 1.6,
         "strength": 8.0
       },
-      "swap_space_gb": {
-        "c": 0.4,
-        "alpha": 0.8,
-        "beta": 1.2,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.62,
         "alpha": 2.48,
@@ -12842,12 +11996,6 @@
         "c": 0.62,
         "alpha": 2.48,
         "beta": 1.52,
-        "strength": 4.0
-      },
-      "kvcache_quantization": {
-        "c": 0.6,
-        "alpha": 2.4,
-        "beta": 1.6,
         "strength": 4.0
       },
       "weight_dtype": {
@@ -12909,12 +12057,6 @@
         "alpha": 0.8,
         "beta": 1.2,
         "strength": 2.0
-      },
-      "sparse_attn_pattern": {
-        "c": 0.56,
-        "alpha": 2.24,
-        "beta": 1.76,
-        "strength": 4.0
       },
       "spec_decoding_enabled": {
         "c": 0.2,
@@ -12982,18 +12124,6 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "compile_mode": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.06,
-        "alpha": 0.12,
-        "beta": 1.88,
-        "strength": 2.0
-      },
       "scheduling_policy": {
         "c": 0.45,
         "alpha": 1.8,
@@ -13017,18 +12147,6 @@
         "alpha": 0.2,
         "beta": 1.8,
         "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.45,
-        "alpha": 1.8,
-        "beta": 2.2,
-        "strength": 4.0
       },
       "max_concurrent_streaming": {
         "c": 0.5,
@@ -13446,12 +12564,6 @@
         "beta": 1.76,
         "strength": 2.0
       },
-      "swap_space_gb": {
-        "c": 0.1,
-        "alpha": 0.2,
-        "beta": 1.8,
-        "strength": 2.0
-      },
       "block_size": {
         "c": 0.45,
         "alpha": 1.8,
@@ -13459,12 +12571,6 @@
         "strength": 4.0
       },
       "kvcache_dtype": {
-        "c": 0.12,
-        "alpha": 0.24,
-        "beta": 1.76,
-        "strength": 2.0
-      },
-      "kvcache_quantization": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -13525,12 +12631,6 @@
         "strength": 2.0
       },
       "lmcache_enabled": {
-        "c": 0.15,
-        "alpha": 0.3,
-        "beta": 1.7,
-        "strength": 2.0
-      },
-      "sparse_attn_pattern": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -13602,18 +12702,6 @@
         "beta": 1.52,
         "strength": 4.0
       },
-      "compile_mode": {
-        "c": 0.55,
-        "alpha": 2.2,
-        "beta": 1.8,
-        "strength": 4.0
-      },
-      "num_jit_warmup_steps": {
-        "c": 0.48,
-        "alpha": 1.92,
-        "beta": 2.08,
-        "strength": 4.0
-      },
       "scheduling_policy": {
         "c": 0.74,
         "alpha": 2.96,
@@ -13636,18 +12724,6 @@
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
-        "strength": 2.0
-      },
-      "expert_offload_enabled": {
-        "c": 0.2,
-        "alpha": 0.4,
-        "beta": 1.6,
-        "strength": 2.0
-      },
-      "gpu_shared_fraction": {
-        "c": 0.3,
-        "alpha": 0.6,
-        "beta": 1.4,
         "strength": 2.0
       },
       "max_concurrent_streaming": {
