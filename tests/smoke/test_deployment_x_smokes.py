@@ -71,6 +71,8 @@ def _snapshot():
         "prefix_cache_enabled": True,
         "target_p99_ttft_ms": 200,
         "target_p99_tpot_ms": 40,
+        "predicted_y": {"p99_ttft_ms": 90.0},
+        "predicted_v": {"kv_cache_util": 0.1},
     }
     return ClusterResourceSnapshot(
         tick=1,
@@ -176,6 +178,9 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(x["attn_heads_per_kv_head"], 8)
         self.assertAlmostEqual(x["bandwidth_per_param"], 3350 / 70)
         self.assertAlmostEqual(x["flops_per_param"], 989.5 / 70)
+        self.assertEqual(deployment.y_predicted, {"p99_ttft_ms": 90.0})
+        self.assertEqual(deployment.v_predicted, {"kv_cache_util": 0.1})
+        self.assertNotIn("predicted_y", x)
         with self.assertRaises(ValueError):
             index.resolve("job_1")
         with self.assertRaises(KeyError):
@@ -226,10 +231,12 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(row.env_label, ENV_LABEL)
         self.assertEqual(row.X["request_arrival_rate"], 50)
         self.assertEqual(row.X["gpu_generation"], "Hopper")
+        self.assertEqual(row.y_predicted, {"p99_ttft_ms": 90.0})
+        self.assertEqual(row.V_predicted_trajectory, {"kv_cache_util": 0.1})
 
 
 class _Telemetry:
-    def collect_telemetry(self, tick_start, tick_end):
+    def collect_telemetry(self, tick_start, tick_end, snapshot):
         return "bundle"
 
     def iter_per_rank(self, bundle):
@@ -237,9 +244,7 @@ class _Telemetry:
             job_id="job_1",
             rank_id="rank_a",
             v_observed={"kv_cache_util": np.array([0.2, 0.3])},
-            v_predicted={"kv_cache_util": 0.1},
             y_observed={"p99_ttft_ms": np.array([100.0, 110.0])},
-            y_predicted={"p99_ttft_ms": 90.0},
         )
 
 

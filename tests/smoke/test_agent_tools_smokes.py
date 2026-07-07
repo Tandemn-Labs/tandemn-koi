@@ -42,7 +42,7 @@ class _RecordingSurrogate:
                 "p99_tpot_ms": 1.0,
                 "throughput_token_per_sec": 1000.0,
             },
-            {},
+            {"kv_cache_util": 0.4},
         )
 
 
@@ -91,6 +91,55 @@ class AgentToolsSmokeTests(unittest.TestCase):
         finally:
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
+
+    def test_stamp_plan_predictions_writes_raw_rank_predictions(self):
+        saved = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("surrogate", "candidate_graph", "dro")
+        }
+        try:
+            agent_tools.bind_tools(
+                surrogate=_RecordingSurrogate(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            snapshot = _Snapshot()
+            plan = agent_tools.stamp_plan_predictions(
+                {
+                    "actions": [
+                        {
+                            "job_id": "job_1",
+                            "type": "place",
+                            "ladder": [
+                                {
+                                    "role": "aggregate",
+                                    "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                    "config": {"instance_type": "p5.48xlarge", "gpu_count": 1},
+                                    "n_replicas": 1,
+                                }
+                            ],
+                        }
+                    ]
+                },
+                snapshot,
+            )
+
+            rank = plan.actions[0].ladder[0]
+            self.assertEqual(rank.predicted_y["p99_ttft_ms"], 10.0)
+            self.assertEqual(rank.predicted_v, {"kv_cache_util": 0.4})
+        finally:
+            for name, value in saved.items():
+                setattr(agent_tools._CTX, name, value)
+
+
+class _Snapshot:
+    def pending_jobs_summary(self):
+        return [
+            {
+                "job_id": "job_1",
+                "job_features": {"model_id": "meta-llama/Llama-3.1-8B-Instruct"},
+            }
+        ]
 
 
 if __name__ == "__main__":

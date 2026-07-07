@@ -96,6 +96,8 @@ class CoreSmokeTests(unittest.TestCase):
                                 "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
                                 "config": {"gpu_count": 1},
                                 "n_replicas": 1,
+                                "predicted_y": {"p99_ttft_ms": 120.0},
+                                "predicted_v": {"kv_cache_util": 0.4},
                             },
                             {
                                 "role": "aggregate",
@@ -117,6 +119,9 @@ class CoreSmokeTests(unittest.TestCase):
             [rank["rank_id"] for rank in action.to_dict()["ladder"]],
             ["rank_0", "latency_rank"],
         )
+        self.assertEqual(action.ladder[0].predicted_y, {"p99_ttft_ms": 120.0})
+        self.assertEqual(action.ladder[0].predicted_v, {"kv_cache_util": 0.4})
+        self.assertEqual(action.to_dict()["ladder"][0]["predicted_y"], {"p99_ttft_ms": 120.0})
 
     def test_plan_action_rejects_duplicate_rank_ids(self):
         with self.assertRaisesRegex(ValueError, "duplicate rank_id"):
