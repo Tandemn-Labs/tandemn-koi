@@ -17,7 +17,47 @@ class _ResourceMap:
             "reserved|aws|us-east-1|use1-az1|H100": {
                 "free": 8,
                 "gpu_type": "H100",
+                "pools": [
+                    {
+                        "instance_type": "p5.48xlarge",
+                        "gpu_type": "H100",
+                        "gpus_per_instance": 8,
+                        "fabric_type": "efa",
+                    }
+                ],
             }
+        }
+
+    def hardware_catalog(self):
+        return {
+            "regions": [
+                {
+                    "cloud": "aws",
+                    "region": "us-east-1",
+                    "instance_types": [
+                        {
+                            "instance_type": "p5.48xlarge",
+                            "accelerators": [
+                                {
+                                    "kind": "gpu",
+                                    "name": "H100",
+                                    "canonical_gpu_name": "H100",
+                                    "count": 8,
+                                    "memory_mib_each": 81920,
+                                    "gpu_bandwidth_gbps": 3350,
+                                    "gpu_tflops_fp16": 989.5,
+                                    "cuda_compute_capability": "9.0",
+                                    "gpu_generation": "Hopper",
+                                    "nvlink_bandwidth_gbps": 900,
+                                    "pcie_bandwidth_gbps": 128,
+                                    "gpu_watts": 700,
+                                }
+                            ],
+                            "network": {"network_cards": [{"peak_bandwidth_gbps": 3200}]},
+                        }
+                    ],
+                }
+            ]
         }
 
     def rank_allocation_summary(self, rank, resources=None):
@@ -31,7 +71,16 @@ class _ResourceMap:
         }
 
     def model_catalog(self, model_id):
-        return {"model_id": model_id, "model_params_b": 70.0, "hidden_size": 8192}
+        return {
+            "model_id": model_id,
+            "model_params_b": 70.0,
+            "hidden_size": 8192,
+            "engine_name": "vllm",
+            "max_num_seq": [{"gpu_type": "H100", "value": 256}],
+            "max_num_batched_tokens": [{"gpu_type": "H100", "value": 8192}],
+            "block_size": [{"gpu_type": "H100", "value": 16}],
+            "kvcache_dtype": [{"gpu_type": "H100", "value": "auto"}],
+        }
 
 
 class _EvidenceStore:
@@ -105,6 +154,15 @@ class AgentToolsSmokeTests(unittest.TestCase):
             self.assertTrue(result["meets_target"])
             job_config, job_features = surrogate.calls[0]
             self.assertEqual(job_config["model_id"], "meta-llama/Llama-3.1-8B-Instruct")
+            self.assertEqual(job_config["model_params_b"], 70.0)
+            self.assertEqual(job_config["hidden_size"], 8192)
+            self.assertEqual(job_config["max_num_seq"], 256)
+            self.assertEqual(job_config["max_num_batched_tokens"], 8192)
+            self.assertEqual(job_config["block_size"], 16)
+            self.assertEqual(job_config["gpu_mem_gb"], 80)
+            self.assertEqual(job_config["gpu_bandwidth_gbps"], 3350)
+            self.assertEqual(job_config["interconnect_type"], "efa")
+            self.assertEqual(job_config["dp"], 1)
             self.assertEqual(job_features["gpu_type"], "H100")
             self.assertEqual(job_features["market"], "reserved")
             self.assertEqual(job_features["cloud"], "aws")

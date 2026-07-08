@@ -87,6 +87,7 @@ from typing import Any
 import numpy as np
 from src.config.hyperparameters import GAMMA_SLO, UTILIZATION_TARGET_ONLINE
 from src.core.models import LADDER_ACTIONS, SWAP_BUDGET_ACTIONS, Plan, RankSpec, env_gpu_type
+from src.infra.deployment_x import build_rank_x
 
 # Residual calibration: debias the surrogate with observed (observed-predicted)
 # residuals from similar past deployments, so scoring uses reality-corrected
@@ -301,6 +302,7 @@ def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
 def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None = None) -> dict:
     """Build the surrogate payload for one rank without mutating the rank."""
     features = dict(job_features or {})
+    env = None
     if rank.env is not None:
         env = list(rank.env) if isinstance(rank.env, (list, tuple)) else str(rank.env).split("|")
         if len(env) >= 5:
@@ -319,6 +321,24 @@ def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None
     config = dict(rank.config)
     if "model_id" not in config and features.get("model_id") is not None:
         config["model_id"] = features["model_id"]
+    resource_map = getattr(_CTX, "resource_map", None)
+    model_id = config.get("model_id") or features.get("model_id")
+    if env and model_id and resource_map is not None:
+        try:
+            count = rank.gpus_per_chain()
+            shape = {**config, "env": list(env), "count": count, "gpu_count": count}
+            compiled_x = build_rank_x(
+                job_values=features,
+                shape=shape,
+                env=(str(env[0]), str(env[1]), str(env[2]), str(env[3]), str(env[4])),
+                resources=resource_map.resources_summary(),
+                hardware_catalog=resource_map.hardware_catalog(),
+                model_catalog=resource_map.model_catalog(str(model_id)),
+                replica_count=max(1, int(rank.n_replicas or 1)),
+            )
+            config.update(compiled_x)
+        except Exception:
+            log.exception("rank prediction X assembly failed; using rank config only")
     return {"job_config": config, "job_features": features}
 
 
