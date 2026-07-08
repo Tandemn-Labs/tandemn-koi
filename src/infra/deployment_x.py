@@ -130,6 +130,30 @@ def build_deployment_x_index(
     return DeploymentXIndex(by_rank)
 
 
+def build_rank_x(
+    *,
+    job_values: dict[str, Any],
+    shape: dict[str, Any],
+    env: EnvLabel,
+    resources: dict[str, Any],
+    hardware_catalog: dict[str, Any],
+    model_catalog: dict[str, Any],
+    replica_count: int,
+    total_replicas: int | None = None,
+) -> dict[str, Any]:
+    """Build one rank's unprojected X from the same sources S2 uses."""
+    return _rank_x(
+        job_values=job_values,
+        shape=shape,
+        env=env,
+        resources=resources,
+        catalog=_catalog_by_instance(hardware_catalog),
+        model_catalog=model_catalog,
+        replica_count=replica_count,
+        total_replicas=total_replicas or replica_count,
+    )
+
+
 def _groups_by_rank(chains: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Group chain replicas by explicit rank id."""
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -164,7 +188,39 @@ def _rank_deployment(
 
     job_values = _job_x(job)
     model_id = _model_id(job_values, shape)
-    catalog_x = _model_catalog_x(model_catalogs[model_id], env[4])
+    x = _rank_x(
+        job_values=job_values,
+        shape=shape,
+        env=env,
+        resources=resources,
+        catalog=catalog,
+        model_catalog=model_catalogs[model_id],
+        replica_count=replica_count,
+        total_replicas=total_replicas,
+    )
+
+    return RankDeployment(
+        job_id=job_id,
+        rank_id=rank_id,
+        env_label=env,
+        x=_project_x(x, x_fields),
+        v_predicted=dict(shape.get("predicted_v") or {}),
+        y_predicted=dict(shape.get("predicted_y") or {}),
+    )
+
+
+def _rank_x(
+    *,
+    job_values: dict[str, Any],
+    shape: dict[str, Any],
+    env: EnvLabel,
+    resources: dict[str, Any],
+    catalog: dict[tuple[str, str, str], dict[str, Any]],
+    model_catalog: dict[str, Any],
+    replica_count: int,
+    total_replicas: int,
+) -> dict[str, Any]:
+    catalog_x = _model_catalog_x(model_catalog, env[4])
     x: dict[str, Any] = {
         **catalog_x,
         **job_values,
@@ -188,15 +244,7 @@ def _rank_deployment(
     x.update(_hardware_x(hardware, env[4]))
     _derive_x(x)
     _allocate_load_x(x, job_values, shape, replica_count, total_replicas)
-
-    return RankDeployment(
-        job_id=job_id,
-        rank_id=rank_id,
-        env_label=env,
-        x=_project_x(x, x_fields),
-        v_predicted=dict(shape.get("predicted_v") or {}),
-        y_predicted=dict(shape.get("predicted_y") or {}),
-    )
+    return x
 
 
 def _job_x(job: dict[str, Any]) -> dict[str, Any]:
