@@ -85,6 +85,15 @@ class ResourceMapManager:
             raise ValueError("hardware catalog is required for deployment X")
         return dict(catalog.catalog)
 
+    def model_catalog(self, model_id: str) -> dict[str, Any]:
+        """Return one Store model catalog row, raising when absent."""
+        from tandemn_system_data.clients import ModelCatalogStore
+
+        catalog = ModelCatalogStore(self._client()).get(model_id)
+        if catalog is None:
+            raise ValueError(f"model catalog missing {model_id!r}")
+        return dict(catalog.model_dump(mode="json"))
+
     def _job_store(self):
         return JobStore(self._client())
 
