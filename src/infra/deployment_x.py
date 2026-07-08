@@ -38,6 +38,32 @@ _ALIASES = {
     "osl_token_min": ("osl_token_min", "output_len_tokens_min"),
     "osl_token_max": ("osl_token_max", "output_len_tokens_max"),
 }
+_USER_JOB_X = {
+    "model_id",
+    "isl_token_avg",
+    "isl_token_min",
+    "isl_token_max",
+    "isl_distribution_type",
+    "osl_token_avg",
+    "osl_token_min",
+    "osl_token_max",
+    "osl_distribution_type",
+    "pd_ratio",
+    "request_arrival_rate",
+    "request_arrival_pattern",
+    "peak_to_mean_ratio",
+    "workload_prefix_concentration",
+    "multi_turn_ratio",
+    "shared_prefix_length_avg",
+    "is_session_affinity",
+    "total_token_budget",
+    "deadline_hrs",
+    "target_p99_ttft_ms",
+    "target_p99_tpot_ms",
+    "priority_class",
+    "max_concurrent_streaming",
+    *(alias for aliases in _ALIASES.values() for alias in aliases),
+}
 
 
 @dataclass
@@ -148,6 +174,12 @@ def _rank_deployment(
     x["cloud"] = env[1]
     x["region"] = env[2]
     x["gpu_type"] = env[4]
+    x.setdefault("sp", 1)
+    x.setdefault("ep", 1)
+    x.setdefault("cp", 1)
+    x["dp"] = replica_count
+    x["prefill_worker_count"] = 0
+    x["decode_worker_count"] = 0
 
     pool = _resource_pool(resources, env, str(x["instance_type"]))
     x["interconnect_type"] = pool["fabric_type"]
@@ -173,10 +205,12 @@ def _job_x(job: dict[str, Any]) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for source in (spec, spec.get("features"), spec.get("job_features"), job.get("job_features")):
         if isinstance(source, dict):
-            values.update(source)
+            values.update({key: value for key, value in source.items() if key in _USER_JOB_X})
             for nested in ("model_profile", "model_config", "workload_profile", "slo"):
                 if isinstance(source.get(nested), dict):
-                    values.update(source[nested])
+                    values.update(
+                        {key: value for key, value in source[nested].items() if key in _USER_JOB_X}
+                    )
     for canonical, aliases in _ALIASES.items():  # this is just aliasing the names
         for alias in aliases:
             if alias in values:

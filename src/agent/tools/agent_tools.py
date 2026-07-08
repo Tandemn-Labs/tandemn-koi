@@ -678,6 +678,11 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
             blobs.append({"tick": r.tick, "theory_blob": r.theory_blob})
 
     features = dict(descriptor.get("job_features", {})) if descriptor else {}
+    spec = dict((descriptor or {}).get("spec_json") or {})
+    model_id = features.get("model_id") or spec.get("model_id")
+    model_catalog = {}
+    if model_id and hasattr(_CTX.resource_map, "model_catalog"):
+        model_catalog = dict(_CTX.resource_map.model_catalog(str(model_id)) or {})
     subset_x = list(features.get("subset_x", features.keys()))
     mechanisms = get_scope({"subset_x": subset_x, "subset_v": []})
 
@@ -685,6 +690,7 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         "job_id": job_id,
         "tenant_id": (descriptor or {}).get("tenant_id", "default"),
         "job_features": features,
+        "model_catalog": model_catalog,
         "current_ladder": (descriptor or {}).get("current_ladder"),
         "recent_q_labels": recent_q,
         "recent_theory_blobs": blobs,

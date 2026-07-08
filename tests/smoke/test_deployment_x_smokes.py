@@ -39,6 +39,7 @@ def _x_fields():
         "max_num_batched_tokens",
         "max_model_len",
         "block_size",
+        "gpu_mem_util",
         "kvcache_dtype",
         "chunked_prefill_enable",
         "cloud",
@@ -46,6 +47,12 @@ def _x_fields():
         "market",
         "gpu_type",
         "instance_type",
+        "sp",
+        "dp",
+        "ep",
+        "cp",
+        "prefill_worker_count",
+        "decode_worker_count",
         "num_nodes_per_chain",
         "tp",
         "pp",
@@ -62,6 +69,7 @@ def _snapshot():
         "deadline_hours": 2,
         "target_p99_ttft_ms": 200,
         "target_p99_tpot_ms": 40,
+        "gpu_mem_util": 0.99,
     }
     shape = {
         "rank_id": "rank_a",
@@ -160,6 +168,7 @@ def _model_catalogs():
             "num_attn_heads": 64,
             "num_kv_heads": 8,
             "engine_name": "vllm",
+            "gpu_mem_util": 0.85,
             "prefix_cache_enabled": True,
             "max_model_len": 8192,
             "chunked_prefill_enable": True,
@@ -185,6 +194,7 @@ def _catalog_x_assertions():
         "max_num_seq": 256,
         "max_num_batched_tokens": 8192,
         "block_size": 16,
+        "gpu_mem_util": 0.85,
         "kvcache_dtype": "auto",
         "max_model_len": 8192,
         "chunked_prefill_enable": True,
@@ -211,6 +221,12 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(x["total_token_budget"], 500)
         self.assertEqual(x["deadline_hrs"], 2)
         self.assertEqual(x["num_nodes_per_chain"], 1)
+        self.assertEqual(x["dp"], 2)
+        self.assertEqual(x["sp"], 1)
+        self.assertEqual(x["ep"], 1)
+        self.assertEqual(x["cp"], 1)
+        self.assertEqual(x["prefill_worker_count"], 0)
+        self.assertEqual(x["decode_worker_count"], 0)
         self.assertEqual(
             {key: x[key] for key in _catalog_x_assertions()},
             _catalog_x_assertions(),
