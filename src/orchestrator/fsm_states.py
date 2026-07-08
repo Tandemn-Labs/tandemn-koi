@@ -153,16 +153,14 @@ class TickRunner:
     """One TickRunner per cluster; run_tick(tick_id) drives one full tick.
 
     Construction wires every component. The telemetry adapter must yield
-    per-rank bundles via iter_per_rank(telemetry); each bundle exposes:
-    job_id, rank_id, v_observed / v_predicted (dict name ->
-    trajectory; predicted may be a scalar), y_observed (dict name ->
-    trajectory), y_predicted (dict name -> scalar), committed_mechanism_id,
-    and optionally deploy_timestamp_utc. Deploy-time X comes from
-    Store/catalog snapshots, not telemetry.
+        per-rank bundles via iter_per_rank(telemetry); each bundle exposes:
+        job_id, rank_id, observed V/Y trajectories, committed_mechanism_id,
+        and optionally deploy_timestamp_utc. Deploy-time X and predictions come
+        from Store/catalog snapshots, not telemetry.
 
     Args:
         evidence_store: Append-only EvidenceRow ledger (EvidenceService).
-        telemetry: Adapter with collect_telemetry(tick_start, tick_end)
+        telemetry: Adapter with collect_telemetry(tick_start, tick_end, snapshot)
             and iter_per_rank(bundle).
         cusum: Cusum instance (V and Y trajectory drift).
         icp: ICP instance (per-edge invariance).
@@ -319,7 +317,11 @@ class TickRunner:
 
         Telemetry owns runtime V/Y. Store/catalog snapshots own deployment X.
         """
-        ctx.telemetry = self.telemetry.collect_telemetry(tick_start=ctx.tick - 1, tick_end=ctx.tick)
+        ctx.telemetry = self.telemetry.collect_telemetry(
+            tick_start=ctx.tick - 1,
+            tick_end=ctx.tick,
+            snapshot=ctx.cluster_snapshot,
+        )
         ctx.deployment_x = self._build_deployment_x_index(ctx)
         return FSMState.S2_VALIDATE
 
@@ -341,8 +343,8 @@ class TickRunner:
         cached_v_params = self.slow_loop.get_sss_cusum_params_v()
         cached_y_params = self.slow_loop.get_sss_cusum_params_y()
 
-        if ctx.deployment_x is None:
-            ctx.deployment_x = self._build_deployment_x_index(ctx)
+        # if ctx.deployment_x is None:
+        #     ctx.deployment_x = self._build_deployment_x_index(ctx)
 
         for rank_telem in self.telemetry.iter_per_rank(ctx.telemetry):
             job_id = str(rank_telem.job_id)
@@ -352,9 +354,9 @@ class TickRunner:
             x = dict(deployment.x)
             env_label = deployment.env_label
             v_obs = dict(rank_telem.v_observed)
-            v_pred = dict(rank_telem.v_predicted)
+            v_pred = dict(deployment.v_predicted)
             y_obs = dict(rank_telem.y_observed)
-            y_pred = dict(rank_telem.y_predicted)
+            y_pred = dict(deployment.y_predicted)
 
             residuals_per_v = self._residuals(v_obs, v_pred)
             residuals_per_y = self._residuals(y_obs, y_pred)
@@ -615,6 +617,7 @@ class TickRunner:
         return build_deployment_x_index(
             ctx.cluster_snapshot,
             hardware_catalog=self._hardware_catalog(),
+            model_catalogs=self._model_catalogs(ctx),
             x_fields=x_fields,
         )
 
@@ -626,6 +629,30 @@ class TickRunner:
         if not catalog:
             raise ValueError("hardware catalog is required to build deployment X")
         return catalog
+
+    def _model_catalogs(self, ctx: TickContext) -> dict[str, Any]:
+        getter = getattr(self.resource_map, "model_catalog", None)
+        if not callable(getter):
+            raise ValueError("resource_map must expose model_catalog(model_id)")
+        snapshot = ctx.cluster_snapshot
+        if snapshot is None:
+            return {}
+        jobs = (
+            snapshot.active_jobs_summary()
+            if hasattr(snapshot, "active_jobs_summary")
+            else getattr(snapshot, "active_jobs", [])
+        )
+        model_ids: set[str] = set()
+        for job in jobs or []:
+            spec = dict(job.get("spec_json") or {})
+            features = dict(job.get("job_features") or {})
+            job_model = spec.get("model_id") or features.get("model_id")
+            for chain in job.get("active_chains") or []:
+                shape = dict(chain.get("shape_json") or {})
+                model_id = shape.get("model_id") or job_model
+                if model_id:
+                    model_ids.add(str(model_id))
+        return {model_id: dict(getter(model_id) or {}) for model_id in model_ids}
 
     @staticmethod
     def _residuals(observed: dict[str, Any], predicted: dict[str, Any]) -> dict[str, np.ndarray]:

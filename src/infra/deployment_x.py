@@ -18,6 +18,8 @@ RankKey = tuple[str, str]
 # ponytail: predictions ride in shape_json, but they are evidence inputs, not X.
 _X_SKIP = {"env", "rank_id", "replica_index", "mechanism_id", "predicted_y", "predicted_v"}
 _LOAD_FIELDS = ("request_arrival_rate", "total_token_budget")
+_MODEL_IDENTITY_FIELDS = {"model_id", "updated_at"}
+_PER_GPU_MODEL_FIELDS = {"max_num_seq", "max_num_batched_tokens", "block_size", "kvcache_dtype"}
 _GPU_FIELDS = (
     "gpu_bandwidth_gbps",
     "gpu_tflops_fp16",
@@ -70,6 +72,7 @@ def build_deployment_x_index(
     snapshot: Any,
     *,
     hardware_catalog: dict[str, Any],
+    model_catalogs: dict[str, dict[str, Any]],
     x_fields: list[str] | tuple[str, ...],
 ) -> DeploymentXIndex:
     """Return the rank-level X index consumed by S2 evidence creation."""
@@ -95,6 +98,7 @@ def build_deployment_x_index(
                 total_replicas=total_replicas,
                 resources=resources,
                 catalog=catalog,
+                model_catalogs=model_catalogs,
                 x_fields=x_fields,
             )
     return DeploymentXIndex(by_rank)
@@ -121,6 +125,7 @@ def _rank_deployment(
     total_replicas: int,
     resources: dict[str, Any],
     catalog: dict[tuple[str, str, str], dict[str, Any]],
+    model_catalogs: dict[str, dict[str, Any]],
     x_fields: list[str] | tuple[str, ...],
 ) -> RankDeployment:
     """Assemble, enrich, derive, and filter X for one rank."""
@@ -132,14 +137,17 @@ def _rank_deployment(
             raise ValueError(f"rank {rank_id!r} has mixed env labels")
 
     job_values = _job_x(job)
+    model_id = _model_id(job_values, shape)
+    catalog_x = _model_catalog_x(model_catalogs[model_id], env[4])
     x: dict[str, Any] = {
+        **catalog_x,
         **job_values,
-        "market": env[0],
-        "cloud": env[1],
-        "region": env[2],
-        "gpu_type": env[4],
         **{key: value for key, value in shape.items() if key not in _X_SKIP},
     }
+    x["market"] = env[0]
+    x["cloud"] = env[1]
+    x["region"] = env[2]
+    x["gpu_type"] = env[4]
 
     pool = _resource_pool(resources, env, str(x["instance_type"]))
     x["interconnect_type"] = pool["fabric_type"]
@@ -175,6 +183,33 @@ def _job_x(job: dict[str, Any]) -> dict[str, Any]:
                 values[canonical] = values[alias]
                 break
     return values
+
+
+def _model_id(job_values: dict[str, Any], shape: dict[str, Any]) -> str:
+    for source in (shape, job_values):
+        value = source.get("model_id")
+        if value:
+            return str(value)
+    raise ValueError("model_id is required to build deployment X")
+
+
+def _model_catalog_x(catalog: dict[str, Any], gpu_type: str) -> dict[str, Any]:
+    return {
+        key: _per_gpu_model_value(value, gpu_type, key) if key in _PER_GPU_MODEL_FIELDS else value
+        for key, value in catalog.items()
+        if key not in _MODEL_IDENTITY_FIELDS
+    }
+
+
+def _per_gpu_model_value(value: Any, gpu_type: str, field: str) -> Any:
+    if not isinstance(value, list):
+        return value
+    if not value:
+        return None
+    for entry in value:
+        if isinstance(entry, dict) and str(entry.get("gpu_type")) == str(gpu_type):
+            return entry.get("value")
+    raise ValueError(f"model catalog field {field!r} missing gpu_type {gpu_type!r}")
 
 
 def _env(chain: dict[str, Any]) -> EnvLabel:

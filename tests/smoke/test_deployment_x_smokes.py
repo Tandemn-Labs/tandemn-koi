@@ -35,6 +35,12 @@ def _x_fields():
         "deadline_hrs",
         "target_p99_ttft_ms",
         "target_p99_tpot_ms",
+        "max_num_seq",
+        "max_num_batched_tokens",
+        "max_model_len",
+        "block_size",
+        "kvcache_dtype",
+        "chunked_prefill_enable",
         "cloud",
         "region",
         "market",
@@ -50,9 +56,7 @@ def _x_fields():
 
 def _snapshot():
     features = {
-        "model_params_b": 70,
-        "num_attn_heads": 64,
-        "num_kv_heads": 8,
+        "model_id": "Qwen/Qwen2.5-72B-Instruct",
         "request_arrival_rate": 100,
         "total_token_budget": 1000,
         "deadline_hours": 2,
@@ -62,13 +66,12 @@ def _snapshot():
     shape = {
         "rank_id": "rank_a",
         "env": list(ENV_LABEL),
+        "model_id": "Qwen/Qwen2.5-72B-Instruct",
         "count": 8,
         "gpu_count": 8,
         "instance_type": "p5.48xlarge",
         "tp": 8,
         "pp": 1,
-        "engine_name": "vllm",
-        "prefix_cache_enabled": True,
         "target_p99_ttft_ms": 200,
         "target_p99_tpot_ms": 40,
         "predicted_y": {"p99_ttft_ms": 90.0},
@@ -149,6 +152,25 @@ def _hardware_catalog():
     }
 
 
+def _model_catalogs():
+    return {
+        "Qwen/Qwen2.5-72B-Instruct": {
+            "model_id": "Qwen/Qwen2.5-72B-Instruct",
+            "model_params_b": 70,
+            "num_attn_heads": 64,
+            "num_kv_heads": 8,
+            "engine_name": "vllm",
+            "prefix_cache_enabled": True,
+            "max_model_len": 8192,
+            "chunked_prefill_enable": True,
+            "max_num_seq": [{"gpu_type": "H100", "value": 256}],
+            "max_num_batched_tokens": [{"gpu_type": "H100", "value": 8192}],
+            "block_size": [{"gpu_type": "H100", "value": 16}],
+            "kvcache_dtype": [{"gpu_type": "H100", "value": "auto"}],
+        }
+    }
+
+
 def _candidate_graph():
     nodes = {name: Node(name, "X") for name in _x_fields()}
     nodes["kv_cache_util"] = Node("kv_cache_util", "V")
@@ -156,11 +178,25 @@ def _candidate_graph():
     return CandidateGraph(nodes, {}, {})
 
 
+def _catalog_x_assertions():
+    return {
+        "engine_name": "vllm",
+        "prefix_cache_enabled": True,
+        "max_num_seq": 256,
+        "max_num_batched_tokens": 8192,
+        "block_size": 16,
+        "kvcache_dtype": "auto",
+        "max_model_len": 8192,
+        "chunked_prefill_enable": True,
+    }
+
+
 class DeploymentXSmokeTests(unittest.TestCase):
     def test_builds_rank_x_from_snapshot_and_catalog(self):
         index = build_deployment_x_index(
             _snapshot(),
             hardware_catalog=_hardware_catalog(),
+            model_catalogs=_model_catalogs(),
             x_fields=_x_fields(),
         )
 
@@ -175,6 +211,10 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(x["total_token_budget"], 500)
         self.assertEqual(x["deadline_hrs"], 2)
         self.assertEqual(x["num_nodes_per_chain"], 1)
+        self.assertEqual(
+            {key: x[key] for key in _catalog_x_assertions()},
+            _catalog_x_assertions(),
+        )
         self.assertEqual(x["attn_heads_per_kv_head"], 8)
         self.assertAlmostEqual(x["bandwidth_per_param"], 3350 / 70)
         self.assertAlmostEqual(x["flops_per_param"], 989.5 / 70)
@@ -195,12 +235,18 @@ class DeploymentXSmokeTests(unittest.TestCase):
             build_deployment_x_index(
                 snapshot,
                 hardware_catalog=_hardware_catalog(),
+                model_catalogs=_model_catalogs(),
                 x_fields=_x_fields(),
             )
 
     def test_missing_hardware_catalog_is_contract_error(self):
         with self.assertRaises(ValueError):
-            build_deployment_x_index(_snapshot(), hardware_catalog={}, x_fields=_x_fields())
+            build_deployment_x_index(
+                _snapshot(),
+                hardware_catalog={},
+                model_catalogs=_model_catalogs(),
+                x_fields=_x_fields(),
+            )
 
     def test_s2_writes_deployment_x_without_telemetry_x(self):
         evidence_store = _EvidenceStore()
@@ -293,6 +339,9 @@ class _MechanismRegistry:
 class _ResourceMap:
     def hardware_catalog(self):
         return _hardware_catalog()
+
+    def model_catalog(self, model_id):
+        return _model_catalogs()[model_id]
 
 
 if __name__ == "__main__":
