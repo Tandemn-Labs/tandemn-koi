@@ -6,6 +6,7 @@ from src.core.models import Edge, EdgeMetadata, EvidenceRow, Mechanism, Node
 from src.validation.cusum import Cusum, CusumDirection, CusumResult
 from src.validation.icp import ICP, ICPResult
 from src.validation.quadrants import Quadrant, QuadrantValidator
+from src.validation.validator import Validator
 
 
 def make_row(row_id, env_label, residuals_per_v=None, residuals_per_y=None, quadrant=None):
@@ -163,6 +164,46 @@ class ValidationSmokeTests(unittest.TestCase):
         icp = ICP()
         self.assertEqual(icp.compute_icp_per_edge(v_edge, store), ICPResult.ACCEPT)
         self.assertEqual(icp.compute_icp_per_edge(y_edge, store), ICPResult.REJECT)
+
+    def test_validator_requires_launch_critical_rank_config(self):
+        result = Validator().val_plan(
+            _raw_place_plan({"instance_type": "p5.48xlarge", "gpu_count": 1, "tp": 1, "pp": 1})
+        )
+        self.assertTrue(result.feasible)
+
+        cases = {
+            "missing_instance": ({"gpu_count": 1, "tp": 1, "pp": 1}, "instance_type"),
+            "missing_gpu_count": (
+                {"instance_type": "p5.48xlarge", "tp": 1, "pp": 1},
+                "gpu_count/count",
+            ),
+            "missing_tp": ({"instance_type": "p5.48xlarge", "gpu_count": 1, "pp": 1}, "tp"),
+            "missing_pp": ({"instance_type": "p5.48xlarge", "gpu_count": 1, "tp": 1}, "pp"),
+        }
+        for name, (config, expected) in cases.items():
+            with self.subTest(name=name):
+                result = Validator().val_plan(_raw_place_plan(config))
+                self.assertFalse(result.feasible)
+                self.assertTrue(any(expected in violation for violation in result.violations))
+
+
+def _raw_place_plan(config):
+    return {
+        "actions": [
+            {
+                "job_id": "job_1",
+                "type": "place",
+                "ladder": [
+                    {
+                        "role": "aggregate",
+                        "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                        "config": config,
+                        "n_replicas": 1,
+                    }
+                ],
+            }
+        ]
+    }
 
 
 if __name__ == "__main__":

@@ -296,6 +296,22 @@ class Validator:
                     violations.append(
                         f"C6 physics: job {action.job_id} rank {i} n_replicas must be >= 1"
                     )
+                cfg = rank.config or {}
+                rank_errors = []
+                if not cfg.get("instance_type"):
+                    rank_errors.append("instance_type is required")
+                gpu_count = cfg.get("gpu_count", cfg.get("count"))
+                if not isinstance(gpu_count, int) or isinstance(gpu_count, bool) or gpu_count <= 0:
+                    rank_errors.append("gpu_count/count must be a positive integer")
+                for key in ("tp", "pp"):
+                    value = cfg.get(key)
+                    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                        rank_errors.append(f"{key} must be a positive integer")
+                if rank_errors:
+                    violations.extend(
+                        f"C6 physics: job {action.job_id} rank {i} {error}" for error in rank_errors
+                    )
+                    continue
                 per_chain, gpu_error = self._rank_engine_gpus(rank)
                 if gpu_error:
                     violations.append(f"C6 physics: job {action.job_id} rank {i} {gpu_error}")

@@ -9,6 +9,9 @@ class _DRO:
 
 
 class _ResourceMap:
+    def snapshot(self):
+        return _Snapshot()
+
     def resources_summary(self):
         return {
             "reserved|aws|us-east-1|use1-az1|H100": {
@@ -26,6 +29,26 @@ class _ResourceMap:
             "price_per_unit_hour": None,
             "capacity_per_replica": gpus,
         }
+
+    def model_catalog(self, model_id):
+        return {"model_id": model_id, "model_params_b": 70.0, "hidden_size": 8192}
+
+
+class _EvidenceStore:
+    def get_rows_for_job(self, job_id):
+        return []
+
+    def retrieve_similar_rows(self, job_features, top_k=10):
+        return []
+
+
+class _MechanismRegistry:
+    def filter_by_scope(self, subset_x, subset_v):
+        return []
+
+
+class _ConfidenceService:
+    pass
 
 
 class _RecordingSurrogate:
@@ -88,6 +111,32 @@ class AgentToolsSmokeTests(unittest.TestCase):
             self.assertEqual(job_features["region"], "us-east-1")
             self.assertEqual(job_features["zone"], "use1-az1")
             self.assertEqual(job_features["instance_type"], "p5.48xlarge")
+        finally:
+            for name, value in saved.items():
+                setattr(agent_tools._CTX, name, value)
+
+    def test_get_job_brief_includes_model_catalog(self):
+        saved = {
+            name: getattr(agent_tools._CTX, name)
+            for name in (
+                "resource_map",
+                "evidence_store",
+                "mechanism_registry",
+                "confidence_service",
+            )
+        }
+        try:
+            agent_tools.bind_tools(
+                resource_map=_ResourceMap(),
+                evidence_store=_EvidenceStore(),
+                mechanism_registry=_MechanismRegistry(),
+                confidence_service=_ConfidenceService(),
+            )
+            brief = agent_tools.get_job_brief("job_1")
+
+            self.assertEqual(brief["job_features"]["model_id"], "meta-llama/Llama-3.1-8B-Instruct")
+            self.assertEqual(brief["model_catalog"]["model_params_b"], 70.0)
+            self.assertNotIn("model_params_b", brief["job_features"])
         finally:
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
