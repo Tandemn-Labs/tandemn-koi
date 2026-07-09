@@ -94,12 +94,16 @@ class AgentTrace:
     is recorded so a tick can be replayed and audited.
     """
 
-    def __init__(self):
+    def __init__(self, live_sink=None):
         self.events: list[dict[str, Any]] = []
+        self.live_sink = live_sink
 
     def add(self, kind: str, **payload) -> None:
         """Record one event with its wall-clock timestamp."""
-        self.events.append({"kind": kind, "ts": time.time(), **payload})
+        event = {"kind": kind, "ts": time.time(), **payload}
+        self.events.append(event)
+        if self.live_sink is not None:
+            self.live_sink(event)
 
 
 class RLMRuntime:
@@ -159,6 +163,7 @@ class RLMRuntime:
         Exceptions are caught and returned as error text so the LLM can
         self-correct; the full output and traceback go to the trace.
         """
+        self.trace.add("repl_exec_started", code=code)
         buffer = io.StringIO()
         error_text = ""
         try:
@@ -232,11 +237,19 @@ class SpecialistRunner:
             "Preempt/resume/retry are disabled in MVP v0. If no "
             "safe ladder fits the budget, return keep (running job) or "
             "defer (waiting job) and report fitness=starved or blocked.\n\n"
-            "Output a single JSON object with keys: job_id, tenant_id, "
+            "Output a single JSON object with keys: job_id, user_id, "
             "type, ladder, predicted_y, predicted_sigma, "
             "budget_utilization, used_capacity, fitness, "
             "marginal_value_of_more, unused_capacity, mechanism_ids (multiple mechanisms are allowed), "
-            "new_mechanism_proposals, reasoning. No prose outside the JSON."
+            "new_mechanism_proposals, reasoning. No prose outside the JSON. "
+            "Env keys MUST be canonical 5-part labels including market: "
+            "market|cloud|region|zone|gpu_type, e.g. "
+            "reserved|aws|us-east-1|us-east-1b|L40S. Never omit market. "
+            "Ladder entries MUST be canonical rank dicts: "
+            "{'role':'aggregate','env':[market,cloud,region,zone,gpu_type],"
+            "'config':{'instance_type':str,'gpu_count':int,'tp':int,'pp':int,"
+            "'engine_name':'vllm'},'n_replicas':int,'mechanism_id':'M_...'}. "
+            "Do not emit shorthand ladder entries like {'env': ..., 'count': ...}."
         )
 
     def run_many(
@@ -312,7 +325,7 @@ class SpecialistRunner:
         is_active = brief.get("current_ladder") is not None
         return {
             "job_id": job_id,
-            "tenant_id": slice_.get("tenant_id", "default"),
+            "user_id": slice_.get("user_id"),
             "type": "keep" if is_active else "defer",
             "ladder": None,
             "predicted_y": {},
@@ -360,16 +373,94 @@ class SpecialistRunner:
         action = result.get("type")
         if action is None or str(action).lower() not in SPECIALIST_ACTIONS:
             violations.append(f"type must be one of {sorted(SPECIALIST_ACTIONS)}")
+        action_name = str(action).lower() if action is not None else ""
+
+        for field in (
+            "used_capacity",
+            "unused_capacity",
+            "marginal_value_of_more",
+            "budget_utilization",
+        ):
+            value = result.get(field) or {}
+            if not isinstance(value, dict):
+                violations.append(f"{field} must be a dict keyed by canonical env")
+                continue
+            for env in value:
+                if len(agent_tools._env_key(env).split("|")) != 5:
+                    violations.append(
+                        f"{field} env {env!r} must be market|cloud|region|zone|gpu_type"
+                    )
+
+        ladder = result.get("ladder")
+        mechanism_ids = result.get("mechanism_ids") or []
+        if action_name in (ActionType.PLACE.value, ActionType.SWAP.value):
+            if not isinstance(mechanism_ids, list) or not mechanism_ids:
+                violations.append(f"{action_name} requires non-empty mechanism_ids")
+            if not isinstance(ladder, list) or not ladder:
+                violations.append(f"{action_name} requires non-empty canonical ladder")
+            else:
+                for i, rank in enumerate(ladder):
+                    violations.extend(
+                        SpecialistRunner._validate_rank_schema(
+                            rank,
+                            i,
+                            mechanism_ids,
+                        )
+                    )
+        elif ladder not in (None, []):
+            violations.append(f"{action_name} must not include ladder")
 
         budget = {
             agent_tools._env_key(env): int(n) for env, n in (slice_.get("env_budget") or {}).items()
         }
         for env, used in (result.get("used_capacity") or {}).items():
             key = agent_tools._env_key(env)
+            if key not in budget:
+                violations.append(f"used_capacity env {key} is not in BudgetSlice")
+                continue
             if int(used) > budget.get(key, 0):
                 violations.append(
                     f"used_capacity {used} in {key} exceeds slice budget {budget.get(key, 0)}"
                 )
+        return violations
+
+    @staticmethod
+    def _validate_rank_schema(rank: Any, index: int, mechanism_ids: list[Any]) -> list[str]:
+        violations: list[str] = []
+        prefix = f"ladder[{index}]"
+        if not isinstance(rank, dict):
+            return [f"{prefix} must be a dict"]
+        if rank.get("role") != "aggregate":
+            violations.append(f"{prefix}.role must be 'aggregate'")
+
+        env = rank.get("env")
+        if not isinstance(env, (list, tuple)) or len(env) != 5:
+            violations.append(f"{prefix}.env must be [market, cloud, region, zone, gpu_type]")
+        elif any(not isinstance(part, str) or not part for part in env):
+            violations.append(f"{prefix}.env entries must be non-empty strings")
+
+        config = rank.get("config")
+        if not isinstance(config, dict):
+            violations.append(f"{prefix}.config must be a dict")
+            config = {}
+        for key in ("model_id", "instance_type", "gpu_type"):
+            if not config.get(key):
+                violations.append(f"{prefix}.config.{key} is required")
+        if config.get("engine_name") not in {"vllm", "sglang"}:
+            violations.append(f"{prefix}.config.engine_name must be 'vllm' or 'sglang'")
+        for key in ("gpu_count", "tp", "pp"):
+            value = config.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                violations.append(f"{prefix}.config.{key} must be a positive int")
+
+        replicas = rank.get("n_replicas")
+        if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas <= 0:
+            violations.append(f"{prefix}.n_replicas must be a positive int")
+        mechanism_id = rank.get("mechanism_id")
+        if not mechanism_id:
+            violations.append(f"{prefix}.mechanism_id is required")
+        elif mechanism_ids and mechanism_id not in mechanism_ids:
+            violations.append(f"{prefix}.mechanism_id must be present in mechanism_ids")
         return violations
 
 
@@ -400,8 +491,8 @@ class KoiAgentHarness:
             model here cuts cost where quality matters least.
         resource_map: Cluster resource service (snapshot, simulation,
             keep-all plan builder). Also reachable via agent_tools.
-        tenant_registry: Optional tenant service for envelopes. None
-            means single-tenant v0.
+        user_registry: Optional user policy service for envelopes. None
+            means Store user owns all visible capacity in v0.
         plan_validator: Optional validator with val_plan(...) used to
             pre-screen K_P candidates before scoring. S5 still runs the
             authoritative validation.
@@ -425,7 +516,7 @@ class KoiAgentHarness:
         llm_client,
         specialist_llm_client=None,
         resource_map=None,
-        tenant_registry=None,
+        user_registry=None,
         plan_validator=None,
         tool_dependencies: dict[str, Any] | None = None,
         config: dict[str, Any] | None = None,
@@ -433,7 +524,7 @@ class KoiAgentHarness:
         cfg = config or {}
         self.llm = llm_client
         self.resource_map = resource_map
-        self.tenant_registry = tenant_registry
+        self.user_registry = user_registry
         self.plan_validator = plan_validator
         self.k_p = int(cfg.get("k_p", K_P))
         self.k_max = int(cfg.get("k_max", K_MAX))
@@ -458,7 +549,7 @@ class KoiAgentHarness:
             agent_tools.bind_tools(**tool_dependencies)
         agent_tools.bind_tools(
             specialist_runner=self.specialist_runner,
-            tenant_registry=tenant_registry,
+            user_registry=user_registry,
             resource_map=resource_map,
             plan_validator=plan_validator,
         )
@@ -603,7 +694,7 @@ class KoiAgentHarness:
             evidence_store=evidence_store,
             mechanism_registry=mechanism_registry,
             resource_map=self.resource_map,
-            tenant_registry=self.tenant_registry,
+            user_registry=self.user_registry,
             budget_book=None,
             plan=None,
             tick=tick,
@@ -928,14 +1019,14 @@ class KoiAgentHarness:
             "full state in the prompt; inspect it with code and print "
             "summaries only.\n\n"
             "REPL variables: cluster_snapshot, slow_state, evidence_store, "
-            "mechanism_registry, resource_map, tenant_registry, budget_book, "
+            "mechanism_registry, resource_map, user_registry, budget_book, "
             "plan, tick. Every agent tool is bound as a function "
-            "(get_cluster_state, get_priority, build_tenant_envelopes, "
-            "validate_budget_book, run_job_specialists, predict_outcome, "
+            "(get_cluster_state, get_priority, build_user_envelopes, "
+            "allocate_budget_book, validate_budget_book, run_job_specialists, predict_outcome, "
             "compute_sigma, get_influencing_knobs, optimize_config, "
             "get_z_star, check_feasibility, ...).\n\n"
             "Objective: one cluster-wide plan maximizing aggregate sigma "
-            "subject to tenant policy, resource capacity, physical chain "
+            "subject to user policy, resource capacity, physical chain "
             "feasibility, SLO chance under DRO, the swap budget B_t, and "
             "admission control.\n\n"
             "Before committing P_t, explore multiple candidate allocation "
@@ -944,15 +1035,20 @@ class KoiAgentHarness:
             "part of the final schema. Use them only to avoid local minima. "
             "For non-trivial ticks, compare several angles: "
             "feasibility/SLO-first, aggregate sigma-first, "
-            "churn/B_t-minimizing, and scarce-resource or tenant-fair "
+            "churn/B_t-minimizing, and scarce-resource or user-fair "
             "allocation. For each serious candidate, use tools to size "
             "ladders, simulate resources, compute_sigma, and "
             "check_feasibility. Keep compact summaries. Then choose "
             "exactly one final Plan P_t and call FINAL_VAR(plan).\n\n"
             "Mandatory order: allocate budgets before per-job specialists. "
-            "Build tenant envelopes, build a job priority table, allocate a "
-            "BudgetBook, validate it with validate_budget_book, and only "
-            "then call run_job_specialists. Specialists optimize inside "
+            "Use this exact sequence, with no extra arguments: "
+            "build_user_envelopes(); priority = get_priority(); "
+            "budget_book = allocate_budget_book(); "
+            "validation = validate_budget_book(budget_book); "
+            "if validation['ok']: specialist_results = run_job_specialists(). "
+            "Do not call budget_book.allocate(); BudgetBook is a dict, not an object. "
+            "Do not pass cluster_snapshot into get_priority, allocate_budget_book, "
+            "validate_budget_book, or run_job_specialists. Specialists optimize inside "
             "their BudgetSlice and report fitness; they never compete for "
             "resources. Specialist results are PROPOSALS - you own every "
             "final per-job decision. Reconcile them at cluster level: "
@@ -1003,7 +1099,7 @@ class KoiAgentHarness:
             "    'actions': [ <one action dict per job you decide> ],\n"
             "  }\n"
             "Action dict:\n"
-            "  {'job_id': str, 'type': <action>, 'tenant_id': str,\n"
+            "  {'job_id': str, 'type': <action>, 'user_id': str,\n"
             "   'ladder': [<rank>, ...],            # only for place/swap\n"
             "   'target_tps': float,                # required throughput for place/swap\n"
             "   'target_p99_ttft_ms': float,        # online SLA, copied from job_features\n"
