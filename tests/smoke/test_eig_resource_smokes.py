@@ -198,6 +198,40 @@ class EigResourceSmokeTests(unittest.TestCase):
             ["env reserved|aws|us-east-2|use2-az3|A100: requested 8 more GPUs than available"],
         )
 
+    def test_job_summary_requires_job_features_object(self):
+        job = {
+            "job_id": "job_missing_features",
+            "user_id": "user_1",
+            "kind": "online",
+            "status": "waiting",
+            "created_at": None,
+            "finished_at": None,
+            "finish_reason": None,
+            "spec_json": {"model_id": "m"},
+            "input_source": {},
+            "output_target": {},
+        }
+
+        with self.assertRaisesRegex(ValueError, "job_features"):
+            ResourceMapManager._job_to_summary(job)
+
+    def test_job_summary_accepts_canonical_job_features(self):
+        job = {
+            "job_id": "job_canonical_features",
+            "user_id": "user_1",
+            "kind": "online",
+            "status": "waiting",
+            "created_at": None,
+            "finished_at": None,
+            "finish_reason": None,
+            "spec_json": {"model_id": "m", "job_features": {"model_id": "m", "type": "online"}},
+            "input_source": {},
+            "output_target": {},
+        }
+
+        summary = ResourceMapManager._job_to_summary(job)
+        self.assertEqual(summary["job_features"], {"model_id": "m", "type": "online"})
+
 
 if __name__ == "__main__":
     unittest.main()

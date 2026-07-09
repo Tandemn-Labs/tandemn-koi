@@ -193,6 +193,7 @@ class SurrogatePrediction:
                     "kv_transfer_method",
                     "preemption_policy",
                     "router_policy",
+                    "num_workers",
                     "isl_token_avg",
                     "osl_token_avg",
                     "request_arrival_rate",
@@ -313,7 +314,7 @@ class SurrogatePrediction:
             )
             if request_arrival_rate is None:
                 raise ValueError("Online simulation needs positive request_arrival_rate")
-            sim_duration_s = 60  # TODO - hardcoded for now, need discussion
+            sim_duration_s = 5  # TODO - hardcoded for now, need discussion
 
             return {
                 "request_count": max(1, int(request_arrival_rate * sim_duration_s)),
@@ -356,7 +357,9 @@ class SurrogatePrediction:
             "max_num_seqs": direct_x_values.get("max_num_seq"),
             "max_num_batched_tokens": direct_x_values.get("max_num_batched_tokens"),
             "aic_backend": direct_x_values.get("engine_name", "vllm"),
-            "aic_backend_version": direct_x_values.get("engine_version"),
+            # AIC's bundled perf database currently has l40s/vllm/0.14.0, while
+            # runtime deployments may use newer vLLM images.
+            "aic_backend_version": "0.14.0",
             "aic_system": self.map_gpu_to_aic_system(gpu_type),
             "aic_model_path": model_id,
             "aic_tp_size": direct_x_values.get("tp", 1),
@@ -379,10 +382,7 @@ class SurrogatePrediction:
             "prefill_worker_count": direct_x_values.get("prefill_worker_count", 1),
             "decode_worker_count": direct_x_values.get("decode_worker_count", 1),
             "num_workers": direct_x_values.get("num_workers", 1),
-            "router_mode": direct_x_values.get(
-                "router_policy",
-                "kv_router" if direct_x_values.get("pd_enabled", False) else "round_robin",
-            ),
+            "router_mode": direct_x_values.get("router_policy", "kv_router"),
             **simulator_controls,
         }
 

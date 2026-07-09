@@ -146,11 +146,14 @@ class ResourceMapManager:
     def _job_to_summary(cls, job) -> dict[str, Any]:
         raw = cls._model_dump(job)
         spec = dict(raw.get("spec_json") or {})
-        job_features = dict(spec.get("job_features") or spec.get("features") or spec)
+        if not isinstance(spec.get("job_features"), dict):
+            raise ValueError(
+                f"job {raw.get('job_id')!r} spec_json must include object 'job_features'"
+            )
+        job_features = dict(spec["job_features"])
         return {
             "job_id": raw.get("job_id"),
             "user_id": raw.get("user_id"),
-            "tenant_id": spec.get("tenant_id", "default"),
             "kind": raw.get("kind"),
             "status": raw.get("status"),
             "created_at": raw.get("created_at"),
@@ -213,7 +216,6 @@ class ResourceMapManager:
         """
         used = used or {}
         raw = dict(resource_map.scheduling_summary())
-        market = cls._default_market(resource_map)
         out: dict[str, dict[str, Any]] = {}
         for key, info in raw.items():
             body = dict(info)
@@ -221,9 +223,6 @@ class ResourceMapManager:
             if len(parts) == 5:
                 env_key = str(key)
                 body.setdefault("market", parts[0])
-            elif len(parts) == 4:
-                env_key = "|".join([market, *parts])
-                body.setdefault("market", market)
             else:
                 env_key = str(key)
             total = int(body.get("total", 0))
@@ -242,11 +241,9 @@ class ResourceMapManager:
 
         The chain's placement env is resolved with precedence
         ``target_node`` -> ``shape_json["env"]`` -> ``shape_json["pool_id"]``;
-        the store writes the env key into the first-class ``target_node``
-        field. A 4-part legacy env is normalized to 5 parts with the map's
-        default market.
+        the store writes the 5-part env key into the first-class
+        ``target_node`` field.
         """
-        default_market = self._default_market(resource_map)
         resources = self._normalized_scheduling_summary(resource_map, used={})
         used: dict[str, int] = {}
         for chain in self.get_running_chains(user_id=user_id):
@@ -259,7 +256,7 @@ class ResourceMapManager:
             )
             if raw_env is None:
                 continue
-            env_key = self._normalize_env_key(raw_env, default_market)
+            env_key = self._env_key(raw_env)
             # tandemn-store guarantees a positive int 'count' at launch; read
             # it directly with no parallelism-derived fallback.
             count = shape.get("count")
@@ -273,29 +270,14 @@ class ResourceMapManager:
             used[env_key] = used.get(env_key, 0) + footprint
         return used
 
-    @classmethod
-    def _normalize_env_key(cls, env, default_market: str) -> str:
-        """Normalize an env (list/tuple or pipe string) to a 5-part key.
-
-        A 4-part key (``cloud|region|zone|gpu_type``) is prefixed with the
-        default market so it matches scheduling_summary's 5-part keys.
-        """
-        key = cls._env_key(env)
-        parts = key.split("|")
-        if len(parts) == 4:
-            return "|".join([default_market, *parts])
-        return key
-
     @staticmethod
     def _default_market(resource_map) -> str:
         markets = getattr(resource_map, "market", None)
-        if markets is None:
-            markets = getattr(resource_map, "capacity_type", None)
         if isinstance(markets, (list, tuple)) and markets:
             return str(markets[0])
         if markets:
             return str(markets)
-        return "reserved"
+        raise ValueError("ResourceMap.market is required")
 
     def dynamic_view(self, user_id: str | None = None) -> dict[str, Any]:
         resource_map = self.get_resource_map(user_id=user_id)
@@ -523,8 +505,8 @@ def _smoke_resource_map():
     if "price_per_instance_hour" in pool_fields:
         pool_values["price_per_instance_hour"] = 32.77
 
-    resource_fields = getattr(ResourceMap, "model_fields", {})
     resource_values = {
+        "market": ["reserved"],
         "clouds": {
             "aws": Cloud(
                 regions={
@@ -545,12 +527,8 @@ def _smoke_resource_map():
                     )
                 }
             )
-        }
+        },
     }
-    if "market" in resource_fields:
-        resource_values["market"] = ["reserved"]
-    elif "capacity_type" in resource_fields:
-        resource_values["capacity_type"] = ["reserved"]
     return ResourceMap(**resource_values)
 
 

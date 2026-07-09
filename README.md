@@ -38,12 +38,12 @@ Koi is that optimizer — a self-learning planner that, for every job:
 A real inference fleet looks like this:
 
 - dozens to thousands of concurrent jobs, some online (latency SLOs), some batch (deadline SLOs);
-- many tenants with different quotas, priorities, budgets, and data-isolation rules;
+- many users with different quotas, priorities, budgets, and data-isolation rules;
 - heterogeneous hardware across clouds, regions, markets, GPU types, instance types, engines, and network topologies;
 - volatile spot capacity, launch failures, chain deaths, and degraded replicas;
 - and a constant pressure to hit SLOs at the lowest possible cost.
 
-The hard part isn't picking a GPU for one model. It's **simultaneous cluster control under constraints** — moving tenant A's low-priority batch job off scarce H100s so tenant B's latency-critical job can meet its SLO, without thrashing the fleet.
+The hard part isn't picking a GPU for one model. It's **simultaneous cluster control under constraints** — moving one user's low-priority batch job off scarce H100s so another user's latency-critical job can meet its SLO, without thrashing the fleet.
 
 Doing that by hand doesn't scale. Koi makes it a continuous, learned, auditable decision.
 
@@ -61,7 +61,7 @@ Every tick (default ~5 minutes, or on demand) walks a fixed spine, `S0 → S7`:
 events / telemetry / scheduler signals
                 │  (recorded as facts, never as reflex prompts)
         ┌───────▼─────────┐
-        │  Runtime State  │   clusters · tenants · jobs · resource map · evidence
+        │  Runtime State  │   clusters · users · jobs · resource map · evidence
         └───────┬─────────┘
                 │
  ┌──────────────▼──────────────────────────────────────────────┐
@@ -85,10 +85,10 @@ Koi is **causal** and **self-calibrating** by construction:
 - **Predict.** A surrogate model predicts each candidate config's outcomes — TTFT, TPOT, throughput, cost — _before_ anything is deployed.
 - **Score.** A **Tchebycheff scalarization** collapses multi-objective trade-offs (per-job SLOs + cost) into a single, comparable score. A **distributionally-robust (DRO)** check keeps SLO promises honest under prediction uncertainty, and a **switch-cost** term discourages needless churn.
 - **Explore.** **Expected Information Gain (EIG)** steers limited canary/exploration capacity toward the configs that will teach the planner the most — so uncertainty shrinks where it actually matters.
-- **Validate.** A deterministic constraint hierarchy (`C0–C7`: tenant policy → resource capacity → physical feasibility → SLO chance → swap budget → admission → repair → side-effect gating) gates every plan. Nothing reaches the executor unvalidated.
+- **Validate.** A deterministic constraint hierarchy (`C0–C7`: user policy → resource capacity → physical feasibility → SLO chance → swap budget → admission → repair → side-effect gating) gates every plan. Nothing reaches the executor unvalidated.
 - **Learn (self-calibrate).** After deployment, observed-vs-predicted trajectories flow through **CUSUM** (drift detection), **ICP** (per-edge conformal invariance), and a **four-quadrant** classifier. These update **Beta confidence** over a causal **mechanism graph** (decision variables → mediators → outcomes) and the slow-loop knobs — exploration weight, swap budget, DRO radius, objective weights. **Koi gets measurably better with every deployment.**
 
-The reasoning core is a **budget-first** planner: it allocates tenant envelopes and per-job budgets _first_, then runs bounded per-job specialists _inside_ those budgets. This is the deliberate anti-"split-brain" design — parallel reasoning without sub-agents fighting over scarce GPUs.
+The reasoning core is a **budget-first** planner: it allocates user envelopes and per-job budgets _first_, then runs bounded per-job specialists _inside_ those budgets. This is the deliberate anti-"split-brain" design — parallel reasoning without sub-agents fighting over scarce GPUs.
 
 ---
 
@@ -129,7 +129,7 @@ We are building Koi **in the open and moving fast.** Here's what's in the repo t
 - [ ] **Prefill/Decode (PD) disaggregation** in the planner — separate prefill and decode deployments, with Koi choosing the optimal **P:D ratio** per job
 - [ ] First-class **SP / PP / CP** planning — sequence, pipeline, and **context parallelism** as native search dimensions
 - [ ] **Upgraded performance database + sharper surrogate stack** for higher-fidelity prediction
-- [ ] **Adaptive objective weights via mirror descent** — automatically walking the Pareto front per fleet and per tenant, instead of fixed weights
+- [ ] **Adaptive objective weights via mirror descent** — automatically walking the Pareto front per fleet and per user, instead of fixed weights
 
 > **PD, full SP/PP/CP planning, and adaptive (mirror-descent) weights all land in roughly two weeks.** This is our current sprint and it's moving.
 

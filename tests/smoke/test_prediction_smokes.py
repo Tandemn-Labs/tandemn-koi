@@ -107,6 +107,7 @@ class MockCandidateGraph:
         "preemption_policy",
         "max_chunked_steps_per_request",
         "router_policy",
+        "num_workers",
         "max_concurrent_streaming",
         "min_chain_warmup_time",
     )
@@ -184,7 +185,8 @@ class PredictionSmokeTests(unittest.TestCase):
             "prefill_worker_count": 1,
             "decode_worker_count": 1,
             "preemption_policy": "lifo",
-            "router_policy": "round_robin",
+            "router_policy": "kv_router",
+            "num_workers": 2,
         }
         job_features = {
             "cloud": "aws",

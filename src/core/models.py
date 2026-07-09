@@ -334,7 +334,7 @@ class PlanAction:
 
     job_id: str
     type: ActionType
-    tenant_id: str | None = None
+    user_id: str | None = None
     ladder: list[RankSpec] | None = None
     target_tps: float | None = None
     target_p99_ttft_ms: float | None = None
@@ -384,7 +384,7 @@ class PlanAction:
         return cls(
             job_id=str(jid),
             type=action_type,
-            tenant_id=raw.get("tenant_id"),
+            user_id=raw.get("user_id"),
             ladder=ladder,
             target_tps=raw.get("target_tps"),
             target_p99_ttft_ms=raw.get("target_p99_ttft_ms"),
@@ -412,7 +412,7 @@ class PlanAction:
         return {
             "job_id": self.job_id,
             "type": self.type.value,
-            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
             "ladder": [r.to_dict() for r in self.ladder] if self.ladder else None,
             "target_tps": self.target_tps,
             "target_p99_ttft_ms": self.target_p99_ttft_ms,
@@ -428,7 +428,7 @@ class PlanAction:
 class Plan:
     """The cluster-wide decision for one tick: one action per job.
 
-    A Plan spans every tenant's jobs, so tenant identity lives on each
+    A Plan spans every user's jobs, so user identity lives on each
     PlanAction (not on the Plan). operator_id is provenance only - who/what
     produced the plan - mapping the illustrative "user_id" field.
     """
