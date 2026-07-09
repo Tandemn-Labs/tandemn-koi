@@ -9,7 +9,7 @@ included. This prevents local reflex prompts from racing the global planner.
 One tick is a closed learning loop:
 
     S0 ENTER_TICK     Freeze a consistent snapshot; reset per-tick caches
-                      (tenant envelopes, validated BudgetBook).
+                      (user envelopes, validated BudgetBook).
     S1 OBSERVE        Pull per-rank telemetry bundles for [t-1, t].
     S2 VALIDATE       Per rank: residuals -> applicable mechanisms ->
                       per-mechanism (V-CUSUM, Y-CUSUM) -> per-mechanism Q ->
@@ -184,7 +184,7 @@ class TickRunner:
         recalibrate_every: Meta-cadence (ticks) for CUSUM (delta, h)
             recalibration. 0 disables.
         on_tick_start: Optional zero-arg hook run in S0. Boot wires
-            agent_tools.reset_tick_caches here so tenant envelopes and the
+            agent_tools.reset_tick_caches here so user envelopes and the
             validated BudgetBook cannot leak across ticks.
         typical_ranges: Per-objective scale; defaults to slow_loop's.
     """
@@ -304,7 +304,7 @@ class TickRunner:
 
         The snapshot is the single consistent input every later state
         references. The on_tick_start hook clears agent-tool tick caches
-        (tenant envelopes, validated BudgetBook) so nothing budget-shaped
+        (user envelopes, validated BudgetBook) so nothing budget-shaped
         survives from the previous tick's capacity.
         """
         if self.on_tick_start is not None:

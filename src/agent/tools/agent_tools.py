@@ -39,9 +39,10 @@ Tool catalog:
         get_gpu_capacity            free GPUs per env for one gpu_type
         get_job_brief               assembled specialist input for one job
 
-    tenant / budget:
-        build_tenant_envelopes      deterministic envelopes per tenant
-        get_tenant_envelopes        cached envelopes for this tick
+    user / budget:
+        build_user_envelopes        deterministic envelopes per user
+        get_user_envelopes          cached envelopes for this tick
+        allocate_budget_book        default BudgetBook from priority + free GPUs
         validate_budget_book        deterministic BudgetBook validation
         run_job_specialists         bounded per-job specialist calls (post-validation)
 
@@ -80,8 +81,11 @@ Tool catalog:
         simulate_outcome_trajectory predicted outcomes for each plan action
 """
 
+import json
 import logging
 import math
+import time
+from functools import wraps
 from typing import Any
 
 import numpy as np
@@ -104,6 +108,7 @@ _NONNEGATIVE_Y = frozenset(
 )
 
 log = logging.getLogger("koi.agent_tools")
+_PREDICT_RAW_CACHE: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
 
 
 class _ToolContext:
@@ -126,11 +131,12 @@ class _ToolContext:
     switchcost_module = None
     plan_validator = None
     regret_calculator = None
-    tenant_registry = None
+    user_registry = None
     specialist_runner = None
+    tool_call_logger = None
 
     # Per-tick caches written by the budget tools.
-    tenant_envelopes = None
+    user_envelopes = None
     validated_budget_book = None
 
 
@@ -146,7 +152,7 @@ def bind_tools(**components) -> None:
             confidence_service, candidate_graph, resource_map, surrogate,
             telemetry, cusum, icp, quadrant_validator, eig_module,
             tchebycheff_module, switchcost_module, plan_validator,
-            regret_calculator, tenant_registry, specialist_runner).
+            regret_calculator, user_registry, specialist_runner).
             None values are ignored so partial rebinds are safe.
 
     Raises:
@@ -168,8 +174,8 @@ def _require(*names: str) -> None:
 
 # Components every planning run needs. Asserted once at the start of the S4
 # loop so a wiring gap surfaces at tick start with the full list, not one
-# tool at a time deep inside a trajectory. tenant_registry is intentionally
-# absent (a single "default" tenant is synthesized when it is unbound), and
+# tool at a time deep inside a trajectory. user_registry is intentionally
+# absent (the Store user_id owns all capacity in v0), and
 # plan_validator is absent (K_P pre-screen is optional; S5 is authoritative).
 _PLANNING_DEPENDENCIES = (
     "slow_loop",
@@ -207,15 +213,16 @@ def assert_planning_ready() -> None:
 
 
 def reset_tick_caches() -> None:
-    """Clear per-tick caches: tenant envelopes and the validated BudgetBook.
+    """Clear per-tick caches: user envelopes and the validated BudgetBook.
 
     Must run at every tick boundary (S0 wires it via the TickRunner's
     on_tick_start hook). Without this, run_job_specialists' default-book
     path could reuse a book validated against LAST tick's capacity -
     a stale-budget hole in the anti-split-brain ordering.
     """
-    _CTX.tenant_envelopes = None
+    _CTX.user_envelopes = None
     _CTX.validated_budget_book = None
+    _PREDICT_RAW_CACHE.clear()
 
 
 # Public module functions that are NOT LLM tools (infrastructure/boot).
@@ -238,7 +245,7 @@ def all_callables() -> dict[str, Any]:
     the boot/infra functions (notably reset_tick_caches, which the model
     must never call mid-trajectory).
     """
-    return {
+    tools = {
         name: fn
         for name, fn in globals().items()
         if callable(fn)
@@ -246,6 +253,52 @@ def all_callables() -> dict[str, Any]:
         and name not in _NON_TOOL_NAMES
         and getattr(fn, "__module__", None) == __name__
     }
+    logger = getattr(_CTX, "tool_call_logger", None)
+    if logger is None:
+        return tools
+    return {name: _logged_tool(name, fn, logger) for name, fn in tools.items()}
+
+
+def _short(value: Any, limit: int = 500) -> str:
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _logged_tool(name, fn, logger):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        started = time.time()
+        logger(
+            {
+                "kind": "tool_call_started",
+                "name": name,
+                "args": [_short(arg) for arg in args],
+                "kwargs": {key: _short(value) for key, value in kwargs.items()},
+            }
+        )
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            logger(
+                {
+                    "kind": "tool_call_error",
+                    "name": name,
+                    "elapsed_sec": round(time.time() - started, 3),
+                    "error": repr(exc),
+                }
+            )
+            raise
+        logger(
+            {
+                "kind": "tool_call_finished",
+                "name": name,
+                "elapsed_sec": round(time.time() - started, 3),
+                "result": _short(result),
+            }
+        )
+        return result
+
+    return wrapper
 
 
 def _env_key(env) -> str:
@@ -481,7 +534,7 @@ def get_active_jobs() -> list[dict[str, Any]]:
     """Return descriptors for currently running jobs.
 
     Returns:
-        List of dicts with at least job_id, tenant_id, current ladder
+        List of dicts with at least job_id, user_id, current ladder
         summary, and recent Q label where available.
     """
     snap = _snapshot()
@@ -590,27 +643,23 @@ def get_strategy_history(window: int = 10) -> list[dict[str, Any]]:
     return []
 
 
-def get_priority(jobs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def get_priority() -> list[dict[str, Any]]:
     """Build a deterministic priority table for jobs.
 
-    Combines tenant priority, job class, online/batch, deadline pressure,
+    Combines user priority, job class, online/batch, deadline pressure,
     SLO margin, queue age, and recent failure signals into one score.
     The root reads this table instead of raw job data, then inspects
     specific jobs near decision boundaries.
 
-    Args:
-        jobs: Job descriptor dicts. Defaults to pending + active jobs.
-
     Returns:
-        List of {"job_id", "tenant_id", "priority_score", "signals"}
+        List of {"job_id", "user_id", "priority_score", "signals"}
         sorted by descending score.
     """
-    if jobs is None:
-        jobs = list(get_pending_jobs()) + list(get_active_jobs())
-    scored = []
+    jobs = list(get_pending_jobs()) + list(get_active_jobs())
+    scored: list[dict[str, Any]] = []
     for j in jobs:
         signals = {
-            "tenant_priority": float(j.get("tenant_priority", 1.0)),
+            "user_priority": float(j.get("user_priority", 1.0)),
             "priority_class": float(j.get("priority_class", 0)),
             "is_online": 1.0 if j.get("type", "online") == "online" else 0.0,
             "deadline_pressure": float(j.get("deadline_pressure", 0.0)),
@@ -619,7 +668,7 @@ def get_priority(jobs: list[dict[str, Any]] | None = None) -> list[dict[str, Any
             "recent_failures": float(j.get("recent_failures", 0)),
         }
         score = (
-            signals["tenant_priority"] * 10.0
+            signals["user_priority"] * 10.0
             + signals["priority_class"] * 10.0
             + signals["is_online"] * 3.0
             + signals["deadline_pressure"] * 5.0
@@ -630,12 +679,12 @@ def get_priority(jobs: list[dict[str, Any]] | None = None) -> list[dict[str, Any
         scored.append(
             {
                 "job_id": j.get("job_id", j.get("id")),
-                "tenant_id": j.get("tenant_id", "default"),
+                "user_id": j.get("user_id"),
                 "priority_score": score,
                 "signals": signals,
             }
         )
-    scored.sort(key=lambda x: x["priority_score"], reverse=True)
+    scored.sort(key=lambda x: float(x["priority_score"]), reverse=True)
     return scored
 
 
@@ -673,7 +722,7 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         job_id: The job to brief.
 
     Returns:
-        Dict with job_id, tenant_id, job_features, current_ladder,
+        Dict with job_id, user_id, job_features, current_ladder,
         recent_q_labels, recent_theory_blobs, similar_deployments,
         applicable_mechanisms.
     """
@@ -708,7 +757,7 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
 
     return {
         "job_id": job_id,
-        "tenant_id": (descriptor or {}).get("tenant_id", "default"),
+        "user_id": (descriptor or {}).get("user_id"),
         "job_features": features,
         "model_catalog": model_catalog,
         "current_ladder": (descriptor or {}).get("current_ladder"),
@@ -720,29 +769,32 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
-# Tenant / budget tools
+# User / budget tools
 # ----------------------------------------------------------------------
 
 
-def build_tenant_envelopes() -> dict[str, dict[str, Any]]:
-    """Build deterministic tenant envelopes for this tick.
+def build_user_envelopes() -> dict[str, dict[str, Any]]:
+    """Build deterministic user envelopes for this tick.
 
-    Envelopes are the legal resource boundary per tenant: floors,
+    Envelopes are the legal resource boundary per user: floors,
     ceilings, quotas, and env allow/deny lists. The root reasons over
-    them but cannot exceed them. With no tenant_registry bound, a single
-    "default" tenant owns all capacity (the v0 single-tenant case).
+    them but cannot exceed them. With no user_registry bound, each Store
+    user owns all capacity exposed by their resource map.
 
     Returns:
-        Dict tenant_id -> envelope dict. Also cached for
-        get_tenant_envelopes and validate_budget_book.
+        Dict user_id -> envelope dict. Also cached for get_user_envelopes
+        and validate_budget_book.
     """
     resources = get_resource_map()
     capacity = {_env_key(env): int(info.get("free", 0)) for env, info in resources.items()}
+    current_user_id = getattr(getattr(_CTX, "resource_map", None), "user_id", None)
+    if not isinstance(current_user_id, str) or not current_user_id:
+        raise ValueError("resource_map.user_id is required to build user envelopes")
 
-    if _CTX.tenant_registry is None:
-        envelopes = {
-            "default": {
-                "tenant_id": "default",
+    if _CTX.user_registry is None:
+        envelopes: dict[str, dict[str, Any]] = {
+            current_user_id: {
+                "user_id": current_user_id,
                 "priority_tier": "standard",
                 "fairness_weight": 1.0,
                 "guaranteed_floor": {},
@@ -755,43 +807,109 @@ def build_tenant_envelopes() -> dict[str, dict[str, Any]]:
             }
         }
     else:
-        tenants = _CTX.tenant_registry.list_tenants()
-        total_weight = sum(float(t.get("fairness_weight", 1.0)) for t in tenants) or 1.0
+        users = _CTX.user_registry.list_users()
+        total_weight = sum(float(u.get("fairness_weight", 1.0)) for u in users) or 1.0
         envelopes = {}
-        for t in tenants:
-            weight = float(t.get("fairness_weight", 1.0))
+        for u in users:
+            user_id = str(u["user_id"])
+            weight = float(u.get("fairness_weight", 1.0))
             share = {env: int(free * weight / total_weight) for env, free in capacity.items()}
-            envelopes[t["tenant_id"]] = {
-                "tenant_id": t["tenant_id"],
-                "priority_tier": t.get("priority_tier", "standard"),
+            envelopes[user_id] = {
+                "user_id": user_id,
+                "priority_tier": u.get("priority_tier", "standard"),
                 "fairness_weight": weight,
-                "guaranteed_floor": dict(t.get("guaranteed_floor", {})),
-                "burst_ceiling": dict(t.get("burst_ceiling", share)),
-                "hard_quota": dict(t.get("hard_quota", share)),
-                "allowed_envs": list(t.get("allowed_envs", capacity.keys())),
-                "denied_envs": list(t.get("denied_envs", [])),
-                "budget_usd_remaining": t.get("budget_usd_remaining"),
-                "can_use_spot": bool(t.get("can_use_spot", False)),
+                "guaranteed_floor": dict(u.get("guaranteed_floor", {})),
+                "burst_ceiling": dict(u.get("burst_ceiling", share)),
+                "hard_quota": dict(u.get("hard_quota", share)),
+                "allowed_envs": list(u.get("allowed_envs", capacity.keys())),
+                "denied_envs": list(u.get("denied_envs", [])),
+                "budget_usd_remaining": u.get("budget_usd_remaining"),
+                "can_use_spot": bool(u.get("can_use_spot", False)),
             }
 
-    _CTX.tenant_envelopes = envelopes
+    _CTX.user_envelopes = envelopes
     return envelopes
 
 
-def get_tenant_envelopes() -> dict[str, dict[str, Any]]:
-    """Return the cached tenant envelopes, building them if needed."""
-    if _CTX.tenant_envelopes is None:
-        return build_tenant_envelopes()
-    return _CTX.tenant_envelopes
+def get_user_envelopes() -> dict[str, dict[str, Any]]:
+    """Return the cached user envelopes, building them if needed."""
+    if _CTX.user_envelopes is None:
+        return build_user_envelopes()
+    return _CTX.user_envelopes
+
+
+def allocate_budget_book() -> dict[str, Any]:
+    """Build the default BudgetBook expected by ``validate_budget_book``.
+
+    v0 is single-pass and greedy: jobs are visited by deterministic priority,
+    and each job receives the currently free GPUs in user-allowed envs. This
+    is enough to unblock the required budget-first protocol without inventing a
+    scheduler inside the tool.
+    """
+    _require("slow_loop")
+    resources = get_resource_map()
+    envelopes = get_user_envelopes()
+    pending = list(get_pending_jobs())
+    active = list(get_active_jobs())
+    pending_ids = {j.get("job_id", j.get("id")) for j in pending}
+    active_ids = {j.get("job_id", j.get("id")) for j in active}
+    by_id = {j.get("job_id", j.get("id")): j for j in pending + active}
+    remaining = {_env_key(env): int(info.get("free", 0)) for env, info in resources.items()}
+    priorities = get_priority()
+    job_budgets: dict[str, dict[str, Any]] = {}
+
+    for entry in priorities:
+        job_id = entry.get("job_id")
+        if not job_id or job_id not in by_id:
+            continue
+        job = by_id[job_id]
+        user_id = job.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            raise ValueError(f"job {job_id!r} missing user_id")
+        envelope = envelopes.get(user_id, {})
+        allowed = {_env_key(env) for env in envelope.get("allowed_envs", remaining.keys())}
+        denied = {_env_key(env) for env in envelope.get("denied_envs", [])}
+        env_budget = {
+            env: free
+            for env, free in remaining.items()
+            if free > 0 and env in allowed and env not in denied
+        }
+        for env, free in env_budget.items():
+            remaining[env] -= free
+
+        is_pending = job_id in pending_ids or job.get("status") == "waiting"
+        is_active = job_id in active_ids or job.get("status") == "running"
+        job_budgets[job_id] = {
+            "slice_id": job_id,
+            "user_id": user_id,
+            "job_id": job_id,
+            "env_budget": env_budget,
+            "allowed_actions": ["place", "defer"] if is_pending else ["keep", "swap"],
+            "strategy_hint": "place"
+            if is_pending and env_budget
+            else "keep"
+            if is_active
+            else "defer",
+            "canary_cap": 1,
+            "priority_score": entry.get("priority_score", 0.0),
+            "notes": "default greedy budget from free capacity",
+        }
+
+    return {
+        "tick": int(getattr(_CTX.slow_loop.state, "tick", 0)),
+        "job_budgets": job_budgets,
+        "reserves": {},
+        "rationale": "default greedy budget from priority order and free capacity",
+    }
 
 
 def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
     """Deterministically validate a BudgetBook before specialists run.
 
     Checks, in order:
-        1. Every job budget references a known tenant envelope.
-        2. No job budget uses an env denied to its tenant.
-        3. Per-tenant env sums stay within the tenant hard quota.
+        1. Every job budget references a known user envelope.
+        2. No job budget uses an env denied to its user.
+        3. Per-user env sums stay within the user hard quota.
         4. Cluster-wide env sums stay within free capacity minus reserves.
         5. Implied active-job swaps stay within the swap budget B_t.
 
@@ -801,7 +919,7 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
     Args:
         budget_book: {"tick": int, "job_budgets": {job_id: slice},
             "reserves": {env_key: int}, "rationale": str}. Each slice is
-            {"tenant_id", "job_id", "env_budget": {env_key: gpus},
+            {"user_id", "job_id", "env_budget": {env_key: gpus},
             "allowed_actions", "strategy_hint", "canary_cap",
             "priority_score", "notes"}.
 
@@ -810,22 +928,22 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
     """
     _require("slow_loop")
     violations: list[str] = []
-    envelopes = get_tenant_envelopes()
+    envelopes = get_user_envelopes()
     resources = get_resource_map()
     capacity = {_env_key(env): int(info.get("free", 0)) for env, info in resources.items()}
     reserves = {_env_key(env): int(n) for env, n in (budget_book.get("reserves") or {}).items()}
 
     job_budgets = budget_book.get("job_budgets") or {}
     cluster_totals: dict[str, int] = {}
-    tenant_totals: dict[str, dict[str, int]] = {}
+    user_totals: dict[str, dict[str, int]] = {}
     implied_swaps = 0
     active_ids = {j.get("job_id", j.get("id")) for j in get_active_jobs()}
 
     for job_id, slice_ in job_budgets.items():
-        tenant_id = slice_.get("tenant_id", "default")
-        envelope = envelopes.get(tenant_id)
+        user_id = slice_.get("user_id")
+        envelope = envelopes.get(user_id)
         if envelope is None:
-            violations.append(f"job {job_id}: unknown tenant {tenant_id!r}")
+            violations.append(f"job {job_id}: unknown user {user_id!r}")
             continue
 
         denied = {_env_key(e) for e in envelope.get("denied_envs", [])}
@@ -836,10 +954,10 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
                 violations.append(f"job {job_id}: negative budget in {key}")
                 continue
             if key in denied:
-                violations.append(f"job {job_id}: env {key} denied for tenant {tenant_id}")
+                violations.append(f"job {job_id}: env {key} denied for user {user_id}")
             cluster_totals[key] = cluster_totals.get(key, 0) + gpus
-            tenant_totals.setdefault(tenant_id, {})
-            tenant_totals[tenant_id][key] = tenant_totals[tenant_id].get(key, 0) + gpus
+            user_totals.setdefault(user_id, {})
+            user_totals[user_id][key] = user_totals[user_id].get(key, 0) + gpus
 
         hint = str(slice_.get("strategy_hint", "")).lower()
         if job_id in active_ids and any(
@@ -847,12 +965,12 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
         ):
             implied_swaps += 1
 
-    for tenant_id, totals in tenant_totals.items():
-        quota = {_env_key(e): int(n) for e, n in envelopes[tenant_id].get("hard_quota", {}).items()}
+    for user_id, totals in user_totals.items():
+        quota = {_env_key(e): int(n) for e, n in envelopes[user_id].get("hard_quota", {}).items()}
         for env, used in totals.items():
             limit = quota.get(env)
             if limit is not None and used > limit:
-                violations.append(f"tenant {tenant_id}: {used} GPUs in {env} exceeds quota {limit}")
+                violations.append(f"user {user_id}: {used} GPUs in {env} exceeds quota {limit}")
 
     for env, used in cluster_totals.items():
         allocatable = capacity.get(env, 0) - reserves.get(env, 0)
@@ -869,10 +987,8 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_job_specialists(
-    jobs: list[str],
-    budget_book: dict[str, Any] | None = None,
     max_workers: int = 8,
-) -> list[dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     """Run bounded per-job specialists under a validated BudgetBook.
 
     Refuses to run when the supplied book is not the one most recently
@@ -882,12 +998,10 @@ def run_job_specialists(
     outside its slice or see the cluster plan.
 
     Args:
-        jobs: Job ids to process. Each must have a slice in the book.
-        budget_book: The validated book. Defaults to the cached one.
         max_workers: Parallel specialist calls.
 
     Returns:
-        List of JobSpecialistResult dicts ({"job_id", "type", "ladder",
+        Dict job_id -> JobSpecialistResult ({"job_id", "type", "ladder",
         "predicted_y", "predicted_sigma", "budget_utilization",
         "fitness", "marginal_value_of_more", "unused_capacity",
         "mechanism_ids", "new_mechanism_proposals", "reasoning"}).
@@ -897,18 +1011,17 @@ def run_job_specialists(
             runner is bound.
     """
     _require("specialist_runner")
-    book = budget_book if budget_book is not None else _CTX.validated_budget_book
-    if book is None or book is not _CTX.validated_budget_book:
+    book = _CTX.validated_budget_book
+    if book is None:
         raise RuntimeError(
             "run_job_specialists requires the BudgetBook most recently "
             "validated by validate_budget_book. Validate first."
         )
-    missing = [j for j in jobs if j not in (book.get("job_budgets") or {})]
-    if missing:
-        raise RuntimeError(f"jobs {missing} have no BudgetSlice in the book")
-    return _CTX.specialist_runner.run_many(
-        jobs=jobs, budget_book=book, max_workers=int(max_workers)
+    job_ids = list((book.get("job_budgets") or {}).keys())
+    results = _CTX.specialist_runner.run_many(
+        jobs=job_ids, budget_book=book, max_workers=int(max_workers)
     )
+    return {str(result.get("job_id")): result for result in results}
 
 
 # ----------------------------------------------------------------------
@@ -973,10 +1086,15 @@ def required_throughput_enumerator(job_features: dict[str, Any]) -> float:
     headroom = float(job_features.get("headroom_factor", 1.5))
     if job_type == "batch":
         budget = float(job_features.get("total_token_budget", 0.0))
-        deadline_s = float(job_features.get("deadline_hours", 24.0)) * 3600.0
+        deadline_s = (
+            float(job_features.get("deadline_hours", job_features.get("deadline_hrs", 24.0)))
+            * 3600.0
+        )
         return budget / max(1.0, deadline_s) * headroom
     rate = float(job_features.get("request_arrival_rate", 0.0))
-    out_avg = float(job_features.get("output_len_tokens_avg", 0.0))
+    out_avg = float(
+        job_features.get("output_len_tokens_avg", job_features.get("osl_token_avg", 0.0))
+    )
     return rate * out_avg * headroom
 
 
@@ -1644,17 +1762,24 @@ def predict_outcome(
     _require("candidate_graph", "dro", "surrogate")
     job_features = dict(config.get("job_features", {}))
     job_config = dict(config.get("job_config", config))
-    result = _CTX.surrogate.compose_prediction(
-        job_config=job_config,
-        job_features=job_features,
-        candidate_graph=_CTX.candidate_graph,
-        method=("AIC_DynoSim",),
+    cache_key = json.dumps(
+        {"job_config": job_config, "job_features": job_features}, sort_keys=True, default=str
     )
-    if isinstance(result, tuple) and len(result) == 2:
-        y_hat_raw, v_hat = result
+    if cache_key in _PREDICT_RAW_CACHE:
+        y_hat_raw, v_hat = _PREDICT_RAW_CACHE[cache_key]
     else:
-        y_hat_raw = getattr(result, "y_hat", {}) or {}
-        v_hat = getattr(result, "v_hat", {}) or {}
+        result = _CTX.surrogate.compose_prediction(
+            job_config=job_config,
+            job_features=job_features,
+            candidate_graph=_CTX.candidate_graph,
+            method=("AIC_DynoSim",),
+        )
+        if isinstance(result, tuple) and len(result) == 2:
+            y_hat_raw, v_hat = result
+        else:
+            y_hat_raw = getattr(result, "y_hat", {}) or {}
+            v_hat = getattr(result, "v_hat", {}) or {}
+        _PREDICT_RAW_CACHE[cache_key] = (dict(y_hat_raw or {}), dict(v_hat or {}))
     y_hat_raw = y_hat_raw or {}
 
     if calibrate and y_hat_raw:
