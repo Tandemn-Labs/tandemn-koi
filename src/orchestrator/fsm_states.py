@@ -401,12 +401,13 @@ class TickRunner:
                 )
 
             j_realized = self._j_realized(y_observed_mean, w_t_snapshot, z_star_snapshot)
+            deploy_timestamp = getattr(rank_telem, "deploy_timestamp_utc", None)
+            if deploy_timestamp is None:
+                deploy_timestamp = time.time()
             row = EvidenceRow(
                 row_id=f"{ctx.tick}_{job_id}_{rank_id}",
                 tick=ctx.tick,
-                deploy_timestamp_utc=float(
-                    getattr(rank_telem, "deploy_timestamp_utc", time.time())
-                ),
+                deploy_timestamp_utc=float(deploy_timestamp),
                 job_id=job_id,
                 rank_id=rank_id,
                 env_label=env_label,
