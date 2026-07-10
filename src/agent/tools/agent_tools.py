@@ -787,7 +787,9 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
     if model_id and hasattr(_CTX.resource_map, "model_catalog"):
         model_catalog = dict(_CTX.resource_map.model_catalog(str(model_id)) or {})
     subset_x = list(features.get("subset_x", features.keys()))
-    mechanisms = get_scope({"subset_x": subset_x, "subset_v": []})
+    mechanisms = get_scope(
+        {"subset_x": subset_x, "subset_v": [], "workload_type": features.get("type")}
+    )
 
     return {
         "job_id": job_id,
@@ -1187,7 +1189,7 @@ def size_ladder(
                         below saturation so queue wait ~ rho/(1-rho) and thus
                         p99 TTFT stay bounded; batch uses 1.0)
         per rank      : needed = ceil(remaining / per_chain_eff), capped by
-                        floor(free_gpus / reserved_capacity_per_replica);
+                        the selected pool's free capacity;
                         remaining -= achieved
         achieved_tps  = SUM over ranks of n_replicas * per_chain_eff
 
@@ -1237,6 +1239,7 @@ def size_ladder(
     marginal: dict[str, int] = {}
     achieved_total = 0.0
     remaining = target
+    remaining_by_pool: dict[tuple[str, str | None], int] = {}
     resources = (
         _CTX.resource_map.resources_summary()
         if hasattr(_CTX.resource_map, "resources_summary")
@@ -1253,9 +1256,9 @@ def size_ladder(
         env_key = _env_key(rank.env)
         if resources is not None:
             info = resources.get(env_key)
-            free = int(info.get("free", 0)) if info and info.get("gpu_type") == gpu_type else 0
+            env_free = int(info.get("free", 0)) if info and info.get("gpu_type") == gpu_type else 0
         else:
-            free = _CTX.resource_map.get_avail_capacity(rank.env, gpu_type) if gpu_type else 0
+            env_free = _CTX.resource_map.get_avail_capacity(rank.env, gpu_type) if gpu_type else 0
         allocation_error = None
         try:
             allocation = _rank_allocation_summary(rank, resources)
@@ -1269,6 +1272,10 @@ def size_ladder(
                 "price_per_unit_hour": None,
             }
             capacity_per_replica = max(1, gpus_per_chain)
+        pool_key = (env_key, allocation["instance_type"])
+        free = remaining_by_pool.setdefault(
+            pool_key, int(allocation.get("free_capacity_gpus", env_free))
+        )
         max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
 
         payload = _rank_prediction_payload(rank, job_features)
@@ -1317,6 +1324,7 @@ def size_ladder(
             no_prediction = True
 
         rank.n_replicas = n_replicas
+        remaining_by_pool[pool_key] = max(0, free - n_replicas * capacity_per_replica)
         # "ranks" is the DEPLOYABLE ladder: a 0-replica rank (excluded for SLO,
         # or capacity-starved) is dropped here and shows only in per_rank.
         if n_replicas >= 1:
@@ -1346,6 +1354,7 @@ def size_ladder(
                 if not allocation_error
                 else None,
                 "capacity_gpus_per_replica": capacity_per_replica,
+                "free_capacity_gpus": free,
                 "price_per_unit_hour": allocation["price_per_unit_hour"]
                 if not allocation_error
                 else None,
@@ -1538,10 +1547,12 @@ def get_scope(job_features: dict[str, Any]) -> list[dict[str, Any]]:
     _require("mechanism_registry", "confidence_service")
     subset_x = job_features.get("subset_x", []) if isinstance(job_features, dict) else []
     subset_v = job_features.get("subset_v", []) if isinstance(job_features, dict) else []
+    workload_type = job_features.get("workload_type") if isinstance(job_features, dict) else None
     mechs = _CTX.mechanism_registry.filter_by_scope(subset_x, subset_v)
     return [
         {
             "mechanism_id": m.mechanism_id,
+            "name": m.name,
             "edge_ids": list(m.edge_ids),
             "scope": dict(m.scope),
             "narrative": m.narrative,
@@ -1550,6 +1561,7 @@ def get_scope(job_features: dict[str, Any]) -> list[dict[str, Any]]:
         }
         for m in mechs
         if m.status == "active"
+        and (not workload_type or m.scope.get("workload_type") in (None, "any", workload_type))
     ]
 
 

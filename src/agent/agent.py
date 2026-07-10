@@ -227,6 +227,8 @@ class SpecialistRunner:
             "7. If overprovisioned, give unused capacity by env.\n\n"
             "Do not exceed budget. If you want more, report it as fitness, "
             "not as allocated ladder demand.\n\n"
+            "Mechanism IDs are opaque Store IDs: use applicable_mechanisms only. "
+            "If none fits, submit new_mechanism_proposals without inventing an ID.\n\n"
             "Your output is a PROPOSAL to the root cluster planner, not a "
             "decision. The root may accept, modify, or discard it during "
             "cluster-level reconciliation. Do not reason about other jobs "
@@ -905,6 +907,15 @@ class KoiAgentHarness:
                 rank.mechanism_id = action.mechanism_id
             if rank.mechanism_id is None:
                 raise PlanMaterializationError(f"job {jid} rank {i}: mechanism_id is required")
+            registry = agent_tools._CTX.mechanism_registry
+            if registry is None:
+                raise PlanMaterializationError("mechanism registry is unavailable")
+            try:
+                registry.get_mechanism(rank.mechanism_id)
+            except KeyError:
+                raise PlanMaterializationError(
+                    f"job {jid} rank {i}: unknown mechanism_id {rank.mechanism_id!r}"
+                ) from None
 
         if book is not None and not action.budget_ref:
             raise PlanMaterializationError(
@@ -1116,7 +1127,8 @@ class KoiAgentHarness:
             "plan unexamined. Do NOT trust specialist predicted_sigma - "
             "rescore with compute_sigma. Reallocate from fitness signals when "
             "the sigma gain is positive, rerun only affected specialists, then "
-            "commit.\n\n"
+            "commit. Mechanism IDs are opaque Store IDs: never author one. Use "
+            "an applicable ID, or call set_new_mechanisms and use its returned ID.\n\n"
             # ---------- SHARPEN BEFORE YOU SCORE ----------
             "SHARPEN EACH JOB BEFORE YOU SCORE IT. predict_outcome returns "
             "predictions already CALIBRATED against the evidence database "
