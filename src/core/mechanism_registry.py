@@ -129,9 +129,9 @@ class MechanismRegistry:
         return True
 
     def filter_by_scope(self, subset_x: list[str], subset_v: list[str]) -> list[Mechanism]:
-        """Return mechanisms whose scope text matches enough requested terms.
+        """Return mechanisms sufficiently covered by available X/V variables.
 
-        v0 uses a simple text-overlap heuristic over mechanism.scope. It is
+        v0 uses a simple overlap heuristic over mechanism.scope. It is
         intentionally broad so S2 can fan out evidence to plausible
         mechanisms before stricter scopeability validation exists.
         """
@@ -147,11 +147,9 @@ class MechanismRegistry:
         subset_v: list[str],
         mechanism: Mechanism,
     ) -> float:
-        """Return percent of requested X/V terms found in mechanism.scope text."""
-        requested_terms = set(subset_x) | set(subset_v)
-        if not requested_terms:
+        """Return percent of the mechanism's X/V scope currently available."""
+        available = set(subset_x) | set(subset_v)
+        scope = set(mechanism.scope.get("x", [])) | set(mechanism.scope.get("v", []))
+        if not scope:
             return 0.0
-
-        scope_text = json.dumps(mechanism.scope, sort_keys=True)
-        matched_terms = sum(term in scope_text for term in requested_terms)
-        return 100.0 * matched_terms / len(requested_terms)
+        return 100.0 * len(available & scope) / len(scope)
