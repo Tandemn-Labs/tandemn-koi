@@ -202,6 +202,8 @@ class CoreSmokeTests(unittest.TestCase):
             registry.percentage_scope_match(["shared_prefix_length_avg"], [], prefix), 0
         )
         self.assertIn(prefix, registry.filter_by_scope(["shared_prefix_length_avg"], []))
+        broad_context = ["shared_prefix_length_avg", *(f"unrelated_{i}" for i in range(30))]
+        self.assertIn(prefix, registry.filter_by_scope(broad_context, []))
         self.assertTrue(registry.archive_mechanism(pd_id, "demo archive"))
         self.assertIn(pd_id, registry.mechanisms_by_status["archived"])
 

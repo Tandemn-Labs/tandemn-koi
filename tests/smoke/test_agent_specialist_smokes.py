@@ -1,7 +1,8 @@
 import unittest
 
-from src.agent.agent import SpecialistRunner
-from src.core.models import RankSpec
+from src.agent.agent import KoiAgentHarness, PlanMaterializationError, SpecialistRunner
+from src.agent.tools import agent_tools
+from src.core.models import PlanAction, RankSpec
 
 ENV = "reserved|aws|us-east-1|us-east-1b|L40S"
 
@@ -46,6 +47,20 @@ def _valid_place():
 
 
 class SpecialistSchemaSmokeTests(unittest.TestCase):
+    def test_unknown_mechanism_fails_before_scoring(self):
+        class Registry:
+            def get_mechanism(self, mechanism_id):
+                raise KeyError(mechanism_id)
+
+        saved = agent_tools._CTX.mechanism_registry
+        agent_tools._CTX.mechanism_registry = Registry()
+        action = PlanAction.from_dict(_valid_place())
+        try:
+            with self.assertRaisesRegex(PlanMaterializationError, "unknown mechanism_id"):
+                KoiAgentHarness.__new__(KoiAgentHarness)._validate_ladder(action, None)
+        finally:
+            agent_tools._CTX.mechanism_registry = saved
+
     def test_rank_spec_strips_engine_knobs_from_both_forms(self):
         forbidden = {
             "max_num_seq": 1,

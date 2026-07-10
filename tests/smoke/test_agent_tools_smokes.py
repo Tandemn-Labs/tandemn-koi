@@ -119,6 +119,137 @@ class _RecordingSurrogate:
 
 
 class AgentToolsSmokeTests(unittest.TestCase):
+    def test_size_ladder_caps_each_instance_pool(self):
+        env = "reserved|aws|us-east-1|us-east-1b|L40S"
+
+        class MixedResourceMap:
+            def resources_summary(self):
+                return {
+                    env: {
+                        "free": 16,
+                        "gpu_type": "L40S",
+                        "pools": [
+                            {
+                                "instance_type": "g6e.xlarge",
+                                "gpus_per_instance": 1,
+                                "free_instances": 4,
+                                "free": 4,
+                            },
+                            {
+                                "instance_type": "g6e.12xlarge",
+                                "gpus_per_instance": 4,
+                                "free_instances": 3,
+                                "free": 12,
+                            },
+                        ],
+                    }
+                }
+
+            def rank_allocation_summary(self, rank, resources=None):
+                info = (resources or self.resources_summary())[env]
+                pool = next(
+                    pool
+                    for pool in info["pools"]
+                    if pool["instance_type"] == rank.config["instance_type"]
+                )
+                return {
+                    "allocation_kind": "instance",
+                    "instance_type": pool["instance_type"],
+                    "gpus_per_unit": pool["gpus_per_instance"],
+                    "price_per_unit_hour": None,
+                    "capacity_per_replica": pool["gpus_per_instance"],
+                    "free_capacity_gpus": pool["free"],
+                    "engine_gpus": rank.gpus_per_chain(),
+                }
+
+        saved_context = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("resource_map", "surrogate", "candidate_graph", "dro")
+        }
+        saved_payload = agent_tools._rank_prediction_payload
+        saved_predict = agent_tools._predict_outcome_core
+        try:
+            agent_tools.bind_tools(
+                resource_map=MixedResourceMap(),
+                surrogate=object(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            agent_tools._rank_prediction_payload = lambda rank, features: {
+                "job_config": {},
+                "job_features": {},
+            }
+            agent_tools._predict_outcome_core = lambda config, features: {
+                "y_hat": {
+                    "p99_ttft_ms": 10.0,
+                    "p99_tpot_ms": 1.0,
+                    "throughput_token_per_sec": 1000.0,
+                }
+            }
+            features = {
+                "type": "online",
+                "target_p99_ttft_ms": 100.0,
+                "target_p99_tpot_ms": 10.0,
+            }
+
+            result = agent_tools.size_ladder(
+                [
+                    {
+                        "role": "aggregate",
+                        "env": env.split("|"),
+                        "config": {
+                            "instance_type": "g6e.xlarge",
+                            "gpu_count": 1,
+                            "tp": 1,
+                            "pp": 1,
+                        },
+                    },
+                    {
+                        "role": "aggregate",
+                        "env": env.split("|"),
+                        "config": {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_count": 2,
+                            "tp": 2,
+                            "pp": 1,
+                        },
+                    },
+                ],
+                features,
+                target_tps=10_000,
+            )
+
+            self.assertEqual(
+                [rank["max_replicas_by_capacity"] for rank in result["per_rank"]], [4, 3]
+            )
+            self.assertEqual([rank["n_replicas"] for rank in result["ranks"]], [4, 3])
+
+            shared = agent_tools.size_ladder(
+                [
+                    {
+                        "role": "aggregate",
+                        "env": env.split("|"),
+                        "config": {
+                            "instance_type": "g6e.12xlarge",
+                            "gpu_count": 2,
+                            "tp": 2,
+                            "pp": 1,
+                        },
+                    }
+                    for _ in range(2)
+                ],
+                features,
+                target_tps=10_000,
+            )
+            self.assertEqual(
+                [rank["max_replicas_by_capacity"] for rank in shared["per_rank"]], [3, 0]
+            )
+        finally:
+            agent_tools._rank_prediction_payload = saved_payload
+            agent_tools._predict_outcome_core = saved_predict
+            for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
     def test_size_ladder_threads_rank_env_and_job_model_to_surrogate(self):
         saved = {
             name: getattr(agent_tools._CTX, name)
