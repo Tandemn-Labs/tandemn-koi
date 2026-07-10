@@ -615,12 +615,31 @@ class TickRunner:
         x_fields = getattr(self.candidate_graph, "x", None)
         if not x_fields:
             raise ValueError("candidate graph X fields are required for deployment X")
+        if not self._has_active_chains(ctx):
+            return build_deployment_x_index(
+                ctx.cluster_snapshot,
+                hardware_catalog={},
+                model_catalogs={},
+                x_fields=x_fields,
+            )
         return build_deployment_x_index(
             ctx.cluster_snapshot,
             hardware_catalog=self._hardware_catalog(),
             model_catalogs=self._model_catalogs(ctx),
             x_fields=x_fields,
         )
+
+    @staticmethod
+    def _has_active_chains(ctx: TickContext) -> bool:
+        snapshot = ctx.cluster_snapshot
+        if snapshot is None:
+            return False
+        jobs = (
+            snapshot.active_jobs_summary()
+            if hasattr(snapshot, "active_jobs_summary")
+            else getattr(snapshot, "active_jobs", [])
+        )
+        return any(job.get("active_chains") for job in jobs or [])
 
     def _hardware_catalog(self) -> dict[str, Any]:
         getter = getattr(self.resource_map, "hardware_catalog", None)

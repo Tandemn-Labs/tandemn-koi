@@ -1,6 +1,7 @@
 import unittest
 
 from src.agent.agent import SpecialistRunner
+from src.core.models import RankSpec
 
 ENV = "reserved|aws|us-east-1|us-east-1b|L40S"
 
@@ -45,6 +46,18 @@ def _valid_place():
 
 
 class SpecialistSchemaSmokeTests(unittest.TestCase):
+    def test_rank_spec_strips_engine_knobs_from_both_forms(self):
+        forbidden = {
+            "max_num_seq": 1,
+            "max_num_batched_tokens": 2,
+            "block_size": 3,
+        }
+        explicit = RankSpec.from_dict({"role": "aggregate", "config": {"tp": 1, **forbidden}})
+        shorthand = RankSpec.from_dict({"aggregate": {"tp": 1, **forbidden}})
+
+        self.assertEqual(explicit.config, {"tp": 1})
+        self.assertEqual(shorthand.config, {"tp": 1})
+
     def test_valid_canonical_place_passes(self):
         self.assertEqual(SpecialistRunner._validate(_valid_place(), "job_1", _slice()), [])
 

@@ -107,6 +107,38 @@ _NONNEGATIVE_Y = frozenset(
     }
 )
 
+AGENT_TUNABLE_X = frozenset(
+    {
+        "model_id",
+        "instance_type",
+        "gpu_count",
+        "tp",
+        "pp",
+        "sp",
+        "ep",
+        "cp",
+        "engine_name",
+        "engine_version",
+        "weight_dtype",
+        "kvcache_dtype",
+        "weight_quantization_bits",
+        "prefix_cache_enabled",
+        "chunked_prefill_enable",
+        "router_policy",
+        "scheduling_policy",
+        "preemption_policy",
+        "gpu_mem_util",
+        "kv_transfer_method",
+    }
+)
+_ENGINE_AUTOTUNED_X = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
+
+
+def _sanitize_agent_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Remove engine-owned values from agent-controlled input."""
+    return {key: value for key, value in (config or {}).items() if key not in _ENGINE_AUTOTUNED_X}
+
+
 log = logging.getLogger("koi.agent_tools")
 _PREDICT_RAW_CACHE: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
 
@@ -354,7 +386,7 @@ def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
 
 def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None = None) -> dict:
     """Build the surrogate payload for one rank without mutating the rank."""
-    features = dict(job_features or {})
+    features = _sanitize_agent_config(dict(job_features or {}))
     env = None
     if rank.env is not None:
         env = list(rank.env) if isinstance(rank.env, (list, tuple)) else str(rank.env).split("|")
@@ -371,7 +403,7 @@ def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None
     if rank.config.get("instance_type") is not None:
         features["instance_type"] = rank.config["instance_type"]
 
-    config = dict(rank.config)
+    config = _sanitize_agent_config(dict(rank.config))
     if "model_id" not in config and features.get("model_id") is not None:
         config["model_id"] = features["model_id"]
     resource_map = getattr(_CTX, "resource_map", None)
@@ -455,8 +487,10 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
     samples: list[tuple[int, dict]] = []
     for rank in action.ladder or []:
         try:
-            # call the surrogate here
-            y = predict_outcome(_rank_prediction_payload(rank, job_features)).get("y_hat", {})
+            payload = _rank_prediction_payload(rank, job_features)
+            y = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
+                "y_hat", {}
+            )
         except Exception:
             log.exception("rank y_hat failed for job %s", action.job_id)
             y = {}
@@ -1182,6 +1216,7 @@ def size_ladder(
     """
     _require("resource_map", "surrogate", "candidate_graph", "dro")
 
+    job_features = _sanitize_agent_config(dict(job_features or {}))
     regime = str(job_features.get("type", "online")).lower()
     is_online = regime != "batch"
     target = (
@@ -1236,7 +1271,10 @@ def size_ladder(
             capacity_per_replica = max(1, gpus_per_chain)
         max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
 
-        y_hat = predict_outcome(_rank_prediction_payload(rank, job_features)).get("y_hat", {})
+        payload = _rank_prediction_payload(rank, job_features)
+        y_hat = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
+            "y_hat", {}
+        )
         per_chain_raw = _y_value(y_hat, "throughput_token_per_sec")
         per_chain_eff = per_chain_raw * util
 
@@ -1475,7 +1513,11 @@ def get_influencing_knobs(
                 )
                 rec["mechanisms"].update(edge_to_mechs.get(xv.edge_id, ()))
 
-    ranked = sorted(knobs.values(), key=lambda r: r["score"], reverse=True)[: int(top_k)]
+    ranked = sorted(
+        (record for record in knobs.values() if record["knob"] in AGENT_TUNABLE_X),
+        key=lambda record: record["score"],
+        reverse=True,
+    )[: int(top_k)]
     for rec in ranked:
         rec["paths"].sort(key=lambda p: p["path_c"], reverse=True)
         rec["paths"] = rec["paths"][:5]
@@ -1759,9 +1801,18 @@ def predict_outcome(
         {"y_hat": calibrated dict, "y_hat_raw": surrogate dict,
          "calibration_offsets": dict, "v_hat": dict, "dro_band": dict}.
     """
+    job_features = _sanitize_agent_config(dict(config.get("job_features", {})))
+    job_config = _sanitize_agent_config(dict(config.get("job_config", config)))
+    return _predict_outcome_core(job_config, job_features, calibrate=calibrate)
+
+
+def _predict_outcome_core(
+    job_config: dict[str, Any],
+    job_features: dict[str, Any],
+    calibrate: bool = True,
+) -> dict[str, Any]:
+    """Run prediction with already trusted or sanitized inputs."""
     _require("candidate_graph", "dro", "surrogate")
-    job_features = dict(config.get("job_features", {}))
-    job_config = dict(config.get("job_config", config))
     cache_key = json.dumps(
         {"job_config": job_config, "job_features": job_features}, sort_keys=True, default=str
     )
@@ -1806,7 +1857,10 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
             continue
         job_features = _job_features_for(snapshot, action.job_id)
         for rank in action.ladder:
-            pred = predict_outcome(_rank_prediction_payload(rank, job_features), calibrate=False)
+            payload = _rank_prediction_payload(rank, job_features)
+            pred = _predict_outcome_core(
+                payload["job_config"], payload["job_features"], calibrate=False
+            )
             rank.predicted_y = dict(pred.get("y_hat_raw") or pred.get("y_hat") or {})
             rank.predicted_v = dict(pred.get("v_hat") or {})
     return typed
@@ -1919,13 +1973,14 @@ def optimize_config(
          "trace": [{"knob","chosen","j"}...]}.
     """
     _require("surrogate", "tchebycheff_module", "slow_loop")
-    features = dict(
-        job_features if job_features is not None else base_config.get("job_features", {})
+    features = _sanitize_agent_config(
+        dict(job_features if job_features is not None else base_config.get("job_features", {}))
     )
     weights = objective_weights if objective_weights is not None else _CTX.slow_loop.get_sss_wt()
     reference = _CTX.slow_loop.get_sss_z_star_t()
-    core = dict(base_config.get("job_config", base_config))
+    core = _sanitize_agent_config(dict(base_config.get("job_config", base_config)))
     core.pop("job_features", None)
+    candidates = {key: values for key, values in candidates.items() if key in AGENT_TUNABLE_X}
 
     def _score(cfg: dict[str, Any]):
         pred = predict_outcome({"job_config": cfg, "job_features": features})
@@ -2344,7 +2399,8 @@ def simulate_outcome_trajectory(plan) -> dict[str, Any]:
         job_features = _job_features_for(snapshot, action.job_id)
         per_rank = []
         for rank in action.ladder:
-            pred = predict_outcome(_rank_prediction_payload(rank, job_features))
+            payload = _rank_prediction_payload(rank, job_features)
+            pred = _predict_outcome_core(payload["job_config"], payload["job_features"])
             per_rank.append(
                 {
                     "env": list(rank.env) if rank.env else None,
@@ -2396,7 +2452,7 @@ def _materialize_ladder(ladder_ranks):
         rank.mechanism_id = r.get("mechanism_id")
         if rank.mechanism_id is None:
             raise ValueError("ladder rank requires mechanism_id")
-        rank.config = r.get("config", {})
+        rank.config = _sanitize_agent_config(r.get("config", {}))
         rank.n_replicas = int(r.get("n_replicas", 1))
         rank.is_canary = bool(r.get("is_canary", False))
         env = r.get("env")

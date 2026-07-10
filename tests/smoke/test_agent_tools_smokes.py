@@ -137,7 +137,13 @@ class AgentToolsSmokeTests(unittest.TestCase):
                     {
                         "role": "aggregate",
                         "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
-                        "config": {"instance_type": "p5.48xlarge", "tp": 1, "pp": 1},
+                        "config": {
+                            "instance_type": "p5.48xlarge",
+                            "tp": 1,
+                            "pp": 1,
+                            "max_num_seq": 1,
+                            "block_size": 1,
+                        },
                     }
                 ],
                 job_features={
@@ -148,6 +154,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                     "headroom_factor": 1.0,
                     "target_p99_ttft_ms": 100.0,
                     "target_p99_tpot_ms": 10.0,
+                    "max_num_batched_tokens": 1,
                 },
             )
 
@@ -172,6 +179,58 @@ class AgentToolsSmokeTests(unittest.TestCase):
         finally:
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
+
+    def test_predict_outcome_strips_engine_knobs_from_agent_inputs(self):
+        saved = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("surrogate", "candidate_graph", "dro")
+        }
+        surrogate = _RecordingSurrogate()
+        try:
+            agent_tools.bind_tools(surrogate=surrogate, candidate_graph=object(), dro=_DRO())
+            agent_tools.predict_outcome(
+                {
+                    "job_config": {"model_id": "model", "max_num_seq": 1, "block_size": 1},
+                    "job_features": {"max_num_batched_tokens": 1},
+                }
+            )
+
+            job_config, job_features = surrogate.calls[0]
+            self.assertEqual(job_config, {"model_id": "model"})
+            self.assertEqual(job_features, {})
+        finally:
+            for name, value in saved.items():
+                setattr(agent_tools._CTX, name, value)
+
+    def test_eig_scope_ignores_engine_knobs(self):
+        class Registry:
+            def __init__(self):
+                self.scope = None
+
+            def get_mechanism(self, mechanism_id):
+                return type("Mechanism", (), {"mechanism_id": mechanism_id})()
+
+            def filter_by_scope(self, subset_x, subset_v):
+                self.scope = (subset_x, subset_v)
+                return []
+
+        saved = agent_tools._CTX.mechanism_registry
+        registry = Registry()
+        try:
+            agent_tools.bind_tools(mechanism_registry=registry)
+            ladder = agent_tools._materialize_ladder(
+                [
+                    {
+                        "mechanism_id": "M_test",
+                        "config": {"tp": 1, "max_num_seq": 1, "block_size": 1},
+                    }
+                ]
+            )
+
+            self.assertEqual(ladder.ranks[0].config, {"tp": 1})
+            self.assertEqual(registry.scope, (["tp"], []))
+        finally:
+            agent_tools._CTX.mechanism_registry = saved
 
     def test_get_job_brief_includes_model_catalog(self):
         saved = {

@@ -202,6 +202,52 @@ def _catalog_x_assertions():
 
 
 class DeploymentXSmokeTests(unittest.TestCase):
+    def test_idle_index_needs_no_catalogs(self):
+        snapshot = ClusterResourceSnapshot(
+            tick=1,
+            resources={},
+            active_jobs=[],
+            pending_jobs=[],
+        )
+
+        index = build_deployment_x_index(
+            snapshot,
+            hardware_catalog={},
+            model_catalogs={},
+            x_fields=["model_id"],
+        )
+
+        self.assertEqual(index.by_rank, {})
+
+    def test_idle_s1_does_not_fetch_catalogs(self):
+        snapshot = ClusterResourceSnapshot(
+            tick=1,
+            resources={},
+            active_jobs=[],
+            pending_jobs=[],
+        )
+        runner = TickRunner(
+            evidence_store=object(),
+            telemetry=_Telemetry(),
+            cusum=object(),
+            icp=object(),
+            quadrant_validator=object(),
+            confidence_service=SimpleNamespace(candidate_graph=_candidate_graph()),
+            slow_loop=object(),
+            dro=object(),
+            mechanism_registry=object(),
+            resource_map=_IdleResourceMap(),
+            agent=object(),
+            plan_validator=object(),
+            executor=object(),
+            candidate_graph=_candidate_graph(),
+        )
+        ctx = TickContext(tick=1, cluster_snapshot=snapshot)
+
+        runner.S1(ctx)
+
+        self.assertEqual(ctx.deployment_x.by_rank, {})
+
     def test_builds_rank_x_from_snapshot_and_catalog(self):
         index = build_deployment_x_index(
             _snapshot(),
@@ -358,6 +404,14 @@ class _ResourceMap:
 
     def model_catalog(self, model_id):
         return _model_catalogs()[model_id]
+
+
+class _IdleResourceMap:
+    def hardware_catalog(self):
+        raise AssertionError("idle S1 must not fetch hardware catalog")
+
+    def model_catalog(self, model_id):
+        raise AssertionError("idle S1 must not fetch model catalog")
 
 
 if __name__ == "__main__":
