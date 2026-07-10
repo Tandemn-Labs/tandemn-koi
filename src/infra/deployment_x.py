@@ -102,16 +102,20 @@ def build_deployment_x_index(
     x_fields: list[str] | tuple[str, ...],
 ) -> DeploymentXIndex:
     """Return the rank-level X index consumed by S2 evidence creation."""
-    if not hardware_catalog:
-        raise ValueError("hardware catalog is required to build deployment X")
     if not x_fields:
         raise ValueError("candidate graph X fields are required")
+
+    active_jobs = list(snapshot.active_jobs_summary())
+    if not any(job.get("active_chains") for job in active_jobs):
+        return DeploymentXIndex({})
+    if not hardware_catalog:
+        raise ValueError("hardware catalog is required to build deployment X")
 
     resources = dict(snapshot.resources_summary())
     catalog = _catalog_by_instance(hardware_catalog)
     by_rank: dict[RankKey, RankDeployment] = {}
 
-    for job in snapshot.active_jobs_summary():
+    for job in active_jobs:
         job_id = str(job["job_id"])
         groups = _groups_by_rank(job["active_chains"])
         total_replicas = sum(len(chains) for chains in groups.values())

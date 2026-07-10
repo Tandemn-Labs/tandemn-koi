@@ -239,6 +239,7 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertGreater(simulator_controls["request_count"], 0)
         self.assertEqual(surrogate_input["method"], "AIC_DynoSim")
         self.assertEqual(surrogate_input["engine_args"]["aic_system"], "h200_sxm")
+        self.assertEqual(surrogate_input["engine_args"]["aic_backend_version"], "0.14.0")
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             y_hat_direct, v_hat_direct = predictor.run_aic_dynosim(surrogate_input)

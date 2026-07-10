@@ -313,7 +313,7 @@ class SurrogatePrediction:
             )
             if request_arrival_rate is None:
                 raise ValueError("Online simulation needs positive request_arrival_rate")
-            sim_duration_s = 60  # TODO - hardcoded for now, need discussion
+            sim_duration_s = 5  # TODO - hardcoded for now, need discussion
 
             return {
                 "request_count": max(1, int(request_arrival_rate * sim_duration_s)),
@@ -356,7 +356,8 @@ class SurrogatePrediction:
             "max_num_seqs": direct_x_values.get("max_num_seq"),
             "max_num_batched_tokens": direct_x_values.get("max_num_batched_tokens"),
             "aic_backend": direct_x_values.get("engine_name", "vllm"),
-            "aic_backend_version": direct_x_values.get("engine_version"),
+            # AIC's bundled performance database currently supports this version.
+            "aic_backend_version": "0.14.0",
             "aic_system": self.map_gpu_to_aic_system(gpu_type),
             "aic_model_path": model_id,
             "aic_tp_size": direct_x_values.get("tp", 1),

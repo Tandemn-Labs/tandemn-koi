@@ -180,6 +180,16 @@ REQUIRED_JOB_STATE = {
 # KNOWN_ROLES = frozenset({"prefill", "decode", "aggregate"})  # full PD set
 KNOWN_ROLES = frozenset({"aggregate"})
 _V0_DISABLED_ROLES = frozenset({"prefill", "decode"})  # rejected until PD lands
+_ENGINE_AUTOTUNED_CONFIG_KEYS = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
+
+
+def _strip_engine_knobs(config) -> dict:
+    """Remove engine-owned values from an agent-supplied rank config."""
+    return {
+        key: value
+        for key, value in dict(config or {}).items()
+        if key not in _ENGINE_AUTOTUNED_CONFIG_KEYS
+    }
 
 
 def _as_env_tuple(env) -> tuple | None:
@@ -268,7 +278,7 @@ class RankSpec:
                 return cls(
                     role=only_key,
                     env=_as_env_tuple(env),
-                    config=inner,
+                    config=_strip_engine_knobs(inner),
                     n_replicas=n_rep,
                     rank_id=rank_id,
                     mechanism_id=mech,
@@ -286,7 +296,7 @@ class RankSpec:
         return cls(
             role=role,
             env=_as_env_tuple(raw.get("env")),
-            config=dict(raw.get("config", {})),
+            config=_strip_engine_knobs(raw.get("config", {})),
             n_replicas=int(n_rep_raw or 1),
             rank_id=raw.get("rank_id"),
             mechanism_id=raw.get("mechanism_id"),
