@@ -551,7 +551,7 @@ class KoiAgentHarness:
         if candidates:
             candidates.sort(key=lambda pair: pair[0], reverse=True)
             self.trace.add("kp_winner_selected", score=candidates[0][0])
-            return candidates[0][1]
+            return agent_tools.stamp_plan_predictions(candidates[0][1], cluster_snapshot)
 
         self.trace.add("safe_fallback_used", tick=tick)
         return self._fallback_plan(cluster_snapshot)
@@ -1016,8 +1016,8 @@ class KoiAgentHarness:
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
             "   'rank_id': 'rank_0',      # omit rank_id; Koi auto-fills rank_0, rank_1, ...\n"
             "   'env': [market, cloud, region, zone, gpu_type],   # REQUIRED - launch target + ICP key\n"
-            "   'config': {instance_type, tp, pp, dp, ep, gpu_count, engine_name, ...},\n"
-            "   'n_replicas': int,\n"
+            "   'config': {instance_type, gpu_count, tp, pp, engine_name, ...},\n"
+            "   'n_replicas': int,       # rank DP / max endpoint count; do NOT put dp in config\n"
             "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
             "v0 is AGGREGATE-ONLY per rank: every rank is one full "
             "prefill+decode engine (role 'aggregate'); do NOT split prefill/"
@@ -1040,10 +1040,13 @@ class KoiAgentHarness:
             "Every ladder rank MUST carry a unique rank_id (or let Koi auto-fill one), "
             "MUST carry a 5-element env, and MUST resolve a "
             "mechanism_id, either on the rank or inherited from the action. "
-            "For cloud instance pools, config.instance_type is required when "
-            "the env has multiple pools. gpu_count is engine GPU demand, not "
+            "config.instance_type, gpu_count, tp, and pp are required; sp/ep/cp "
+            "default to 1 when omitted. For cloud instance pools, "
+            "config.instance_type is required when the env has multiple pools. "
+            "gpu_count is engine GPU demand, not "
             "reserved capacity; Koi reserves and charges one full instance per "
-            "n_replicas. Discrete on-prem GPU pools may remain GPU-granular. "
+            "n_replicas. n_replicas is the rank's DP/max endpoint count; do not "
+            "set dp separately. Discrete on-prem GPU pools may remain GPU-granular. "
             "Jobs you omit are auto-kept (running) or auto-deferred (waiting), "
             "so list only the jobs you actually decide.\n"
             "Do NOT guess n_replicas. Call size_ladder(ranks, job_features): "

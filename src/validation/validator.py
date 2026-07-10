@@ -12,12 +12,12 @@ mechanism_registry, ...) are injected once and any check whose dependency is
 absent is skipped rather than failing - so the gate is usable in tests with only
 a snapshot, and progressively stricter as more of the system is wired.
 
-Constraint hierarchy (tenant policy ahead of resource feasibility):
+Constraint hierarchy (user policy ahead of resource feasibility):
 
     C0 structure      plan parses; one action per job (no duplicates)
     C1 state          job exists in the snapshot; action legal for its state
     C2 coverage       every job in the snapshot has an action
-    C3 tenant/budget  per-tenant policy (skipped when no tenant_registry)
+    C3 user/budget    per-user policy (skipped when no user_registry)
     C4 swap budget    active-job churn does not exceed B_t
     C5 capacity       allocation-unit footprint fits snapshot free capacity
     C6 chain physics  each rank is launchable (5-tuple env, >=1 replica, fits)
@@ -70,7 +70,7 @@ class Validator:
     Args:
         candidate_graph: CandidateGraph; required for mechanism/scope checks.
         mechanism_registry: MechanismRegistry; used for duplicate detection.
-        tenant_registry: Optional tenant policy service. When present and it
+        user_registry: Optional user policy service. When present and it
             exposes ``check_plan(plan, snapshot) -> (ok, violations)``, C3 runs.
         slo_predictor: Reserved for a future hard SLO gate; MVP does not call it.
         slo_breach_threshold: Reserved threshold for the future SLO gate.
@@ -82,14 +82,14 @@ class Validator:
         self,
         candidate_graph=None,
         mechanism_registry=None,
-        tenant_registry=None,
+        user_registry=None,
         slo_predictor=None,
         slo_breach_threshold: float = 0.5,
         resource_map=None,
     ):
         self.candidate_graph = candidate_graph
         self.mechanism_registry = mechanism_registry
-        self.tenant_registry = tenant_registry
+        self.user_registry = user_registry
         self.resource_map = resource_map
         self.slo_predictor = slo_predictor
         self.slo_breach_threshold = float(slo_breach_threshold)
@@ -128,7 +128,7 @@ class Validator:
 
         self._record(by, "C1", self._check_state(typed, states))
         self._record(by, "C2", self._check_coverage(typed, states))
-        self._record(by, "C3", self._check_tenant(typed, cluster_snapshot))
+        self._record(by, "C3", self._check_user_policy(typed, cluster_snapshot))
         self._record(by, "C4", self._check_swap_budget(typed, cluster_snapshot, slow_state))
         self._record(by, "C5", self._check_capacity(typed, cluster_snapshot))
         self._record(by, "C6", self._check_chain_physics(typed, cluster_snapshot))
@@ -198,18 +198,18 @@ class Validator:
             if jid not in covered
         ]
 
-    # ----- C3 tenant / budget -----
+    # ----- C3 user / budget -----
 
-    def _check_tenant(self, typed: Plan, snapshot) -> list[str]:
-        """Delegate to the tenant registry's policy check when one is wired."""
-        registry = self.tenant_registry
+    def _check_user_policy(self, typed: Plan, snapshot) -> list[str]:
+        """Delegate to the user registry's policy check when one is wired."""
+        registry = self.user_registry
         if registry is None or not hasattr(registry, "check_plan"):
             return []
         try:
             ok, violations = registry.check_plan(typed, snapshot)
         except Exception as exc:  # a policy backend error must not crash S5
-            return [f"C3 tenant: policy check failed ({exc})"]
-        return [] if ok else [f"C3 tenant: {v}" for v in (violations or [])]
+            return [f"C3 user: policy check failed ({exc})"]
+        return [] if ok else [f"C3 user: {v}" for v in (violations or [])]
 
     # ----- C4 swap budget -----
 
@@ -296,6 +296,22 @@ class Validator:
                     violations.append(
                         f"C6 physics: job {action.job_id} rank {i} n_replicas must be >= 1"
                     )
+                cfg = rank.config or {}
+                rank_errors = []
+                if not cfg.get("instance_type"):
+                    rank_errors.append("instance_type is required")
+                gpu_count = cfg.get("gpu_count", cfg.get("count"))
+                if not isinstance(gpu_count, int) or isinstance(gpu_count, bool) or gpu_count <= 0:
+                    rank_errors.append("gpu_count/count must be a positive integer")
+                for key in ("tp", "pp"):
+                    value = cfg.get(key)
+                    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                        rank_errors.append(f"{key} must be a positive integer")
+                if rank_errors:
+                    violations.extend(
+                        f"C6 physics: job {action.job_id} rank {i} {error}" for error in rank_errors
+                    )
+                    continue
                 per_chain, gpu_error = self._rank_engine_gpus(rank)
                 if gpu_error:
                     violations.append(f"C6 physics: job {action.job_id} rank {i} {gpu_error}")

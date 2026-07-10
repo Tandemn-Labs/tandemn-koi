@@ -15,8 +15,11 @@ from src.core.models import EnvLabel
 
 RankKey = tuple[str, str]
 
-_X_SKIP = {"env", "rank_id", "replica_index", "mechanism_id"}
+# ponytail: predictions ride in shape_json, but they are evidence inputs, not X.
+_X_SKIP = {"env", "rank_id", "replica_index", "mechanism_id", "predicted_y", "predicted_v"}
 _LOAD_FIELDS = ("request_arrival_rate", "total_token_budget")
+_MODEL_IDENTITY_FIELDS = {"model_id", "updated_at"}
+_PER_GPU_MODEL_FIELDS = {"max_num_seq", "max_num_batched_tokens", "block_size", "kvcache_dtype"}
 _GPU_FIELDS = (
     "gpu_bandwidth_gbps",
     "gpu_tflops_fp16",
@@ -35,6 +38,32 @@ _ALIASES = {
     "osl_token_min": ("osl_token_min", "output_len_tokens_min"),
     "osl_token_max": ("osl_token_max", "output_len_tokens_max"),
 }
+_USER_JOB_X = {
+    "model_id",
+    "isl_token_avg",
+    "isl_token_min",
+    "isl_token_max",
+    "isl_distribution_type",
+    "osl_token_avg",
+    "osl_token_min",
+    "osl_token_max",
+    "osl_distribution_type",
+    "pd_ratio",
+    "request_arrival_rate",
+    "request_arrival_pattern",
+    "peak_to_mean_ratio",
+    "workload_prefix_concentration",
+    "multi_turn_ratio",
+    "shared_prefix_length_avg",
+    "is_session_affinity",
+    "total_token_budget",
+    "deadline_hrs",
+    "target_p99_ttft_ms",
+    "target_p99_tpot_ms",
+    "priority_class",
+    "max_concurrent_streaming",
+    *(alias for aliases in _ALIASES.values() for alias in aliases),
+}
 
 
 @dataclass
@@ -45,6 +74,8 @@ class RankDeployment:
     rank_id: str
     env_label: EnvLabel
     x: dict[str, object]
+    v_predicted: dict[str, float]
+    y_predicted: dict[str, float]
 
 
 @dataclass
@@ -67,6 +98,7 @@ def build_deployment_x_index(
     snapshot: Any,
     *,
     hardware_catalog: dict[str, Any],
+    model_catalogs: dict[str, dict[str, Any]],
     x_fields: list[str] | tuple[str, ...],
 ) -> DeploymentXIndex:
     """Return the rank-level X index consumed by S2 evidence creation."""
@@ -92,9 +124,34 @@ def build_deployment_x_index(
                 total_replicas=total_replicas,
                 resources=resources,
                 catalog=catalog,
+                model_catalogs=model_catalogs,
                 x_fields=x_fields,
             )
     return DeploymentXIndex(by_rank)
+
+
+def build_rank_x(
+    *,
+    job_values: dict[str, Any],
+    shape: dict[str, Any],
+    env: EnvLabel,
+    resources: dict[str, Any],
+    hardware_catalog: dict[str, Any],
+    model_catalog: dict[str, Any],
+    replica_count: int,
+    total_replicas: int | None = None,
+) -> dict[str, Any]:
+    """Build one rank's unprojected X from the same sources S2 uses."""
+    return _rank_x(
+        job_values=job_values,
+        shape=shape,
+        env=env,
+        resources=resources,
+        catalog=_catalog_by_instance(hardware_catalog),
+        model_catalog=model_catalog,
+        replica_count=replica_count,
+        total_replicas=total_replicas or replica_count,
+    )
 
 
 def _groups_by_rank(chains: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -118,6 +175,7 @@ def _rank_deployment(
     total_replicas: int,
     resources: dict[str, Any],
     catalog: dict[tuple[str, str, str], dict[str, Any]],
+    model_catalogs: dict[str, dict[str, Any]],
     x_fields: list[str] | tuple[str, ...],
 ) -> RankDeployment:
     """Assemble, enrich, derive, and filter X for one rank."""
@@ -129,14 +187,55 @@ def _rank_deployment(
             raise ValueError(f"rank {rank_id!r} has mixed env labels")
 
     job_values = _job_x(job)
+    model_id = _model_id(job_values, shape)
+    x = _rank_x(
+        job_values=job_values,
+        shape=shape,
+        env=env,
+        resources=resources,
+        catalog=catalog,
+        model_catalog=model_catalogs[model_id],
+        replica_count=replica_count,
+        total_replicas=total_replicas,
+    )
+
+    return RankDeployment(
+        job_id=job_id,
+        rank_id=rank_id,
+        env_label=env,
+        x=_project_x(x, x_fields),
+        v_predicted=dict(shape.get("predicted_v") or {}),
+        y_predicted=dict(shape.get("predicted_y") or {}),
+    )
+
+
+def _rank_x(
+    *,
+    job_values: dict[str, Any],
+    shape: dict[str, Any],
+    env: EnvLabel,
+    resources: dict[str, Any],
+    catalog: dict[tuple[str, str, str], dict[str, Any]],
+    model_catalog: dict[str, Any],
+    replica_count: int,
+    total_replicas: int,
+) -> dict[str, Any]:
+    catalog_x = _model_catalog_x(model_catalog, env[4])
     x: dict[str, Any] = {
+        **catalog_x,
         **job_values,
-        "market": env[0],
-        "cloud": env[1],
-        "region": env[2],
-        "gpu_type": env[4],
         **{key: value for key, value in shape.items() if key not in _X_SKIP},
     }
+    x["market"] = env[0]
+    x["cloud"] = env[1]
+    x["region"] = env[2]
+    x["gpu_type"] = env[4]
+    x.setdefault("sp", 1)
+    x.setdefault("ep", 1)
+    x.setdefault("cp", 1)
+    x["dp"] = replica_count
+    x["prefill_worker_count"] = 0
+    x["decode_worker_count"] = 0
 
     pool = _resource_pool(resources, env, str(x["instance_type"]))
     x["interconnect_type"] = pool["fabric_type"]
@@ -145,13 +244,7 @@ def _rank_deployment(
     x.update(_hardware_x(hardware, env[4]))
     _derive_x(x)
     _allocate_load_x(x, job_values, shape, replica_count, total_replicas)
-
-    return RankDeployment(
-        job_id=job_id,
-        rank_id=rank_id,
-        env_label=env,
-        x=_project_x(x, x_fields),
-    )
+    return x
 
 
 def _job_x(job: dict[str, Any]) -> dict[str, Any]:
@@ -160,16 +253,45 @@ def _job_x(job: dict[str, Any]) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for source in (spec, spec.get("features"), spec.get("job_features"), job.get("job_features")):
         if isinstance(source, dict):
-            values.update(source)
+            values.update({key: value for key, value in source.items() if key in _USER_JOB_X})
             for nested in ("model_profile", "model_config", "workload_profile", "slo"):
                 if isinstance(source.get(nested), dict):
-                    values.update(source[nested])
+                    values.update(
+                        {key: value for key, value in source[nested].items() if key in _USER_JOB_X}
+                    )
     for canonical, aliases in _ALIASES.items():  # this is just aliasing the names
         for alias in aliases:
             if alias in values:
                 values[canonical] = values[alias]
                 break
     return values
+
+
+def _model_id(job_values: dict[str, Any], shape: dict[str, Any]) -> str:
+    for source in (shape, job_values):
+        value = source.get("model_id")
+        if value:
+            return str(value)
+    raise ValueError("model_id is required to build deployment X")
+
+
+def _model_catalog_x(catalog: dict[str, Any], gpu_type: str) -> dict[str, Any]:
+    return {
+        key: _per_gpu_model_value(value, gpu_type, key) if key in _PER_GPU_MODEL_FIELDS else value
+        for key, value in catalog.items()
+        if key not in _MODEL_IDENTITY_FIELDS
+    }
+
+
+def _per_gpu_model_value(value: Any, gpu_type: str, field: str) -> Any:
+    if not isinstance(value, list):
+        return value
+    if not value:
+        return None
+    for entry in value:
+        if isinstance(entry, dict) and str(entry.get("gpu_type")) == str(gpu_type):
+            return entry.get("value")
+    raise ValueError(f"model catalog field {field!r} missing gpu_type {gpu_type!r}")
 
 
 def _env(chain: dict[str, Any]) -> EnvLabel:

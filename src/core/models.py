@@ -224,6 +224,8 @@ class RankSpec:
     rank_id: str | None = None  # Koi logical rank id; Orca preserves it into chains/pods
     mechanism_id: str | None = None
     chain_id: str | None = None  # stable fingerprint for switch-cost delta matching
+    predicted_y: dict | None = None
+    predicted_v: dict | None = None
 
     @classmethod
     def from_dict(cls, raw) -> "RankSpec":
@@ -259,6 +261,8 @@ class RankSpec:
                 rank_id = inner.pop("rank_id", None)
                 mech = inner.pop("mechanism_id", None)
                 chain_id = inner.pop("chain_id", None)
+                predicted_y = inner.pop("predicted_y", None)
+                predicted_v = inner.pop("predicted_v", None)
                 n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1)) or 1
                 n_rep = int(n_rep_raw)
                 return cls(
@@ -269,6 +273,8 @@ class RankSpec:
                     rank_id=rank_id,
                     mechanism_id=mech,
                     chain_id=chain_id,
+                    predicted_y=predicted_y,
+                    predicted_v=predicted_v,
                 )
 
         role = raw.get("role")
@@ -285,6 +291,8 @@ class RankSpec:
             rank_id=raw.get("rank_id"),
             mechanism_id=raw.get("mechanism_id"),
             chain_id=raw.get("chain_id"),
+            predicted_y=raw.get("predicted_y"),
+            predicted_v=raw.get("predicted_v"),
         )
 
     def to_dict(self) -> dict:
@@ -296,6 +304,8 @@ class RankSpec:
             "rank_id": self.rank_id,
             "mechanism_id": self.mechanism_id,
             "chain_id": self.chain_id,
+            "predicted_y": self.predicted_y,
+            "predicted_v": self.predicted_v,
         }
 
     def gpus_per_chain(self) -> int:
@@ -324,7 +334,7 @@ class PlanAction:
 
     job_id: str
     type: ActionType
-    tenant_id: str | None = None
+    user_id: str | None = None
     ladder: list[RankSpec] | None = None
     target_tps: float | None = None
     target_p99_ttft_ms: float | None = None
@@ -374,7 +384,7 @@ class PlanAction:
         return cls(
             job_id=str(jid),
             type=action_type,
-            tenant_id=raw.get("tenant_id"),
+            user_id=raw.get("user_id"),
             ladder=ladder,
             target_tps=raw.get("target_tps"),
             target_p99_ttft_ms=raw.get("target_p99_ttft_ms"),
@@ -402,7 +412,7 @@ class PlanAction:
         return {
             "job_id": self.job_id,
             "type": self.type.value,
-            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
             "ladder": [r.to_dict() for r in self.ladder] if self.ladder else None,
             "target_tps": self.target_tps,
             "target_p99_ttft_ms": self.target_p99_ttft_ms,
@@ -418,7 +428,7 @@ class PlanAction:
 class Plan:
     """The cluster-wide decision for one tick: one action per job.
 
-    A Plan spans every tenant's jobs, so tenant identity lives on each
+    A Plan spans every user's jobs, so user identity lives on each
     PlanAction (not on the Plan). operator_id is provenance only - who/what
     produced the plan - mapping the illustrative "user_id" field.
     """

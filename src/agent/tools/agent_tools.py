@@ -87,6 +87,7 @@ from typing import Any
 import numpy as np
 from src.config.hyperparameters import GAMMA_SLO, UTILIZATION_TARGET_ONLINE
 from src.core.models import LADDER_ACTIONS, SWAP_BUDGET_ACTIONS, Plan, RankSpec, env_gpu_type
+from src.infra.deployment_x import build_rank_x
 
 # Residual calibration: debias the surrogate with observed (observed-predicted)
 # residuals from similar past deployments, so scoring uses reality-corrected
@@ -301,6 +302,7 @@ def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
 def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None = None) -> dict:
     """Build the surrogate payload for one rank without mutating the rank."""
     features = dict(job_features or {})
+    env = None
     if rank.env is not None:
         env = list(rank.env) if isinstance(rank.env, (list, tuple)) else str(rank.env).split("|")
         if len(env) >= 5:
@@ -319,6 +321,24 @@ def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None
     config = dict(rank.config)
     if "model_id" not in config and features.get("model_id") is not None:
         config["model_id"] = features["model_id"]
+    resource_map = getattr(_CTX, "resource_map", None)
+    model_id = config.get("model_id") or features.get("model_id")
+    if env and model_id and resource_map is not None:
+        try:
+            count = rank.gpus_per_chain()
+            shape = {**config, "env": list(env), "count": count, "gpu_count": count}
+            compiled_x = build_rank_x(
+                job_values=features,
+                shape=shape,
+                env=(str(env[0]), str(env[1]), str(env[2]), str(env[3]), str(env[4])),
+                resources=resource_map.resources_summary(),
+                hardware_catalog=resource_map.hardware_catalog(),
+                model_catalog=resource_map.model_catalog(str(model_id)),
+                replica_count=max(1, int(rank.n_replicas or 1)),
+            )
+            config.update(compiled_x)
+        except Exception:
+            log.exception("rank prediction X assembly failed; using rank config only")
     return {"job_config": config, "job_features": features}
 
 
@@ -374,11 +394,15 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
     composed). A single-rank ladder returns that rank's y_hat unchanged, so
     homogeneous ladders are unaffected.
     """
-    if action.predicted_y:
-        return dict(action.predicted_y)
+    # TODO - I can debate this as we don't need the LLM to pass the predicted_y
+    # we want it to CALL The SUrrogate ALWAYS
+    # so i am, for now, removing this call.
+    # if action.predicted_y:
+    #     return dict(action.predicted_y)
     samples: list[tuple[int, dict]] = []
     for rank in action.ladder or []:
         try:
+            # call the surrogate here
             y = predict_outcome(_rank_prediction_payload(rank, job_features)).get("y_hat", {})
         except Exception:
             log.exception("rank y_hat failed for job %s", action.job_id)
@@ -674,6 +698,11 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
             blobs.append({"tick": r.tick, "theory_blob": r.theory_blob})
 
     features = dict(descriptor.get("job_features", {})) if descriptor else {}
+    spec = dict((descriptor or {}).get("spec_json") or {})
+    model_id = features.get("model_id") or spec.get("model_id")
+    model_catalog = {}
+    if model_id and hasattr(_CTX.resource_map, "model_catalog"):
+        model_catalog = dict(_CTX.resource_map.model_catalog(str(model_id)) or {})
     subset_x = list(features.get("subset_x", features.keys()))
     mechanisms = get_scope({"subset_x": subset_x, "subset_v": []})
 
@@ -681,6 +710,7 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         "job_id": job_id,
         "tenant_id": (descriptor or {}).get("tenant_id", "default"),
         "job_features": features,
+        "model_catalog": model_catalog,
         "current_ladder": (descriptor or {}).get("current_ladder"),
         "recent_q_labels": recent_q,
         "recent_theory_blobs": blobs,
@@ -1640,6 +1670,21 @@ def predict_outcome(
         "v_hat": v_hat or {},
         "dro_band": dro_band,
     }
+
+
+def stamp_plan_predictions(plan, cluster_snapshot=None):
+    """Attach raw per-rank predictions to the plan that will be deployed."""
+    typed = _as_plan(plan)
+    snapshot = cluster_snapshot if cluster_snapshot is not None else _snapshot()
+    for action in typed.actions:
+        if action.type not in LADDER_ACTIONS or not action.ladder:
+            continue
+        job_features = _job_features_for(snapshot, action.job_id)
+        for rank in action.ladder:
+            pred = predict_outcome(_rank_prediction_payload(rank, job_features), calibrate=False)
+            rank.predicted_y = dict(pred.get("y_hat_raw") or pred.get("y_hat") or {})
+            rank.predicted_v = dict(pred.get("v_hat") or {})
+    return typed
 
 
 def get_z_star(job_features: dict[str, Any] | None = None) -> dict[str, float]:

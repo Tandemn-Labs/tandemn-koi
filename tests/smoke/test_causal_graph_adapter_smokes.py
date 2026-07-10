@@ -39,11 +39,11 @@ class CausalGraphAdapterSmokeTests(unittest.TestCase):
     def test_seed_tables_parse_to_koi_runtime_objects(self):
         graph, registry = parse_seed_tables()
 
-        self.assertEqual(len(graph.x), 103)
+        self.assertEqual(len(graph.x), 96)
         self.assertEqual(len(graph.v), 22)
         self.assertEqual(len(graph.y), 5)
-        self.assertEqual(len(graph.edge_table), 2376)
-        self.assertEqual(len(registry.mechanism_table), 100)
+        self.assertEqual(len(graph.edge_table), 2222)
+        self.assertEqual(len(registry.mechanism_table), 89)
 
         names = {mechanism.name for mechanism in registry.mechanism_table.values()}
         self.assertIn("queueing_under_burst", names)
@@ -120,8 +120,8 @@ class CausalGraphAdapterSmokeTests(unittest.TestCase):
             graph, registry, confidence = init_causal_graph(user_id, postgres_client=client)
             self.assertIsInstance(registry, StoreBackedMechanismRegistry)
             self.assertIsInstance(confidence, StoreBackedConfidenceService)
-            self.assertEqual(len(graph.edge_table), 2376)
-            self.assertEqual(len(registry.mechanism_table), 100)
+            self.assertEqual(len(graph.edge_table), 2222)
+            self.assertEqual(len(registry.mechanism_table), 89)
 
             edge = next(
                 edge
