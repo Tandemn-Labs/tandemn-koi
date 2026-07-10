@@ -174,6 +174,8 @@ class EigResourceSmokeTests(unittest.TestCase):
         manager = SmokeManager()
         resources = manager.resources_summary()
         self.assertEqual(resources[env]["free"], 0)
+        self.assertEqual(resources[env]["pools"][0]["free_instances"], 0)
+        self.assertEqual(resources[env]["pools"][0]["free"], 0)
 
         plan = {
             "actions": [
@@ -197,6 +199,52 @@ class EigResourceSmokeTests(unittest.TestCase):
             violations,
             ["env reserved|aws|us-east-2|use2-az3|A100: requested 8 more GPUs than available"],
         )
+
+    def test_mixed_instance_pools_expose_free_instances(self):
+        env = "reserved|aws|us-east-1|us-east-1b|L40S"
+
+        class FakeResourceMap:
+            market = ("reserved",)
+
+            def scheduling_summary(self):
+                return {
+                    env: {
+                        "gpu_type": "L40S",
+                        "total": 16,
+                        "total_instances": 7,
+                        "pools": [
+                            {
+                                "instance_type": "g6e.xlarge",
+                                "gpus_per_instance": 1,
+                                "total_instances": 4,
+                            },
+                            {
+                                "instance_type": "g6e.12xlarge",
+                                "gpus_per_instance": 4,
+                                "total_instances": 3,
+                            },
+                        ],
+                    }
+                }
+
+        class SmokeManager(ResourceMapManager):
+            def __init__(self):
+                super().__init__(user_id="mixed_pool_smoke")
+
+            def get_resource_map(self, user_id=None):
+                return FakeResourceMap()
+
+            def get_running_chains(self, user_id=None):
+                return []
+
+        resources = SmokeManager().resources_summary()[env]
+        pools = {pool["instance_type"]: pool for pool in resources["pools"]}
+
+        self.assertEqual(resources["free"], 16)
+        self.assertEqual(pools["g6e.xlarge"]["free_instances"], 4)
+        self.assertEqual(pools["g6e.xlarge"]["free"], 4)
+        self.assertEqual(pools["g6e.12xlarge"]["free_instances"], 3)
+        self.assertEqual(pools["g6e.12xlarge"]["free"], 12)
 
 
 if __name__ == "__main__":

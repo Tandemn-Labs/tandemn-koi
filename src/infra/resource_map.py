@@ -199,19 +199,23 @@ class ResourceMapManager:
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
         resource_map = self.get_resource_map(user_id=user_id)
-        used = self._used_gpus_by_env(resource_map, user_id=user_id)
-        return self._normalized_scheduling_summary(resource_map, used)
+        used_gpus, used_instances = self._used_capacity(resource_map, user_id=user_id)
+        return self._normalized_scheduling_summary(resource_map, used_gpus, used_instances)
 
     @classmethod
     def _normalized_scheduling_summary(
-        cls, resource_map, used: dict[str, int] | None = None
+        cls,
+        resource_map,
+        used_gpus: dict[str, int] | None = None,
+        used_instances: dict[tuple[str, str], int] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Flatten the store ResourceMap to env_key -> capacity info.
 
         The store map carries total capacity only; ``free`` is derived here
         as ``total`` minus GPUs consumed by running chains (``used``).
         """
-        used = used or {}
+        used_gpus = used_gpus or {}
+        used_instances = used_instances or {}
         raw = dict(resource_map.scheduling_summary())
         market = cls._default_market(resource_map)
         out: dict[str, dict[str, Any]] = {}
@@ -226,13 +230,31 @@ class ResourceMapManager:
                 body.setdefault("market", market)
             else:
                 env_key = str(key)
-            total = int(body.get("total", 0))
-            body["free"] = max(0, total - int(used.get(env_key, 0)))
+            pools = []
+            for raw_pool in body.get("pools") or []:
+                pool = dict(raw_pool)
+                instance_type = str(pool.get("instance_type"))
+                free_instances = max(
+                    0,
+                    int(pool.get("total_instances", 0))
+                    - used_instances.get((env_key, instance_type), 0),
+                )
+                pool["free_instances"] = free_instances
+                pool["free"] = free_instances * int(pool.get("gpus_per_instance", 1))
+                pools.append(pool)
+            body["pools"] = pools
+            body["free"] = (
+                sum(int(pool["free"]) for pool in pools)
+                if pools
+                else max(0, int(body.get("total", 0)) - used_gpus.get(env_key, 0))
+            )
             out[env_key] = body
         return out
 
-    def _used_gpus_by_env(self, resource_map, user_id: str | None = None) -> dict[str, int]:
-        """GPUs currently consumed by running chains, bucketed by env_key.
+    def _used_capacity(
+        self, resource_map, user_id: str | None = None
+    ) -> tuple[dict[str, int], dict[tuple[str, str], int]]:
+        """Return used GPUs by env and used instances by env/pool.
 
         Free capacity is not stored on the resource map (total-only); it is
         inferred by subtracting this from each env's total. One chain row is
@@ -247,8 +269,9 @@ class ResourceMapManager:
         default market.
         """
         default_market = self._default_market(resource_map)
-        resources = self._normalized_scheduling_summary(resource_map, used={})
-        used: dict[str, int] = {}
+        resources = self._normalized_scheduling_summary(resource_map)
+        used_gpus: dict[str, int] = {}
+        used_instances: dict[tuple[str, str], int] = {}
         for chain in self.get_running_chains(user_id=user_id):
             shape = chain.get("shape_json") or {}
             raw_env = (
@@ -270,8 +293,11 @@ class ResourceMapManager:
                 )
             unit = self.resolve_allocation_unit(env_key, shape, resources)
             footprint = count if unit.allocation_kind == "gpu" else unit.gpus_per_unit
-            used[env_key] = used.get(env_key, 0) + footprint
-        return used
+            used_gpus[env_key] = used_gpus.get(env_key, 0) + footprint
+            if unit.allocation_kind == "instance" and unit.instance_type:
+                key = (env_key, unit.instance_type)
+                used_instances[key] = used_instances.get(key, 0) + 1
+        return used_gpus, used_instances
 
     @classmethod
     def _normalize_env_key(cls, env, default_market: str) -> str:
@@ -299,8 +325,8 @@ class ResourceMapManager:
 
     def dynamic_view(self, user_id: str | None = None) -> dict[str, Any]:
         resource_map = self.get_resource_map(user_id=user_id)
-        used = self._used_gpus_by_env(resource_map, user_id=user_id)
-        resources = self._normalized_scheduling_summary(resource_map, used)
+        used_gpus, used_instances = self._used_capacity(resource_map, user_id=user_id)
+        resources = self._normalized_scheduling_summary(resource_map, used_gpus, used_instances)
         return {
             "resource_map_version": resource_map.version,
             "updated_at": resource_map.updated_at,
@@ -394,15 +420,19 @@ class ResourceMapManager:
         resources: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Return engine demand plus reserved capacity for one rank replica."""
+        resources = resources if resources is not None else self.resources_summary()
         engine_gpus = rank.gpus_per_chain()
         unit = self.resolve_allocation_unit(rank.env, rank.config, resources)
         capacity = engine_gpus if unit.allocation_kind == "gpu" else unit.gpus_per_unit
+        info = resources[unit.env_key]
+        pool = self._select_pool(unit.env_key, info, rank.config)
         return {
             "allocation_kind": unit.allocation_kind,
             "instance_type": unit.instance_type,
             "gpus_per_unit": unit.gpus_per_unit,
             "price_per_unit_hour": unit.price_per_unit_hour,
             "capacity_per_replica": capacity,
+            "free_capacity_gpus": int((pool or info).get("free", 0)),
             "engine_gpus": engine_gpus,
         }
 
