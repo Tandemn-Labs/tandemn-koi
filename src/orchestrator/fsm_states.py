@@ -342,6 +342,18 @@ class TickRunner:
         z_star_snapshot = self.slow_loop.get_sss_z_star_t()
         cached_v_params = self.slow_loop.get_sss_cusum_params_v()
         cached_y_params = self.slow_loop.get_sss_cusum_params_y()
+        snapshot = ctx.cluster_snapshot
+        jobs: list[dict[str, Any]] = []
+        if snapshot is not None:
+            jobs = (
+                snapshot.active_jobs_summary()
+                if hasattr(snapshot, "active_jobs_summary")
+                else getattr(snapshot, "active_jobs", [])
+            )
+        job_features = {
+            str(job.get("job_id", job.get("id"))): dict(job.get("job_features") or {})
+            for job in jobs or []
+        }
 
         # if ctx.deployment_x is None:
         #     ctx.deployment_x = self._build_deployment_x_index(ctx)
@@ -363,7 +375,8 @@ class TickRunner:
             y_observed_mean = {name: float(np.mean(arr)) for name, arr in y_obs.items() if len(arr)}
 
             committed = self._committed_mechanism_id(rank_telem)
-            applicable = self._applicable_mechanisms(x.keys(), v_obs.keys(), committed)
+            mechanism_context = {**job_features.get(job_id, {}), **x}
+            applicable = self._applicable_mechanisms(mechanism_context, committed)
 
             v_params = self._resolve_cusum_params(residuals_per_v, cached_v_params)
             y_params = self._resolve_cusum_params(residuals_per_y, cached_y_params)
@@ -374,10 +387,10 @@ class TickRunner:
 
             for mech in applicable:
                 bundle = self._bundle(mech)
-                touched_edge_ids.update(bundle.edge_ids)
                 if not self._bundle_observable(bundle, v_obs, v_pred, y_obs, y_pred):
                     q_per_mech[mech.mechanism_id] = None
                     continue
+                touched_edge_ids.update(bundle.edge_ids)
                 v_verdict, y_verdict = self.cusum.cusum_per_mechanism(
                     mechanism=mech,
                     candidate_graph=self.candidate_graph,
@@ -706,22 +719,20 @@ class TickRunner:
 
     def _applicable_mechanisms(
         self,
-        x_keys,
-        v_keys,
+        context: dict[str, Any],
         committed_id: str | None,
     ) -> list[Any]:
         """Resolve the mechanisms this rank's evidence speaks to.
 
-        Active scope matches on (X keys, observed V names), plus the
+        Active structured matches on deployed X and workload values, plus the
         committed mechanism regardless of status - the agent's bet always
         receives its verdict, even if the mechanism was archived
         mid-flight.
         """
-        applicable: dict[str, Any] = {}
-        matches = self.mechanism_registry.filter_by_scope(sorted(x_keys), sorted(v_keys))
-        for mech in matches:
-            if mech.status == "active":
-                applicable[mech.mechanism_id] = mech
+        applicable = {
+            mechanism.mechanism_id: mechanism
+            for mechanism, _ in self.mechanism_registry.find_applicable(context)
+        }
         if committed_id is not None and committed_id not in applicable:
             try:
                 applicable[committed_id] = self.mechanism_registry.get_mechanism(committed_id)
