@@ -427,6 +427,12 @@ def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None
     return {"job_config": config, "job_features": features}
 
 
+def _rank_mechanism_context(rank: RankSpec, job_features: dict[str, Any]) -> dict[str, Any]:
+    """Return the same enriched rank context used for prediction."""
+    payload = _rank_prediction_payload(rank, job_features)
+    return {**payload["job_features"], **payload["job_config"], "dp": rank.n_replicas}
+
+
 def _prev_ladder_for(snapshot, job_id: str) -> list:
     """The job's current ladder from the snapshot, as a rank-dict list.
 
@@ -758,7 +764,7 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
     Returns:
         Dict with job_id, user_id, job_features, current_ladder,
         recent_q_labels, recent_theory_blobs, similar_deployments,
-        applicable_mechanisms.
+        mechanism_candidates.
     """
     _require("evidence_store", "mechanism_registry", "confidence_service")
     descriptor = None
@@ -786,10 +792,11 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
     model_catalog = {}
     if model_id and hasattr(_CTX.resource_map, "model_catalog"):
         model_catalog = dict(_CTX.resource_map.model_catalog(str(model_id)) or {})
-    subset_x = list(features.get("subset_x", features.keys()))
-    mechanisms = get_scope(
-        {"subset_x": subset_x, "subset_v": [], "workload_type": features.get("type")}
+    mechanism_context = {**model_catalog, **features}
+    mechanism_context["workload_type"] = (
+        features.get("workload_type") or features.get("type") or (descriptor or {}).get("kind")
     )
+    mechanisms = get_scope(mechanism_context)
 
     return {
         "job_id": job_id,
@@ -800,7 +807,7 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         "recent_q_labels": recent_q,
         "recent_theory_blobs": blobs,
         "similar_deployments": get_similar_deployments(features, top_k=5),
-        "applicable_mechanisms": mechanisms,
+        "mechanism_candidates": mechanisms,
     }
 
 
@@ -1477,9 +1484,8 @@ def get_influencing_knobs(
     tool only traverses and ranks.
 
     Args:
-        job_features: feature dict; subset_x / subset_v scope the
-            applicable-mechanism annotation. Does not restrict which knobs
-            are returned (the graph is closed-world).
+        job_features: Workload values used for mechanism annotation. Does not
+            restrict which knobs are returned (the graph is closed-world).
         objective: a Y variable name to trace. None traces every Y node.
         top_k: max knobs to return, highest path confidence first.
 
@@ -1498,13 +1504,13 @@ def get_influencing_knobs(
 
     edge_to_mechs: dict[str, set] = {}
     if _CTX.mechanism_registry is not None and isinstance(job_features, dict):
-        mechs = _CTX.mechanism_registry.filter_by_scope(
-            job_features.get("subset_x", []), job_features.get("subset_v", [])
+        matches = _CTX.mechanism_registry.find_applicable(
+            job_features,
+            require_x_overlap=False,
         )
-        for m in mechs:
-            if m.status == "active":
-                for eid in m.edge_ids:
-                    edge_to_mechs.setdefault(eid, set()).add(m.mechanism_id)
+        for mechanism, _ in matches:
+            for edge_id in mechanism.edge_ids:
+                edge_to_mechs.setdefault(edge_id, set()).add(mechanism.mechanism_id)
 
     knobs: dict[str, dict[str, Any]] = {}
     for y in objectives:
@@ -1534,35 +1540,51 @@ def get_influencing_knobs(
     return ranked
 
 
-def get_scope(job_features: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return active mechanisms whose scope matches job features.
-
-    Args:
-        job_features: Dict with subset_x and subset_v lists (or any
-            feature names; they are matched against mechanism scopes).
-
-    Returns:
-        List of mechanism briefs with confidence and visit counts.
-    """
-    _require("mechanism_registry", "confidence_service")
-    subset_x = job_features.get("subset_x", []) if isinstance(job_features, dict) else []
-    subset_v = job_features.get("subset_v", []) if isinstance(job_features, dict) else []
-    workload_type = job_features.get("workload_type") if isinstance(job_features, dict) else None
-    mechs = _CTX.mechanism_registry.filter_by_scope(subset_x, subset_v)
+def _mechanism_briefs(matches) -> list[dict[str, Any]]:
     return [
         {
-            "mechanism_id": m.mechanism_id,
-            "name": m.name,
-            "edge_ids": list(m.edge_ids),
-            "scope": dict(m.scope),
-            "narrative": m.narrative,
-            "c": _CTX.confidence_service.get_mechanism_confidence(m.mechanism_id),
-            "visit_count": _CTX.confidence_service.get_mechanism_visit_count(m.mechanism_id),
+            "mechanism_id": mechanism.mechanism_id,
+            "name": mechanism.name,
+            "edge_ids": list(mechanism.edge_ids),
+            "scope": dict(mechanism.scope),
+            "narrative": mechanism.narrative,
+            "c": _CTX.confidence_service.get_mechanism_confidence(mechanism.mechanism_id),
+            "visit_count": _CTX.confidence_service.get_mechanism_visit_count(
+                mechanism.mechanism_id
+            ),
+            "match_quality": match["quality"],
+            "matched_x": match["matched_x"],
+            "missing_x": match["missing_x"],
+            "condition_results": match["condition_results"],
         }
-        for m in mechs
-        if m.status == "active"
-        and (not workload_type or m.scope.get("workload_type") in (None, "any", workload_type))
+        for mechanism, match in matches
     ]
+
+
+def get_scope(job_features: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return existing mechanism candidates for a pre-rank job context.
+
+    Args:
+        job_features: Workload and model values known before a rank exists.
+
+    Returns:
+        Exact and partial mechanism briefs with confidence and match details.
+    """
+    _require("mechanism_registry", "confidence_service")
+    context = dict(job_features or {})
+    matches = _CTX.mechanism_registry.find_applicable(context, require_x_overlap=False)
+    return _mechanism_briefs(matches)
+
+
+def get_applicable_mechanisms(
+    rank: dict[str, Any],
+    job_features: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return exact and partial mechanisms for one concrete candidate rank."""
+    _require("mechanism_registry", "confidence_service")
+    typed_rank = RankSpec.from_dict(rank)
+    context = _rank_mechanism_context(typed_rank, job_features)
+    return _mechanism_briefs(_CTX.mechanism_registry.find_applicable(context))
 
 
 def get_similar_deployments(
@@ -1675,9 +1697,8 @@ def set_new_mechanisms(
 def val_new_mechanisms(m_new) -> dict[str, Any]:
     """Run pre-admission validation on a mechanism proposal.
 
-    Checks that every edge_id exists in CandidateGraph, that the bundle
-    topology only uses X->V and V->Y edges, and that the proposal is not
-    a duplicate of an existing mechanism.
+    Uses the canonical proposal validator for edges, topology, duplicates,
+    scope variables, qualifiers, and conditions.
 
     Args:
         m_new: Mechanism object or dict with edge_ids, scope, narrative.
@@ -1686,32 +1707,13 @@ def val_new_mechanisms(m_new) -> dict[str, Any]:
         {"ok": bool, "violations": List[str]}.
     """
     _require("mechanism_registry", "candidate_graph")
-    from src.core.models import Mechanism
+    from src.validation.validator import Validator
 
-    if isinstance(m_new, dict):
-        m_new = Mechanism(
-            edge_ids=list(m_new.get("edge_ids", [])),
-            scope=dict(m_new.get("scope", {})),
-            narrative=str(m_new.get("narrative", "")),
-        )
-
-    violations: list[str] = []
-    cg = _CTX.candidate_graph
-    edge_objs = []
-    for eid in m_new.edge_ids:
-        if eid not in cg.edge_table:
-            violations.append(f"edge {eid!r} not in CandidateGraph")
-            continue
-        edge_objs.append(cg.edge_table[eid])
-
-    if edge_objs and not cg.val_topology(edge_objs):
-        violations.append("topology violation - only X->V and V->Y edges allowed")
-
-    is_dup, existing_id = _CTX.mechanism_registry.is_duplicate_mechanism(m_new)
-    if is_dup:
-        violations.append(f"duplicate of existing mechanism {existing_id}")
-
-    return {"ok": len(violations) == 0, "violations": violations}
+    ok, violations = Validator(
+        candidate_graph=_CTX.candidate_graph,
+        mechanism_registry=_CTX.mechanism_registry,
+    ).val_mechanism_proposal(m_new)
+    return {"ok": ok, "violations": violations}
 
 
 # ----------------------------------------------------------------------
@@ -2440,10 +2442,8 @@ def _materialize_ladder(ladder_ranks):
 
     eig.py expects .ranks (each .mechanism_id, .config, .n_replicas),
     .envs(), .duration_minutes, and .applicable_mechanisms. The
-    applicable set is resolved from the registry: the committed
-    mechanisms of every rank plus scope matches on the rank configs.
-    An empty applicable set would zero the relevance gate and silently
-    kill EIG, so committed mechanisms are always included.
+    applicable set contains the mechanisms committed by the ranks. An empty
+    set would zero the relevance gate and silently kill EIG.
     """
 
     class _Ladder:
@@ -2455,7 +2455,6 @@ def _materialize_ladder(ladder_ranks):
     ladder = _Ladder()
     ladder.ranks = []
     ladder.duration_minutes = 5.0
-    config_keys: set = set()
 
     for r in ladder_ranks:
         if hasattr(r, "to_dict"):
@@ -2472,7 +2471,6 @@ def _materialize_ladder(ladder_ranks):
         # a set, so coerce to a hashable tuple here.
         rank.env = tuple(env) if isinstance(env, (list, tuple)) else env
         ladder.ranks.append(rank)
-        config_keys |= set(rank.config.keys())
 
     applicable = {}
     if _CTX.mechanism_registry is not None:
@@ -2482,9 +2480,6 @@ def _materialize_ladder(ladder_ranks):
                 applicable[mech.mechanism_id] = mech
             except KeyError:
                 raise ValueError(f"unknown mechanism_id {rank.mechanism_id!r}") from None
-        for mech in _CTX.mechanism_registry.filter_by_scope(sorted(config_keys), []):
-            if mech.status == "active":
-                applicable[mech.mechanism_id] = mech
 
     ladder.applicable_mechanisms = list(applicable.values())
     ladder.envs = lambda: {r.env for r in ladder.ranks if r.env is not None}

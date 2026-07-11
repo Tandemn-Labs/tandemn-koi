@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import numpy as np
 from src.core.candidate_graph import CandidateGraph
-from src.core.models import Node
+from src.core.mechanism_registry import MechanismRegistry
+from src.core.models import Mechanism, Node
 from src.infra.deployment_x import build_deployment_x_index
 from src.infra.resource_map import ClusterResourceSnapshot
 from src.orchestrator.fsm_states import TickContext, TickRunner
@@ -63,6 +64,7 @@ def _x_fields():
 
 def _snapshot():
     features = {
+        "type": "online",
         "model_id": "Qwen/Qwen2.5-72B-Instruct",
         "request_arrival_rate": 100,
         "total_token_budget": 1000,
@@ -312,6 +314,7 @@ class DeploymentXSmokeTests(unittest.TestCase):
 
     def test_s2_writes_deployment_x_without_telemetry_x(self):
         evidence_store = _EvidenceStore()
+        mechanism_registry = _MechanismRegistry()
         runner = TickRunner(
             evidence_store=evidence_store,
             telemetry=_Telemetry(),
@@ -321,7 +324,7 @@ class DeploymentXSmokeTests(unittest.TestCase):
             confidence_service=SimpleNamespace(candidate_graph=_candidate_graph()),
             slow_loop=_SlowLoop(),
             dro=_Dro(),
-            mechanism_registry=_MechanismRegistry(),
+            mechanism_registry=mechanism_registry,
             resource_map=_ResourceMap(),
             agent=object(),
             plan_validator=object(),
@@ -341,6 +344,56 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(row.X["gpu_generation"], "Hopper")
         self.assertEqual(row.y_predicted, {"p99_ttft_ms": 90.0})
         self.assertEqual(row.V_predicted_trajectory, {"kv_cache_util": 0.1})
+        self.assertEqual(mechanism_registry.context["type"], "online")
+        self.assertEqual(mechanism_registry.context["request_arrival_rate"], 50)
+
+    def test_s2_applicability_uses_values_and_preserves_committed(self):
+        registry = MechanismRegistry()
+        exact_id = registry.add_mechanism(
+            Mechanism(
+                edge_ids=["tp->comm_overhead_pct"],
+                scope={
+                    "x": ["tp"],
+                    "v": ["comm_overhead_pct"],
+                    "workload_type": "online",
+                    "conditions": [{"feature": "tp", "op": ">", "value": 1}],
+                },
+                narrative="Tensor parallel communication.",
+            )
+        )
+        partial_id = registry.add_mechanism(
+            Mechanism(
+                edge_ids=["tp->comm_overhead_pct"],
+                scope={
+                    "x": ["tp", "unknown_knob"],
+                    "v": ["comm_overhead_pct"],
+                    "workload_type": "online",
+                    "conditions": [{"feature": "unknown_knob", "op": ">", "value": 0}],
+                },
+                narrative="Partially known communication mechanism.",
+            )
+        )
+        false_id = registry.add_mechanism(
+            Mechanism(
+                edge_ids=["peak_to_mean_ratio->depth_req_q"],
+                scope={
+                    "x": ["peak_to_mean_ratio"],
+                    "v": ["depth_req_q"],
+                    "workload_type": "online",
+                    "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 2}],
+                },
+                narrative="Only bursty workloads use this mechanism.",
+            )
+        )
+        runner = TickRunner.__new__(TickRunner)
+        runner.mechanism_registry = registry
+        context = {"type": "online", "tp": 2, "peak_to_mean_ratio": 2}
+
+        matched = {m.mechanism_id for m in runner._applicable_mechanisms(context, None)}
+        committed = {m.mechanism_id for m in runner._applicable_mechanisms(context, false_id)}
+
+        self.assertEqual(matched, {exact_id, partial_id})
+        self.assertEqual(committed, {exact_id, partial_id, false_id})
 
 
 class _Telemetry:
@@ -392,9 +445,8 @@ class _Dro:
 
 
 class _MechanismRegistry:
-    def filter_by_scope(self, subset_x, subset_v):
-        self.subset_x = subset_x
-        self.subset_v = subset_v
+    def find_applicable(self, context):
+        self.context = context
         return []
 
 
