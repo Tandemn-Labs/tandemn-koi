@@ -3,7 +3,8 @@ import unittest
 from src.agent.tools import agent_tools
 from src.core.candidate_graph import CandidateGraph
 from src.core.mechanism_registry import MechanismRegistry
-from src.core.models import Edge, EdgeMetadata, Mechanism, Node
+from src.core.models import Edge, EdgeMetadata, Mechanism, Node, PlanAction
+from src.infra.resource_map import ClusterResourceSnapshot, ResourceMapManager
 
 
 class _DRO:
@@ -537,6 +538,126 @@ class AgentToolsSmokeTests(unittest.TestCase):
             agent_tools._rank_prediction_payload = saved_payload
             agent_tools._predict_outcome_core = saved_predict
             for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
+    def test_budget_book_tracks_and_enforces_instance_pools(self):
+        env = "reserved|aws|us-east-1|us-east-1b|L40S"
+        resources = {
+            env: {
+                "free": 16,
+                "total": 16,
+                "gpu_type": "L40S",
+                "pools": [
+                    {
+                        "instance_type": "g6e.xlarge",
+                        "gpus_per_instance": 1,
+                        "free_instances": 4,
+                        "free": 4,
+                    },
+                    {
+                        "instance_type": "g6e.12xlarge",
+                        "gpus_per_instance": 4,
+                        "free_instances": 3,
+                        "free": 12,
+                    },
+                ],
+            }
+        }
+        snapshot = ClusterResourceSnapshot(
+            tick=1,
+            resources=resources,
+            active_jobs=[],
+            pending_jobs=[{"job_id": "job_1", "user_id": "usr_test", "status": "waiting"}],
+        )
+
+        class BudgetResourceMap(ResourceMapManager):
+            def __init__(self):
+                super().__init__(user_id="usr_test")
+
+            def snapshot(self):
+                return snapshot
+
+        class SlowLoop:
+            state = type("State", (), {"tick": 1})()
+
+            @staticmethod
+            def get_sss_swap_budget_t():
+                return 10
+
+        saved = {
+            name: getattr(agent_tools._CTX, name)
+            for name in (
+                "resource_map",
+                "slow_loop",
+                "user_registry",
+                "user_envelopes",
+                "validated_budget_book",
+                "cluster_snapshot",
+            )
+        }
+        try:
+            agent_tools._CTX.resource_map = BudgetResourceMap()
+            agent_tools._CTX.slow_loop = SlowLoop()
+            agent_tools._CTX.user_registry = None
+            agent_tools._CTX.user_envelopes = None
+            agent_tools._CTX.cluster_snapshot = snapshot
+            book = agent_tools.allocate_budget_book()
+            slice_ = book["job_budgets"]["job_1"]
+
+            self.assertEqual(
+                slice_["pool_budget"][env],
+                {"g6e.xlarge": 4, "g6e.12xlarge": 3},
+            )
+            self.assertTrue(agent_tools.validate_budget_book(book)["ok"])
+
+            legacy_book = {
+                "job_budgets": {"job_1": {"user_id": "usr_test", "env_budget": {env: 16}}}
+            }
+            legacy_result = agent_tools.validate_budget_book(legacy_book)
+            self.assertFalse(legacy_result["ok"])
+            self.assertTrue(
+                any("pool_budget is required" in v for v in legacy_result["violations"])
+            )
+
+            split_book = {
+                "job_budgets": {
+                    job_id: {
+                        "user_id": "usr_test",
+                        "env_budget": {env: 8},
+                        "pool_budget": {env: {"g6e.12xlarge": 2}},
+                    }
+                    for job_id in ("job_1", "job_2")
+                }
+            }
+            split_result = agent_tools.validate_budget_book(split_book)
+            self.assertFalse(split_result["ok"])
+            self.assertTrue(any("budgets sum to 4" in v for v in split_result["violations"]))
+
+            action = PlanAction.from_dict(
+                {
+                    "job_id": "job_1",
+                    "type": "place",
+                    "ladder": [
+                        {
+                            "role": "aggregate",
+                            "env": env.split("|"),
+                            "config": {
+                                "instance_type": "g6e.12xlarge",
+                                "gpu_count": 2,
+                                "tp": 2,
+                                "pp": 1,
+                            },
+                            "n_replicas": 4,
+                        }
+                    ],
+                }
+            )
+            self.assertIn(
+                "pool g6e.12xlarge",
+                agent_tools._budget_violations(action, slice_)[0],
+            )
+        finally:
+            for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
 
     def test_size_ladder_threads_rank_env_and_job_model_to_surrogate(self):

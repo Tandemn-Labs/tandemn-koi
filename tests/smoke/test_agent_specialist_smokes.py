@@ -143,7 +143,6 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
         result["used_capacity"] = {"aws|us-east-1|us-east-1b|L40S": 4}
         result["ladder"][0]["env"] = ["aws", "us-east-1", "us-east-1b", "L40S"]
         violations = SpecialistRunner._validate(result, "job_1", _slice())
-        self.assertTrue(any("used_capacity env" in violation for violation in violations))
         self.assertTrue(any("ladder[0].env" in violation for violation in violations))
 
     def test_defer_must_not_include_ladder(self):

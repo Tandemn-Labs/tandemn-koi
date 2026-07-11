@@ -4,6 +4,7 @@ import numpy as np
 from src.core.candidate_graph import CandidateGraph
 from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import Edge, EdgeMetadata, EvidenceRow, Mechanism, Node
+from src.infra.resource_map import ResourceMapManager
 from src.validation.cusum import Cusum, CusumDirection, CusumResult
 from src.validation.icp import ICP, ICPResult
 from src.validation.quadrants import Quadrant, QuadrantValidator
@@ -317,6 +318,62 @@ class ValidationSmokeTests(unittest.TestCase):
                 result = Validator().val_plan(_raw_place_plan(config))
                 self.assertFalse(result.feasible)
                 self.assertTrue(any(expected in violation for violation in result.violations))
+
+    def test_c5_rejects_cross_job_instance_pool_overallocation(self):
+        env = "reserved|aws|us-east-1|us-east-1b|L40S"
+        resources = {
+            env: {
+                "free": 16,
+                "total": 16,
+                "gpu_type": "L40S",
+                "pools": [
+                    {
+                        "instance_type": "g6e.xlarge",
+                        "gpus_per_instance": 1,
+                        "free_instances": 4,
+                        "free": 4,
+                    },
+                    {
+                        "instance_type": "g6e.12xlarge",
+                        "gpus_per_instance": 4,
+                        "free_instances": 3,
+                        "free": 12,
+                    },
+                ],
+            }
+        }
+
+        class Snapshot:
+            @staticmethod
+            def resources_summary():
+                return resources
+
+        rank = {
+            "role": "aggregate",
+            "env": env.split("|"),
+            "config": {
+                "instance_type": "g6e.12xlarge",
+                "gpu_count": 2,
+                "tp": 2,
+                "pp": 1,
+            },
+            "n_replicas": 2,
+        }
+        plan = {
+            "actions": [
+                {"job_id": "job_1", "type": "place", "ladder": [rank]},
+                {"job_id": "job_2", "type": "place", "ladder": [rank]},
+            ]
+        }
+        result = Validator(resource_map=ResourceMapManager(user_id="test")).val_plan(
+            plan, Snapshot()
+        )
+
+        self.assertFalse(result.feasible)
+        self.assertIn(
+            f"C5 capacity: env {env} pool g6e.12xlarge requested 4 instances, only 3 free",
+            result.violations,
+        )
 
 
 def _raw_place_plan(config):

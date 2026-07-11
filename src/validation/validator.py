@@ -252,8 +252,35 @@ class Validator:
         resources = self._resources(snapshot)
         if resources is None:
             return []
-        requested = self._requested_gpus_by_env(typed, resources)
+        try:
+            requested, requested_by_pool = self._requested_capacity(typed, resources)
+        except (TypeError, ValueError) as exc:
+            return [f"C5 capacity: {exc}"]
         violations: list[str] = []
+        resource_map = self.resource_map
+        pool_capacity = (
+            resource_map.pool_capacity(resources)
+            if resource_map is not None and hasattr(resource_map, "pool_capacity")
+            else {}
+        )
+        pool_failed_envs = set()
+        for (env_key, instance_type), demand in sorted(requested_by_pool.items()):
+            limit = pool_capacity.get((env_key, instance_type))
+            if limit is None:
+                pool_failed_envs.add(env_key)
+                violations.append(
+                    f"C5 capacity: pool {instance_type} is not available in env {env_key}"
+                )
+                continue
+            units = int(demand["units"])
+            available = int(limit["available_units"])
+            if units > available:
+                pool_failed_envs.add(env_key)
+                unit = "GPUs" if limit["allocation_kind"] == "gpu" else "instances"
+                violations.append(
+                    f"C5 capacity: env {env_key} pool {instance_type} requested "
+                    f"{units} {unit}, only {available} free"
+                )
         for env_key, gpus in sorted(requested.items()):
             info = resources.get(env_key)
             if info is None:
@@ -262,7 +289,7 @@ class Validator:
                 )
                 continue
             free = int(info.get("free", 0))
-            if gpus > free:
+            if gpus > free and env_key not in pool_failed_envs:
                 violations.append(
                     f"C5 capacity: env {env_key} requested {gpus} GPUs, only {free} free"
                 )
@@ -665,6 +692,16 @@ class Validator:
                     rank, resources
                 )
         return requested
+
+    def _requested_capacity(
+        self,
+        typed: Plan,
+        resources: dict[str, Any],
+    ) -> tuple[dict[str, int], dict[tuple[str, str], dict[str, int]]]:
+        resource_map = self.resource_map
+        if resource_map is not None and hasattr(resource_map, "requested_capacity"):
+            return resource_map.requested_capacity(typed, resources)
+        return self._requested_gpus_by_env(typed, resources), {}
 
     def _rank_footprint(self, rank, resources: dict[str, Any] | None) -> int:
         engine_gpus, _ = self._rank_engine_gpus(rank)
