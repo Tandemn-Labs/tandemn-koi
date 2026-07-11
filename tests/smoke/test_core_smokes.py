@@ -198,14 +198,96 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(registry.get_mechanism(prefix_id), prefix)
         self.assertIn(prefix_id, registry.mechanisms_by_edge[prefix.edge_ids[0]])
         self.assertTrue(registry.is_duplicate_mechanism(prefix)[0])
-        self.assertGreater(
-            registry.percentage_scope_match(["shared_prefix_length_avg"], [], prefix), 0
-        )
-        self.assertIn(prefix, registry.filter_by_scope(["shared_prefix_length_avg"], []))
-        broad_context = ["shared_prefix_length_avg", *(f"unrelated_{i}" for i in range(30))]
-        self.assertIn(prefix, registry.filter_by_scope(broad_context, []))
         self.assertTrue(registry.archive_mechanism(pd_id, "demo archive"))
         self.assertIn(pd_id, registry.mechanisms_by_status["archived"])
+
+    def test_mechanism_registry_matches_scope_values(self):
+        registry = MechanismRegistry()
+        prefix = Mechanism(
+            edge_ids=["prefix_cache_enabled->kvcache_hit_rate"],
+            scope={
+                "x": [
+                    "prefix_cache_enabled",
+                    "shared_prefix_length_avg",
+                    "workload_prefix_concentration",
+                ],
+                "v": ["kvcache_hit_rate"],
+                "workload_type": "online",
+                "model_type": "any",
+                "conditions": [{"feature": "shared_prefix_length_avg", "op": ">", "value": 256}],
+            },
+            narrative="Shared prefixes can benefit from prefix caching.",
+        )
+        burst = Mechanism(
+            edge_ids=["peak_to_mean_ratio->depth_req_q"],
+            scope={
+                "x": ["request_arrival_rate", "peak_to_mean_ratio", "max_num_seq"],
+                "v": ["depth_req_q"],
+                "workload_type": "online",
+                "model_type": "any",
+                "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 2}],
+            },
+            narrative="Bursts build queues.",
+        )
+        dense = Mechanism(
+            edge_ids=["tp->comm_overhead_pct"],
+            scope={"x": ["tp"], "v": [], "model_type": "dense_large"},
+            narrative="Dense model communication.",
+        )
+        moe = Mechanism(
+            edge_ids=["ep->comm_overhead_pct"],
+            scope={"x": ["ep"], "v": [], "model_type": "moe"},
+            narrative="MoE communication.",
+        )
+
+        exact = registry.match_scope(
+            prefix,
+            {
+                "type": "online",
+                "prefix_cache_enabled": True,
+                "shared_prefix_length_avg": 500,
+                "workload_prefix_concentration": 0,
+            },
+        )
+        self.assertEqual(exact["quality"], "exact")
+
+        self.assertEqual(
+            registry.match_scope(
+                burst,
+                {
+                    "type": "online",
+                    "request_arrival_rate": 1.0,
+                    "peak_to_mean_ratio": 2,
+                    "max_num_seq": 256,
+                },
+            )["quality"],
+            "reject",
+        )
+        self.assertEqual(
+            registry.match_scope(prefix, {"type": "online", "prefix_cache_enabled": True})[
+                "quality"
+            ],
+            "partial",
+        )
+        self.assertEqual(
+            registry.match_scope(dense, {"tp": 2})["quality"],
+            "reject",
+        )
+        self.assertEqual(
+            registry.match_scope(moe, {"ep": 2, "is_moe": True})["quality"],
+            "exact",
+        )
+        self.assertEqual(
+            registry.match_scope(moe, {"ep": 2, "is_moe": False})["quality"],
+            "reject",
+        )
+        self.assertEqual(
+            registry.match_scope(
+                Mechanism(edge_ids=[], scope={"x": ["tp"], "v": []}, narrative="exact key"),
+                {"throughput_token_per_sec": 100},
+            )["quality"],
+            "reject",
+        )
 
     def test_evidence_service_indexes(self):
         client = PostgresClient()

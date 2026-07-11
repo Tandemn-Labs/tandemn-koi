@@ -1,6 +1,9 @@
 import unittest
 
 from src.agent.tools import agent_tools
+from src.core.candidate_graph import CandidateGraph
+from src.core.mechanism_registry import MechanismRegistry
+from src.core.models import Edge, EdgeMetadata, Mechanism, Node
 
 
 class _DRO:
@@ -92,7 +95,7 @@ class _EvidenceStore:
 
 
 class _MechanismRegistry:
-    def filter_by_scope(self, subset_x, subset_v):
+    def find_applicable(self, context, require_x_overlap=True):
         return []
 
 
@@ -119,6 +122,292 @@ class _RecordingSurrogate:
 
 
 class AgentToolsSmokeTests(unittest.TestCase):
+    def test_set_new_mechanisms_uses_canonical_validation(self):
+        xv = Edge("tp->kv_cache_util", "tp", "kv_cache_util", "X", "V")
+        vy = Edge(
+            "kv_cache_util->p99_tpot_ms",
+            "kv_cache_util",
+            "p99_tpot_ms",
+            "V",
+            "Y",
+        )
+        graph = CandidateGraph(
+            {
+                "tp": Node("tp", "X"),
+                "kv_cache_util": Node("kv_cache_util", "V"),
+                "p99_tpot_ms": Node("p99_tpot_ms", "Y"),
+            },
+            {xv.edge_id: xv, vy.edge_id: vy},
+            {
+                xv.edge_id: EdgeMetadata(xv.edge_id),
+                vy.edge_id: EdgeMetadata(vy.edge_id),
+            },
+        )
+        registry = MechanismRegistry()
+
+        class Confidence:
+            def __init__(self):
+                self.seeded = []
+
+            def seed_new_mechanism_confidence(self, mechanism_id):
+                self.seeded.append(mechanism_id)
+                return 0.5
+
+        confidence = Confidence()
+        saved = (
+            agent_tools._CTX.candidate_graph,
+            agent_tools._CTX.mechanism_registry,
+            agent_tools._CTX.confidence_service,
+        )
+        try:
+            agent_tools._CTX.candidate_graph = graph
+            agent_tools._CTX.mechanism_registry = registry
+            agent_tools._CTX.confidence_service = confidence
+            empty = agent_tools.set_new_mechanisms(
+                [],
+                {"x": ["tp"], "v": ["kv_cache_util"]},
+                "Empty bundle.",
+            )
+            malformed = agent_tools.set_new_mechanisms(
+                [xv.edge_id],
+                {
+                    "x": ["tp"],
+                    "v": ["kv_cache_util"],
+                    "conditions": [{"feature": "tp", "op": "!=", "value": 1}],
+                },
+                "Malformed condition.",
+            )
+            set_scope = agent_tools.set_new_mechanisms(
+                [xv.edge_id, vy.edge_id],
+                {"x": {"tp"}, "v": ["kv_cache_util"]},
+                "Non-serializable scope.",
+            )
+            valid = agent_tools.set_new_mechanisms(
+                [xv.edge_id, vy.edge_id],
+                {
+                    "x": ["tp"],
+                    "v": ["kv_cache_util"],
+                    "workload_type": "online",
+                    "model_type": "any",
+                },
+                "Tensor parallelism changes KV pressure and TPOT.",
+            )
+        finally:
+            (
+                agent_tools._CTX.candidate_graph,
+                agent_tools._CTX.mechanism_registry,
+                agent_tools._CTX.confidence_service,
+            ) = saved
+
+        self.assertFalse(empty["ok"])
+        self.assertFalse(malformed["ok"])
+        self.assertFalse(set_scope["ok"])
+        self.assertEqual(len(registry.mechanism_table), 1)
+        self.assertTrue(valid["ok"])
+        self.assertEqual(confidence.seeded, [valid["mechanism_id"]])
+        stored = registry.get_mechanism(valid["mechanism_id"])
+        self.assertEqual(
+            stored.scope,
+            {
+                "x": ["tp"],
+                "v": ["kv_cache_util"],
+                "workload_type": "online",
+                "model_type": "any",
+                "conditions": [],
+            },
+        )
+        self.assertEqual(
+            registry.match_scope(stored, {"type": "online", "tp": 2})["quality"],
+            "exact",
+        )
+
+    def test_get_scope_uses_condition_values(self):
+        registry = MechanismRegistry()
+        prefix = Mechanism(
+            edge_ids=["prefix_cache_enabled->kvcache_hit_rate"],
+            scope={
+                "x": ["prefix_cache_enabled", "shared_prefix_length_avg"],
+                "v": ["kvcache_hit_rate"],
+                "workload_type": "online",
+                "conditions": [{"feature": "shared_prefix_length_avg", "op": ">", "value": 256}],
+            },
+            narrative="Shared prefixes can benefit from prefix caching.",
+        )
+        burst = Mechanism(
+            edge_ids=["peak_to_mean_ratio->depth_req_q"],
+            scope={
+                "x": ["peak_to_mean_ratio"],
+                "v": ["depth_req_q"],
+                "workload_type": "online",
+                "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 2}],
+            },
+            narrative="Bursts build queues.",
+        )
+        prefix_id = registry.add_mechanism(prefix)
+        registry.add_mechanism(burst)
+
+        class Confidence:
+            @staticmethod
+            def get_mechanism_confidence(mechanism_id):
+                return 0.5
+
+            @staticmethod
+            def get_mechanism_visit_count(mechanism_id):
+                return 0
+
+        saved = (agent_tools._CTX.mechanism_registry, agent_tools._CTX.confidence_service)
+        try:
+            agent_tools.bind_tools(mechanism_registry=registry, confidence_service=Confidence())
+            matches = agent_tools.get_scope(
+                {
+                    "type": "online",
+                    "shared_prefix_length_avg": 500,
+                    "peak_to_mean_ratio": 2,
+                }
+            )
+        finally:
+            agent_tools._CTX.mechanism_registry, agent_tools._CTX.confidence_service = saved
+
+        self.assertEqual([match["mechanism_id"] for match in matches], [prefix_id])
+        self.assertEqual(matches[0]["match_quality"], "partial")
+
+    def test_get_applicable_mechanisms_uses_rank_dp(self):
+        registry = MechanismRegistry()
+        mechanism_id = registry.add_mechanism(
+            Mechanism(
+                edge_ids=["dp->depth_req_q"],
+                scope={
+                    "x": ["dp", "request_arrival_rate", "priority_class"],
+                    "v": ["depth_req_q"],
+                    "workload_type": "online",
+                },
+                narrative="Replica count trades cost for queueing latency.",
+            )
+        )
+
+        class Confidence:
+            @staticmethod
+            def get_mechanism_confidence(mechanism_id):
+                return 0.5
+
+            @staticmethod
+            def get_mechanism_visit_count(mechanism_id):
+                return 0
+
+        saved = (
+            agent_tools._CTX.mechanism_registry,
+            agent_tools._CTX.confidence_service,
+            agent_tools._CTX.resource_map,
+        )
+        try:
+            agent_tools._CTX.mechanism_registry = registry
+            agent_tools._CTX.confidence_service = Confidence()
+            agent_tools._CTX.resource_map = None
+            matches = agent_tools.get_applicable_mechanisms(
+                {
+                    "role": "aggregate",
+                    "env": [
+                        "reserved",
+                        "aws",
+                        "us-east-1",
+                        "use1-az1",
+                        "H100",
+                    ],
+                    "config": {"tp": 1, "pp": 1, "gpu_count": 1},
+                    "n_replicas": 4,
+                },
+                {
+                    "type": "online",
+                    "request_arrival_rate": 1.0,
+                    "priority_class": "STANDARD",
+                },
+            )
+        finally:
+            (
+                agent_tools._CTX.mechanism_registry,
+                agent_tools._CTX.confidence_service,
+                agent_tools._CTX.resource_map,
+            ) = saved
+
+        self.assertEqual([match["mechanism_id"] for match in matches], [mechanism_id])
+        self.assertEqual(matches[0]["match_quality"], "exact")
+
+    def test_get_influencing_knobs_attaches_structured_scope_matches(self):
+        graph = CandidateGraph(
+            {
+                "tp": Node("tp", "X"),
+                "kv_cache_util": Node("kv_cache_util", "V"),
+                "p99_tpot_ms": Node("p99_tpot_ms", "Y"),
+            },
+            {
+                "tp->kv_cache_util": Edge("tp->kv_cache_util", "tp", "kv_cache_util", "X", "V"),
+                "kv_cache_util->p99_tpot_ms": Edge(
+                    "kv_cache_util->p99_tpot_ms",
+                    "kv_cache_util",
+                    "p99_tpot_ms",
+                    "V",
+                    "Y",
+                ),
+            },
+            {
+                edge_id: EdgeMetadata(edge_id=edge_id)
+                for edge_id in ("tp->kv_cache_util", "kv_cache_util->p99_tpot_ms")
+            },
+        )
+        registry = MechanismRegistry()
+        partial_id = registry.add_mechanism(
+            Mechanism(
+                edge_ids=["tp->kv_cache_util"],
+                scope={
+                    "x": ["tp"],
+                    "v": ["kv_cache_util"],
+                    "workload_type": "online",
+                    "conditions": [{"feature": "tp", "op": ">", "value": 1}],
+                },
+                narrative="Tensor parallelism changes KV pressure.",
+            )
+        )
+        registry.add_mechanism(
+            Mechanism(
+                edge_ids=["tp->kv_cache_util"],
+                scope={
+                    "x": ["peak_to_mean_ratio"],
+                    "v": ["kv_cache_util"],
+                    "workload_type": "online",
+                    "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 2}],
+                },
+                narrative="Only bursty workloads use this mechanism.",
+            )
+        )
+
+        class Confidence:
+            @staticmethod
+            def get_edge_confidence(edge_id):
+                return 0.8
+
+        saved = (
+            agent_tools._CTX.candidate_graph,
+            agent_tools._CTX.confidence_service,
+            agent_tools._CTX.mechanism_registry,
+        )
+        try:
+            agent_tools._CTX.candidate_graph = graph
+            agent_tools._CTX.confidence_service = Confidence()
+            agent_tools._CTX.mechanism_registry = registry
+            knobs = agent_tools.get_influencing_knobs(
+                {"type": "online", "peak_to_mean_ratio": 2},
+                "p99_tpot_ms",
+            )
+        finally:
+            (
+                agent_tools._CTX.candidate_graph,
+                agent_tools._CTX.confidence_service,
+                agent_tools._CTX.mechanism_registry,
+            ) = saved
+
+        self.assertEqual(knobs[0]["knob"], "tp")
+        self.assertEqual(knobs[0]["mechanisms"], [partial_id])
+
     def test_size_ladder_caps_each_instance_pool(self):
         env = "reserved|aws|us-east-1|us-east-1b|L40S"
 
@@ -333,17 +622,16 @@ class AgentToolsSmokeTests(unittest.TestCase):
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
 
-    def test_eig_scope_ignores_engine_knobs(self):
+    def test_eig_materialization_uses_committed_mechanisms_only(self):
         class Registry:
             def __init__(self):
-                self.scope = None
+                self.mechanisms = {
+                    "M_test": type("Mechanism", (), {"mechanism_id": "M_test"})(),
+                    "M_unrelated": type("Mechanism", (), {"mechanism_id": "M_unrelated"})(),
+                }
 
             def get_mechanism(self, mechanism_id):
-                return type("Mechanism", (), {"mechanism_id": mechanism_id})()
-
-            def filter_by_scope(self, subset_x, subset_v):
-                self.scope = (subset_x, subset_v)
-                return []
+                return self.mechanisms[mechanism_id]
 
         saved = agent_tools._CTX.mechanism_registry
         registry = Registry()
@@ -359,7 +647,12 @@ class AgentToolsSmokeTests(unittest.TestCase):
             )
 
             self.assertEqual(ladder.ranks[0].config, {"tp": 1})
-            self.assertEqual(registry.scope, (["tp"], []))
+            self.assertEqual(
+                [mechanism.mechanism_id for mechanism in ladder.applicable_mechanisms],
+                ["M_test"],
+            )
+            with self.assertRaisesRegex(ValueError, "unknown mechanism_id"):
+                agent_tools._materialize_ladder([{"mechanism_id": "M_missing", "config": {}}])
         finally:
             agent_tools._CTX.mechanism_registry = saved
 
@@ -385,6 +678,8 @@ class AgentToolsSmokeTests(unittest.TestCase):
             self.assertEqual(brief["job_features"]["model_id"], "meta-llama/Llama-3.1-8B-Instruct")
             self.assertEqual(brief["model_catalog"]["model_params_b"], 70.0)
             self.assertNotIn("model_params_b", brief["job_features"])
+            self.assertEqual(brief["mechanism_candidates"], [])
+            self.assertNotIn("applicable_mechanisms", brief)
         finally:
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)

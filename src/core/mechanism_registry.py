@@ -7,6 +7,7 @@ edge-to-mechanism lookups used by S2, EIG, and agent tooling.
 
 import hashlib
 import json
+from typing import Any
 
 from src.core.models import Mechanism, MechanismMetadata
 
@@ -128,28 +129,112 @@ class MechanismRegistry:
         self.mechanisms_by_status["active"].discard(mechanism_id)
         return True
 
-    def filter_by_scope(self, subset_x: list[str], subset_v: list[str]) -> list[Mechanism]:
-        """Return mechanisms sufficiently covered by available X/V variables.
-
-        v0 uses a simple overlap heuristic over mechanism.scope. It is
-        intentionally broad so S2 can fan out evidence to plausible
-        mechanisms before stricter scopeability validation exists.
-        """
-        matching_mechanisms = []
-        for mechanism in self.mechanism_table.values():
-            if self.percentage_scope_match(subset_x, subset_v, mechanism) > 25:
-                matching_mechanisms.append(mechanism)
-        return matching_mechanisms
-
-    def percentage_scope_match(
+    def match_scope(
         self,
-        subset_x: list[str],
-        subset_v: list[str],
         mechanism: Mechanism,
-    ) -> float:
-        """Return percent of the mechanism's X/V scope currently available."""
-        available = set(subset_x) | set(subset_v)
-        scope = set(mechanism.scope.get("x", [])) | set(mechanism.scope.get("v", []))
-        if not scope:
-            return 0.0
-        return 100.0 * len(available & scope) / len(scope)
+        context: dict,
+        *,
+        require_x_overlap: bool = True,
+    ) -> dict[str, Any]:
+        """Match a mechanism against workload, model, and candidate values."""
+        matched_x = sorted(set(mechanism.scope.get("x", ())) & context.keys())
+        missing_x = sorted(set(mechanism.scope.get("x", ())) - context.keys())
+        result: dict[str, Any] = {
+            "quality": "exact",
+            "matched_x": matched_x,
+            "missing_x": missing_x,
+            "condition_results": [],
+            "reasons": [],
+        }
+
+        def reject(reason: str) -> dict[str, Any]:
+            result["quality"] = "reject"
+            result["reasons"].append(reason)
+            return result
+
+        if mechanism.status != "active":
+            return reject("mechanism is not active")
+
+        expected_workload = str(mechanism.scope.get("workload_type") or "any").lower()
+        workload = context.get("workload_type", context.get("type", context.get("kind")))
+        workload = str(workload).lower() if workload is not None else None
+        if expected_workload != "any":
+            if workload is None:
+                result["quality"] = "partial"
+                result["reasons"].append("workload type is missing")
+            elif workload != expected_workload:
+                return reject(f"workload {workload!r} does not match {expected_workload!r}")
+
+        model_type = str(mechanism.scope.get("model_type") or "any").lower()
+        if model_type in {"dense_small", "dense_large"}:
+            return reject(f"model type {model_type!r} is not defined by Store")
+        if model_type == "moe" and context.get("is_moe") is not True:
+            return reject("model is not known to be MoE")
+        if model_type not in {"any", "moe"}:
+            return reject(f"unknown model type {model_type!r}")
+
+        if require_x_overlap and not matched_x:
+            return reject("candidate has no scoped X variable")
+        if missing_x:
+            result["quality"] = "partial"
+
+        operators = {
+            ">": lambda actual, expected: actual > expected,
+            "<": lambda actual, expected: actual < expected,
+            ">=": lambda actual, expected: actual >= expected,
+            "<=": lambda actual, expected: actual <= expected,
+            "==": lambda actual, expected: actual == expected,
+        }
+        for condition in mechanism.scope.get("conditions", ()):
+            if not isinstance(condition, dict):
+                return reject("condition must be a dict")
+            feature = condition.get("feature")
+            op = condition.get("op")
+            expected = condition.get("value")
+            check = {"feature": feature, "op": op, "expected": expected}
+            result["condition_results"].append(check)
+            if op not in operators:
+                check["result"] = False
+                return reject(f"unknown condition operator {op!r}")
+            if feature not in context:
+                check["result"] = None
+                result["quality"] = "partial"
+                result["reasons"].append(f"condition feature {feature!r} is missing")
+                continue
+
+            actual = context[feature]
+            check["actual"] = actual
+            if op != "==" and (
+                isinstance(actual, bool)
+                or isinstance(expected, bool)
+                or not isinstance(actual, (int, float))
+                or not isinstance(expected, (int, float))
+            ):
+                check["result"] = False
+                return reject(f"condition {feature!r} requires numeric operands")
+            if op == "==" and (isinstance(actual, bool) != isinstance(expected, bool)):
+                check["result"] = False
+                return reject(f"condition {feature!r} compares incompatible values")
+            try:
+                passed = operators[op](actual, expected)
+            except TypeError:
+                passed = False
+            check["result"] = passed
+            if not passed:
+                return reject(f"condition {feature!r} {op} {expected!r} is false")
+
+        return result
+
+    def find_applicable(
+        self,
+        context: dict,
+        *,
+        require_x_overlap: bool = True,
+    ) -> list[tuple[Mechanism, dict[str, Any]]]:
+        """Return exact and partial matches, with exact matches first."""
+        matches = []
+        for mechanism in self.mechanism_table.values():
+            match = self.match_scope(mechanism, context, require_x_overlap=require_x_overlap)
+            if match["quality"] != "reject":
+                matches.append((mechanism, match))
+        return sorted(matches, key=lambda item: item[1]["quality"] != "exact")

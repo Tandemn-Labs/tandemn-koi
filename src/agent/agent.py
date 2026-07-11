@@ -227,7 +227,8 @@ class SpecialistRunner:
             "7. If overprovisioned, give unused capacity by env.\n\n"
             "Do not exceed budget. If you want more, report it as fitness, "
             "not as allocated ladder demand.\n\n"
-            "Mechanism IDs are opaque Store IDs: use applicable_mechanisms only. "
+            "Mechanism IDs are opaque Store IDs: prefer exact entries in "
+            "mechanism_candidates, then partial entries. "
             "If none fits, submit new_mechanism_proposals without inventing an ID.\n\n"
             "Your output is a PROPOSAL to the root cluster planner, not a "
             "decision. The root may accept, modify, or discard it during "
@@ -869,7 +870,7 @@ class KoiAgentHarness:
                     )
 
             if action.type in LADDER_ACTIONS:
-                self._validate_ladder(action, book)
+                self._validate_ladder(action, book, cluster_snapshot)
 
         if states is not None:
             self._autofill_coverage(plan, states)
@@ -882,7 +883,7 @@ class KoiAgentHarness:
 
         return plan
 
-    def _validate_ladder(self, action: PlanAction, book) -> None:
+    def _validate_ladder(self, action: PlanAction, book, cluster_snapshot=None) -> None:
         """Validate a ladder-bearing action; raise on hard violations."""
         jid = action.job_id
         if action.ladder is None:
@@ -895,6 +896,7 @@ class KoiAgentHarness:
         except ValueError as exc:
             raise PlanMaterializationError(str(exc)) from exc
 
+        job_features = agent_tools._job_features_for(cluster_snapshot, jid)
         for i, rank in enumerate(action.ladder):
             if rank.env is None or len(rank.env) != 5:
                 raise PlanMaterializationError(
@@ -911,11 +913,18 @@ class KoiAgentHarness:
             if registry is None:
                 raise PlanMaterializationError("mechanism registry is unavailable")
             try:
-                registry.get_mechanism(rank.mechanism_id)
+                mechanism = registry.get_mechanism(rank.mechanism_id)
             except KeyError:
                 raise PlanMaterializationError(
                     f"job {jid} rank {i}: unknown mechanism_id {rank.mechanism_id!r}"
                 ) from None
+            context = agent_tools._rank_mechanism_context(rank, job_features)
+            match = registry.match_scope(mechanism, context)
+            if match["quality"] == "reject":
+                raise PlanMaterializationError(
+                    f"job {jid} rank {i}: mechanism {rank.mechanism_id!r} does not apply "
+                    f"({'; '.join(match['reasons'])})"
+                )
 
         if book is not None and not action.budget_ref:
             raise PlanMaterializationError(
@@ -1043,7 +1052,8 @@ class KoiAgentHarness:
             "Every agent tool is bound as a function (get_cluster_state, "
             "get_priority, build_user_envelopes, allocate_budget_book, "
             "validate_budget_book, run_job_specialists, predict_outcome, "
-            "compute_sigma, get_influencing_knobs, optimize_config, "
+            "compute_sigma, get_applicable_mechanisms, get_influencing_knobs, "
+            "optimize_config, "
             "get_z_star, size_ladder, check_feasibility, ...).\n\n"
             # ---------- YOUR JOB THIS TICK ----------
             "YOUR JOB: produce one cluster-wide plan that maximizes aggregate "
@@ -1128,7 +1138,9 @@ class KoiAgentHarness:
             "rescore with compute_sigma. Reallocate from fitness signals when "
             "the sigma gain is positive, rerun only affected specialists, then "
             "commit. Mechanism IDs are opaque Store IDs: never author one. Use "
-            "an applicable ID, or call set_new_mechanisms and use its returned ID.\n\n"
+            "an applicable ID, or call set_new_mechanisms and use its returned ID. "
+            "After proposing a rank, call get_applicable_mechanisms(rank, "
+            "job_features); prefer exact matches, then partial matches.\n\n"
             # ---------- SHARPEN BEFORE YOU SCORE ----------
             "SHARPEN EACH JOB BEFORE YOU SCORE IT. predict_outcome returns "
             "predictions already CALIBRATED against the evidence database "

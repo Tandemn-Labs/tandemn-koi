@@ -2,7 +2,8 @@ import unittest
 
 from src.agent.agent import KoiAgentHarness, PlanMaterializationError, SpecialistRunner
 from src.agent.tools import agent_tools
-from src.core.models import PlanAction, RankSpec
+from src.core.mechanism_registry import MechanismRegistry
+from src.core.models import Mechanism, PlanAction, RankSpec
 
 ENV = "reserved|aws|us-east-1|us-east-1b|L40S"
 
@@ -72,6 +73,60 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
 
         self.assertEqual(explicit.config, {"tp": 1})
         self.assertEqual(shorthand.config, {"tp": 1})
+
+    def test_ladder_rejects_false_scope_but_accepts_partial(self):
+        registry = MechanismRegistry()
+        burst_id = registry.add_mechanism(
+            Mechanism(
+                edge_ids=["peak_to_mean_ratio->depth_req_q"],
+                scope={
+                    "x": ["peak_to_mean_ratio"],
+                    "v": ["depth_req_q"],
+                    "workload_type": "online",
+                    "conditions": [{"feature": "peak_to_mean_ratio", "op": ">", "value": 2}],
+                },
+                narrative="Bursts build queues.",
+            )
+        )
+        partial_id = registry.add_mechanism(
+            Mechanism(
+                edge_ids=["tp->comm_overhead_pct"],
+                scope={
+                    "x": ["tp", "unknown_knob"],
+                    "v": ["comm_overhead_pct"],
+                    "workload_type": "online",
+                    "conditions": [{"feature": "unknown_knob", "op": ">", "value": 0}],
+                },
+                narrative="Partially known communication mechanism.",
+            )
+        )
+
+        class Snapshot:
+            @staticmethod
+            def pending_jobs_summary():
+                return [
+                    {
+                        "job_id": "job_1",
+                        "job_features": {"type": "online", "peak_to_mean_ratio": 2},
+                    }
+                ]
+
+        saved = (agent_tools._CTX.mechanism_registry, agent_tools._CTX.resource_map)
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        try:
+            agent_tools._CTX.mechanism_registry = registry
+            agent_tools._CTX.resource_map = None
+
+            false_scope = _valid_place()
+            false_scope["ladder"][0]["mechanism_id"] = burst_id
+            with self.assertRaisesRegex(PlanMaterializationError, "does not apply"):
+                harness._validate_ladder(PlanAction.from_dict(false_scope), None, Snapshot())
+
+            partial = _valid_place()
+            partial["ladder"][0]["mechanism_id"] = partial_id
+            harness._validate_ladder(PlanAction.from_dict(partial), None, Snapshot())
+        finally:
+            agent_tools._CTX.mechanism_registry, agent_tools._CTX.resource_map = saved
 
     def test_valid_canonical_place_passes(self):
         self.assertEqual(SpecialistRunner._validate(_valid_place(), "job_1", _slice()), [])

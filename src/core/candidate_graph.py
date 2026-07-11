@@ -144,12 +144,24 @@ class CandidateGraph:
         return True
 
     def check_connected(self, edges: Sequence[Edge]) -> bool:
-        """Validate node references and allowed topology for an edge bundle."""
-        for edge in edges:
-            if not self.val_edges(edge):
-                return False
+        """Return True when a valid edge bundle is weakly connected."""
+        if not edges or not all(self.val_edges(edge) for edge in edges):
+            return False
+        if not self.val_topology(edges):
+            return False
 
-        return self.val_topology(edges)
+        adjacent: dict[str, set[str]] = {}
+        for edge in edges:
+            adjacent.setdefault(edge.src, set()).add(edge.dst)
+            adjacent.setdefault(edge.dst, set()).add(edge.src)
+
+        pending = [next(iter(adjacent))]
+        visited = set(pending)
+        while pending:
+            for node in adjacent[pending.pop()] - visited:
+                visited.add(node)
+                pending.append(node)
+        return visited == set(adjacent)
 
     def get_node_type(self, node_id: str) -> str:
         """Return a node's X/V/Y type, raising on unknown node ids."""

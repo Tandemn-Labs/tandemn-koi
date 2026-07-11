@@ -44,7 +44,10 @@ from src.core.models import (
 # for them. TODO(v0): add preempt/resume/retry with lifecycle snapshot support.
 _EXISTENCE_REQUIRED = frozenset({ActionType.KEEP, ActionType.SWAP})
 
-_KNOWN_WORKLOAD_TYPES = frozenset({"any", "online", "batch", "batched", "offline"})
+_KNOWN_WORKLOAD_TYPES = frozenset({"any", "online", "batch"})
+_KNOWN_MODEL_TYPES = frozenset({"any", "moe", "dense_small", "dense_large"})
+_CONDITION_OPERATORS = frozenset({">", "<", ">=", "<=", "=="})
+_ALLOWED_SCOPE_KEYS = frozenset({"x", "v", "workload_type", "model_type", "conditions"})
 
 
 @dataclass
@@ -409,10 +412,16 @@ class Validator:
                     violations.append(f"mechanism: edge {eid!r} not in CandidateGraph")
                 else:
                     edge_objs.append(cg.edge_table[eid])
-            if edge_objs and not cg.val_topology(edge_objs):
-                violations.append(
-                    "mechanism: topology violation - only X->V and V->Y edges allowed"
-                )
+            if edge_objs:
+                if not cg.val_topology(edge_objs):
+                    violations.append(
+                        "mechanism: topology violation - only X->V and V->Y edges allowed"
+                    )
+                else:
+                    if not cg.check_connected(edge_objs):
+                        violations.append("mechanism: edge bundle is disconnected")
+                    if not self._has_complete_path(edge_objs):
+                        violations.append("mechanism: edge bundle has no complete X->V->Y path")
 
         if self.mechanism_registry is not None:
             is_dup, existing = self.mechanism_registry.is_duplicate_mechanism(mechanism)
@@ -428,26 +437,27 @@ class Validator:
     def val_scopeability(self, scope) -> tuple[bool, list[str]]:
         """Validate a mechanism scope.
 
-        Structural checks always run: scope is a dict and names at least one
-        X or V variable. Semantic checks run only when a candidate_graph is
-        bound: each named X variable must be an X node, each V variable a V
-        node, and any workload_type must be recognized.
+        Structural checks always run: scope is a dict, names at least one X or
+        V variable, uses known workload/model qualifiers, and has well-formed
+        conditions. Graph checks ensure scoped and conditioned variables have
+        the expected node types.
 
         Args:
-            scope: the proposal's scope dict, e.g.
-                {"x" or "subset_x": [...], "v" or "subset_v": [...]}.
+            scope: The proposal's canonical scope dict.
 
         Returns:
             (ok, violations).
         """
-        if not isinstance(scope, dict):
-            return False, ["scope: must be a dict"]
+        try:
+            scope = self._canonical_scope(scope)
+        except ValueError as exc:
+            return False, [f"scope: {exc}"]
 
-        x_vars, x_violations = self._scope_vars(scope, "x", "subset_x")
-        v_vars, v_violations = self._scope_vars(scope, "v", "subset_v")
-        violations: list[str] = [*x_violations, *v_violations]
-        if not x_vars and not v_vars:
-            violations.append("scope: must name at least one X or V variable")
+        x_vars = scope["x"]
+        v_vars = scope["v"]
+        violations: list[str] = []
+        if not x_vars:
+            violations.append("scope: must name at least one X variable")
 
         workload_type = scope.get("workload_type")
         if workload_type is not None and str(workload_type).lower() not in _KNOWN_WORKLOAD_TYPES:
@@ -455,6 +465,43 @@ class Validator:
                 f"scope: unknown workload_type {workload_type!r} "
                 f"(expected one of {sorted(_KNOWN_WORKLOAD_TYPES)})"
             )
+
+        model_type = scope.get("model_type")
+        if model_type is not None and str(model_type).lower() not in _KNOWN_MODEL_TYPES:
+            violations.append(
+                f"scope: unknown model_type {model_type!r} "
+                f"(expected one of {sorted(_KNOWN_MODEL_TYPES)})"
+            )
+
+        conditions = scope["conditions"]
+
+        condition_features = []
+        for index, condition in enumerate(conditions):
+            if not isinstance(condition, dict):
+                violations.append(f"scope: conditions[{index}] must be a dict")
+                continue
+            feature = condition.get("feature")
+            operator = condition.get("op")
+            value = condition.get("value")
+            if not isinstance(feature, str) or not feature:
+                violations.append(f"scope: conditions[{index}].feature must be a non-empty string")
+            else:
+                condition_features.append((index, feature))
+            if operator not in _CONDITION_OPERATORS:
+                violations.append(
+                    f"scope: conditions[{index}].op {operator!r} is unknown "
+                    f"(expected one of {sorted(_CONDITION_OPERATORS)})"
+                )
+            if operator in {">", "<", ">=", "<="} and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+            ):
+                violations.append(
+                    f"scope: conditions[{index}].value must be numeric for {operator}"
+                )
+            elif operator == "==" and not isinstance(value, (bool, int, float)):
+                violations.append(
+                    f"scope: conditions[{index}].value must be boolean or numeric for =="
+                )
 
         cg = self.candidate_graph
         if cg is not None:
@@ -471,6 +518,17 @@ class Validator:
                     violations.append(f"scope: V variable {var!r} is not a graph node")
                 elif node.node_type != "V":
                     violations.append(f"scope: {var!r} is a {node.node_type} node, not V")
+            for index, feature in condition_features:
+                node = node_table.get(feature)
+                if node is None:
+                    violations.append(
+                        f"scope: conditions[{index}].feature {feature!r} is not a graph node"
+                    )
+                elif node.node_type != "X":
+                    violations.append(
+                        f"scope: conditions[{index}].feature {feature!r} is a "
+                        f"{node.node_type} node, not X"
+                    )
 
         return len(violations) == 0, violations
 
@@ -493,18 +551,17 @@ class Validator:
         if violations:
             by[code] = violations
 
-    @staticmethod
-    def _as_mechanism(proposal) -> Mechanism:
+    @classmethod
+    def _as_mechanism(cls, proposal) -> Mechanism:
         """Coerce a proposal dict into a Mechanism (pass objects through)."""
         if isinstance(proposal, Mechanism):
+            proposal.scope = cls._canonical_scope(proposal.scope)
             return proposal
         if isinstance(proposal, dict):
             scope = proposal.get("scope") or proposal.get("applicable_to") or {}
-            if not isinstance(scope, dict):
-                raise ValueError("scope must be a dict")
             return Mechanism(
                 edge_ids=list(proposal.get("edge_ids", [])),
-                scope=dict(scope),
+                scope=cls._canonical_scope(scope),
                 narrative=str(proposal.get("narrative", proposal.get("llm_blurb", ""))),
             )
         raise ValueError(
@@ -512,15 +569,46 @@ class Validator:
         )
 
     @staticmethod
-    def _scope_vars(scope: dict, key: str, alias: str) -> tuple[list[str], list[str]]:
-        value = scope.get(key, scope.get(alias, []))
-        if value is None:
-            return [], []
-        if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
-            return [], [f"scope: {key}/{alias} must be a list of strings"]
-        if not all(isinstance(var, str) for var in value):
-            return [], [f"scope: {key}/{alias} must be a list of strings"]
-        return list(value), []
+    def _canonical_scope(scope) -> dict[str, Any]:
+        if not isinstance(scope, dict):
+            raise ValueError("scope must be a dict")
+        unknown = sorted(set(scope) - _ALLOWED_SCOPE_KEYS)
+        if unknown:
+            raise ValueError(f"unknown scope keys: {unknown}")
+
+        def variables(key: str) -> list[str]:
+            value = scope.get(key, [])
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) and item for item in value
+            ):
+                raise ValueError(f"{key} must be a list of non-empty strings")
+            return sorted(set(value))
+
+        conditions = scope.get("conditions", [])
+        if not isinstance(conditions, list):
+            raise ValueError("conditions must be a list")
+        condition_keys = {"feature", "op", "value"}
+        if any(
+            not isinstance(condition, dict) or set(condition) != condition_keys
+            for condition in conditions
+        ):
+            raise ValueError("conditions require feature, op, and value")
+
+        return {
+            "x": variables("x"),
+            "v": variables("v"),
+            "workload_type": str(scope.get("workload_type", "any")).lower(),
+            "model_type": str(scope.get("model_type", "any")).lower(),
+            "conditions": [dict(condition) for condition in conditions],
+        }
+
+    @staticmethod
+    def _has_complete_path(edges) -> bool:
+        mediators = {edge.dst for edge in edges if edge.src_type == "X" and edge.dst_type == "V"}
+        return any(
+            edge.src in mediators and edge.src_type == "V" and edge.dst_type == "Y"
+            for edge in edges
+        )
 
     @staticmethod
     def _job_states(snapshot) -> dict[str, str] | None:
