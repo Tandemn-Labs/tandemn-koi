@@ -197,7 +197,10 @@ class EigResourceSmokeTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(
             violations,
-            ["env reserved|aws|us-east-2|use2-az3|A100: requested 8 more GPUs than available"],
+            [
+                "env reserved|aws|us-east-2|use2-az3|A100 pool p4d.24xlarge: "
+                "requested 1 instances, only 0 free"
+            ],
         )
 
     def test_mixed_instance_pools_expose_free_instances(self):
@@ -237,7 +240,8 @@ class EigResourceSmokeTests(unittest.TestCase):
             def get_running_chains(self, user_id=None):
                 return []
 
-        resources = SmokeManager().resources_summary()[env]
+        manager = SmokeManager()
+        resources = manager.resources_summary()[env]
         pools = {pool["instance_type"]: pool for pool in resources["pools"]}
 
         self.assertEqual(resources["free"], 16)
@@ -245,6 +249,84 @@ class EigResourceSmokeTests(unittest.TestCase):
         self.assertEqual(pools["g6e.xlarge"]["free"], 4)
         self.assertEqual(pools["g6e.12xlarge"]["free_instances"], 3)
         self.assertEqual(pools["g6e.12xlarge"]["free"], 12)
+
+        plan = {
+            "actions": [
+                {
+                    "job_id": "job_new",
+                    "type": "place",
+                    "ladder": [
+                        {
+                            "role": "aggregate",
+                            "env": env.split("|"),
+                            "config": {
+                                "instance_type": "g6e.12xlarge",
+                                "gpu_count": 2,
+                                "tp": 2,
+                                "pp": 1,
+                            },
+                            "n_replicas": 4,
+                        }
+                    ],
+                }
+            ]
+        }
+        future = manager.simulate_future_resources(plan)[env]
+        large_pool = next(
+            pool for pool in future["pools"] if pool["instance_type"] == "g6e.12xlarge"
+        )
+        ok, violations = manager.check_resource_feasibility(plan)
+
+        self.assertEqual(future["free_after"], 0)
+        self.assertEqual(large_pool["free_units_after"], -1)
+        self.assertFalse(ok)
+        self.assertIn("requested 4 instances, only 3 free", violations[0])
+
+        plan["actions"][0]["type"] = "keep"
+        self.assertEqual(manager.requested_capacity(plan)[0], {})
+
+    def test_gpu_pool_subtracts_running_gpu_usage(self):
+        env = "reserved|onprem|local|rack-1|H100"
+
+        class FakeResourceMap:
+            market = ("reserved",)
+
+            @staticmethod
+            def scheduling_summary():
+                return {
+                    env: {
+                        "gpu_type": "H100",
+                        "total": 4,
+                        "pools": [
+                            {
+                                "instance_type": "gpu-pool",
+                                "allocation_unit": "gpu",
+                                "gpus_per_unit": 1,
+                                "total": 4,
+                                "total_instances": 4,
+                            }
+                        ],
+                    }
+                }
+
+        class SmokeManager(ResourceMapManager):
+            def __init__(self):
+                super().__init__(user_id="gpu_pool_smoke")
+
+            def get_resource_map(self, user_id=None):
+                return FakeResourceMap()
+
+            def get_running_chains(self, user_id=None):
+                return [
+                    {
+                        "chain_id": "chain_1",
+                        "target_node": env,
+                        "shape_json": {"instance_type": "gpu-pool", "count": 2},
+                    }
+                ]
+
+        pool = SmokeManager().resources_summary()[env]["pools"][0]
+        self.assertEqual(pool["free"], 2)
 
 
 if __name__ == "__main__":

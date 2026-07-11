@@ -414,18 +414,14 @@ class SpecialistRunner:
         elif ladder not in (None, []):
             violations.append(f"{action_name} must not include ladder")
 
-        budget = {
-            agent_tools._env_key(env): int(n) for env, n in (slice_.get("env_budget") or {}).items()
-        }
-        for env, used in (result.get("used_capacity") or {}).items():
-            key = agent_tools._env_key(env)
-            if key not in budget:
-                violations.append(f"used_capacity env {key} is not in BudgetSlice")
-                continue
-            if int(used) > budget.get(key, 0):
-                violations.append(
-                    f"used_capacity {used} in {key} exceeds slice budget {budget.get(key, 0)}"
-                )
+        if action_name in (ActionType.PLACE.value, ActionType.SWAP.value) and isinstance(
+            ladder, list
+        ):
+            try:
+                action_obj = PlanAction.from_dict(result)
+                violations.extend(agent_tools._budget_violations(action_obj, slice_))
+            except (TypeError, ValueError):
+                pass  # Schema violations above already describe malformed ladders.
         return violations
 
     @staticmethod
@@ -598,6 +594,7 @@ class KoiAgentHarness:
         agent_tools.bind_tools(
             evidence_store=evidence_store,
             mechanism_registry=mechanism_registry,
+            cluster_snapshot=cluster_snapshot,
         )
         agent_tools.assert_planning_ready()
         self._current_tick = tick
@@ -926,11 +923,18 @@ class KoiAgentHarness:
                     f"({'; '.join(match['reasons'])})"
                 )
 
-        if book is not None and not action.budget_ref:
-            raise PlanMaterializationError(
-                f"job {jid}: ladder action needs budget_ref when a "
-                "BudgetBook was validated this tick"
+        if book is not None:
+            slice_ = (book.get("job_budgets") or {}).get(jid)
+            if slice_ is None or action.budget_ref != slice_.get("slice_id"):
+                raise PlanMaterializationError(f"job {jid}: invalid BudgetSlice reference")
+            resources = (
+                cluster_snapshot.resources_summary()
+                if cluster_snapshot is not None and hasattr(cluster_snapshot, "resources_summary")
+                else None
             )
+            violations = agent_tools._budget_violations(action, slice_, resources)
+            if violations:
+                raise PlanMaterializationError(f"job {jid}: {'; '.join(violations)}")
 
     def _autofill_coverage(self, plan: Plan, states: dict[str, str]) -> None:
         """Add conservative no-op actions for jobs the plan omitted.
@@ -1124,6 +1128,7 @@ class KoiAgentHarness:
             "call budget_book.allocate(). It returns a dict shaped: "
             "{'tick': int, 'job_budgets': {job_id: {'slice_id': str, "
             "'job_id': str, 'user_id': str, 'env_budget': {env_key: gpus}, "
+            "'pool_budget': {env_key: {instance_type: units}}, "
             "'allowed_actions': [...], 'strategy_hint': str, 'canary_cap': "
             "int, 'priority_score': float}}, 'reserves': {env_key: int}, "
             "'rationale': str}. Read a job's slice id as "

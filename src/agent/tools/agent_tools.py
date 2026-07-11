@@ -166,6 +166,7 @@ class _ToolContext:
     user_registry = None
     specialist_runner = None
     tool_call_logger = None
+    cluster_snapshot = None
 
     # Per-tick caches written by the budget tools.
     user_envelopes = None
@@ -342,7 +343,7 @@ def _env_key(env) -> str:
 
 def _snapshot():
     _require("resource_map")
-    return _CTX.resource_map.snapshot()
+    return _CTX.cluster_snapshot or _CTX.resource_map.snapshot()
 
 
 def _as_plan(plan, tick: int = 0) -> Plan:
@@ -816,6 +817,39 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+def _pool_limits(resources: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    resource_map = getattr(_CTX, "resource_map", None)
+    if resource_map is None or not hasattr(resource_map, "pool_capacity"):
+        return {}
+    return resource_map.pool_capacity(resources)
+
+
+def _pool_budget_by_env(resources: dict[str, Any]) -> dict[str, dict[str, int]]:
+    budget: dict[str, dict[str, int]] = {}
+    for (env, instance_type), limit in _pool_limits(resources).items():
+        budget.setdefault(env, {})[instance_type] = int(limit["available_units"])
+    return budget
+
+
+def _parse_pool_budget(slice_: dict[str, Any]) -> tuple[dict[str, dict[str, int]], list[str]]:
+    raw = slice_.get("pool_budget") or {}
+    if not isinstance(raw, dict):
+        return {}, ["pool_budget must be a dict"]
+    budget: dict[str, dict[str, int]] = {}
+    violations = []
+    for env, pools in raw.items():
+        env_key = _env_key(env)
+        if not isinstance(pools, dict):
+            violations.append(f"pool_budget[{env_key}] must be a dict")
+            continue
+        for instance_type, units in pools.items():
+            if isinstance(units, bool) or not isinstance(units, int) or units < 0:
+                violations.append(f"pool budget for {instance_type} in {env_key} must be >= 0")
+                continue
+            budget.setdefault(env_key, {})[str(instance_type)] = units
+    return budget, violations
+
+
 def build_user_envelopes() -> dict[str, dict[str, Any]]:
     """Build deterministic user envelopes for this tick.
 
@@ -898,6 +932,7 @@ def allocate_budget_book() -> dict[str, Any]:
     active_ids = {j.get("job_id", j.get("id")) for j in active}
     by_id = {j.get("job_id", j.get("id")): j for j in pending + active}
     remaining = {_env_key(env): int(info.get("free", 0)) for env, info in resources.items()}
+    remaining_pools = _pool_budget_by_env(resources)
     priorities = get_priority()
     job_budgets: dict[str, dict[str, Any]] = {}
 
@@ -917,6 +952,11 @@ def allocate_budget_book() -> dict[str, Any]:
             for env, free in remaining.items()
             if free > 0 and env in allowed and env not in denied
         }
+        pool_budget = {
+            env: dict(remaining_pools.get(env, {}))
+            for env in env_budget
+            if remaining_pools.get(env)
+        }
         for env, free in env_budget.items():
             remaining[env] -= free
 
@@ -927,6 +967,7 @@ def allocate_budget_book() -> dict[str, Any]:
             "user_id": user_id,
             "job_id": job_id,
             "env_budget": env_budget,
+            "pool_budget": pool_budget,
             "allowed_actions": ["place", "defer"] if is_pending else ["keep", "swap"],
             "strategy_hint": "place"
             if is_pending and env_budget
@@ -963,6 +1004,7 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
         budget_book: {"tick": int, "job_budgets": {job_id: slice},
             "reserves": {env_key: int}, "rationale": str}. Each slice is
             {"user_id", "job_id", "env_budget": {env_key: gpus},
+            "pool_budget": {env_key: {instance_type: units}},
             "allowed_actions", "strategy_hint", "canary_cap",
             "priority_score", "notes"}.
 
@@ -974,10 +1016,12 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
     envelopes = get_user_envelopes()
     resources = get_resource_map()
     capacity = {_env_key(env): int(info.get("free", 0)) for env, info in resources.items()}
+    pool_limits = _pool_limits(resources)
     reserves = {_env_key(env): int(n) for env, n in (budget_book.get("reserves") or {}).items()}
 
     job_budgets = budget_book.get("job_budgets") or {}
     cluster_totals: dict[str, int] = {}
+    pool_totals: dict[tuple[str, str], int] = {}
     user_totals: dict[str, dict[str, int]] = {}
     implied_swaps = 0
     active_ids = {j.get("job_id", j.get("id")) for j in get_active_jobs()}
@@ -990,9 +1034,10 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
             continue
 
         denied = {_env_key(e) for e in envelope.get("denied_envs", [])}
-        for env, gpus in (slice_.get("env_budget") or {}).items():
-            key = _env_key(env)
-            gpus = int(gpus)
+        env_budget = {
+            _env_key(env): int(gpus) for env, gpus in (slice_.get("env_budget") or {}).items()
+        }
+        for key, gpus in env_budget.items():
             if gpus < 0:
                 violations.append(f"job {job_id}: negative budget in {key}")
                 continue
@@ -1001,6 +1046,20 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
             cluster_totals[key] = cluster_totals.get(key, 0) + gpus
             user_totals.setdefault(user_id, {})
             user_totals[user_id][key] = user_totals[user_id].get(key, 0) + gpus
+
+        pool_budget, pool_errors = _parse_pool_budget(slice_)
+        violations.extend(f"job {job_id}: {error}" for error in pool_errors)
+        pool_envs = {env for env, _ in pool_limits}
+        for env, gpus in env_budget.items():
+            if gpus > 0 and env in pool_envs and env not in pool_budget:
+                violations.append(f"job {job_id}: pool_budget is required for env {env}")
+        for env, pools in pool_budget.items():
+            env_key = _env_key(env)
+            if env_key not in env_budget:
+                violations.append(f"job {job_id}: pool budget env {env_key} has no env budget")
+            for instance_type, units in pools.items():
+                pool_key = (env_key, str(instance_type))
+                pool_totals[pool_key] = pool_totals.get(pool_key, 0) + units
 
         hint = str(slice_.get("strategy_hint", "")).lower()
         if job_id in active_ids and any(
@@ -1020,6 +1079,16 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
         if used > allocatable:
             violations.append(f"env {env}: budgets sum to {used} but allocatable is {allocatable}")
 
+    for pool_key, used in pool_totals.items():
+        pool_limit = pool_limits.get(pool_key)
+        if pool_limit is None:
+            violations.append(f"pool {pool_key[1]} is not available in env {pool_key[0]}")
+        elif used > int(pool_limit["available_units"]):
+            violations.append(
+                f"pool {pool_key[1]} in {pool_key[0]} budgets sum to {used} but only "
+                f"{pool_limit['available_units']} units are free"
+            )
+
     b_t = _CTX.slow_loop.get_sss_swap_budget_t()
     if implied_swaps > b_t:
         violations.append(f"implied swaps {implied_swaps} exceed swap budget B_t={b_t}")
@@ -1027,6 +1096,36 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
     ok = len(violations) == 0
     _CTX.validated_budget_book = budget_book if ok else None
     return {"ok": ok, "violations": violations}
+
+
+def _budget_violations(
+    action,
+    slice_: dict[str, Any],
+    resources: dict[str, Any] | None = None,
+) -> list[str]:
+    """Check a ladder's actual reserved capacity against its BudgetSlice."""
+    resource_map = getattr(_CTX, "resource_map", None)
+    if resource_map is None or not hasattr(resource_map, "requested_capacity"):
+        return []
+    resources = resources if resources is not None else get_resource_map()
+    by_env, by_pool = resource_map.requested_capacity(Plan(tick=0, actions=[action]), resources)
+    env_budget = {
+        _env_key(env): int(value) for env, value in (slice_.get("env_budget") or {}).items()
+    }
+    pool_budget, violations = _parse_pool_budget(slice_)
+    violations.extend(
+        f"reserved capacity {used} in {env} exceeds slice budget {env_budget.get(env, 0)}"
+        for env, used in by_env.items()
+        if used > env_budget.get(env, 0)
+    )
+    for (env, instance_type), demand in by_pool.items():
+        allowed = pool_budget.get(env, {}).get(instance_type, 0)
+        if demand["units"] > allowed:
+            violations.append(
+                f"pool {instance_type} in {env} needs {demand['units']} units, "
+                f"slice allows {allowed}"
+            )
+    return violations
 
 
 def run_job_specialists(
