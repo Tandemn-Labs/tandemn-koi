@@ -90,7 +90,15 @@ from typing import Any
 
 import numpy as np
 from src.config.hyperparameters import GAMMA_SLO, UTILIZATION_TARGET_ONLINE
-from src.core.models import LADDER_ACTIONS, SWAP_BUDGET_ACTIONS, Plan, RankSpec, env_gpu_type
+from src.core.models import (
+    LADDER_ACTIONS,
+    SWAP_BUDGET_ACTIONS,
+    ActionType,
+    Plan,
+    PlanAction,
+    RankSpec,
+    env_gpu_type,
+)
 from src.infra.deployment_x import build_rank_x
 
 # Residual calibration: debias the surrogate with observed (observed-predicted)
@@ -107,16 +115,45 @@ _NONNEGATIVE_Y = frozenset(
     }
 )
 
+# The ONLY knobs the planner may propose: placement (where), topology, model
+# parallelism, and the disaggregated prefill/decode worker split. Everything
+# else (engine, router, quantization, cache flags, scheduling, batch autotune)
+# is engine/catalog-owned - see _ENGINE_OWNED_X.
 AGENT_TUNABLE_X = frozenset(
     {
-        "model_id",
+        # placement / environment
+        "market",
+        "cloud",
+        "region",
+        "gpu_type",
         "instance_type",
-        "gpu_count",
+        # topology
+        "num_nodes_per_chain",
+        "interconnect_type",
+        # model parallelism
         "tp",
         "pp",
         "sp",
+        "dp",
         "ep",
         "cp",
+        # disaggregated prefill/decode worker split
+        "prefill_worker_count",
+        "decode_worker_count",
+    }
+)
+
+# Engine-AUTOTUNED batch knobs: never valid from the agent OR from workload
+# features. Stripped from BOTH config and features.
+_ENGINE_AUTOTUNED_X = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
+
+# Engine/catalog-owned CONFIG knobs the agent must NOT set (not in the allowed
+# proposal set). The engine/catalog supplies them, and the valid workload value
+# for something like router_policy lives in the job's FEATURES - so these are
+# dropped from the agent's CONFIG only and kept in features. This is what stops
+# an invented value like router_policy='latency' from ever reaching the surrogate.
+_ENGINE_OWNED_X = frozenset(
+    {
         "engine_name",
         "engine_version",
         "weight_dtype",
@@ -131,12 +168,78 @@ AGENT_TUNABLE_X = frozenset(
         "kv_transfer_method",
     }
 )
-_ENGINE_AUTOTUNED_X = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
 
 
 def _sanitize_agent_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Remove engine-owned values from agent-controlled input."""
-    return {key: value for key, value in (config or {}).items() if key not in _ENGINE_AUTOTUNED_X}
+    """Strip engine-owned + engine-autotuned knobs from an agent-proposed CONFIG.
+
+    The agent may only propose the placement/topology/parallelism/PD knobs in
+    AGENT_TUNABLE_X; everything else is engine/catalog-owned and is removed here
+    so an invalid invented value (router_policy='latency', an unsupported tp,
+    etc.) can never reach the surrogate. The catalog, workload features, and
+    surrogate defaults supply the real values.
+    """
+    drop = _ENGINE_AUTOTUNED_X | _ENGINE_OWNED_X
+    return {key: value for key, value in (config or {}).items() if key not in drop}
+
+
+def _sanitize_agent_features(features: dict[str, Any]) -> dict[str, Any]:
+    """Strip only engine-AUTOTUNED batch knobs from WORKLOAD features.
+
+    Features legitimately carry workload-owned values the surrogate needs
+    (router_policy='kv_router', isl/osl, arrival rate, ...), so we keep the
+    engine-owned set here and only remove the three batch-autotune knobs the
+    agent must never smuggle in through features.
+    """
+    return {key: value for key, value in (features or {}).items() if key not in _ENGINE_AUTOTUNED_X}
+
+
+# --- Scoring priors (P1) --------------------------------------------------
+# The slow loop OWNS z*/typical_ranges, but at cold start it hands z*=0 and a
+# {name: 1.0} range stub. That makes the Tchebycheff gap = raw magnitude and
+# collapses J to ~ -50, so every placement loses to defer=0. Until the slow
+# loop is seeded, the scorer defends itself by substituting these domain priors
+# for degenerate values. Objectives: p99_ttft_ms / p99_tpot_ms / cost_per_token
+# are MINIMIZED; throughput_token_per_sec / slo_margin are MAXIMIZED.
+# cost_per_token values are order-of-magnitude - set them to YOUR cost units.
+DEFAULT_TYPICAL_RANGES = {
+    "p99_ttft_ms": 500.0,
+    "p99_tpot_ms": 50.0,
+    "cost_per_token": 5e-6,
+    "throughput_token_per_sec": 1000.0,
+    "slo_margin": 1.0,
+}
+DEFAULT_COLD_START_Z_STAR = {
+    "p99_ttft_ms": 100.0,
+    "p99_tpot_ms": 20.0,
+    "cost_per_token": 1e-6,
+    "throughput_token_per_sec": 3000.0,
+    "slo_margin": 1.0,
+}
+# Opportunity cost charged per WAITING job the plan leaves unserved, so a
+# feasible placement (sigma ~ J<=0 + EIG) beats defer (0). Scaled by priority.
+UNSERVED_PENALTY = 1.0
+
+
+def _seeded_ranges(ranges: dict[str, Any] | None) -> dict[str, float]:
+    """Replace degenerate (missing / 0 / 1.0-stub) per-objective ranges with
+    domain priors, so a Tchebycheff gap is O(1) instead of raw magnitude."""
+    merged = dict(ranges or {})
+    for obj, default in DEFAULT_TYPICAL_RANGES.items():
+        if merged.get(obj) in (None, 0, 0.0, 1.0):
+            merged[obj] = default
+    return merged
+
+
+def _seeded_z_star(z_star: dict[str, Any] | None) -> dict[str, float]:
+    """Replace missing / zero z* with domain priors. z*=0 is dimensionally wrong
+    for MAXIMIZED objectives (throughput/slo_margin) and over-penalizes the rest;
+    evidence-set nonzero values are left untouched."""
+    merged = dict(z_star or {})
+    for obj, default in DEFAULT_COLD_START_Z_STAR.items():
+        if merged.get(obj) in (None, 0, 0.0):
+            merged[obj] = default
+    return merged
 
 
 log = logging.getLogger("koi.agent_tools")
@@ -387,7 +490,7 @@ def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
 
 def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None = None) -> dict:
     """Build the surrogate payload for one rank without mutating the rank."""
-    features = _sanitize_agent_config(dict(job_features or {}))
+    features = _sanitize_agent_features(dict(job_features or {}))
     env = None
     if rank.env is not None:
         env = list(rank.env) if isinstance(rank.env, (list, tuple)) else str(rank.env).split("|")
@@ -1324,7 +1427,7 @@ def size_ladder(
     """
     _require("resource_map", "surrogate", "candidate_graph", "dro")
 
-    job_features = _sanitize_agent_config(dict(job_features or {}))
+    job_features = _sanitize_agent_features(dict(job_features or {}))
     regime = str(job_features.get("type", "online")).lower()
     is_online = regime != "batch"
     target = (
@@ -1385,9 +1488,18 @@ def size_ladder(
         max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
 
         payload = _rank_prediction_payload(rank, job_features)
-        y_hat = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
-            "y_hat", {}
-        )
+        pred_error = None
+        try:
+            y_hat = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
+                "y_hat", {}
+            )
+        except Exception as exc:
+            # A config the surrogate rejects (invalid router_policy, tp not
+            # dividing attention heads, etc.) must NOT crash the whole sizing
+            # pass. Mark this frame infeasible and let the other ranks proceed.
+            log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
+            pred_error = str(exc)
+            y_hat = {}
         per_chain_raw = _y_value(y_hat, "throughput_token_per_sec")
         per_chain_eff = per_chain_raw * util
 
@@ -1410,6 +1522,8 @@ def size_ladder(
                 f"engine needs {gpus_per_chain} GPUs but {allocation['instance_type']} "
                 f"has {allocation['gpus_per_unit']}"
             )
+        if pred_error:
+            physical_violations.append(f"surrogate rejected config: {pred_error}")
         physical_ok = not physical_violations
 
         # An SLO-infeasible online config is not viable at ANY replica count
@@ -1893,6 +2007,7 @@ def _calibrate_y_hat(y_hat: dict[str, float], job_features: dict[str, Any]):
 def predict_outcome(
     config: dict[str, Any],
     mechanism: dict[str, Any] | None = None,
+    env: list[str] | tuple[str, ...] | None = None,  # TODO - Added direct env to this tool for v0
     calibrate: bool = True,
 ) -> dict[str, Any]:
     """Run the surrogate, debias it with evidence, attach the DRO band.
@@ -1908,14 +2023,24 @@ def predict_outcome(
         config: X variables for the candidate. May embed job_config and
             job_features sub-dicts; otherwise the whole dict is job_config.
         mechanism: Optional mechanism context, informational only.
+        env: Optional canonical [market, cloud, region, zone, gpu_type].
         calibrate: Apply the residual correction (default True).
 
     Returns:
         {"y_hat": calibrated dict, "y_hat_raw": surrogate dict,
          "calibration_offsets": dict, "v_hat": dict, "dro_band": dict}.
     """
-    job_features = _sanitize_agent_config(dict(config.get("job_features", {})))
+    if not isinstance(config, dict):
+        raise ValueError(
+            "predict_outcome scores ONE config dict, not a ladder/list. Pass "
+            "{'job_config': {...}, 'job_features': {...}} (or a flat X config). "
+            "To score a whole ladder: assemble ranks into an action, build a "
+            "plan, then call compute_sigma(plan)."
+        )
+    job_features = _sanitize_agent_features(dict(config.get("job_features", {})))
     job_config = _sanitize_agent_config(dict(config.get("job_config", config)))
+    if env and len(env) == 5 and not job_config.get("gpu_type"):
+        job_config["gpu_type"] = env[4]
     return _predict_outcome_core(job_config, job_features, calibrate=calibrate)
 
 
@@ -2033,8 +2158,9 @@ def compute_tchebycheff(
     """
     _require("tchebycheff_module", "slow_loop")
     weights = wt if wt is not None else _CTX.slow_loop.get_sss_wt()
-    reference = z_star if z_star is not None else _CTX.slow_loop.get_sss_z_star_t()
-    y_score = _scoreable_y_hat(y_hat, weights, reference, _CTX.slow_loop.typical_ranges)
+    reference = _seeded_z_star(z_star if z_star is not None else _CTX.slow_loop.get_sss_z_star_t())
+    ranges = _seeded_ranges(_CTX.slow_loop.typical_ranges)
+    y_score = _scoreable_y_hat(y_hat, weights, reference, ranges)
     if not y_score:
         return 0.0
     return float(
@@ -2042,7 +2168,7 @@ def compute_tchebycheff(
             y_hat=y_score,
             w_t=weights,
             z_star_t=reference,
-            normalization_range=_CTX.slow_loop.typical_ranges,
+            normalization_range=ranges,
         )
     )
 
@@ -2051,6 +2177,7 @@ def optimize_config(
     base_config: dict[str, Any],
     candidates: dict[str, list],
     job_features: dict[str, Any] | None = None,
+    env: list[str] | tuple[str, ...] | None = None,  # TODO - Added direct env to this tool for v0
     objective_weights: dict[str, float] | None = None,
     max_passes: int = 2,
 ) -> dict[str, Any]:
@@ -2077,6 +2204,7 @@ def optimize_config(
             everything else in base_config stays fixed.
         job_features: W features for calibration and weighting. Defaults to
             base_config["job_features"] when present.
+        env: Optional canonical [market, cloud, region, zone, gpu_type].
         objective_weights: override w_t; defaults to the slow loop's w_t.
         max_passes: coordinate-descent sweeps over the knob set.
 
@@ -2086,17 +2214,22 @@ def optimize_config(
          "trace": [{"knob","chosen","j"}...]}.
     """
     _require("surrogate", "tchebycheff_module", "slow_loop")
-    features = _sanitize_agent_config(
+    features = _sanitize_agent_features(
         dict(job_features if job_features is not None else base_config.get("job_features", {}))
     )
     weights = objective_weights if objective_weights is not None else _CTX.slow_loop.get_sss_wt()
-    reference = _CTX.slow_loop.get_sss_z_star_t()
+    reference = _seeded_z_star(_CTX.slow_loop.get_sss_z_star_t())
     core = _sanitize_agent_config(dict(base_config.get("job_config", base_config)))
     core.pop("job_features", None)
     candidates = {key: values for key, values in candidates.items() if key in AGENT_TUNABLE_X}
 
     def _score(cfg: dict[str, Any]):
-        pred = predict_outcome({"job_config": cfg, "job_features": features})
+        try:
+            pred = predict_outcome({"job_config": cfg, "job_features": features}, env=env)
+        except Exception as exc:
+            # Skip a config the surrogate rejects instead of crashing the sweep.
+            log.warning("optimize_config: surrogate rejected config, skipping (%s)", exc)
+            return float("-inf"), None
         j = compute_tchebycheff(pred["y_hat"], weights, reference)
         return j, pred
 
@@ -2128,7 +2261,7 @@ def optimize_config(
     return {
         "config": best_cfg,
         "j": best_j,
-        "y_hat": best_pred["y_hat"],
+        "y_hat": best_pred["y_hat"] if best_pred else {},
         "improved": bool(trace),
         "n_evaluated": n_eval,
         "trace": trace,
@@ -2270,7 +2403,9 @@ def compute_sigma(plan) -> dict[str, Any]:
     aggregate = 0.0
 
     w_t = _CTX.slow_loop.get_sss_wt()
-    z_star = _CTX.slow_loop.get_sss_z_star_t()
+    # z_star is fetched PER JOB in the loop; z*/ranges are seeded against domain
+    # priors so an unseeded slow loop (z*=0, range=1.0) cannot collapse J to ~-50.
+    ranges = _seeded_ranges(_CTX.slow_loop.typical_ranges)
     beta = _CTX.slow_loop.get_sss_eig_incentive_t()
     lam = _CTX.slow_loop.get_sss_lambda_switch()
     eps_dro = _CTX.slow_loop.get_sss_radius_dro()
@@ -2282,10 +2417,11 @@ def compute_sigma(plan) -> dict[str, Any]:
         job_id = action.job_id
         ladder_dicts = _ranks_as_dicts(action)
         job_features = _job_features_for(snapshot, job_id)
+        z_star = _seeded_z_star(get_z_star(job_features))
         y_hat = _compose_job_y_hat(action, job_features)
         if not y_hat:
             continue
-        y_score = _scoreable_y_hat(y_hat, w_t, z_star, _CTX.slow_loop.typical_ranges)
+        y_score = _scoreable_y_hat(y_hat, w_t, z_star, ranges)
         if not y_score:
             continue
         slo_thresholds = _slo_thresholds_for(snapshot, job_id)
@@ -2295,7 +2431,7 @@ def compute_sigma(plan) -> dict[str, Any]:
                 y_hat=y_score,
                 w_t=w_t,
                 z_star_t=z_star,
-                normalization_range=_CTX.slow_loop.typical_ranges,
+                normalization_range=ranges,
             )
         )
         eig_value = float(
@@ -2333,10 +2469,26 @@ def compute_sigma(plan) -> dict[str, Any]:
         }
         aggregate += sigma_i
 
+    # Serve-value: leaving a waiting job unserved is NOT free. Charge an
+    # opportunity cost per pending job the plan does not place, over snapshot
+    # demand (not just explicit defer actions, so omitting a job cannot dodge
+    # it). This is what makes a feasible placement (sigma ~ J<=0 + EIG) beat
+    # defer (0); it cancels for jobs no plan can serve, so it only biases toward
+    # serving where a placement is actually possible.
+    served = {a.job_id for a in typed.actions if a.type in LADDER_ACTIONS and a.ladder}
+    unserved_penalty = 0.0
+    for job in get_pending_jobs():
+        jid = job.get("job_id", job.get("id"))
+        if jid and jid not in served:
+            priority = float(job.get("priority_class") or job.get("user_priority") or 1.0)
+            unserved_penalty += UNSERVED_PENALTY * max(1.0, priority)
+    aggregate -= unserved_penalty
+
     return {
         "per_job": per_job,
         "aggregate_sigma": aggregate,
         "swap_count": swap_counter(typed),
+        "unserved_penalty": unserved_penalty,
     }
 
 
@@ -2350,8 +2502,25 @@ def check_feasibility(plan) -> dict[str, Any]:
         {"feasible": bool, "violations": List[str]}.
     """
     _require("plan_validator", "resource_map", "slow_loop")
+    # Materialize omitted jobs (active -> keep, waiting -> defer) BEFORE
+    # validation, exactly as the harness does to the committed plan. Otherwise
+    # C2 coverage rejects any plan that legitimately relies on auto-defer, the
+    # place-vs-defer baseline (an empty/defer plan) reads as INFEASIBLE, and the
+    # planner defers everything because it can never establish a baseline sigma.
+    typed = _as_plan(plan)
+    covered = {a.job_id for a in typed.actions}
+    for job in list(get_active_jobs()):
+        jid = job.get("job_id", job.get("id"))
+        if jid and jid not in covered:
+            typed.actions.append(PlanAction(job_id=str(jid), type=ActionType.KEEP))
+            covered.add(jid)
+    for job in list(get_pending_jobs()):
+        jid = job.get("job_id", job.get("id"))
+        if jid and jid not in covered:
+            typed.actions.append(PlanAction(job_id=str(jid), type=ActionType.DEFER))
+            covered.add(jid)
     result = _CTX.plan_validator.val_plan(
-        plan=_as_plan(plan),
+        plan=typed,
         cluster_snapshot=_snapshot(),
         slow_state=_CTX.slow_loop.state,
     )

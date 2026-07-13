@@ -76,7 +76,7 @@ class OpenAICompatClient:
         api_key: str = "EMPTY",
         fold_system: bool = False,
         temperature: float | None = 0.4,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         timeout_sec: float = 120.0,
         extra: dict | None = None,
     ):

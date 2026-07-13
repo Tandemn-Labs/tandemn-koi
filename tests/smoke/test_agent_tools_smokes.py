@@ -743,6 +743,25 @@ class AgentToolsSmokeTests(unittest.TestCase):
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
 
+    def test_predict_outcome_derives_gpu_type_from_env(self):
+        saved = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("surrogate", "candidate_graph", "dro")
+        }
+        surrogate = _RecordingSurrogate()
+        try:
+            agent_tools.bind_tools(surrogate=surrogate, candidate_graph=object(), dro=_DRO())
+            agent_tools.predict_outcome(
+                {"job_config": {"model_id": "model"}, "job_features": {}},
+                env=["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+            )
+
+            job_config, _job_features = surrogate.calls[0]
+            self.assertEqual(job_config["gpu_type"], "H100")
+        finally:
+            for name, value in saved.items():
+                setattr(agent_tools._CTX, name, value)
+
     def test_eig_materialization_uses_committed_mechanisms_only(self):
         class Registry:
             def __init__(self):
