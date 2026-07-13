@@ -180,7 +180,8 @@ class SlowLoop:
 
         n_obj = max(1, len(self.objectives))
         initial_weights = dict.fromkeys(self.objectives, 1.0 / n_obj)
-        initial_z_star = dict.fromkeys(self.objectives, 0.0)
+        # initial_z_star = dict.fromkeys(self.objectives, 0.0)
+        initial_z_star = dict.fromkeys(self.objectives, 999999.0)
 
         self.state = SlowState(
             w_t=initial_weights,
@@ -537,7 +538,8 @@ class SlowLoop:
                 and r.y_observed_mean[obj] is not None
             ]
             if not values:
-                z_star[obj] = 0.0
+                # TODO - Cold Start Problem here - changed this to 99999 for now to
+                z_star[obj] = 99999
                 continue
             offset = float(slack.get(obj, 0.0))
             z_star[obj] = (max(values) + offset) if _is_maximize(obj) else (min(values) - offset)

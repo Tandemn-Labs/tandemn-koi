@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from src.agent.agent import KoiAgentHarness, PlanMaterializationError, SpecialistRunner
@@ -48,6 +49,34 @@ def _valid_place():
 
 
 class SpecialistSchemaSmokeTests(unittest.TestCase):
+    def test_fallback_preserves_rejected_specialist_proposal(self):
+        class LLM:
+            def __init__(self, response):
+                self.response = response
+
+            def complete(self, _messages):
+                return self.response
+
+        saved = agent_tools.get_job_brief
+        rejected = _valid_place()
+        rejected["job_id"] = "wrong_job"
+        try:
+            agent_tools.get_job_brief = lambda _job_id: {
+                "job_id": "job_1",
+                "job_features": {"model_id": "Qwen/Qwen2.5-7B-Instruct"},
+            }
+            result = SpecialistRunner(LLM(json.dumps(rejected))).run_one("job_1", _slice())
+
+            self.assertEqual(result["type"], "defer")
+            self.assertEqual(result["fitness"], "blocked")
+            self.assertEqual(result["rejected_ladder"], rejected["ladder"])
+            self.assertEqual(result["rejected_proposal"]["ladder"], rejected["ladder"])
+            self.assertTrue(
+                any("job_id mismatch" in violation for violation in result["rejected_violations"])
+            )
+        finally:
+            agent_tools.get_job_brief = saved
+
     def test_unknown_mechanism_fails_before_scoring(self):
         class Registry:
             def get_mechanism(self, mechanism_id):

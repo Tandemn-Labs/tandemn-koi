@@ -221,7 +221,9 @@ class SpecialistRunner:
             "1. Explore candidate ladders internally, then return the single best one inside the budget.\n"
             "2. Choose existing mechanisms or propose a new valid mechanism.\n"
             "3. Estimate predicted_y and predicted_sigma.\n"
-            "4. Report exact budget utilization.\n"
+            "4. Report exact budget utilization as a FLAT dict keyed by "
+            "canonical 5-part env: {env_key: {used, budgeted, fraction}}. Do "
+            "NOT nest it under 'pool' or an instance type.\n"
             "5. Report fitness as starved, happy, overprovisioned, or blocked.\n"
             "6. If starved, give marginal value of more capacity by env.\n"
             "7. If overprovisioned, give unused capacity by env.\n\n"
@@ -251,9 +253,16 @@ class SpecialistRunner:
             "Ladder entries MUST be canonical rank dicts: "
             "{'role':'aggregate','env':[market,cloud,region,zone,gpu_type],"
             "'config':{'instance_type':str,'gpu_count':int,'tp':int,'pp':int,"
-            "'engine_name':'vllm'},'n_replicas':int,'mechanism_id':'M_...'}. "
-            "Never set engine_version or AIC/engine-autotuned values. "
-            "Do not emit shorthand ladder entries like {'env': ..., 'count': ...}."
+            "'sp':int,'ep':int,'cp':int},'n_replicas':int,'mechanism_id':'M_...'}. "
+            "You may ONLY set placement (instance_type), parallelism "
+            "(tp/pp/sp/ep/cp), and n_replicas. Do NOT set engine_name, "
+            "engine_version, router_policy, scheduling_policy, preemption_policy, "
+            "weight/kvcache dtype, quantization, prefix/chunked-prefill flags, "
+            "gpu_mem_util, kv_transfer_method, or any max_num_*/block_size - the "
+            "engine/catalog owns those and Koi drops them if you set them. "
+            "Do not emit shorthand ladder entries like {'env': ..., 'count': ...}. "
+            "You do NOT need config.gpu_type or config.model_id - Koi derives "
+            "gpu_type from env[4] and model_id from the job; you may omit them."
         )
 
     def run_many(
@@ -297,23 +306,54 @@ class SpecialistRunner:
         prompt = self.prompt_builder(job_id, slice_, brief)
         messages = [{"role": "user", "content": prompt}]
 
-        for attempt in range(2):
+        content_attempts = 0
+        empty_retries = 0
+        max_content_attempts = 2
+        max_empty_retries = 2
+        last_rejected_result: dict[str, Any] | None = None
+        last_rejected_violations: list[str] = []
+        while content_attempts < max_content_attempts:
             try:
                 response = self.llm.complete(messages)
             except Exception:
                 log.exception("specialist LLM call failed for %s", job_id)
                 break
+            if not (response or "").strip():
+                # Empty completion (usually reasoning-token exhaustion). Retry
+                # with a firmer instruction WITHOUT spending a content attempt,
+                # so an empty first reply does not consume the only real retry.
+                if empty_retries >= max_empty_retries:
+                    break
+                empty_retries += 1
+                self.trace.add("specialist_empty_response", job_id=job_id)
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You returned empty output. Respond with ONLY the "
+                            "single JSON object described above - no reasoning "
+                            "or prose outside the JSON."
+                        ),
+                    }
+                )
+                continue
             result = self._parse_json(response)
+            if isinstance(result, dict):
+                self._backfill_derived_fields(result, brief)
             violations = self._validate(result, job_id, slice_)
             self.trace.add(
                 "specialist_result",
                 job_id=job_id,
-                attempt=attempt,
+                attempt=content_attempts,
                 violations=violations,
             )
             if not violations:
                 assert result is not None
                 return result
+            if isinstance(result, dict):
+                last_rejected_result = result
+                last_rejected_violations = list(violations)
+            content_attempts += 1
             messages.append({"role": "assistant", "content": response})
             messages.append(
                 {
@@ -327,11 +367,11 @@ class SpecialistRunner:
             )
 
         is_active = brief.get("current_ladder") is not None
-        return {
+        fallback: dict[str, Any] = {
             "job_id": job_id,
             "user_id": slice_.get("user_id"),
             "type": "keep" if is_active else "defer",
-            "ladder": None,
+            "ladder": [],
             "predicted_y": {},
             "predicted_sigma": 0.0,
             "budget_utilization": {},
@@ -343,6 +383,36 @@ class SpecialistRunner:
             "new_mechanism_proposals": [],
             "reasoning": "specialist fallback after validation failure",
         }
+        if last_rejected_result is not None:
+            fallback["rejected_proposal"] = last_rejected_result
+            fallback["rejected_ladder"] = last_rejected_result.get("ladder") or []
+            fallback["rejected_violations"] = last_rejected_violations
+        return fallback
+
+    @staticmethod
+    def _backfill_derived_fields(result: dict[str, Any], brief: dict[str, Any]) -> None:
+        """Fill rank-config fields Koi derives, so the specialist need not emit them.
+
+        gpu_type comes from env[4]; model_id from the job brief. Downstream
+        (deployment_x, the surrogate) derives these regardless; backfilling
+        keeps the committed rank config self-describing and lets validation
+        pass without asking a weak model for redundant, error-prone fields.
+        """
+        model_id = ((brief or {}).get("job_features") or {}).get("model_id")
+        ladder = result.get("ladder")
+        if not isinstance(ladder, list):
+            return
+        for rank in ladder:
+            if not isinstance(rank, dict):
+                continue
+            config = rank.get("config")
+            if not isinstance(config, dict):
+                continue
+            env = rank.get("env")
+            if not config.get("gpu_type") and isinstance(env, (list, tuple)) and len(env) == 5:
+                config["gpu_type"] = env[4]
+            if not config.get("model_id") and model_id:
+                config["model_id"] = model_id
 
     @staticmethod
     def _parse_json(response: str) -> dict[str, Any] | None:
@@ -443,10 +513,18 @@ class SpecialistRunner:
         if not isinstance(config, dict):
             violations.append(f"{prefix}.config must be a dict")
             config = {}
-        for key in ("model_id", "instance_type", "gpu_type"):
+        # Only instance_type is required in config: gpu_type is derived from
+        # env[4] and model_id from the job (both backfilled in run_one and
+        # re-derived downstream), so we do not reject a rank for omitting them.
+        for key in ("instance_type",):
             if not config.get(key):
                 violations.append(f"{prefix}.config.{key} is required")
-        if config.get("engine_name") not in {"vllm", "sglang"}:
+        # engine_name is engine/catalog-owned, not a knob the planner must set;
+        # only reject a PRESENT-but-invalid value, never a missing one.
+        if config.get("engine_name") is not None and config.get("engine_name") not in {
+            "vllm",
+            "sglang",
+        }:
             violations.append(f"{prefix}.config.engine_name must be 'vllm' or 'sglang'")
         for key in ("gpu_count", "tp", "pp"):
             value = config.get(key)
@@ -1053,6 +1131,13 @@ class KoiAgentHarness:
             "the prompt; inspect it with code and print summaries only. REPL "
             "variables: cluster_snapshot, slow_state, evidence_store, "
             "mechanism_registry, resource_map, user_registry, plan, tick. "
+            "These are live OBJECTS, not dicts: do NOT subscript them "
+            "(cluster_snapshot['resources'] raises) and do NOT print them raw "
+            "(you get a useless '<...object at 0x...>' repr, not the contents). "
+            "To read cluster state call get_cluster_state() - it returns a dict "
+            "with keys 'resources', 'active_jobs', 'pending_jobs' - or use the "
+            "snapshot's accessor methods cluster_snapshot.resources_summary(), "
+            ".active_jobs_summary(), .pending_jobs_summary(). "
             "Every agent tool is bound as a function (get_cluster_state, "
             "get_priority, build_user_envelopes, allocate_budget_book, "
             "validate_budget_book, run_job_specialists, predict_outcome, "
@@ -1067,18 +1152,19 @@ class KoiAgentHarness:
             "reserved market exists this version - never plan spot or "
             "on-demand capacity.\n\n"
             # ---------- THE OBJECTIVE, EXACTLY ----------
-            "THE OBJECTIVE, EXACTLY. Only PLACE and SWAP actions score. "
-            "keep / defer / terminate / diagnose deploy nothing new and score "
-            "EXACTLY 0. Aggregate sigma = sum over your place/swap actions of "
-            "sigma_i = J + beta*EIG - gamma*Pr_DRO - lambda*SwitchCost, "
-            "where:\n"
+            "THE OBJECTIVE, EXACTLY. Only PLACE and SWAP actions add a per-job "
+            "sigma_i; keep / defer / terminate / diagnose add nothing. Aggregate "
+            "sigma = (sum over your place/swap actions of "
+            "sigma_i = J + beta*EIG - gamma*Pr_DRO - lambda*SwitchCost) MINUS an "
+            "unserved-demand penalty for every WAITING job you leave unplaced. So "
+            "deferring a serveable job LOWERS aggregate sigma - it is NOT free.\n"
             "  - J (augmented Tchebycheff, higher is better): how close the "
-            "job's predicted y_hat is to the ideal point z*. This is NOT a "
-            "weighted sum - J is dominated by your WORST weighted objective "
-            "gap (max_j w_j*gap_j), so you CANNOT hide bad latency behind "
-            "great cost. To raise J, lift the WEAKEST objective. get_z_star() "
-            "shows z* (what 'good' means right now); w_t are the objective "
-            "weights.\n"
+            "job's predicted y_hat is to the ideal point z*. J is a DISTANCE, so "
+            "J <= 0 ALWAYS - a negative J is normal and is NOT a reason to defer. "
+            "It is dominated by your WORST weighted objective gap "
+            "(max_j w_j*gap_j), so you CANNOT hide bad latency behind great cost; "
+            "to raise J, lift the WEAKEST objective. get_z_star() shows z* (what "
+            "'good' means now); w_t are the objective weights.\n"
             "  - EIG (weighted by beta, exploration): expected information "
             "gain from actually trying this ladder. High when the mechanism is "
             "low-confidence - an uncertain-but-promising config is rewarded "
@@ -1090,17 +1176,25 @@ class KoiAgentHarness:
             "off its current ladder (migration, reprice, disruption). Keeping "
             "a good-enough config beats churning for a tiny gain.\n\n"
             # ---------- WHEN TO DEFER ----------
-            "WHEN TO DEFER - READ THIS. Deferring a waiting job scores 0. That "
-            "is NOT 'harmless': the job stays UNSERVED and you earned no "
-            "credit for it. defer / keep-all is a LAST RESORT, valid ONLY when "
-            "either (a) no feasible placement exists given reserved capacity, "
-            "or (b) EVERY feasible placement remains negative sigma AFTER you "
-            "tried to fix its config with get_influencing_knobs + "
-            "optimize_config and re-sized with size_ladder. Free capacity alone "
-            "does not make a placement worthwhile; use its computed sigma. "
-            "Never defer a job you did not attempt to place. If you are about "
-            "to defer most jobs, stop and re-check z*, your configs, and your "
-            "sizing before committing.\n\n"
+            "WHEN TO DEFER - READ THIS. Do NOT gate placement on 'sigma > 0'. J "
+            "is a distance to the ideal, so a good placement's sigma is typically "
+            "NEGATIVE - that is expected, not a failure. Leaving a waiting job "
+            "unserved is itself PENALIZED in the objective (an unserved-demand "
+            "opportunity cost), so the correct test is PLACE-vs-DEFER, not "
+            "place-vs-zero: compare the aggregate sigma of the plan WITH the "
+            "placement to the plan WITHOUT it (deferring), and place whenever WITH "
+            "is higher. A placement with negative J still WINS when serving beats "
+            "eating the unserved penalty. Concretely: "
+            "base = compute_sigma(plan_without_this_job)['aggregate_sigma']; "
+            "cand = compute_sigma(plan_with_the_placement)['aggregate_sigma']; "
+            "place if cand > base. defer / keep-all is a LAST RESORT, valid ONLY "
+            "when either (a) no feasible placement exists given reserved capacity, "
+            "or (b) EVERY feasible placement still LOWERS aggregate sigma versus "
+            "deferring, AFTER you tried to fix its config with "
+            "get_influencing_knobs + optimize_config and re-sized with "
+            "size_ladder. Never defer a job you did not attempt to place; if you "
+            "are about to defer most jobs, re-check z*, your configs, and your "
+            "sizing first.\n\n"
             # ---------- HOW TO REASON ----------
             "HOW TO REASON. Before committing P_t, sketch several allocation "
             "frames psi_t - internal scratch reasoning only, not physical "
@@ -1140,7 +1234,14 @@ class KoiAgentHarness:
             "results are PROPOSALS - you own every final per-job decision: "
             "accept, modify, or discard each one, and never copy one into the "
             "plan unexamined. Do NOT trust specialist predicted_sigma - "
-            "rescore with compute_sigma. Reallocate from fitness signals when "
+            "rescore with compute_sigma. A specialist that returns defer/blocked "
+            "is reporting a LOCAL verdict inside its budget slice - it is not a "
+            "cluster decision. If you can construct a feasible, positively-scored "
+            "placement yourself (including by reallocating budget from lower-priority "
+            "jobs), do it. Inherit a defer only when your OWN scored candidates are "
+            "all worse than serving. Treat fitness, marginal_value_of_more, and any "
+            "rejected_proposal/rejected_violations as repair signals, not decisions. "
+            "Reallocate from fitness signals when "
             "the sigma gain is positive, rerun only affected specialists, then "
             "commit. Mechanism IDs are opaque Store IDs: never author one. Use "
             "an applicable ID, or call set_new_mechanisms and use its returned ID. "
@@ -1154,12 +1255,35 @@ class KoiAgentHarness:
             "so a surrogate that was wrong last tick is self-correcting. To "
             "improve a config: get_influencing_knobs(job_features, objective) "
             "ranks which X knobs move that objective and how confident we are, "
-            "then optimize_config(base_config, candidates, job_features) runs a "
+            "then optimize_config(base_config, candidates, job_features, env=rank['env']) runs a "
             "calibrated coordinate descent over candidate values YOU choose and "
             "returns the best config by Tchebycheff J. These are optional "
             "refinement aids - use them on a config you reasoned to; you stay "
             "free to propose configs directly, and they never replace "
             "cluster-level reconciliation.\n\n"
+            # ---------- TOOL CONTRACTS (exact call shapes) ----------
+            "TOOL CONTRACTS - follow these EXACTLY:\n"
+            "  - predict_outcome(config) scores ONE config dict: "
+            "predict_outcome({'job_config': rank['config'], 'job_features': {...}}, env=rank['env']). "
+            "Pass env when scoring a rank so Koi can derive gpu_type. "
+            "NEVER pass a ladder or a list of ranks - that raises a ValueError.\n"
+            "  - size_ladder(ranks, job_features) sizes replicas and RETURNS the "
+            "throughput target it used as sized['target_tps']; reuse THAT for the "
+            "action - do NOT compute target_tps yourself (that double-counts input "
+            "tokens). size_ladder may return ranks=[] with meets_target=False; an "
+            "empty ladder means 'this frame does not fit', not a crash.\n"
+            "  - compute_sigma(plan) and check_feasibility(plan) take a whole PLAN "
+            "dict ({'tick_rationale', 'actions': [...]}), never a bare action or a "
+            "y_hat.\n"
+            "Worked pipeline for one candidate frame:\n"
+            "    sized = size_ladder(ranks, job_features)\n"
+            "    action = {'job_id': jid, 'type': 'place', 'user_id': user_id,\n"
+            "              'ladder': sized['ranks'], 'target_tps': sized['target_tps'],\n"
+            "              'mechanism_id': mid, 'budget_ref': slice_id, ...}\n"
+            "    plan = {'tick_rationale': '...', 'actions': [action]}\n"
+            "    feas = check_feasibility(plan); sig = compute_sigma(plan)\n"
+            "Guard tool outputs before indexing: a rank's 'ladder' may be [] or "
+            "None and sized['ranks'] may be empty - check before subscripting.\n\n"
             f"{self._plan_schema_section()}"
             # ---------- MECHANICS ----------
             "Write Python in ```repl blocks. Print what you need to see. Think "
@@ -1200,11 +1324,14 @@ class KoiAgentHarness:
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
             "   'rank_id': 'rank_0',      # omit rank_id; Koi auto-fills rank_0, rank_1, ...\n"
             "   'env': [market, cloud, region, zone, gpu_type],   # REQUIRED - launch target + ICP key\n"
-            "   'config': {instance_type, gpu_count, tp, pp, sp, ep, cp, engine_name,\n"
-            "              weight_dtype, kvcache_dtype,\n"
-            "              weight_quantization_bits, prefix_cache_enabled, router_policy},\n"
-            "   # Koi supplies max_num_seq, max_num_batched_tokens, and block_size;\n"
-            "   # do not put engine-managed, workload, or hardware facts in config.\n"
+            "   'config': {instance_type, gpu_count, tp, pp, sp, ep, cp,\n"
+            "              num_nodes_per_chain, interconnect_type},  # the ONLY config knobs you set\n"
+            "   # Koi/the engine own everything else - do NOT set engine_name,\n"
+            "   # engine_version, router_policy, scheduling_policy, preemption_policy,\n"
+            "   # weight_dtype, kvcache_dtype, weight_quantization_bits,\n"
+            "   # prefix_cache_enabled, chunked_prefill_enable, gpu_mem_util,\n"
+            "   # kv_transfer_method, max_num_seq, max_num_batched_tokens, block_size.\n"
+            "   # Any such key you set is dropped; the engine/catalog supplies it.\n"
             "   'n_replicas': int,       # rank DP / max endpoint count; do NOT put dp in config\n"
             "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
             "v0 is AGGREGATE-ONLY per rank: every rank is one full "
