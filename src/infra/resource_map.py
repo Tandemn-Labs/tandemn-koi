@@ -150,7 +150,6 @@ class ResourceMapManager:
         return {
             "job_id": raw.get("job_id"),
             "user_id": raw.get("user_id"),
-            "tenant_id": spec.get("tenant_id", "default"),
             "kind": raw.get("kind"),
             "status": raw.get("status"),
             "created_at": raw.get("created_at"),
