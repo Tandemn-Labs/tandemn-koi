@@ -231,13 +231,51 @@ def _seeded_ranges(ranges: dict[str, Any] | None) -> dict[str, float]:
     return merged
 
 
+# The slow loop initializes z_star_t to a UNIFORM placeholder before it has any
+# evidence - historically all-zero, and in current builds all-99999 (a five-nines
+# "unset" sentinel, seen in live traces). Neither is a real ideal: fed to
+# Tchebycheff the gap becomes a raw sentinel magnitude and J blows up to +/-
+# millions, inverting the contract (J <= 0). The primary detector is direction-
+# and value-agnostic (a z* that is uniform across every objective is a
+# placeholder, whatever the constant); the explicit sentinel set is documented
+# insurance for a PARTIALLY-degenerate vector.
+_Z_STAR_UNSET_SENTINELS = frozenset({0.0, 99999.0})
+
+
+def _is_placeholder_z_star(values: list[float]) -> bool:
+    """True when a z* vector is empty or uniform across all objectives - i.e. the
+    slow loop's cold-start placeholder, not an evidence-derived ideal (real z*
+    values are heterogeneous: cost ~1e-6, latency ~100, throughput ~thousands)."""
+    if not values:
+        return True
+    return len(values) >= 2 and len(set(values)) == 1
+
+
 def _seeded_z_star(z_star: dict[str, Any] | None) -> dict[str, float]:
-    """Replace missing / zero z* with domain priors. z*=0 is dimensionally wrong
-    for MAXIMIZED objectives (throughput/slo_margin) and over-penalizes the rest;
-    evidence-set nonzero values are left untouched."""
+    """Replace a missing / non-physical / placeholder z* with domain priors, so
+    Tchebycheff distance is O(1) and J stays <= 0. A degenerate value is None,
+    non-numeric, non-finite, <= 0 (dimensionally wrong for every objective), the
+    slow loop's unset sentinel, or a member of a uniform placeholder vector.
+    Evidence-set, heterogeneous, positive values are left untouched."""
     merged = dict(z_star or {})
+    numeric = [
+        v
+        for v in merged.values()
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    ]
+    placeholder = _is_placeholder_z_star(numeric)
     for obj, default in DEFAULT_COLD_START_Z_STAR.items():
-        if merged.get(obj) in (None, 0, 0.0):
+        v = merged.get(obj)
+        degenerate = (
+            v is None
+            or isinstance(v, bool)
+            or not isinstance(v, (int, float))
+            or not math.isfinite(v)
+            or v <= 0
+            or float(v) in _Z_STAR_UNSET_SENTINELS
+            or placeholder
+        )
+        if degenerate:
             merged[obj] = default
     return merged
 
@@ -348,6 +386,22 @@ def assert_planning_ready() -> None:
         )
 
 
+# Per-tick surrogate-call budget: a runaway BACKSTOP, not a quality limiter.
+# The planner may explore freely (grid / coordinate search) up to this many
+# DISTINCT surrogate simulations per tick; beyond it a sim raises
+# SurrogateBudgetExceeded, which size_ladder / optimize_config / the specialist
+# eval loops catch and treat as an infeasible/skipped frame - so hitting it late
+# just means "commit the best scored so far", never a crash or forced defer.
+# Cache hits are free and do NOT count. Raise it for deeper search; it is
+# generous by design (a normal tick uses far fewer).
+SURROGATE_CALL_BUDGET = 100
+_surrogate_calls = 0
+
+
+class SurrogateBudgetExceeded(RuntimeError):
+    """Raised when a tick exceeds SURROGATE_CALL_BUDGET distinct surrogate sims."""
+
+
 def reset_tick_caches() -> None:
     """Clear per-tick caches: user envelopes and the validated BudgetBook.
 
@@ -356,9 +410,11 @@ def reset_tick_caches() -> None:
     path could reuse a book validated against LAST tick's capacity -
     a stale-budget hole in the anti-split-brain ordering.
     """
+    global _surrogate_calls
     _CTX.user_envelopes = None
     _CTX.validated_budget_book = None
     _PREDICT_RAW_CACHE.clear()
+    _surrogate_calls = 0
 
 
 # Public module functions that are NOT LLM tools (infrastructure/boot).
@@ -912,7 +968,38 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         "recent_theory_blobs": blobs,
         "similar_deployments": get_similar_deployments(features, top_k=5),
         "mechanism_candidates": mechanisms,
+        "instance_catalog": instance_catalog(),
     }
+
+
+def instance_catalog() -> dict[str, dict[str, dict[str, Any]]]:
+    """Per-env INSTANCE facts from the resource map, so the planner/specialist
+    can size correctly instead of guessing hardware it cannot know from training.
+
+    For each env_key: {instance_type: {gpus_per_instance, free_instances,
+    gpu_type, price_per_instance_hour}}. gpus_per_instance is the key fact: a
+    rank's config.gpu_count is the GPUs used per replica on ONE instance and must
+    be <= gpus_per_instance * num_nodes_per_chain. So the right instance for a
+    tp=8 frame is an 8-GPU box (e.g. p5.48xlarge), NOT eight 1-GPU boxes
+    (p5.4xlarge). pool_budget UNIT counts are how many instances are free, which
+    is NOT the same as GPUs per instance - do not confuse them.
+    """
+    catalog: dict[str, dict[str, dict[str, Any]]] = {}
+    for env_key, info in get_resource_map().items():
+        env_map: dict[str, dict[str, Any]] = {}
+        for pool in info.get("pools") or []:
+            instance_type = pool.get("instance_type")
+            if not instance_type:
+                continue
+            env_map[str(instance_type)] = {
+                "gpus_per_instance": int(pool.get("gpus_per_instance", 0) or 0),
+                "free_instances": int(pool.get("free_instances", 0) or 0),
+                "gpu_type": info.get("gpu_type") or str(env_key).split("|")[-1],
+                "price_per_instance_hour": pool.get("price_per_instance_hour"),
+            }
+        if env_map:
+            catalog[str(env_key)] = env_map
+    return catalog
 
 
 # ----------------------------------------------------------------------
@@ -1021,10 +1108,16 @@ def get_user_envelopes() -> dict[str, dict[str, Any]]:
 def allocate_budget_book() -> dict[str, Any]:
     """Build the default BudgetBook expected by ``validate_budget_book``.
 
-    v0 is single-pass and greedy: jobs are visited by deterministic priority,
-    and each job receives the currently free GPUs in user-allowed envs. This
-    is enough to unblock the required budget-first protocol without inventing a
-    scheduler inside the tool.
+    v0 hands every job a PERMISSIVE upper-bound budget: each job may see the FULL
+    free pool in every env it is allowed (capped by the user's hard quota), NOT
+    an exclusive slice. Budgets deliberately OVERLAP across jobs. The old
+    pre-partition was the split-brain bug: a fair-share split stranded H100 with
+    a job that did not need it and boxed the one that did out of the 8-GPU frame
+    it wanted, so both under-served and deferred. The real cross-job capacity
+    decision is now made GLOBALLY, after specialists propose, by
+    jointly_select_placements (joint GPU selection) + check_feasibility. So a
+    specialist is free to propose the best GPU for its job, and the root
+    reconciles the ONE shared pool jointly instead of guessing the split up front.
     """
     _require("slow_loop")
     resources = get_resource_map()
@@ -1034,8 +1127,8 @@ def allocate_budget_book() -> dict[str, Any]:
     pending_ids = {j.get("job_id", j.get("id")) for j in pending}
     active_ids = {j.get("job_id", j.get("id")) for j in active}
     by_id = {j.get("job_id", j.get("id")): j for j in pending + active}
-    remaining = {_env_key(env): int(info.get("free", 0)) for env, info in resources.items()}
-    remaining_pools = _pool_budget_by_env(resources)
+    free_env = {_env_key(env): int(info.get("free", 0)) for env, info in resources.items()}
+    free_pools = {env: dict(pools) for env, pools in _pool_budget_by_env(resources).items()}
     priorities = get_priority()
     job_budgets: dict[str, dict[str, Any]] = {}
 
@@ -1048,20 +1141,21 @@ def allocate_budget_book() -> dict[str, Any]:
         if not isinstance(user_id, str) or not user_id:
             raise ValueError(f"job {job_id!r} missing user_id")
         envelope = envelopes.get(user_id, {})
-        allowed = {_env_key(env) for env in envelope.get("allowed_envs", remaining.keys())}
+        allowed = {_env_key(env) for env in envelope.get("allowed_envs", free_env.keys())}
         denied = {_env_key(env) for env in envelope.get("denied_envs", [])}
-        env_budget = {
-            env: free
-            for env, free in remaining.items()
-            if free > 0 and env in allowed and env not in denied
-        }
+        quota = {_env_key(e): int(n) for e, n in envelope.get("hard_quota", {}).items()}
+        # Full free pool per allowed env, capped only by the user's hard quota.
+        # Overlaps other jobs on purpose - it is an upper bound, not a reservation.
+        env_budget: dict[str, int] = {}
+        for env in allowed - denied:
+            cap = free_env.get(env, 0)
+            if env in quota:
+                cap = min(cap, quota[env])
+            if cap > 0:
+                env_budget[env] = cap
         pool_budget = {
-            env: dict(remaining_pools.get(env, {}))
-            for env in env_budget
-            if remaining_pools.get(env)
+            env: dict(free_pools.get(env, {})) for env in env_budget if free_pools.get(env)
         }
-        for env, free in env_budget.items():
-            remaining[env] -= free
 
         is_pending = job_id in pending_ids or job.get("status") == "waiting"
         is_active = job_id in active_ids or job.get("status") == "running"
@@ -1079,14 +1173,14 @@ def allocate_budget_book() -> dict[str, Any]:
             else "defer",
             "canary_cap": 1,
             "priority_score": entry.get("priority_score", 0.0),
-            "notes": "default greedy budget from free capacity",
+            "notes": "permissive upper-bound budget (full free pool; joint selector reconciles)",
         }
 
     return {
         "tick": int(getattr(_CTX.slow_loop.state, "tick", 0)),
         "job_budgets": job_budgets,
         "reserves": {},
-        "rationale": "default greedy budget from priority order and free capacity",
+        "rationale": "permissive upper-bound budgets: each job sees the full free pool (capped by quota); jointly_select_placements + check_feasibility reconcile across jobs",
     }
 
 
@@ -1096,9 +1190,14 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
     Checks, in order:
         1. Every job budget references a known user envelope.
         2. No job budget uses an env denied to its user.
-        3. Per-user env sums stay within the user hard quota.
-        4. Cluster-wide env sums stay within free capacity minus reserves.
+        3. Each job's per-env budget stays within the user hard quota.
+        4. Each job's per-env budget stays within free capacity minus reserves.
         5. Implied active-job swaps stay within the swap budget B_t.
+
+    Budgets are PERMISSIVE upper bounds that overlap across jobs (see
+    allocate_budget_book), so each is validated as a per-job cap, NOT a
+    cross-job partition sum; the real shared-pool fit is enforced later by
+    jointly_select_placements + check_feasibility.
 
     On success the book is cached so run_job_specialists can verify it
     was validated. Any change to the book requires re-validation.
@@ -1123,12 +1222,13 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
     reserves = {_env_key(env): int(n) for env, n in (budget_book.get("reserves") or {}).items()}
 
     job_budgets = budget_book.get("job_budgets") or {}
-    cluster_totals: dict[str, int] = {}
-    pool_totals: dict[tuple[str, str], int] = {}
-    user_totals: dict[str, dict[str, int]] = {}
+    allocatable = {env: capacity.get(env, 0) - reserves.get(env, 0) for env in capacity}
     implied_swaps = 0
     active_ids = {j.get("job_id", j.get("id")) for j in get_active_jobs()}
 
+    # Budgets are permissive per-job UPPER BOUNDS (they overlap across jobs), so
+    # each is validated as a cap - never a cross-job sum. The shared-pool fit is
+    # decided globally by jointly_select_placements + check_feasibility.
     for job_id, slice_ in job_budgets.items():
         user_id = slice_.get("user_id")
         envelope = envelopes.get(user_id)
@@ -1137,6 +1237,7 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
             continue
 
         denied = {_env_key(e) for e in envelope.get("denied_envs", [])}
+        quota = {_env_key(e): int(n) for e, n in envelope.get("hard_quota", {}).items()}
         env_budget = {
             _env_key(env): int(gpus) for env, gpus in (slice_.get("env_budget") or {}).items()
         }
@@ -1146,9 +1247,14 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
                 continue
             if key in denied:
                 violations.append(f"job {job_id}: env {key} denied for user {user_id}")
-            cluster_totals[key] = cluster_totals.get(key, 0) + gpus
-            user_totals.setdefault(user_id, {})
-            user_totals[user_id][key] = user_totals[user_id].get(key, 0) + gpus
+            if gpus > allocatable.get(key, 0):
+                violations.append(
+                    f"job {job_id}: {gpus} GPUs in {key} exceeds free capacity "
+                    f"{allocatable.get(key, 0)}"
+                )
+            limit = quota.get(key)
+            if limit is not None and gpus > limit:
+                violations.append(f"job {job_id}: {gpus} GPUs in {key} exceeds user quota {limit}")
 
         pool_budget, pool_errors = _parse_pool_budget(slice_)
         violations.extend(f"job {job_id}: {error}" for error in pool_errors)
@@ -1161,8 +1267,16 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
             if env_key not in env_budget:
                 violations.append(f"job {job_id}: pool budget env {env_key} has no env budget")
             for instance_type, units in pools.items():
-                pool_key = (env_key, str(instance_type))
-                pool_totals[pool_key] = pool_totals.get(pool_key, 0) + units
+                pool_limit = pool_limits.get((env_key, str(instance_type)))
+                if pool_limit is None:
+                    violations.append(
+                        f"job {job_id}: pool {instance_type} is not available in env {env_key}"
+                    )
+                elif int(units) > int(pool_limit["available_units"]):
+                    violations.append(
+                        f"job {job_id}: {units} units of {instance_type} in {env_key} exceed "
+                        f"{pool_limit['available_units']} free"
+                    )
 
         hint = str(slice_.get("strategy_hint", "")).lower()
         if job_id in active_ids and any(
@@ -1170,35 +1284,15 @@ def validate_budget_book(budget_book: dict[str, Any]) -> dict[str, Any]:
         ):
             implied_swaps += 1
 
-    for user_id, totals in user_totals.items():
-        quota = {_env_key(e): int(n) for e, n in envelopes[user_id].get("hard_quota", {}).items()}
-        for env, used in totals.items():
-            limit = quota.get(env)
-            if limit is not None and used > limit:
-                violations.append(f"user {user_id}: {used} GPUs in {env} exceeds quota {limit}")
-
-    for env, used in cluster_totals.items():
-        allocatable = capacity.get(env, 0) - reserves.get(env, 0)
-        if used > allocatable:
-            violations.append(f"env {env}: budgets sum to {used} but allocatable is {allocatable}")
-
-    for pool_key, used in pool_totals.items():
-        pool_limit = pool_limits.get(pool_key)
-        if pool_limit is None:
-            violations.append(f"pool {pool_key[1]} is not available in env {pool_key[0]}")
-        elif used > int(pool_limit["available_units"]):
-            violations.append(
-                f"pool {pool_key[1]} in {pool_key[0]} budgets sum to {used} but only "
-                f"{pool_limit['available_units']} units are free"
-            )
-
     b_t = _CTX.slow_loop.get_sss_swap_budget_t()
     if implied_swaps > b_t:
         violations.append(f"implied swaps {implied_swaps} exceed swap budget B_t={b_t}")
 
     ok = len(violations) == 0
     _CTX.validated_budget_book = budget_book if ok else None
-    return {"ok": ok, "violations": violations}
+    # "feasible" mirrors "ok" so a planner that standardizes on either key reads
+    # both validation tools consistently (see check_feasibility).
+    return {"ok": ok, "feasible": ok, "violations": violations}
 
 
 def _budget_violations(
@@ -1376,6 +1470,72 @@ def _rank_allocation_summary(rank, resources=None) -> dict[str, Any]:
     }
 
 
+def _model_num_heads(config: dict[str, Any], job_features: dict[str, Any] | None) -> int | None:
+    """Best-effort attention-head count for the rank's model, from the rank
+    config, the job features, or the model catalog. None when unknown (then
+    head-divisibility is not enforced here and the surrogate stays the backstop).
+    """
+    for source in (config or {}), (job_features or {}):
+        for key in (
+            "num_attn_heads",
+            "num_attention_heads",
+            "n_heads",
+            "num_heads",
+            "attention_heads",
+        ):
+            value = source.get(key) if isinstance(source, dict) else None
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    model_id = (config or {}).get("model_id") or (job_features or {}).get("model_id")
+    resource_map = getattr(_CTX, "resource_map", None)
+    if model_id and resource_map is not None and hasattr(resource_map, "model_catalog"):
+        try:
+            catalog = dict(resource_map.model_catalog(str(model_id)) or {})
+        except Exception:
+            return None
+        for key in (
+            "num_attn_heads",
+            "num_attention_heads",
+            "n_heads",
+            "num_heads",
+            "attention_heads",
+        ):
+            value = catalog.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    return None
+
+
+def config_runnable(
+    config: dict[str, Any],
+    job_features: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Deterministic physical-validity pre-check for a rank config.
+
+    Enforces the HARD constraints the model/hardware impose - tp*pp must fit the
+    engine's GPU demand, and tp must divide the model's attention-head count - in
+    CODE, so an unrunnable config (e.g. tp=8 on a 28-head model) is rejected with
+    a clear reason instead of being nagged about in the prompt or crashing the
+    surrogate. Checks it cannot evaluate (missing catalog arch) are skipped, not
+    failed - the surrogate stays the backstop for those. Returns (ok, reason).
+    """
+    config = config or {}
+    try:
+        tp = int(config.get("tp") or 1)
+        pp = int(config.get("pp") or 1)
+    except (TypeError, ValueError):
+        return True, ""  # non-numeric parallelism - let the schema/validator handle it
+    if tp < 1 or pp < 1:
+        return False, f"tp={tp} and pp={pp} must both be >= 1"
+    gpu_count = config.get("gpu_count")
+    if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and tp * pp > gpu_count:
+        return False, f"tp*pp={tp * pp} exceeds gpu_count={gpu_count} (need one GPU per shard)"
+    heads = _model_num_heads(config, job_features)
+    if heads and heads % tp != 0:
+        return False, f"tp={tp} does not divide the model's {heads} attention heads (cannot shard)"
+    return True, ""
+
+
 def size_ladder(
     ranks: list[dict[str, Any]],
     job_features: dict[str, Any],
@@ -1489,17 +1649,24 @@ def size_ladder(
 
         payload = _rank_prediction_payload(rank, job_features)
         pred_error = None
-        try:
-            y_hat = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
-                "y_hat", {}
-            )
-        except Exception as exc:
-            # A config the surrogate rejects (invalid router_policy, tp not
-            # dividing attention heads, etc.) must NOT crash the whole sizing
-            # pass. Mark this frame infeasible and let the other ranks proceed.
-            log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
-            pred_error = str(exc)
+        runnable, validity_reason = config_runnable(dict(rank.config), payload["job_features"])
+        if not runnable:
+            # Physically unrunnable (parallelism vs GPUs, model sharding): reject
+            # in code with a reason and SKIP the surrogate - no wasted sim, no
+            # crash. Replaces hand-checking divisibility in the prompt.
+            pred_error = validity_reason
             y_hat = {}
+        else:
+            try:
+                y_hat = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
+                    "y_hat", {}
+                )
+            except Exception as exc:
+                # Backstop for anything the pre-check couldn't evaluate (missing
+                # catalog arch, other engine rejection): infeasible, don't crash.
+                log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
+                pred_error = str(exc)
+                y_hat = {}
         per_chain_raw = _y_value(y_hat, "throughput_token_per_sec")
         per_chain_eff = per_chain_raw * util
 
@@ -1523,7 +1690,7 @@ def size_ladder(
                 f"has {allocation['gpus_per_unit']}"
             )
         if pred_error:
-            physical_violations.append(f"surrogate rejected config: {pred_error}")
+            physical_violations.append(f"config not runnable: {pred_error}")
         physical_ok = not physical_violations
 
         # An SLO-infeasible online config is not viable at ANY replica count
@@ -2057,6 +2224,13 @@ def _predict_outcome_core(
     if cache_key in _PREDICT_RAW_CACHE:
         y_hat_raw, v_hat = _PREDICT_RAW_CACHE[cache_key]
     else:
+        global _surrogate_calls
+        _surrogate_calls += 1
+        if _surrogate_calls > SURROGATE_CALL_BUDGET:
+            raise SurrogateBudgetExceeded(
+                f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
+                "narrow to your best few candidate configs and reuse scored results."
+            )
         result = _CTX.surrogate.compose_prediction(
             job_config=job_config,
             job_features=job_features,
@@ -2472,16 +2646,29 @@ def compute_sigma(plan) -> dict[str, Any]:
     # Serve-value: leaving a waiting job unserved is NOT free. Charge an
     # opportunity cost per pending job the plan does not place, over snapshot
     # demand (not just explicit defer actions, so omitting a job cannot dodge
-    # it). This is what makes a feasible placement (sigma ~ J<=0 + EIG) beat
-    # defer (0); it cancels for jobs no plan can serve, so it only biases toward
-    # serving where a placement is actually possible.
+    # it), SCALED by the job's priority score.
+    #
+    # The scale matters: placing job i beats deferring it iff sigma_i + penalty_i
+    # > 0, i.e. penalty_i > |sigma_i|. A config's Tchebycheff distance |sigma| is
+    # empirically ~10-30 even for an SLO-crushing frame (J measures distance to
+    # the IDEAL z*, not to the SLO), so a flat penalty of 1.0 could NEVER offset
+    # it and defer always won. The bug: priority was read from the raw pending-job
+    # dict (`priority_class` / `user_priority`), which carries no COMPOSED score,
+    # so it fell back to 1.0. Use the real priority_score from get_priority() (the
+    # same table the budget book uses; scale ~10-50). Now a serveable job is
+    # placed, while a job whose only feasible frame is far from ideal (e.g. a 72B
+    # stuck on L40S, |sigma|~33) correctly stays deferred until a better frame
+    # (e.g. H100) is available. Raise UNSERVED_PENALTY above 1.0 to bias harder
+    # toward serving.
     served = {a.job_id for a in typed.actions if a.type in LADDER_ACTIONS and a.ladder}
+    priority_by_job = {
+        p.get("job_id"): float(p.get("priority_score", 1.0) or 1.0) for p in get_priority()
+    }
     unserved_penalty = 0.0
     for job in get_pending_jobs():
         jid = job.get("job_id", job.get("id"))
         if jid and jid not in served:
-            priority = float(job.get("priority_class") or job.get("user_priority") or 1.0)
-            unserved_penalty += UNSERVED_PENALTY * max(1.0, priority)
+            unserved_penalty += UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0))
     aggregate -= unserved_penalty
 
     return {
@@ -2489,6 +2676,210 @@ def compute_sigma(plan) -> dict[str, Any]:
         "aggregate_sigma": aggregate,
         "swap_count": swap_counter(typed),
         "unserved_penalty": unserved_penalty,
+    }
+
+
+def _cap_key_str(key: tuple) -> str:
+    """Readable capacity key: ('gpu', env) -> 'gpu:env'; ('pool', env, it) -> 'pool:env:it'."""
+    return ":".join(str(part) for part in key)
+
+
+def _ladder_capacity_cost(
+    ladder: list[Any], instance_specs: dict[str, dict[str, dict[str, Any]]]
+) -> dict[tuple, int]:
+    """Resource cost of a ladder as {capacity_key: amount}, in BOTH dimensions the
+    validator enforces:
+      ('gpu', env_key)            -> GPUs used = sum(gpu_count * n_replicas)
+      ('pool', env_key, instance) -> whole INSTANCES used
+                                     = sum(n_replicas * ceil(gpu_count / gpus_per_instance))
+    Per-pool instances is the constraint the old env-GPU-only check missed: eight
+    1-GPU g6e.xlarge replicas need 8 INSTANCES even though they are only 8 of the
+    L40S env's 16 GPUs, and only 4 g6e.xlarge may be free (validator C5) - so the
+    solver picked an infeasible set and the planner deferred everything. Pool cost
+    is added only when instance_specs knows the instance's gpus_per_instance;
+    otherwise the coarse env-GPU dimension still bounds it."""
+    cost: dict[tuple, int] = {}
+    for rank in ladder or []:
+        if not isinstance(rank, dict):
+            continue
+        env = rank.get("env")
+        if env is None:
+            continue
+        env_key = _env_key(env)
+        cfg = rank.get("config") or {}
+        try:
+            gpus = max(0, int(cfg.get("gpu_count", 0) or 0))
+            reps = max(0, int(rank.get("n_replicas", 1) or 1))
+        except (TypeError, ValueError):
+            continue
+        cost[("gpu", env_key)] = cost.get(("gpu", env_key), 0) + gpus * reps
+        instance_type = cfg.get("instance_type")
+        spec = (
+            (instance_specs.get(env_key) or {}).get(str(instance_type)) if instance_type else None
+        )
+        gpi = int(spec.get("gpus_per_instance", 0) or 0) if spec else 0
+        if gpi > 0:
+            per_replica = max(1, -(-gpus // gpi))  # ceil(gpus / gpi) instances per replica
+            key = ("pool", env_key, str(instance_type))
+            cost[key] = cost.get(key, 0) + reps * per_replica
+    return cost
+
+
+def jointly_select_placements(
+    candidates: list[dict[str, Any]],
+    reserves: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Joint GPU selection across ALL waiting jobs against the one shared pool.
+
+    Chooses at most one candidate frame per job (or defers it) to MAXIMIZE the
+    cluster objective - the sum of placed per-job sigma minus the unserved-demand
+    penalty for every waiting job left unplaced - subject to per-env free-GPU
+    capacity. This is the joint decision the greedy per-job loop cannot make: it
+    weighs every job's GPU options together, so a scarce type (e.g. H100) goes to
+    whichever job it helps most instead of being pre-split blindly. It ARBITRATES
+    the frames you pass; it does NOT invent them. Proposing the right GPU types
+    (an L40S frame and an H100 frame for a big model) is the planner's
+    domain-knowledge job - this tool just picks the joint optimum among them.
+
+    Capacity is enforced in TWO dimensions - env GPU totals AND per-pool whole-
+    INSTANCE limits (validator C5) - so the returned assignment actually fits the
+    instance pools, not just the env GPU count (two 4x g6e.xlarge jobs need 8
+    such instances but only 4 may be free). Still run check_feasibility on the
+    assembled plan for the full C0-C7 checks (SLO, quota, swap budget, ...).
+
+    Args:
+        candidates: scored, already check_feasibility-passed frames. Each is a
+            dict:
+              {"job_id": str,
+               "sigma": float,       # the PER-JOB sigma, i.e.
+                                     # compute_sigma(one_job_plan)["per_job"][job_id]["sigma"]
+                                     # (NOT aggregate_sigma - the serve penalty is applied here),
+               "ladder": [rank, ...] # each rank carries env + config.gpu_count + n_replicas,
+               ...}                  # any other keys (type, user_id, target_tps, mechanism_id,
+                                     # rationale, ...) pass through on the winner, so the chosen
+                                     # entries are ready to drop into plan["actions"].
+        reserves: optional {env_key: int} GPUs to hold back.
+
+    Returns:
+        {"chosen": [candidate, ...],   # <=1 per job, the joint-optimal set
+         "deferred": [job_id, ...],    # waiting jobs no candidate served
+         "objective": float,           # gain over the all-defer baseline (>= 0)
+         "used": {cap_key: int}, "capacity": {cap_key: int}}
+    (cap_key is 'gpu:<env>' or 'pool:<env>:<instance_type>')
+    """
+    _require("resource_map")
+    reserve_map = {_env_key(env): int(n) for env, n in (reserves or {}).items()}
+    resources = get_resource_map()
+    specs = instance_catalog()
+    # Capacity is two-dimensional: env GPU totals AND per-pool whole-instance
+    # limits. The pool dimension is what the old env-GPU-only check missed.
+    capacity: dict[tuple, int] = {}
+    for env, info in resources.items():
+        env_key = _env_key(env)
+        capacity[("gpu", env_key)] = max(0, int(info.get("free", 0)) - reserve_map.get(env_key, 0))
+    for env_key, pools in specs.items():
+        for instance_type, spec in pools.items():
+            capacity[("pool", env_key, str(instance_type))] = int(
+                spec.get("free_instances", 0) or 0
+            )
+    priority_by_job = {
+        p.get("job_id"): float(p.get("priority_score", 1.0) or 1.0) for p in get_priority()
+    }
+
+    def penalty(jid: str) -> float:
+        return UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0))
+
+    # Group scored candidates by job, attaching each frame's per-env GPU cost and
+    # its GAIN over deferring that job: placing adds sigma AND avoids the -penalty,
+    # so the marginal value of placing vs deferring is sigma + penalty. A frame
+    # whose gain <= 0 (sigma more negative than the serve penalty) is never worth
+    # placing over a defer and is dropped up front.
+    by_job: dict[str, list[dict[str, Any]]] = {}
+    for cand in candidates or []:
+        jid = cand.get("job_id")
+        if not jid:
+            continue
+        cost = _ladder_capacity_cost(cand.get("ladder") or [], specs)
+        if not cost:
+            continue  # no real GPU footprint -> not a placeable frame
+        gain = float(cand.get("sigma", 0.0)) + penalty(jid)
+        if gain <= 0:
+            continue
+        by_job.setdefault(jid, []).append({"cand": cand, "cost": cost, "gain": gain})
+    jobs = [jid for jid in by_job if by_job[jid]]
+
+    best: dict[str, Any] = {"objective": 0.0, "chosen": []}  # all-defer baseline == 0 gain
+
+    space = 1
+    for jid in jobs:
+        space *= 1 + len(by_job[jid])
+
+    if space <= 200_000:
+        # Exact branch-and-bound: every node is a capacity-feasible assignment
+        # (deferring the remaining jobs), so its accumulated gain is a valid
+        # objective; keep the best. Place-branches that overflow a pool are pruned.
+        def dfs(i: int, used: dict[str, int], gain: float, chosen: list[dict[str, Any]]) -> None:
+            if gain > best["objective"]:
+                best["objective"] = gain
+                best["chosen"] = list(chosen)
+            if i >= len(jobs):
+                return
+            dfs(i + 1, used, gain, chosen)  # defer job i
+            for entry in by_job[jobs[i]]:
+                new_used = dict(used)
+                over = False
+                for key, need in entry["cost"].items():
+                    new_used[key] = new_used.get(key, 0) + need
+                    if new_used[key] > capacity.get(key, 0):
+                        over = True
+                        break
+                if over:
+                    continue
+                chosen.append(entry["cand"])
+                dfs(i + 1, new_used, gain + entry["gain"], chosen)
+                chosen.pop()
+
+        dfs(0, {}, 0.0, [])
+    else:
+        # Greedy fallback for a large choice space: best-gain frame per job in
+        # priority order, taking each only if it still fits. Bounded, never over
+        # capacity, not guaranteed optimal.
+        log.warning("jointly_select_placements: %d combos, using greedy fallback", space)
+        used: dict[str, int] = {}
+        chosen: list[dict[str, Any]] = []
+        total = 0.0
+        for jid in sorted(jobs, key=lambda j: priority_by_job.get(j, 1.0), reverse=True):
+            for entry in sorted(by_job[jid], key=lambda e: e["gain"], reverse=True):
+                trial = dict(used)
+                over = False
+                for key, need in entry["cost"].items():
+                    trial[key] = trial.get(key, 0) + need
+                    if trial[key] > capacity.get(key, 0):
+                        over = True
+                        break
+                if not over:
+                    used, total = trial, total + entry["gain"]
+                    chosen.append(entry["cand"])
+                    break
+        best = {"objective": total, "chosen": chosen}
+
+    chosen = best["chosen"]
+    placed_ids = {c.get("job_id") for c in chosen}
+    used_final: dict[str, int] = {}
+    for c in chosen:
+        for key, need in _ladder_capacity_cost(c.get("ladder") or [], specs).items():
+            used_final[_cap_key_str(key)] = used_final.get(_cap_key_str(key), 0) + need
+    deferred = [
+        jid
+        for jid in (j.get("job_id", j.get("id")) for j in get_pending_jobs())
+        if jid and jid not in placed_ids
+    ]
+    return {
+        "chosen": chosen,
+        "deferred": deferred,
+        "objective": best["objective"],
+        "used": used_final,
+        "capacity": {_cap_key_str(k): v for k, v in capacity.items()},
     }
 
 
@@ -2524,9 +2915,29 @@ def check_feasibility(plan) -> dict[str, Any]:
         cluster_snapshot=_snapshot(),
         slow_state=_CTX.slow_loop.state,
     )
+    feasible = bool(getattr(result, "feasible", False))
+    violations = list(getattr(result, "violations", []))
+    # Physical-validity of each proposed config (tp*pp vs GPUs, model sharding),
+    # enforced in CODE not the prompt: a config the model cannot shard is
+    # infeasible regardless of what the C0-C7 validator checked.
+    snapshot = _snapshot()
+    for action in typed.actions:
+        if action.type in LADDER_ACTIONS and action.ladder:
+            for i, rank in enumerate(action.ladder):
+                ok_cfg, reason = config_runnable(
+                    dict(getattr(rank, "config", {}) or {}),
+                    _job_features_for(snapshot, action.job_id),
+                )
+                if not ok_cfg:
+                    feasible = False
+                    violations.append(f"job {action.job_id} rank {i}: {reason}")
+    # Return BOTH keys (ok + feasible) so either planner convention reads it
+    # right - check_feasibility historically used "feasible" while every other
+    # validation tool uses "ok"; exposing both removes that footgun.
     return {
-        "feasible": bool(getattr(result, "feasible", False)),
-        "violations": list(getattr(result, "violations", [])),
+        "feasible": feasible,
+        "ok": feasible,
+        "violations": violations,
     }
 
 
