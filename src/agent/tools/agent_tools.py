@@ -85,6 +85,7 @@ import json
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from typing import Any
 
@@ -664,8 +665,8 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
             samples.append((max(1, int(rank.n_replicas or 1)), y))
     if not samples:
         return {}
-    if len(samples) == 1:
-        return dict(samples[0][1])
+    # Always roll up (even a single rank) so DP is applied: a lone rank with
+    # n_replicas=N must report N * per_chain throughput, not per_chain.
     return _roll_up_ranks(samples)
 
 
@@ -682,7 +683,15 @@ def _roll_up_ranks(samples: list[tuple[int, dict]]) -> dict[str, Any]:
         present = [(n, float(y[obj]), _tput(y)) for n, y in samples if y.get(obj) is not None]
         if not present:
             continue
-        if obj in _LATENCY_OBJS:
+        if obj == _THROUGHPUT_OBJ:
+            # Data-parallel replicas serve IN PARALLEL, so aggregate throughput is
+            # the SUM over replicas (n_replicas * per_chain_tps), NOT an average.
+            # Scoring per-chain here under-counted delivered throughput by the
+            # replica factor - it made every multi-replica job's J far too negative
+            # (big models, which need the most replicas, hit hardest -> deferred).
+            # size_ladder already scales by replicas for meets_target; J must match.
+            composed[obj] = sum(n * v for n, v, _ in present)
+        elif obj in _LATENCY_OBJS:
             composed[obj] = max(v for _, v, _ in present)
         elif obj in _MARGIN_OBJS:
             composed[obj] = min(v for _, v, _ in present)
@@ -2544,6 +2553,46 @@ def compute_slo_dro(
 # ----------------------------------------------------------------------
 
 
+def _target_reference(job_features: dict[str, Any]) -> dict[str, float]:
+    """Per-job scoring reference = the job's OWN SLO / throughput TARGET, not the
+    absolute best-achievable z* ideal. Meeting the target is "good enough" (see
+    _clamp_to_reference), so J stops rewarding over-service. Empty when the job
+    declares no targets (caller then falls back to z*)."""
+    ref: dict[str, float] = {}
+    ttft = _feature_value(job_features, "target_p99_ttft_ms", "target_p99_TTFT_ms")
+    tpot = _feature_value(job_features, "target_p99_tpot_ms", "target_p99_TPOT_ms")
+    if ttft:
+        ref["p99_ttft_ms"] = float(ttft)
+    if tpot:
+        ref["p99_tpot_ms"] = float(tpot)
+    try:
+        req_tps = float(required_throughput_enumerator(job_features))
+        if req_tps > 0:
+            ref[_THROUGHPUT_OBJ] = req_tps
+    except Exception:
+        pass
+    return ref
+
+
+def _clamp_to_reference(y_hat: dict[str, Any], reference: dict[str, float]) -> dict[str, float]:
+    """One-sided distance: a value that MEETS its target (latency <= target, or
+    throughput >= target) is snapped TO the target so its Tchebycheff gap is 0 -
+    exceeding a target earns no extra credit. Missing it keeps the real value, so
+    only the shortfall is penalized."""
+    out: dict[str, float] = {}
+    for obj, value in (y_hat or {}).items():
+        if value is None:
+            continue
+        target = reference.get(obj)
+        v = float(value)
+        if target is not None and (
+            (obj in _LATENCY_OBJS and v < target) or (obj == _THROUGHPUT_OBJ and v > target)
+        ):
+            v = target
+        out[obj] = v
+    return out
+
+
 def compute_sigma(plan) -> dict[str, Any]:
     """Score a plan: per-job sigma and the cluster aggregate.
 
@@ -2591,11 +2640,26 @@ def compute_sigma(plan) -> dict[str, Any]:
         job_id = action.job_id
         ladder_dicts = _ranks_as_dicts(action)
         job_features = _job_features_for(snapshot, job_id)
-        z_star = _seeded_z_star(get_z_star(job_features))
         y_hat = _compose_job_y_hat(action, job_features)
         if not y_hat:
             continue
-        y_score = _scoreable_y_hat(y_hat, w_t, z_star, ranges)
+        # Score against the job's OWN SLO/throughput TARGET, not the absolute z*
+        # ideal: meeting the target is "good enough" and earns 0 gap (no reward for
+        # over-service), so the optimizer stops lavishing scarce GPUs on a job that
+        # already meets its SLO and starving the one that needs them. Fall back to
+        # z* only when a job declares no targets.
+        target_ref = _target_reference(job_features)
+        if target_ref:
+            reference, y_for_score = target_ref, _clamp_to_reference(y_hat, target_ref)
+            # Normalize by the TARGET itself, so a gap is a FRACTION of the
+            # requirement (|y-target|/target), not |y-target|/typical_range. The
+            # seeded range (~1000 tps) dwarfs a target (~150), which flattened a
+            # 73%-of-target miss into a ~0.1 gap - the solver then could not tell
+            # the 72B needs H100 far more than a 7B does, and mis-gave the H100.
+            norm = {obj: abs(t) for obj, t in target_ref.items() if t}
+        else:
+            reference, y_for_score, norm = _seeded_z_star(get_z_star(job_features)), y_hat, ranges
+        y_score = _scoreable_y_hat(y_for_score, w_t, reference, norm)
         if not y_score:
             continue
         slo_thresholds = _slo_thresholds_for(snapshot, job_id)
@@ -2604,8 +2668,8 @@ def compute_sigma(plan) -> dict[str, Any]:
             _CTX.tchebycheff_module.compute_tchebycheff(
                 y_hat=y_score,
                 w_t=w_t,
-                z_star_t=z_star,
-                normalization_range=ranges,
+                z_star_t=reference,
+                normalization_range=norm,
             )
         )
         eig_value = float(
@@ -2723,6 +2787,296 @@ def _ladder_capacity_cost(
             key = ("pool", env_key, str(instance_type))
             cost[key] = cost.get(key, 0) + reps * per_replica
     return cost
+
+
+def _largest_pow2_divisor_leq(heads: int | None, cap: int) -> int:
+    """Largest power of 2 that divides `heads` and is <= cap; 1 if heads unknown.
+    Picks a tp that both shards the model (divides attention heads) and fits the
+    instance's GPU count."""
+    if not heads or int(heads) <= 0 or cap < 1:
+        return 1
+    tp, power = 1, 2
+    while power <= cap and int(heads) % power == 0:
+        tp, power = power, power * 2
+    return tp
+
+
+def _normalize_candidate_rank(raw: Any) -> dict[str, Any] | None:
+    """Clean any proposed rank to the canonical shape, or None if unusable."""
+    if not isinstance(raw, dict):
+        return None
+    env = raw.get("env")
+    cfg = raw.get("config")
+    if not (isinstance(env, (list, tuple)) and len(env) == 5 and isinstance(cfg, dict)):
+        return None
+    keep = (
+        "instance_type",
+        "gpu_count",
+        "tp",
+        "pp",
+        "sp",
+        "ep",
+        "cp",
+        "num_nodes_per_chain",
+        "interconnect_type",
+    )
+    config = {k: cfg[k] for k in keep if k in cfg and cfg[k] is not None}
+    if not config.get("instance_type"):
+        return None
+    for knob, default in (
+        ("gpu_count", 1),
+        ("tp", 1),
+        ("pp", 1),
+        ("sp", 1),
+        ("ep", 1),
+        ("cp", 1),
+        ("num_nodes_per_chain", 1),
+    ):
+        config.setdefault(knob, default)
+    try:
+        n_replicas = max(1, int(raw.get("n_replicas", 1) or 1))
+    except (TypeError, ValueError):
+        n_replicas = 1
+    return {"role": "aggregate", "env": list(env), "config": config, "n_replicas": n_replicas}
+
+
+def _rank_shape_key(rank: dict[str, Any]) -> tuple:
+    cfg = rank.get("config") or {}
+    return (
+        tuple(rank.get("env") or []),
+        cfg.get("instance_type"),
+        cfg.get("tp"),
+        cfg.get("pp"),
+        cfg.get("gpu_count"),
+        cfg.get("num_nodes_per_chain"),
+    )
+
+
+def _score_one_frame(
+    jid: str, user_id: Any, slice_id: Any, rank: dict[str, Any], features: dict[str, Any]
+) -> dict[str, Any]:
+    """The proven per-frame pipeline: runnable -> mechanism -> size_ladder ->
+    feasibility -> per-job sigma. Returns {candidate|None, meets_target, diag}."""
+    env = rank.get("env")
+    cfg = dict(rank.get("config") or {})
+    gpu_type = env_gpu_type(env) if env else None
+    diag: dict[str, Any] = {
+        "env": gpu_type,
+        "instance_type": cfg.get("instance_type"),
+        "tp": cfg.get("tp"),
+        "status": None,
+        "reason": None,
+        "meets_target": False,
+        "achieved_tps": None,
+        "target_tps": None,
+        "sigma": None,
+    }
+    runnable, reason = config_runnable(cfg, features)
+    if not runnable:
+        diag.update(status="unrunnable", reason=reason)
+        return {"candidate": None, "meets_target": False, "diag": diag}
+    mid = None
+    try:
+        apps = get_applicable_mechanisms(rank, features)
+        if isinstance(apps, dict):
+            mid = apps.get("exact") or apps.get("mechanism_id")
+            if not mid:
+                vals = apps.get("mechanisms") or apps.get("applicable") or []
+                if vals:
+                    mid = vals[0] if isinstance(vals[0], str) else vals[0].get("mechanism_id")
+        elif isinstance(apps, (list, tuple)) and apps:
+            mid = apps[0] if isinstance(apps[0], str) else apps[0].get("mechanism_id")
+    except Exception:
+        mid = None
+    if not mid:
+        diag.update(status="no_mechanism", reason="no applicable mechanism")
+        return {"candidate": None, "meets_target": False, "diag": diag}
+    scored_rank = dict(rank)
+    scored_rank["mechanism_id"] = mid
+    try:
+        sized = size_ladder([scored_rank], features)
+    except Exception as exc:
+        diag.update(status="size_error", reason=f"size_ladder failed: {exc}")
+        return {"candidate": None, "meets_target": False, "diag": diag}
+    ranks = sized.get("ranks") or []
+    meets = bool(sized.get("meets_target"))
+    diag.update(
+        achieved_tps=sized.get("achieved_tps"),
+        target_tps=sized.get("target_tps"),
+        meets_target=meets,
+    )
+    if not ranks:
+        diag.update(
+            status="no_fit",
+            reason=f"does not fit/meet SLO (achieved {sized.get('achieved_tps')} of "
+            f"{sized.get('target_tps')} tps)",
+        )
+        return {"candidate": None, "meets_target": False, "diag": diag}
+    act = {
+        "job_id": jid,
+        "type": "place",
+        "user_id": user_id,
+        "ladder": ranks,
+        "target_tps": sized.get("target_tps"),
+        "mechanism_id": mid,
+        "budget_ref": slice_id,
+        "rationale": f"Deterministic {gpu_type} candidate "
+        f"({'full-service' if meets else 'under-target'}).",
+    }
+    one = {"tick_rationale": "candidate scoring", "actions": [act]}
+    try:
+        feas = check_feasibility(one)
+        if not feas.get("feasible"):
+            diag.update(status="infeasible", reason="; ".join(feas.get("violations", []))[:200])
+            return {"candidate": None, "meets_target": meets, "diag": diag}
+        act["sigma"] = compute_sigma(one)["per_job"][jid]["sigma"]
+    except Exception as exc:
+        diag.update(status="score_error", reason=f"scoring failed: {exc}")
+        return {"candidate": None, "meets_target": meets, "diag": diag}
+    diag.update(status="ok", sigma=act["sigma"])
+    return {"candidate": act, "meets_target": meets, "diag": diag}
+
+
+def build_scored_candidates(
+    budget_book: dict[str, Any] | None = None,
+    specialist_results: Any = None,
+) -> dict[str, Any]:
+    """Deterministic candidate pipeline for all waiting jobs: normalize specialist
+    ladders (HINTS), generate a frame on each OTHER viable GPU type they skipped
+    (largest free instance of that type, tp = a head-dividing power of 2 that fits,
+    from instance_catalog + the model's head count), size each, and score per-job
+    sigma via the proven chain (config_runnable -> get_applicable_mechanisms ->
+    size_ladder -> check_feasibility -> compute_sigma).
+
+    EVERY physically-runnable, feasible frame is returned as a candidate - INCLUDING
+    under-target ones - because placing a job beats deferring it; the joint solver
+    decides serve-vs-defer from the scored sigma, not a hard meets_target gate here.
+    A job appears in `exhausted` only when it has NO runnable, feasible frame at all.
+
+    Returns {"candidates": [...for jointly_select_placements],
+             "exhausted": {job_id: reason},
+             "diagnostics": {job_id: [per-frame diag incl. meets_target/achieved_tps]}}.
+    """
+    _require("resource_map", "surrogate")
+    snapshot = _snapshot()
+    specs = instance_catalog()
+    gpu_type_env: dict[str, list[str]] = {}
+    for env_key, info in get_resource_map().items():
+        try:
+            if int(info.get("free", 0) or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        gpu_type = info.get("gpu_type") or str(env_key).split("|")[-1]
+        gpu_type_env.setdefault(str(gpu_type), str(env_key).split("|"))
+
+    spec_by_job: dict[str, dict[str, Any]] = {}
+    if isinstance(specialist_results, dict):
+        if specialist_results.get("job_id"):
+            spec_by_job[specialist_results["job_id"]] = specialist_results
+        else:
+            spec_by_job = {k: v for k, v in specialist_results.items() if isinstance(v, dict)}
+    elif isinstance(specialist_results, (list, tuple)):
+        for result in specialist_results:
+            if isinstance(result, dict) and result.get("job_id"):
+                spec_by_job[result["job_id"]] = result
+    budgets = (
+        ((budget_book or {}).get("job_budgets") or {}) if isinstance(budget_book, dict) else {}
+    )
+
+    # Phase 1 (cheap, no surrogate): build the candidate FRAME list per job -
+    # specialist ladders (hints) plus one generated frame per viable GPU type the
+    # specialist skipped (largest free instance of that type; big models need it,
+    # small models keep their cheaper specialist frame and the solver picks by sigma).
+    frames_by_job: dict[str, list[dict[str, Any]]] = {}
+    ctx_by_job: dict[str, tuple[Any, Any, dict[str, Any]]] = {}
+    for job in get_pending_jobs():
+        jid = job.get("job_id", job.get("id"))
+        if not jid:
+            continue
+        features = _job_features_for(snapshot, jid) or dict(job.get("job_features") or {})
+        model_id = features.get("model_id") or job.get("model_id")
+        user_id = job.get("user_id") or features.get("user_id")
+        slice_id = (budgets.get(jid) or {}).get("slice_id", jid)
+        heads = _model_num_heads({"model_id": model_id}, features)
+
+        frames: list[dict[str, Any]] = []
+        seen: set = set()
+        for raw in (spec_by_job.get(jid) or {}).get("ladder") or []:
+            rank = _normalize_candidate_rank(raw)
+            if rank is not None and _rank_shape_key(rank) not in seen:
+                seen.add(_rank_shape_key(rank))
+                frames.append(rank)
+        covered = {env_gpu_type(r["env"]) for r in frames if r.get("env")}
+        for gpu_type, env in gpu_type_env.items():
+            if gpu_type in covered:
+                continue
+            best_instance = None
+            for instance_type, spec in (specs.get(_env_key(env)) or {}).items():
+                gpi = int(spec.get("gpus_per_instance", 0) or 0)
+                if gpi <= 0 or int(spec.get("free_instances", 0) or 0) <= 0:
+                    continue
+                if best_instance is None or gpi > best_instance[1]:
+                    best_instance = (instance_type, gpi)
+            if best_instance is None:
+                continue
+            instance_type, gpi = best_instance
+            tp = _largest_pow2_divisor_leq(heads, gpi)
+            rank = _normalize_candidate_rank(
+                {
+                    "role": "aggregate",
+                    "env": list(env),
+                    "config": {"instance_type": instance_type, "gpu_count": tp, "tp": tp, "pp": 1},
+                    "n_replicas": 1,
+                }
+            )
+            if rank is not None and _rank_shape_key(rank) not in seen:
+                seen.add(_rank_shape_key(rank))
+                frames.append(rank)
+        frames_by_job[jid] = frames
+        ctx_by_job[jid] = (user_id, slice_id, features)
+
+    # Phase 2 (surrogate-heavy): score EVERY frame across all jobs CONCURRENTLY.
+    # Each _score_one_frame runs size_ladder + check_feasibility + compute_sigma -
+    # tens of seconds of surrogate each - so scoring them serially blew the tick
+    # (~7 min). Fan the leaf scorings out on a thread pool: the surrogate runs its
+    # own worker pool and concurrent tool calls are already used safely in the REPL.
+    tasks = [
+        (jid, ctx_by_job[jid][0], ctx_by_job[jid][1], rank, ctx_by_job[jid][2])
+        for jid, frames in frames_by_job.items()
+        for rank in frames
+    ]
+    scored_by_job: dict[str, list[dict[str, Any]]] = {jid: [] for jid in frames_by_job}
+    if tasks:
+
+        def _run(task: tuple) -> tuple:
+            jid, user_id, slice_id, rank, features = task
+            return jid, _score_one_frame(jid, user_id, slice_id, rank, features)
+
+        with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
+            for jid, scored in pool.map(_run, tasks):
+                scored_by_job[jid].append(scored)
+
+    # Phase 3 (cheap): group into candidates / exhausted / diagnostics. Every
+    # feasible frame is a candidate - INCLUDING under-target ones (placing beats
+    # deferring; the joint solver decides serve-vs-defer from sigma). `exhausted` =
+    # a job with NO runnable, feasible frame at all, not merely "under target".
+    candidates: list[dict[str, Any]] = []
+    exhausted: dict[str, str] = {}
+    diagnostics: dict[str, list[dict[str, Any]]] = {}
+    for jid, scored_list in scored_by_job.items():
+        job_diag = [s["diag"] for s in scored_list]
+        job_candidates = [s["candidate"] for s in scored_list if s["candidate"] is not None]
+        diagnostics[jid] = job_diag
+        if job_candidates:
+            candidates.extend(job_candidates)
+        else:
+            reasons = [d["reason"] for d in job_diag if d.get("reason")]
+            exhausted[jid] = (
+                "; ".join(dict.fromkeys(reasons)) if reasons else "no runnable, feasible frame"
+            )
+
+    return {"candidates": candidates, "exhausted": exhausted, "diagnostics": diagnostics}
 
 
 def jointly_select_placements(
