@@ -1,3 +1,9 @@
+import math
+
+ONLINE_REPLAY_WINDOW_S = 5
+ONLINE_MIN_REQUESTS = 100
+
+
 class SurrogatePrediction:
     def __init__(self, objective="batched"):
         self.objective = objective  # can be online or batched
@@ -308,18 +314,40 @@ class SurrogatePrediction:
             }
 
         if objective == "online":
+            # Online workload semantics, offline replay execution: DynoSim uses a
+            # logical clock instead of live async workers. This is not batch/offline serving.
+            traffic_mode = job_features.get("_traffic_mode") or job_config.get("_traffic_mode")
+            traffic_mode = str(traffic_mode or "request_rate")
             request_arrival_rate = self._first_positive(
                 (direct_x_values, job_features, job_config), "request_arrival_rate"
             )
+            if traffic_mode == "concurrency":
+                replay_concurrency = self._first_positive(
+                    (direct_x_values, job_features, job_config),
+                    "max_concurrent_streaming",
+                    "max_concurrent_requests",
+                    "concurrency",
+                )
+                if replay_concurrency is None:
+                    raise ValueError("Online concurrency replay needs positive max concurrency")
+                replay_concurrency = max(1, math.ceil(replay_concurrency))
+                return {
+                    "request_count": replay_concurrency * 20,
+                    "replay_concurrency": replay_concurrency,
+                    "replay_mode": "offline",
+                }
+            if traffic_mode != "request_rate":
+                raise ValueError(f"Unknown online _traffic_mode: {traffic_mode!r}")
             if request_arrival_rate is None:
                 raise ValueError("Online simulation needs positive request_arrival_rate")
-            sim_duration_s = 5  # TODO - hardcoded for now, need discussion
 
             return {
-                "request_count": max(1, int(request_arrival_rate * sim_duration_s)),
-                "replay_concurrency": job_config.get("max_concurrent_streaming"),
+                "request_count": max(
+                    ONLINE_MIN_REQUESTS,
+                    math.ceil(request_arrival_rate * ONLINE_REPLAY_WINDOW_S),
+                ),
                 "arrival_interval_ms": 1000.0 / request_arrival_rate,
-                "replay_mode": "online",
+                "replay_mode": "offline",
             }
 
     @staticmethod
@@ -371,6 +399,16 @@ class SurrogatePrediction:
         if queue_policy in {"fcfs", "lcfs", "wspt"}:
             engine_args["router_queue_policy"] = queue_policy
 
+        num_workers = int(direct_x_values.get("num_workers") or 1)
+        router_mode = self._router_mode_for_replay(
+            direct_x_values.get(
+                "router_policy",
+                "kv_router" if direct_x_values.get("pd_enabled", False) else "round_robin",
+            ),
+            simulator_controls.get("replay_mode", "offline"),
+            num_workers,
+        )
+
         replay_args = {
             "input_tokens": direct_x_values.get("isl_token_avg"),
             "output_tokens": direct_x_values.get("osl_token_avg"),
@@ -379,11 +417,8 @@ class SurrogatePrediction:
             "pd_enabled": direct_x_values.get("pd_enabled", False),
             "prefill_worker_count": direct_x_values.get("prefill_worker_count", 1),
             "decode_worker_count": direct_x_values.get("decode_worker_count", 1),
-            "num_workers": direct_x_values.get("num_workers", 1),
-            "router_mode": direct_x_values.get(
-                "router_policy",
-                "kv_router" if direct_x_values.get("pd_enabled", False) else "round_robin",
-            ),
+            "num_workers": num_workers,
+            "router_mode": router_mode,
             **simulator_controls,
         }
 
@@ -395,6 +430,19 @@ class SurrogatePrediction:
             "engine_args": engine_args,
             "replay_args": replay_args,
         }
+
+    @staticmethod
+    def _router_mode_for_replay(router_mode, replay_mode, num_workers):
+        """Return a DynoSim-valid router mode for the replay call.
+
+        TODO: Find a better / more realistic solution for this. Koi currently
+        predicts one worker per rank and scales replicas outside DynoSim; offline
+        ``kv_router`` requires multiple workers, and with one worker it is
+        equivalent to ``round_robin`` anyway.
+        """
+        if replay_mode == "offline" and router_mode == "kv_router" and int(num_workers) <= 1:
+            return "round_robin"
+        return router_mode
 
     def run_surrogate(self, surrogate_input, method, accumulate_logic="average"):
         # Run the surrogate model.
@@ -428,13 +476,15 @@ class SurrogatePrediction:
             )
 
         common_replay_args = {
-            "replay_concurrency": replay_args.get("replay_concurrency"),
             "replay_mode": replay_mode,
             "router_mode": router_mode,
-            "arrival_interval_ms": replay_args.get("arrival_interval_ms", 1.0),
             "turns_per_session": replay_args.get("turns_per_session", 1),
             "shared_prefix_ratio": replay_args.get("shared_prefix_ratio", 0.0),
         }
+        if replay_args.get("replay_concurrency") is not None:
+            common_replay_args["replay_concurrency"] = replay_args["replay_concurrency"]
+        elif replay_args.get("arrival_interval_ms") is not None:
+            common_replay_args["arrival_interval_ms"] = replay_args["arrival_interval_ms"]
 
         if pd_enabled:
             prefill_engine_args = dict(engine_args)

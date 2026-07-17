@@ -164,6 +164,57 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(j, -0.0)
         self.assertLess(j_dro, j)
 
+    def test_online_request_rate_mode_uses_arrival_timing(self):
+        controls = SurrogatePrediction(objective="online")._build_simulator_controls(
+            objective="online",
+            job_config={},
+            job_features={"_traffic_mode": "request_rate", "request_arrival_rate": 0.1},
+            direct_x_values={},
+        )
+
+        self.assertEqual(controls["replay_mode"], "offline")
+        self.assertEqual(controls["request_count"], 100)
+        self.assertEqual(controls["arrival_interval_ms"], 10000.0)
+        self.assertNotIn("replay_concurrency", controls)
+
+        high_rate_controls = SurrogatePrediction(objective="online")._build_simulator_controls(
+            objective="online",
+            job_config={},
+            job_features={"_traffic_mode": "request_rate", "request_arrival_rate": 100.0},
+            direct_x_values={},
+        )
+        self.assertEqual(high_rate_controls["request_count"], 500)
+        self.assertEqual(high_rate_controls["arrival_interval_ms"], 10.0)
+
+    def test_online_concurrency_mode_uses_replay_concurrency(self):
+        controls = SurrogatePrediction(objective="online")._build_simulator_controls(
+            objective="online",
+            job_config={},
+            job_features={"_traffic_mode": "concurrency", "max_concurrent_streaming": 7.2},
+            direct_x_values={},
+        )
+
+        self.assertEqual(controls["replay_mode"], "offline")
+        self.assertEqual(controls["replay_concurrency"], 8)
+        self.assertEqual(controls["request_count"], 160)
+        self.assertNotIn("arrival_interval_ms", controls)
+
+    def test_offline_single_worker_kv_router_downgrades_to_round_robin(self):
+        surrogate_input = SurrogatePrediction().build_surrogate_inputs(
+            direct_x_values={
+                "model_id": "m",
+                "gpu_type": "H100",
+                "router_policy": "kv_router",
+                "isl_token_avg": 1,
+                "osl_token_avg": 1,
+            },
+            simulator_controls={"request_count": 1, "replay_mode": "offline"},
+            method=("AIC_DynoSim",),
+        )
+
+        self.assertEqual(surrogate_input["replay_args"]["num_workers"], 1)
+        self.assertEqual(surrogate_input["replay_args"]["router_mode"], "round_robin")
+
     def test_surrogate_full_dynosim_smoke(self):
         predictor = SurrogatePrediction(objective="batched")
         direct_x, derive_x, direct_v, derive_v, direct_y, derive_y = (
