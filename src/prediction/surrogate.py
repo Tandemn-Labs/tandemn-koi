@@ -1,7 +1,11 @@
 import math
 
-ONLINE_REPLAY_WINDOW_S = 5
-ONLINE_MIN_REQUESTS = 100
+from aiconfigurator_core.sdk.memory import (  # type: ignore[import-untyped]
+    estimate_num_gpu_blocks,
+)
+
+ONLINE_REPLAY_WINDOW_S = 1
+ONLINE_MIN_REQUESTS = 20
 
 
 class SurrogatePrediction:
@@ -12,7 +16,7 @@ class SurrogatePrediction:
         self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",)
     ):
         env_vector = self.get_env_row(job_features)
-        price_vector = self.fetch_cloud_prices(env_vector)
+        price_vector = self.fetch_cloud_prices(job_config, job_features, env_vector)
         # 1. Resolve what this surrogate is allowed to use/produce in the prediction
         direct_x, _derive_x, _direct_v, derive_v, _direct_y, derive_y = (
             self.resolve_prediction_scope(candidate_graph, method)
@@ -270,15 +274,17 @@ class SurrogatePrediction:
 
         return (direct_x, derive_x, direct_v, derive_v, direct_y, derive_y)
 
-    def fetch_cloud_prices(self, env_vector):
-        # Fetch real-time per-hour cost of compute resources
-        # Inputs: EnvVector
-        # Outputs: Per Hour Pricing
-        # pricing_of_the_gpu = get_gpu_pricing(
-        #     env_vector
-        # )  # TODO: Implement this function (helper function?)
+    def fetch_cloud_prices(self, *sources):
+        """Return explicit hourly allocation price supplied by Koi, or None.
 
-        return 98.32  # placeholder for now TODO
+        The resource map owns pricing. Do not invent a cloud fallback here: a fake
+        shared price makes faster GPUs look artificially cheap per token.
+        """
+        for source in sources:
+            price = self.get_price_per_hour(source)
+            if price is not None:
+                return {"price_per_hour": price}
+        return None
 
     def _build_simulator_controls(self, objective, job_config, job_features, direct_x_values):
         # Build DynoSim run controls. These are not DAG X values.
@@ -394,6 +400,7 @@ class SurrogatePrediction:
             "enable_chunked_prefill": direct_x_values.get("chunked_prefill_enable", False),
             "preemption_mode": direct_x_values.get("preemption_policy"),
         }
+        self._resolve_aic_num_gpu_blocks(engine_args, direct_x_values)
 
         queue_policy = direct_x_values.get("scheduling_policy")
         if queue_policy in {"fcfs", "lcfs", "wspt"}:
@@ -430,6 +437,57 @@ class SurrogatePrediction:
             "engine_args": engine_args,
             "replay_args": replay_args,
         }
+
+    def _resolve_aic_num_gpu_blocks(self, engine_args, direct_x_values):
+        """Run AIC's memory fit/KV-capacity estimator before DynoSim replay."""
+        if engine_args.get("num_gpu_blocks") is not None or not engine_args.get("aic_backend"):
+            return
+        if not engine_args.get("aic_model_path"):
+            raise ValueError("AIC memory preflight failed: missing aic_model_path")
+
+        try:
+            blocks = self._estimate_num_gpu_blocks(
+                model_path=engine_args["aic_model_path"],
+                system=engine_args.get("aic_system"),
+                backend=engine_args["aic_backend"],
+                backend_version=engine_args.get("aic_backend_version"),
+                scheduler_block_size=int(engine_args.get("block_size") or 64),
+                max_num_tokens=int(engine_args.get("max_num_batched_tokens") or 8192),
+                max_batch_size=int(engine_args.get("max_num_seqs") or 256),
+                memory_fraction_kind=self._memory_fraction_kind(engine_args["aic_backend"]),
+                memory_fraction_value=float(direct_x_values.get("gpu_mem_util") or 0.9),
+                tp_size=int(engine_args.get("aic_tp_size") or 1),
+                pp_size=int(direct_x_values.get("pp") or 1),
+                attention_dp_size=int(direct_x_values.get("dp") or 1),
+                moe_ep_size=engine_args.get("aic_moe_ep_size"),
+                gpu_memory_capacity_bytes_override=self._gpu_memory_capacity_bytes(direct_x_values),
+                allow_naive_fallback=False,
+                allow_hf_config_download=False,
+            )
+        except Exception as exc:
+            raise ValueError(f"AIC memory preflight failed: {exc}") from exc
+        if int(blocks) <= 0:
+            raise ValueError(f"AIC memory preflight failed: num_gpu_blocks={blocks}")
+        engine_args["num_gpu_blocks"] = int(blocks)
+
+    @staticmethod
+    def _estimate_num_gpu_blocks(**kwargs):
+        return estimate_num_gpu_blocks(**kwargs)
+
+    @staticmethod
+    def _memory_fraction_kind(backend):
+        if backend == "trtllm":
+            return "of_free"
+        if backend in {"vllm", "sglang"}:
+            return "of_total"
+        raise ValueError(f"unknown backend {backend!r} for AIC memory preflight")
+
+    @staticmethod
+    def _gpu_memory_capacity_bytes(direct_x_values):
+        gpu_mem_gb = direct_x_values.get("gpu_mem_gb")
+        if gpu_mem_gb is None:
+            return None
+        return int(float(gpu_mem_gb) * (1 << 30))
 
     @staticmethod
     def _router_mode_for_replay(router_mode, replay_mode, num_workers):
@@ -620,7 +678,14 @@ class SurrogatePrediction:
         if not isinstance(price_vector, dict):
             return None
 
-        for key in ("price_per_hour", "hourly_price", "usd_per_hour", "cost_per_hour"):
+        for key in (
+            "price_per_hour",
+            "price_per_unit_hour",
+            "price_per_instance_hour",
+            "hourly_price",
+            "usd_per_hour",
+            "cost_per_hour",
+        ):
             if price_vector.get(key) is not None:
                 return float(price_vector[key])
 

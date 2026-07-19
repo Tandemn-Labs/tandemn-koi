@@ -5,6 +5,7 @@ description = "Your project description"
 requires-python = ">=3.12"
 dependencies = [
     "ai-dynamo[mocker]==1.2.1",
+    "aiconfigurator>=0.10.0",
     "huggingface_hub>=0.23.0",
     "numpy>=1.26.0",
     "openai>=1.0.0",
@@ -60,4 +61,6 @@ strict_equality = true
 show_error_codes = true
 
 [tool.uv.sources]
+aiconfigurator = { path = "../aiconfigurator", editable = true }
+aiconfigurator-core = { path = "../aiconfigurator/aic-core", editable = true }
 tandemn-store = { path = "../tandemn-store", editable = true }

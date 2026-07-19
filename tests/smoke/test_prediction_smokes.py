@@ -1,8 +1,12 @@
+import builtins
 import contextlib
 import io
 import math
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
+from src.prediction import surrogate as surrogate_module
 from src.prediction.surrogate import SurrogatePrediction
 from src.prediction.tchebycheff import (
     DEFAULT_MAXIMIZE,
@@ -200,7 +204,9 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertNotIn("arrival_interval_ms", controls)
 
     def test_offline_single_worker_kv_router_downgrades_to_round_robin(self):
-        surrogate_input = SurrogatePrediction().build_surrogate_inputs(
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = lambda **_: 1234
+        surrogate_input = predictor.build_surrogate_inputs(
             direct_x_values={
                 "model_id": "m",
                 "gpu_type": "H100",
@@ -214,6 +220,103 @@ class PredictionSmokeTests(unittest.TestCase):
 
         self.assertEqual(surrogate_input["replay_args"]["num_workers"], 1)
         self.assertEqual(surrogate_input["replay_args"]["router_mode"], "round_robin")
+
+    def test_aic_memory_preflight_sets_num_gpu_blocks(self):
+        captured = {}
+
+        def estimate(**kwargs):
+            captured.update(kwargs)
+            return 1234
+
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = estimate
+        surrogate_input = predictor.build_surrogate_inputs(
+            direct_x_values={
+                "model_id": "m",
+                "gpu_type": "H100",
+                "gpu_mem_gb": 80,
+                "tp": 2,
+                "pp": 1,
+                "isl_token_avg": 1,
+                "osl_token_avg": 1,
+            },
+            simulator_controls={"request_count": 1, "replay_mode": "offline"},
+            method=("AIC_DynoSim",),
+        )
+
+        self.assertEqual(surrogate_input["engine_args"]["num_gpu_blocks"], 1234)
+        self.assertEqual(captured["model_path"], "m")
+        self.assertEqual(captured["system"], "h100_sxm")
+        self.assertEqual(captured["backend"], "vllm")
+        self.assertEqual(captured["tp_size"], 2)
+        self.assertEqual(captured["memory_fraction_kind"], "of_total")
+        self.assertEqual(captured["gpu_memory_capacity_bytes_override"], 80 * (1 << 30))
+
+    def test_aic_memory_preflight_failure_raises_before_replay(self):
+        def estimate(**_kwargs):
+            raise ValueError("no KV budget")
+
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = estimate
+        with self.assertRaisesRegex(ValueError, "AIC memory preflight failed: no KV budget"):
+            predictor.build_surrogate_inputs(
+                direct_x_values={
+                    "model_id": "m",
+                    "gpu_type": "H100",
+                    "isl_token_avg": 1,
+                    "osl_token_avg": 1,
+                },
+                simulator_controls={"request_count": 1, "replay_mode": "offline"},
+                method=("AIC_DynoSim",),
+            )
+
+    def test_aic_memory_estimator_does_not_lazy_import_legacy_module_under_threads(self):
+        predictor = SurrogatePrediction()
+        real_import = builtins.__import__
+
+        def estimate(**kwargs):
+            return kwargs["worker_id"]
+
+        def block_legacy_import(name, *args, **kwargs):
+            if name == "aiconfigurator.sdk.memory":
+                raise AssertionError("legacy AIC import used")
+            return real_import(name, *args, **kwargs)
+
+        def estimate_in_worker(worker_id):
+            return predictor._estimate_num_gpu_blocks(worker_id=worker_id)
+
+        with (
+            patch.object(surrogate_module, "estimate_num_gpu_blocks", estimate),
+            patch("builtins.__import__", block_legacy_import),
+            ThreadPoolExecutor(max_workers=8) as pool,
+        ):
+            results = list(pool.map(estimate_in_worker, range(32)))
+
+        self.assertEqual(results, list(range(32)))
+
+    def test_cost_per_token_uses_explicit_price_only(self):
+        predictor = SurrogatePrediction()
+        y_hat, _ = predictor.derive_outputs(
+            derive_v=[],
+            derive_y=["cost_per_token"],
+            y_hat_direct={"throughput_token_per_sec": 100.0},
+            v_hat_direct={},
+            job_config={},
+            job_features={},
+            price_vector={"price_per_instance_hour": 10.0},
+        )
+        self.assertEqual(y_hat["cost_per_token"], 10.0 / (100.0 * 3600.0))
+
+        no_price, _ = predictor.derive_outputs(
+            derive_v=[],
+            derive_y=["cost_per_token"],
+            y_hat_direct={"throughput_token_per_sec": 100.0},
+            v_hat_direct={},
+            job_config={},
+            job_features={},
+            price_vector=None,
+        )
+        self.assertNotIn("cost_per_token", no_price)
 
     def test_surrogate_full_dynosim_smoke(self):
         predictor = SurrogatePrediction(objective="batched")
