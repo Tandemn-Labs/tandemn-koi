@@ -75,6 +75,18 @@ SURROGATE_CONSUMED_X_FIELDS = (
 )
 
 
+class SurrogateMemoryNoFit(Exception):
+    pass
+
+
+class SurrogateUnsupportedConfig(Exception):
+    pass
+
+
+class SurrogateExecutionError(Exception):
+    pass
+
+
 class SurrogatePrediction:
     def __init__(self, objective="batched"):
         self.objective = objective  # can be online or batched
@@ -99,7 +111,7 @@ class SurrogatePrediction:
         )
         model_id = job_config.get("model_id") or job_features.get("model_id")
         if model_id is None:
-            raise ValueError("AIC_DynoSim needs model_id")
+            raise SurrogateUnsupportedConfig("AIC_DynoSim needs model_id")
         direct_x_values["model_id"] = model_id
         # field names -> actual values from job_config/env_vector
 
@@ -238,7 +250,7 @@ class SurrogatePrediction:
         if normalized_key in gpu_to_aic_system:
             return gpu_to_aic_system[normalized_key]
 
-        raise ValueError(f"No AIC system mapping for gpu_type={gpu_type}")
+        raise SurrogateUnsupportedConfig(f"No AIC system mapping for gpu_type={gpu_type}")
 
     def resolve_prediction_scope(self, candidate_graph, method):
         # Resolve the prediction scope for the surrogate stack
@@ -327,7 +339,7 @@ class SurrogatePrediction:
             }
         }
         if method_name not in method_scope:
-            raise ValueError(f"Unsupported surrogate method: {method_name}")
+            raise SurrogateUnsupportedConfig(f"Unsupported surrogate method: {method_name}")
 
         scope = method_scope[method_name]
         direct_x = sorted(candidate_x & scope["direct_x"])
@@ -441,19 +453,21 @@ class SurrogatePrediction:
         )
 
         if method_name != "AIC_DynoSim":
-            raise ValueError(f"Unsupported method or multi method is not supported yet: {method}")
+            raise SurrogateUnsupportedConfig(
+                f"Unsupported method or multi method is not supported yet: {method}"
+            )
 
         model_id = direct_x_values.get("model_id")
         if model_id is None:
-            raise ValueError("AIC_DynoSim needs model_id")
+            raise SurrogateUnsupportedConfig("AIC_DynoSim needs model_id")
 
         gpu_type = direct_x_values.get("gpu_type")
         if gpu_type is None:
-            raise ValueError("AIC_DynoSim needs gpu_type")
+            raise SurrogateUnsupportedConfig("AIC_DynoSim needs gpu_type")
 
         pp = int(direct_x_values.get("pp") or 1)
         if pp != 1:
-            raise ValueError("DynoSim does not support pp != 1")
+            raise SurrogateUnsupportedConfig("DynoSim AIC replay supports pp=1 only")
 
         engine_args = {
             "engine_type": direct_x_values.get("engine_name", "vllm"),
@@ -521,7 +535,9 @@ class SurrogatePrediction:
         if engine_args.get("num_gpu_blocks") is not None or not engine_args.get("aic_backend"):
             return
         if not engine_args.get("aic_model_path"):
-            raise ValueError("AIC memory preflight failed: missing aic_model_path")
+            raise SurrogateUnsupportedConfig(
+                "AIC memory preflight unsupported config: missing aic_model_path"
+            )
 
         try:
             blocks = self._estimate_num_gpu_blocks(
@@ -547,11 +563,27 @@ class SurrogatePrediction:
                 allow_naive_fallback=False,
                 allow_hf_config_download=False,
             )
+        except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig, SurrogateExecutionError):
+            raise
         except Exception as exc:
-            raise ValueError(f"AIC memory preflight failed: {exc}") from exc
+            raise self._memory_preflight_error(exc) from exc
         if int(blocks) <= 0:
-            raise ValueError(f"AIC memory preflight failed: num_gpu_blocks={blocks}")
+            raise SurrogateMemoryNoFit(f"AIC memory preflight no-fit: num_gpu_blocks={blocks}")
         engine_args["num_gpu_blocks"] = int(blocks)
+
+    @staticmethod
+    def _memory_preflight_error(exc):
+        text = str(exc).lower()
+        type_name = type(exc).__name__.lower()
+        if (
+            "no kv budget" in text
+            or "insufficientmemory" in type_name
+            or "kvcachecapacity" in type_name
+        ):
+            return SurrogateMemoryNoFit(f"AIC memory preflight no-fit: {exc}")
+        if "unsupported" in text or "not supported" in text or "unknown backend" in text:
+            return SurrogateUnsupportedConfig(f"AIC memory preflight unsupported config: {exc}")
+        return SurrogateExecutionError(f"AIC memory preflight execution failed: {exc}")
 
     @staticmethod
     def _estimate_num_gpu_blocks(**kwargs):
@@ -563,7 +595,7 @@ class SurrogatePrediction:
             return "of_free"
         if backend in {"vllm", "sglang"}:
             return "of_total"
-        raise ValueError(f"unknown backend {backend!r} for AIC memory preflight")
+        raise SurrogateUnsupportedConfig(f"unknown backend {backend!r} for AIC memory preflight")
 
     @staticmethod
     def _gpu_memory_capacity_bytes(direct_x_values):

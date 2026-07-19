@@ -7,7 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from src.prediction import surrogate as surrogate_module
-from src.prediction.surrogate import SurrogatePrediction
+from src.prediction.surrogate import (
+    SurrogateExecutionError,
+    SurrogateMemoryNoFit,
+    SurrogatePrediction,
+    SurrogateUnsupportedConfig,
+)
 from src.prediction.tchebycheff import (
     DEFAULT_MAXIMIZE,
     compute_tchebycheff,
@@ -278,13 +283,13 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(captured["attention_dp_size"], 2)
         self.assertEqual(surrogate_input["replay_args"]["num_workers"], 4)
 
-    def test_aic_memory_preflight_failure_raises_before_replay(self):
+    def test_aic_memory_preflight_no_fit_raises_before_replay(self):
         def estimate(**_kwargs):
             raise ValueError("no KV budget")
 
         predictor = SurrogatePrediction()
         predictor._estimate_num_gpu_blocks = estimate
-        with self.assertRaisesRegex(ValueError, "AIC memory preflight failed: no KV budget"):
+        with self.assertRaisesRegex(SurrogateMemoryNoFit, "no KV budget"):
             predictor.build_surrogate_inputs(
                 direct_x_values={
                     "model_id": "m",
@@ -292,6 +297,32 @@ class PredictionSmokeTests(unittest.TestCase):
                     "isl_token_avg": 1,
                     "osl_token_avg": 1,
                 },
+                simulator_controls={"request_count": 1, "replay_mode": "offline"},
+                method=("AIC_DynoSim",),
+            )
+
+    def test_aic_memory_preflight_unsupported_config_is_structured(self):
+        def estimate(**_kwargs):
+            raise ValueError("unsupported model/backend/GPU for KV-cache estimation")
+
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = estimate
+        with self.assertRaisesRegex(SurrogateUnsupportedConfig, "unsupported"):
+            predictor.build_surrogate_inputs(
+                direct_x_values={"model_id": "m", "gpu_type": "H100"},
+                simulator_controls={"request_count": 1, "replay_mode": "offline"},
+                method=("AIC_DynoSim",),
+            )
+
+    def test_aic_memory_preflight_execution_error_is_structured(self):
+        def estimate(**_kwargs):
+            raise ImportError("AIC import failed")
+
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = estimate
+        with self.assertRaisesRegex(SurrogateExecutionError, "AIC import failed"):
+            predictor.build_surrogate_inputs(
+                direct_x_values={"model_id": "m", "gpu_type": "H100"},
                 simulator_controls={"request_count": 1, "replay_mode": "offline"},
                 method=("AIC_DynoSim",),
             )
@@ -347,7 +378,7 @@ class PredictionSmokeTests(unittest.TestCase):
         )
         predictor.run_surrogate = lambda *_: self.fail("surrogate should not run")
 
-        with self.assertRaisesRegex(ValueError, "pp != 1"):
+        with self.assertRaisesRegex(SurrogateUnsupportedConfig, "pp=1"):
             predictor.compose_prediction(
                 job_config={
                     "model_id": "m",
