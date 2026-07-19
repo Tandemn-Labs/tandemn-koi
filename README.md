@@ -110,6 +110,8 @@ src/
   bootstrap/     seed tables · initialization
 ```
 
+Koi's DynoSim/AIC surrogate requires `aiconfigurator>=0.10.0` because Koi uses AIC's memory estimator before replay.
+
 ---
 
 ## Roadmap
