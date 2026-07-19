@@ -7,6 +7,72 @@ from aiconfigurator_core.sdk.memory import (  # type: ignore[import-untyped]
 ONLINE_REPLAY_WINDOW_S = 1
 ONLINE_MIN_REQUESTS = 20
 
+AIC_MEMORY_X_FIELDS = frozenset(
+    {
+        "gpu_mem_gb",
+        "gpu_mem_util",
+        "tp",
+        "pp",
+        "dp",
+        "ep",
+        "gemm_quant_mode",
+        "moe_quant_mode",
+        "kvcache_quant_mode",
+        "fmha_quant_mode",
+        "comm_quant_mode",
+    }
+)
+AIC_PERFORMANCE_X_FIELDS = frozenset(
+    {
+        "model_id",
+        "gpu_type",
+        "engine_name",
+        "block_size",
+        "max_num_seq",
+        "max_num_batched_tokens",
+        "tp",
+        "ep",
+        "prefix_cache_enabled",
+        "chunked_prefill_enable",
+        "preemption_policy",
+        "scheduling_policy",
+    }
+)
+DYNOSIM_WORKLOAD_X_FIELDS = frozenset(
+    {
+        "isl_token_avg",
+        "osl_token_avg",
+        "request_arrival_rate",
+        "max_concurrent_streaming",
+        "max_concurrent_requests",
+        "concurrency",
+        "workload_prefix_concentration",
+        "is_session_affinity",
+        "pd_enabled",
+        "prefill_worker_count",
+        "decode_worker_count",
+        "router_policy",
+        "num_workers",
+    }
+)
+POST_PROCESSING_X_FIELDS = frozenset(
+    {
+        "max_num_batched_tokens",
+        "pd_enabled",
+        "target_p99_ttft_ms",
+        "target_p99_tpot_ms",
+        "tp",
+        "pp",
+        "ep",
+    }
+)
+SURROGATE_CONSUMED_X_FIELDS = (
+    AIC_MEMORY_X_FIELDS
+    | AIC_PERFORMANCE_X_FIELDS
+    | DYNOSIM_WORKLOAD_X_FIELDS
+    | POST_PROCESSING_X_FIELDS
+)
+
 
 class SurrogatePrediction:
     def __init__(self, objective="batched"):
@@ -23,9 +89,9 @@ class SurrogatePrediction:
         )
         # field names only
 
-        # 2. Pull actual values for the DAG X fields
+        # 2. Pull only X values consumed by this surrogate stack.
         direct_x_values = self.extract_x_values(
-            direct_x,
+            set(direct_x) | SURROGATE_CONSUMED_X_FIELDS,
             job_config,
             job_features,
             env_vector,
@@ -384,6 +450,10 @@ class SurrogatePrediction:
         if gpu_type is None:
             raise ValueError("AIC_DynoSim needs gpu_type")
 
+        pp = int(direct_x_values.get("pp") or 1)
+        if pp != 1:
+            raise ValueError("DynoSim does not support pp != 1")
+
         engine_args = {
             "engine_type": direct_x_values.get("engine_name", "vllm"),
             "block_size": direct_x_values.get("block_size", 64),
@@ -400,7 +470,12 @@ class SurrogatePrediction:
             "enable_chunked_prefill": direct_x_values.get("chunked_prefill_enable", False),
             "preemption_mode": direct_x_values.get("preemption_policy"),
         }
-        self._resolve_aic_num_gpu_blocks(engine_args, direct_x_values)
+        memory_x_values = {
+            key: direct_x_values[key]
+            for key in AIC_MEMORY_X_FIELDS
+            if direct_x_values.get(key) is not None
+        }
+        self._resolve_aic_num_gpu_blocks(engine_args, memory_x_values)
 
         queue_policy = direct_x_values.get("scheduling_policy")
         if queue_policy in {"fcfs", "lcfs", "wspt"}:
@@ -438,7 +513,7 @@ class SurrogatePrediction:
             "replay_args": replay_args,
         }
 
-    def _resolve_aic_num_gpu_blocks(self, engine_args, direct_x_values):
+    def _resolve_aic_num_gpu_blocks(self, engine_args, memory_x_values):
         """Run AIC's memory fit/KV-capacity estimator before DynoSim replay."""
         if engine_args.get("num_gpu_blocks") is not None or not engine_args.get("aic_backend"):
             return
@@ -455,12 +530,17 @@ class SurrogatePrediction:
                 max_num_tokens=int(engine_args.get("max_num_batched_tokens") or 8192),
                 max_batch_size=int(engine_args.get("max_num_seqs") or 256),
                 memory_fraction_kind=self._memory_fraction_kind(engine_args["aic_backend"]),
-                memory_fraction_value=float(direct_x_values.get("gpu_mem_util") or 0.9),
+                memory_fraction_value=float(memory_x_values.get("gpu_mem_util") or 0.9),
                 tp_size=int(engine_args.get("aic_tp_size") or 1),
-                pp_size=int(direct_x_values.get("pp") or 1),
-                attention_dp_size=int(direct_x_values.get("dp") or 1),
+                pp_size=int(memory_x_values.get("pp") or 1),
+                attention_dp_size=int(memory_x_values.get("dp") or 1),
                 moe_ep_size=engine_args.get("aic_moe_ep_size"),
-                gpu_memory_capacity_bytes_override=self._gpu_memory_capacity_bytes(direct_x_values),
+                gemm_quant_mode=memory_x_values.get("gemm_quant_mode"),
+                moe_quant_mode=memory_x_values.get("moe_quant_mode"),
+                kvcache_quant_mode=memory_x_values.get("kvcache_quant_mode"),
+                fmha_quant_mode=memory_x_values.get("fmha_quant_mode"),
+                comm_quant_mode=memory_x_values.get("comm_quant_mode"),
+                gpu_memory_capacity_bytes_override=self._gpu_memory_capacity_bytes(memory_x_values),
                 allow_naive_fallback=False,
                 allow_hf_config_download=False,
             )
