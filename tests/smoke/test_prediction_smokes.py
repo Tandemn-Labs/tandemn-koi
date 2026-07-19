@@ -237,6 +237,7 @@ class PredictionSmokeTests(unittest.TestCase):
                 "gpu_mem_gb": 80,
                 "tp": 2,
                 "pp": 1,
+                "dp": 4,
                 "isl_token_avg": 1,
                 "osl_token_avg": 1,
             },
@@ -249,8 +250,33 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(captured["system"], "h100_sxm")
         self.assertEqual(captured["backend"], "vllm")
         self.assertEqual(captured["tp_size"], 2)
+        self.assertEqual(captured["attention_dp_size"], 1)
         self.assertEqual(captured["memory_fraction_kind"], "of_total")
         self.assertEqual(captured["gpu_memory_capacity_bytes_override"], 80 * (1 << 30))
+        self.assertEqual(surrogate_input["replay_args"]["num_workers"], 4)
+
+    def test_aic_attention_dp_requires_explicit_engine_knob(self):
+        captured = {}
+
+        def estimate(**kwargs):
+            captured.update(kwargs)
+            return 1234
+
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = estimate
+        surrogate_input = predictor.build_surrogate_inputs(
+            direct_x_values={
+                "model_id": "m",
+                "gpu_type": "H100",
+                "dp": 4,
+                "aic_attention_dp_size": 2,
+            },
+            simulator_controls={"request_count": 1, "replay_mode": "offline"},
+            method=("AIC_DynoSim",),
+        )
+
+        self.assertEqual(captured["attention_dp_size"], 2)
+        self.assertEqual(surrogate_input["replay_args"]["num_workers"], 4)
 
     def test_aic_memory_preflight_failure_raises_before_replay(self):
         def estimate(**_kwargs):
