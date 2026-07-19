@@ -270,6 +270,75 @@ class PredictionSmokeTests(unittest.TestCase):
                 method=("AIC_DynoSim",),
             )
 
+    def test_compose_prediction_keeps_consumed_non_direct_x_values(self):
+        captured_memory = {}
+        captured_surrogate = {}
+
+        def estimate(**kwargs):
+            captured_memory.update(kwargs)
+            return 1234
+
+        def run_surrogate(surrogate_input, _method):
+            captured_surrogate.update(surrogate_input)
+            return (
+                {"p99_ttft_ms": 10.0, "p99_tpot_ms": 1.0, "throughput_token_per_sec": 100.0},
+                {"input_length_observed": 1.0, "output_length_observed": 1.0},
+            )
+
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = estimate
+        predictor.run_surrogate = run_surrogate
+        predictor.compose_prediction(
+            job_config={
+                "model_id": "m",
+                "max_num_seq": 8,
+                "max_num_batched_tokens": 128,
+                "scheduling_policy": "wspt",
+                "pp": 1,
+                "gemm_quant_mode": "fp8",
+                "kvcache_quant_mode": "fp8",
+            },
+            job_features={
+                "gpu_type": "H100",
+                "gpu_mem_gb": 80,
+                "isl_token_avg": 1,
+                "osl_token_avg": 1,
+            },
+            candidate_graph=MockCandidateGraph(),
+            method=("AIC_DynoSim",),
+        )
+
+        self.assertEqual(captured_memory["gpu_memory_capacity_bytes_override"], 80 * (1 << 30))
+        self.assertEqual(captured_memory["pp_size"], 1)
+        self.assertEqual(captured_memory["gemm_quant_mode"], "fp8")
+        self.assertEqual(captured_memory["kvcache_quant_mode"], "fp8")
+        self.assertEqual(captured_surrogate["engine_args"]["router_queue_policy"], "wspt")
+
+    def test_compose_prediction_rejects_pp_until_dynosim_supports_it(self):
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = lambda **_: self.fail(
+            "memory preflight should not run"
+        )
+        predictor.run_surrogate = lambda *_: self.fail("surrogate should not run")
+
+        with self.assertRaisesRegex(ValueError, "pp != 1"):
+            predictor.compose_prediction(
+                job_config={
+                    "model_id": "m",
+                    "max_num_seq": 8,
+                    "max_num_batched_tokens": 128,
+                    "pp": 2,
+                },
+                job_features={
+                    "gpu_type": "H100",
+                    "gpu_mem_gb": 80,
+                    "isl_token_avg": 1,
+                    "osl_token_avg": 1,
+                },
+                candidate_graph=MockCandidateGraph(),
+                method=("AIC_DynoSim",),
+            )
+
     def test_aic_memory_estimator_does_not_lazy_import_legacy_module_under_threads(self):
         predictor = SurrogatePrediction()
         real_import = builtins.__import__
