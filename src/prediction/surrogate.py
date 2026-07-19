@@ -13,7 +13,7 @@ AIC_MEMORY_X_FIELDS = frozenset(
         "gpu_mem_util",
         "tp",
         "pp",
-        "dp",
+        "aic_attention_dp_size",
         "ep",
         "gemm_quant_mode",
         "moe_quant_mode",
@@ -53,6 +53,7 @@ DYNOSIM_WORKLOAD_X_FIELDS = frozenset(
         "decode_worker_count",
         "router_policy",
         "num_workers",
+        "dp",
     }
 )
 POST_PROCESSING_X_FIELDS = frozenset(
@@ -481,7 +482,9 @@ class SurrogatePrediction:
         if queue_policy in {"fcfs", "lcfs", "wspt"}:
             engine_args["router_queue_policy"] = queue_policy
 
-        num_workers = int(direct_x_values.get("num_workers") or 1)
+        # Koi dp is independent engine replicas. AIC attention DP is a separate
+        # engine-level knob, so dp only affects replay workers here.
+        num_workers = int(direct_x_values.get("num_workers") or direct_x_values.get("dp") or 1)
         router_mode = self._router_mode_for_replay(
             direct_x_values.get(
                 "router_policy",
@@ -533,7 +536,7 @@ class SurrogatePrediction:
                 memory_fraction_value=float(memory_x_values.get("gpu_mem_util") or 0.9),
                 tp_size=int(engine_args.get("aic_tp_size") or 1),
                 pp_size=int(memory_x_values.get("pp") or 1),
-                attention_dp_size=int(memory_x_values.get("dp") or 1),
+                attention_dp_size=int(memory_x_values.get("aic_attention_dp_size") or 1),
                 moe_ep_size=engine_args.get("aic_moe_ep_size"),
                 gemm_quant_mode=memory_x_values.get("gemm_quant_mode"),
                 moe_quant_mode=memory_x_values.get("moe_quant_mode"),
