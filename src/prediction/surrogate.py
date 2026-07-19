@@ -512,7 +512,8 @@ class SurrogatePrediction:
             "input_tokens": direct_x_values.get("isl_token_avg"),
             "output_tokens": direct_x_values.get("osl_token_avg"),
             "shared_prefix_ratio": direct_x_values.get("workload_prefix_concentration", 0.0),
-            "turns_per_session": 2 if direct_x_values.get("is_session_affinity") else 1,
+            # TODO: model mixed multi-turn sessions without changing total emitted request rate.
+            "turns_per_session": 1,
             "pd_enabled": direct_x_values.get("pd_enabled", False),
             "prefill_worker_count": direct_x_values.get("prefill_worker_count", 1),
             "decode_worker_count": direct_x_values.get("decode_worker_count", 1),
