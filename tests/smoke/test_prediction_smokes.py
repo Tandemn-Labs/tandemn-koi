@@ -226,6 +226,24 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(surrogate_input["replay_args"]["num_workers"], 1)
         self.assertEqual(surrogate_input["replay_args"]["router_mode"], "round_robin")
 
+    def test_session_affinity_does_not_double_replay_turns(self):
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = lambda **_: 1234
+        surrogate_input = predictor.build_surrogate_inputs(
+            direct_x_values={
+                "model_id": "m",
+                "gpu_type": "H100",
+                "is_session_affinity": True,
+                "isl_token_avg": 1,
+                "osl_token_avg": 1,
+            },
+            simulator_controls={"request_count": 20, "replay_mode": "offline"},
+            method=("AIC_DynoSim",),
+        )
+
+        self.assertEqual(surrogate_input["replay_args"]["request_count"], 20)
+        self.assertEqual(surrogate_input["replay_args"]["turns_per_session"], 1)
+
     def test_aic_memory_preflight_sets_num_gpu_blocks(self):
         captured = {}
 
