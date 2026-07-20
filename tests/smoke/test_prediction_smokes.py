@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from src.prediction import surrogate as surrogate_module
 from src.prediction.surrogate import (
+    ONLINE_MIN_REQUESTS,
     SurrogateExecutionError,
     SurrogateMemoryNoFit,
     SurrogatePrediction,
@@ -61,6 +62,7 @@ class MockCandidateGraph:
         "peak_to_mean_ratio",
         "workload_prefix_concentration",
         "multi_turn_ratio",
+        "multi_turn_avg_turns",
         "shared_prefix_length_avg",
         "is_session_affinity",
         "total_token_budget",
@@ -182,8 +184,9 @@ class PredictionSmokeTests(unittest.TestCase):
         )
 
         self.assertEqual(controls["replay_mode"], "offline")
-        self.assertEqual(controls["request_count"], 100)
+        self.assertEqual(controls["request_count"], ONLINE_MIN_REQUESTS)
         self.assertEqual(controls["arrival_interval_ms"], 10000.0)
+        self.assertEqual(controls["turns_per_session"], 1)
         self.assertNotIn("replay_concurrency", controls)
 
         high_rate_controls = SurrogatePrediction(objective="online")._build_simulator_controls(
@@ -192,8 +195,61 @@ class PredictionSmokeTests(unittest.TestCase):
             job_features={"_traffic_mode": "request_rate", "request_arrival_rate": 100.0},
             direct_x_values={},
         )
-        self.assertEqual(high_rate_controls["request_count"], 500)
+        self.assertEqual(high_rate_controls["request_count"], 100)
         self.assertEqual(high_rate_controls["arrival_interval_ms"], 10.0)
+
+    def test_online_peak_and_multiturn_stress_scenarios_preserve_turn_rate(self):
+        predictor = SurrogatePrediction(objective="online")
+        features = {
+            "_traffic_mode": "request_rate",
+            "request_arrival_rate": 0.1,
+            "peak_to_mean_ratio": 2,
+            "multi_turn_ratio": 0.5,
+            "multi_turn_avg_turns": 3,
+        }
+
+        mean = predictor._build_simulator_controls("online", {}, features, {}, scenario="mean")
+        peak = predictor._build_simulator_controls("online", {}, features, {}, scenario="peak")
+        stress = predictor._build_simulator_controls(
+            "online", {}, features, {}, scenario="peak_all_multiturn_stress"
+        )
+
+        self.assertEqual(mean["turns_per_session"], 1)
+        self.assertEqual(mean["arrival_interval_ms"], 10000.0)
+        self.assertEqual(peak["turns_per_session"], 1)
+        self.assertEqual(peak["arrival_interval_ms"], 5000.0)
+        self.assertEqual(stress["turns_per_session"], 3)
+        self.assertEqual(stress["arrival_interval_ms"], 15000.0)
+        self.assertGreaterEqual(stress["expected_completed_requests"], ONLINE_MIN_REQUESTS)
+        self.assertEqual(
+            stress["expected_completed_requests"],
+            stress["request_count"] * stress["turns_per_session"],
+        )
+        self.assertEqual(stress["inter_turn_delay_ms"], 0.0)
+        self.assertEqual(stress["shared_prefix_ratio"], 0.0)
+        self.assertEqual(stress["num_prefix_groups"], 0)
+
+    def test_multiturn_stress_defaults_and_ceilings(self):
+        predictor = SurrogatePrediction(objective="online")
+        base = {
+            "_traffic_mode": "request_rate",
+            "request_arrival_rate": 1.0,
+            "multi_turn_ratio": 0.5,
+        }
+
+        default = predictor._build_simulator_controls(
+            "online", {}, base, {}, scenario="peak_all_multiturn_stress"
+        )
+        noninteger = predictor._build_simulator_controls(
+            "online",
+            {},
+            {**base, "multi_turn_avg_turns": 2.5},
+            {},
+            scenario="peak_all_multiturn_stress",
+        )
+
+        self.assertEqual(default["turns_per_session"], 2)
+        self.assertEqual(noninteger["turns_per_session"], 3)
 
     def test_online_concurrency_mode_uses_replay_concurrency(self):
         controls = SurrogatePrediction(objective="online")._build_simulator_controls(
@@ -227,6 +283,23 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(surrogate_input["replay_args"]["router_mode"], "round_robin")
 
     def test_session_affinity_does_not_double_replay_turns(self):
+        predictor_online = SurrogatePrediction(objective="online")
+        features = {
+            "_traffic_mode": "request_rate",
+            "request_arrival_rate": 1.0,
+            "peak_to_mean_ratio": 2.0,
+            "is_session_affinity": True,
+        }
+        mean = predictor_online._build_simulator_controls(
+            "online", {}, features, {}, scenario="mean"
+        )
+        peak = predictor_online._build_simulator_controls(
+            "online", {}, features, {}, scenario="peak"
+        )
+
+        self.assertEqual(mean["turns_per_session"], 1)
+        self.assertEqual(peak["turns_per_session"], 1)
+
         predictor = SurrogatePrediction()
         predictor._estimate_num_gpu_blocks = lambda **_: 1234
         surrogate_input = predictor.build_surrogate_inputs(
@@ -451,6 +524,18 @@ class PredictionSmokeTests(unittest.TestCase):
         )
         self.assertEqual(y_hat["cost_per_token"], 10.0 / (100.0 * 3600.0))
 
+        aggregate_rank, _ = predictor.derive_outputs(
+            derive_v=[],
+            derive_y=["cost_per_token"],
+            y_hat_direct={"throughput_token_per_sec": 300.0},
+            v_hat_direct={},
+            job_config={},
+            job_features={},
+            price_vector={"price_per_instance_hour": 10.0},
+            replay_args={"num_workers": 3},
+        )
+        self.assertEqual(aggregate_rank["cost_per_token"], 30.0 / (300.0 * 3600.0))
+
         no_price, _ = predictor.derive_outputs(
             derive_v=[],
             derive_y=["cost_per_token"],
@@ -461,6 +546,37 @@ class PredictionSmokeTests(unittest.TestCase):
             price_vector=None,
         )
         self.assertNotIn("cost_per_token", no_price)
+
+    def test_aic_replay_completed_requests_must_match_expected(self):
+        predictor = SurrogatePrediction()
+        raw_report = {
+            "completed_requests": 2,
+            "total_input_tokens": 10,
+            "total_output_tokens": 6,
+            "p99_ttft_ms": 1.0,
+            "p99_itl_ms": 2.0,
+            "output_throughput_tok_s": 100.0,
+        }
+
+        y_hat, v_hat = predictor.canonicalize_aic_dynosim_output(raw_report, expected_requests=2)
+        self.assertEqual(y_hat["p99_tpot_ms"], 2.0)
+        self.assertEqual(v_hat["input_length_observed"], 5.0)
+        self.assertEqual(v_hat["output_length_observed"], 3.0)
+        self.assertEqual(v_hat["completed_requests"], 2)
+
+        with self.assertRaisesRegex(SurrogateExecutionError, "completed 0/1 requests"):
+            predictor.canonicalize_aic_dynosim_output(
+                {**raw_report, "completed_requests": 0}, expected_requests=1
+            )
+        with self.assertRaisesRegex(SurrogateExecutionError, "completed 1/2 requests"):
+            predictor.canonicalize_aic_dynosim_output(
+                {**raw_report, "completed_requests": 1}, expected_requests=2
+            )
+        with self.assertRaisesRegex(SurrogateExecutionError, "missing completed_requests"):
+            predictor.canonicalize_aic_dynosim_output(
+                {key: value for key, value in raw_report.items() if key != "completed_requests"},
+                expected_requests=2,
+            )
 
     def test_surrogate_full_dynosim_smoke(self):
         predictor = SurrogatePrediction(objective="batched")
