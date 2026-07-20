@@ -54,6 +54,7 @@ _USER_JOB_X = {
     "peak_to_mean_ratio",
     "workload_prefix_concentration",
     "multi_turn_ratio",
+    "multi_turn_avg_turns",
     "shared_prefix_length_avg",
     "is_session_affinity",
     "total_token_budget",

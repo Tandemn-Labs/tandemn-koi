@@ -187,7 +187,8 @@ class SlowLoop:
         # Overwrite initial_z_star for specified objectives
         for obj in ["throughput_token_per_sec", "slo_margin"]:
             if obj in initial_z_star:
-                initial_z_star[obj] = 10.0  # TODO - HACK
+                initial_z_star[obj] = 10.0
+        # TODO - HACK
 
         self.state = SlowState(
             w_t=initial_weights,
