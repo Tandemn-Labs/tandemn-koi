@@ -804,6 +804,11 @@ class SurrogatePrediction:
             raise SurrogateExecutionError(
                 f"completed {completed_requests}/{int(expected_requests)} requests"
             )
+        p99_ttft_ms = self._required_report_metric(raw_report, "p99_ttft_ms")
+        p99_tpot_ms = self._required_report_metric(raw_report, "p99_tpot_ms")
+        throughput = self._required_report_metric(
+            raw_report, "output_throughput_tok_s", positive=True
+        )
 
         v_hat_direct = {
             "input_length_observed": raw_report.get("total_input_tokens", 0) / completed_requests,
@@ -813,12 +818,23 @@ class SurrogatePrediction:
         }
 
         y_hat_direct = {
-            "p99_ttft_ms": raw_report.get("p99_ttft_ms"),
-            "p99_tpot_ms": raw_report.get("p99_tpot_ms", raw_report.get("p99_itl_ms")),
-            "throughput_token_per_sec": raw_report.get("output_throughput_tok_s"),
+            "p99_ttft_ms": p99_ttft_ms,
+            "p99_tpot_ms": p99_tpot_ms,
+            "throughput_token_per_sec": throughput,
         }
 
         return y_hat_direct, v_hat_direct
+
+    @staticmethod
+    def _required_report_metric(raw_report, key, positive=False):
+        value = raw_report.get(key)
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise SurrogateExecutionError(f"invalid {key}: {value!r}") from exc
+        if not math.isfinite(number) or number < 0 or (positive and number <= 0):
+            raise SurrogateExecutionError(f"invalid {key}: {value!r}")
+        return number
 
     def derive_outputs(
         self,
@@ -842,16 +858,12 @@ class SurrogatePrediction:
         throughput = y_hat_direct.get("throughput_token_per_sec")
 
         if input_tokens is not None and output_tokens is not None:
-            total_tokens = input_tokens + output_tokens
-
+            # TODO: derive kv_cache_util and kv_pressure_score from Profiling DB / Dynamo
+            # KV occupancy metrics. Do not estimate them from token length heuristics.
             if "kv_pressure_score" in requested_v:
-                max_tokens = job_config.get("max_num_batched_tokens")
-                if max_tokens:
-                    v_hat_derived["kv_pressure_score"] = min(1.0, total_tokens / max_tokens)
-
+                v_hat_derived["kv_pressure_score"] = 0.0
             if "kv_cache_util" in requested_v:
-                # Placeholder until we derive real KV blocks from memory/block size.
-                v_hat_derived["kv_cache_util"] = v_hat_derived.get("kv_pressure_score")
+                v_hat_derived["kv_cache_util"] = 0.0
 
         is_single_worker = (
             job_config.get("tp", 1) == 1
