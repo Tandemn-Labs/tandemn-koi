@@ -91,8 +91,8 @@ class SurrogateExecutionError(Exception):
 
 
 class SurrogatePrediction:
-    def __init__(self, objective="batched"):
-        self.objective = objective  # can be online or batched
+    def __init__(self, objective="batch"):
+        self.objective = objective
 
     def compose_prediction(
         self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",), scenario="mean"
@@ -123,8 +123,9 @@ class SurrogatePrediction:
         # this is a very AIC/DynoSim specific control
         # so TODO - maybe we can move into a different function?
         # to maintain a very modular architecture
+        objective = self._prediction_objective(job_features)
         simulator_controls = self._build_simulator_controls(
-            self.objective,
+            objective,
             job_config,
             job_features,
             direct_x_values,
@@ -372,13 +373,20 @@ class SurrogatePrediction:
                 return {"price_per_hour": price}
         return None
 
+    @staticmethod
+    def _prediction_objective(job_features):
+        objective = str((job_features or {}).get("type") or "").lower()
+        if objective not in {"online", "batch"}:
+            raise ValueError("prediction job_features['type'] must be 'online' or 'batch'")
+        return objective
+
     def _build_simulator_controls(
         self, objective, job_config, job_features, direct_x_values, scenario="mean"
     ):
         # Build DynoSim run controls. These are not DAG X values.
         # Inputs: objective, JobConfig, JobFeatures, direct_x_values
         # Outputs: simulator_controls
-        if objective == "batched":
+        if objective == "batch":
             sources = (direct_x_values, job_features, job_config)
             isl = self._first_positive(sources, "isl_token_avg", "input_len_tokens_avg")
             osl = self._first_positive(sources, "osl_token_avg", "output_len_tokens_avg")
@@ -386,9 +394,9 @@ class SurrogatePrediction:
             max_num_batched_tokens = direct_x_values.get("max_num_batched_tokens")
 
             if max_num_seq is None or max_num_batched_tokens is None:
-                raise ValueError("Batched simulation needs max_num_seq and max_num_batched_tokens")
+                raise ValueError("Batch simulation needs max_num_seq and max_num_batched_tokens")
             if isl is None or osl is None:
-                raise ValueError("Batched simulation needs positive input/output token lengths")
+                raise ValueError("Batch simulation needs positive input/output token lengths")
 
             tokens_per_request = isl + osl
             target_concurrency = int(
@@ -518,6 +526,8 @@ class SurrogatePrediction:
                     }
                 )
             return controls
+
+        raise ValueError("prediction objective must be 'online' or 'batch'")
 
     @staticmethod
     def _first_positive(sources, *names):

@@ -447,6 +447,7 @@ class PredictionSmokeTests(unittest.TestCase):
                 "kvcache_quant_mode": "fp8",
             },
             job_features={
+                "type": "batch",
                 "gpu_type": "H100",
                 "gpu_mem_gb": 80,
                 "isl_token_avg": 1,
@@ -478,6 +479,7 @@ class PredictionSmokeTests(unittest.TestCase):
                     "pp": 2,
                 },
                 job_features={
+                    "type": "batch",
                     "gpu_type": "H100",
                     "gpu_mem_gb": 80,
                     "isl_token_avg": 1,
@@ -485,6 +487,52 @@ class PredictionSmokeTests(unittest.TestCase):
                 },
                 candidate_graph=MockCandidateGraph(),
                 method=("AIC_DynoSim",),
+            )
+
+    def test_compose_prediction_resolves_regime_per_job_not_instance(self):
+        replay_args = []
+
+        def run_surrogate(surrogate_input, _method):
+            replay_args.append(dict(surrogate_input["replay_args"]))
+            return (
+                {"p99_ttft_ms": 10.0, "p99_tpot_ms": 1.0, "throughput_token_per_sec": 100.0},
+                {"input_length_observed": 1.0, "output_length_observed": 1.0},
+            )
+
+        predictor = SurrogatePrediction(objective="online")
+        predictor._estimate_num_gpu_blocks = lambda **_: 1234
+        predictor.run_surrogate = run_surrogate
+        common_config = {"model_id": "m", "max_num_seq": 8, "max_num_batched_tokens": 128}
+        common_features = {"gpu_type": "H100", "isl_token_avg": 1, "osl_token_avg": 1}
+
+        predictor.compose_prediction(
+            job_config=common_config,
+            job_features={
+                **common_features,
+                "type": "online",
+                "_traffic_mode": "request_rate",
+                "request_arrival_rate": 2.0,
+            },
+            candidate_graph=MockCandidateGraph(),
+        )
+        predictor.compose_prediction(
+            job_config=common_config,
+            job_features={**common_features, "type": "batch"},
+            candidate_graph=MockCandidateGraph(),
+        )
+
+        self.assertEqual(replay_args[0]["arrival_interval_ms"], 500.0)
+        self.assertNotIn("replay_concurrency", replay_args[0])
+        self.assertEqual(replay_args[1]["arrival_interval_ms"], 0.0)
+        self.assertIn("replay_concurrency", replay_args[1])
+
+    def test_compose_prediction_requires_job_type(self):
+        predictor = SurrogatePrediction()
+        with self.assertRaisesRegex(ValueError, r"job_features\['type'\]"):
+            predictor.compose_prediction(
+                job_config={"model_id": "m"},
+                job_features={"gpu_type": "H100"},
+                candidate_graph=MockCandidateGraph(),
             )
 
     def test_aic_memory_estimator_does_not_lazy_import_legacy_module_under_threads(self):
@@ -579,7 +627,7 @@ class PredictionSmokeTests(unittest.TestCase):
             )
 
     def test_surrogate_full_dynosim_smoke(self):
-        predictor = SurrogatePrediction(objective="batched")
+        predictor = SurrogatePrediction(objective="batch")
         direct_x, derive_x, direct_v, derive_v, direct_y, derive_y = (
             predictor.resolve_prediction_scope(MockCandidateGraph(), "AIC_DynoSim")
         )
@@ -601,6 +649,7 @@ class PredictionSmokeTests(unittest.TestCase):
             "router_policy": "round_robin",
         }
         job_features = {
+            "type": "batch",
             "cloud": "aws",
             "region": "us-east-1",
             "market": "reserved",
@@ -639,7 +688,7 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(predictor.map_gpu_to_aic_system(direct_x_values["gpu_type"]), "h200_sxm")
 
         simulator_controls = predictor._build_simulator_controls(
-            objective=predictor.objective,
+            objective="batch",
             job_config=job_config,
             job_features=job_features,
             direct_x_values=direct_x_values,
