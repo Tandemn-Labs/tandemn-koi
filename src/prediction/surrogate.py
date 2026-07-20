@@ -336,7 +336,6 @@ class SurrogatePrediction:
                     "gpu_mem_used_fraction",
                     "kv_cache_util",
                     "vram_headroom_gb",
-                    "total_token_budget",
                     "kv_pressure_score",
                     "per_tok_comm_bytes",
                     "comm_overhead_pct",
@@ -844,9 +843,6 @@ class SurrogatePrediction:
 
         if input_tokens is not None and output_tokens is not None:
             total_tokens = input_tokens + output_tokens
-
-            if "total_token_budget" in requested_v:
-                v_hat_derived["total_token_budget"] = total_tokens
 
             if "kv_pressure_score" in requested_v:
                 max_tokens = job_config.get("max_num_batched_tokens")
