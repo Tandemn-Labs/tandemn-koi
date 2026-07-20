@@ -602,7 +602,11 @@ class SurrogatePrediction:
         replay_args = {
             "input_tokens": direct_x_values.get("isl_token_avg"),
             "output_tokens": direct_x_values.get("osl_token_avg"),
-            "shared_prefix_ratio": direct_x_values.get("workload_prefix_concentration", 0.0),
+            # TODO: map workload_prefix_concentration/shared_prefix_length_avg to DynoSim
+            # prefix groups once replay prefix semantics are calibrated.
+            # "shared_prefix_ratio": direct_x_values.get("workload_prefix_concentration", 0.0),
+            "shared_prefix_ratio": 0.0,
+            "num_prefix_groups": 0,
             "turns_per_session": 1,
             "pd_enabled": direct_x_values.get("pd_enabled", False),
             "prefill_worker_count": direct_x_values.get("prefill_worker_count", 1),

@@ -317,6 +317,40 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(surrogate_input["replay_args"]["request_count"], 20)
         self.assertEqual(surrogate_input["replay_args"]["turns_per_session"], 1)
 
+    def test_prefix_concentration_does_not_enable_replay_prefix_benefits(self):
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = lambda **_: 1234
+
+        for scenario in ("mean", "peak"):
+            with self.subTest(scenario=scenario):
+                controls = SurrogatePrediction(objective="online")._build_simulator_controls(
+                    "online",
+                    {},
+                    {
+                        "type": "online",
+                        "_traffic_mode": "request_rate",
+                        "request_arrival_rate": 1.0,
+                        "peak_to_mean_ratio": 2.0,
+                    },
+                    {},
+                    scenario=scenario,
+                )
+                surrogate_input = predictor.build_surrogate_inputs(
+                    direct_x_values={
+                        "model_id": "m",
+                        "gpu_type": "H100",
+                        "workload_prefix_concentration": 0.9,
+                        "shared_prefix_length_avg": 1024,
+                        "isl_token_avg": 1,
+                        "osl_token_avg": 1,
+                    },
+                    simulator_controls=controls,
+                    method=("AIC_DynoSim",),
+                )
+
+                self.assertEqual(surrogate_input["replay_args"]["shared_prefix_ratio"], 0.0)
+                self.assertEqual(surrogate_input["replay_args"]["num_prefix_groups"], 0)
+
     def test_aic_memory_preflight_sets_num_gpu_blocks(self):
         captured = {}
 
