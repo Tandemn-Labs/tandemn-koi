@@ -48,6 +48,9 @@ DYNOSIM_WORKLOAD_X_FIELDS = frozenset(
         "concurrency",
         "workload_prefix_concentration",
         "is_session_affinity",
+        "peak_to_mean_ratio",
+        "multi_turn_ratio",
+        "multi_turn_avg_turns",
         "pd_enabled",
         "prefill_worker_count",
         "decode_worker_count",
@@ -92,7 +95,7 @@ class SurrogatePrediction:
         self.objective = objective  # can be online or batched
 
     def compose_prediction(
-        self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",)
+        self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",), scenario="mean"
     ):
         env_vector = self.get_env_row(job_features)
         price_vector = self.fetch_cloud_prices(job_config, job_features, env_vector)
@@ -125,6 +128,7 @@ class SurrogatePrediction:
             job_config,
             job_features,
             direct_x_values,
+            scenario=scenario,
         )
         # objective-specific DynoSim controls, not DAG nodes
 
@@ -141,6 +145,8 @@ class SurrogatePrediction:
             surrogate_input,
             method,
         )
+        y_hat_direct = y_hat_direct or {}
+        v_hat_direct = v_hat_direct or {}
         # execute simulator
 
         # 6. Later: use derive_x + direct outputs to compute derived outputs
@@ -152,6 +158,7 @@ class SurrogatePrediction:
             job_config,
             job_features,
             price_vector,
+            surrogate_input["replay_args"],
         )
         # post process direct outputs to get derived outputs
 
@@ -365,7 +372,9 @@ class SurrogatePrediction:
                 return {"price_per_hour": price}
         return None
 
-    def _build_simulator_controls(self, objective, job_config, job_features, direct_x_values):
+    def _build_simulator_controls(
+        self, objective, job_config, job_features, direct_x_values, scenario="mean"
+    ):
         # Build DynoSim run controls. These are not DAG X values.
         # Inputs: objective, JobConfig, JobFeatures, direct_x_values
         # Outputs: simulator_controls
@@ -396,16 +405,34 @@ class SurrogatePrediction:
                 "replay_concurrency": target_concurrency,
                 "arrival_interval_ms": 0.0,
                 "replay_mode": "offline",
+                "expected_completed_requests": target_concurrency * sim_num_waves,
             }
 
         if objective == "online":
             # Online workload semantics, offline replay execution: DynoSim uses a
             # logical clock instead of live async workers. This is not batch/offline serving.
-            traffic_mode = job_features.get("_traffic_mode") or job_config.get("_traffic_mode")
-            traffic_mode = str(traffic_mode or "request_rate")
+            scenario = str(scenario or "mean")
+            if scenario not in {"mean", "peak", "peak_all_multiturn_stress"}:
+                raise ValueError(f"Unknown online replay scenario: {scenario!r}")
+            raw_traffic_mode = job_features.get("_traffic_mode") or job_config.get("_traffic_mode")
             request_arrival_rate = self._first_positive(
                 (direct_x_values, job_features, job_config), "request_arrival_rate"
             )
+            has_concurrency = (
+                self._first_positive(
+                    (direct_x_values, job_features, job_config),
+                    "max_concurrent_streaming",
+                    "max_concurrent_requests",
+                    "concurrency",
+                )
+                is not None
+            )
+            if raw_traffic_mode is None and request_arrival_rate is not None and has_concurrency:
+                raise ValueError("online job requires explicit _traffic_mode")
+            traffic_mode = str(raw_traffic_mode or "request_rate")
+            if traffic_mode not in {"request_rate", "concurrency"}:
+                raise ValueError("online job requires explicit _traffic_mode")
+
             if traffic_mode == "concurrency":
                 replay_concurrency = self._first_positive(
                     (direct_x_values, job_features, job_config),
@@ -420,20 +447,77 @@ class SurrogatePrediction:
                     "request_count": replay_concurrency * 20,
                     "replay_concurrency": replay_concurrency,
                     "replay_mode": "offline",
+                    "turns_per_session": 1,
+                    "expected_completed_requests": replay_concurrency * 20,
                 }
-            if traffic_mode != "request_rate":
-                raise ValueError(f"Unknown online _traffic_mode: {traffic_mode!r}")
             if request_arrival_rate is None:
                 raise ValueError("Online simulation needs positive request_arrival_rate")
 
-            return {
-                "request_count": max(
-                    ONLINE_MIN_REQUESTS,
-                    math.ceil(request_arrival_rate * ONLINE_REPLAY_WINDOW_S),
-                ),
-                "arrival_interval_ms": 1000.0 / request_arrival_rate,
+            peak_to_mean_ratio = (
+                self._first_positive(
+                    (direct_x_values, job_features, job_config), "peak_to_mean_ratio"
+                )
+                or 1.0
+            )
+            turn_rate = request_arrival_rate * (peak_to_mean_ratio if scenario != "mean" else 1.0)
+            if turn_rate <= 0:
+                raise ValueError("Online simulation needs positive turn rate")
+            turns_per_session = 1
+            if scenario == "peak_all_multiturn_stress":
+                multi_turn_ratio = (
+                    self._first_positive(
+                        (direct_x_values, job_features, job_config), "multi_turn_ratio"
+                    )
+                    or 0.0
+                )
+                if multi_turn_ratio <= 0:
+                    raise ValueError("peak_all_multiturn_stress requires multi_turn_ratio > 0")
+                multi_turn_avg_turns = (
+                    self._first_positive(
+                        (direct_x_values, job_features, job_config), "multi_turn_avg_turns"
+                    )
+                    or 2.0
+                )
+                turns_per_session = max(2, math.ceil(multi_turn_avg_turns))
+
+                # request_arrival_rate counts emitted turns/sec, but DynoSim's
+                # arrival_interval_ms spaces new sessions when turns_per_session > 1.
+                # Divide turn rate by turns/session so the stress scenario does not
+                # multiply the offered traffic.
+                # TODO: DynoSim needs one integer turn count per synthetic session;
+                # v0 uses all-multiturn peak stress instead of mixing single- and
+                # multi-turn sessions in one replay.
+                arrival_interval_ms = 1000.0 * turns_per_session / turn_rate
+            else:
+                arrival_interval_ms = 1000.0 / turn_rate
+
+            target_emitted_turns = max(
+                ONLINE_MIN_REQUESTS,
+                math.ceil(turn_rate * ONLINE_REPLAY_WINDOW_S),
+            )
+            request_count = (
+                math.ceil(target_emitted_turns / turns_per_session)
+                if scenario == "peak_all_multiturn_stress"
+                else target_emitted_turns
+            )
+            expected_completed_requests = request_count * turns_per_session
+
+            controls = {
+                "request_count": request_count,
+                "arrival_interval_ms": arrival_interval_ms,
                 "replay_mode": "offline",
+                "turns_per_session": turns_per_session,
+                "expected_completed_requests": expected_completed_requests,
             }
+            if scenario == "peak_all_multiturn_stress":
+                controls.update(
+                    {
+                        "inter_turn_delay_ms": 0.0,
+                        "shared_prefix_ratio": 0.0,
+                        "num_prefix_groups": 0,
+                    }
+                )
+            return controls
 
     @staticmethod
     def _first_positive(sources, *names):
@@ -496,8 +580,6 @@ class SurrogatePrediction:
         if queue_policy in {"fcfs", "lcfs", "wspt"}:
             engine_args["router_queue_policy"] = queue_policy
 
-        # Koi dp is independent engine replicas. AIC attention DP is a separate
-        # engine-level knob, so dp only affects replay workers here.
         num_workers = int(direct_x_values.get("num_workers") or direct_x_values.get("dp") or 1)
         router_mode = self._router_mode_for_replay(
             direct_x_values.get(
@@ -512,7 +594,6 @@ class SurrogatePrediction:
             "input_tokens": direct_x_values.get("isl_token_avg"),
             "output_tokens": direct_x_values.get("osl_token_avg"),
             "shared_prefix_ratio": direct_x_values.get("workload_prefix_concentration", 0.0),
-            # TODO: model mixed multi-turn sessions without changing total emitted request rate.
             "turns_per_session": 1,
             "pd_enabled": direct_x_values.get("pd_enabled", False),
             "prefill_worker_count": direct_x_values.get("prefill_worker_count", 1),
@@ -521,6 +602,14 @@ class SurrogatePrediction:
             "router_mode": router_mode,
             **simulator_controls,
         }
+        if (
+            replay_args.get("expected_completed_requests") is None
+            and replay_args.get("request_count") is not None
+        ):
+            turns_per_session = int(replay_args.get("turns_per_session") or 1)
+            replay_args["expected_completed_requests"] = (
+                int(replay_args["request_count"]) * turns_per_session
+            )
 
         engine_args = {key: value for key, value in engine_args.items() if value is not None}
         replay_args = {key: value for key, value in replay_args.items() if value is not None}
@@ -639,6 +728,10 @@ class SurrogatePrediction:
         input_tokens = int(replay_args["input_tokens"])
         output_tokens = int(replay_args["output_tokens"])
         request_count = int(replay_args["request_count"])
+        expected_requests = int(
+            replay_args.get("expected_completed_requests")
+            or request_count * int(replay_args.get("turns_per_session") or 1)
+        )
         replay_mode = replay_args.get("replay_mode", "offline")
         router_mode = replay_args.get("router_mode", "round_robin")
         pd_enabled = replay_args.get("pd_enabled", False)
@@ -655,6 +748,10 @@ class SurrogatePrediction:
             "turns_per_session": replay_args.get("turns_per_session", 1),
             "shared_prefix_ratio": replay_args.get("shared_prefix_ratio", 0.0),
         }
+        if replay_args.get("num_prefix_groups") is not None:
+            common_replay_args["num_prefix_groups"] = replay_args["num_prefix_groups"]
+        if replay_args.get("inter_turn_delay_ms") is not None:
+            common_replay_args["inter_turn_delay_ms"] = replay_args["inter_turn_delay_ms"]
         if replay_args.get("replay_concurrency") is not None:
             common_replay_args["replay_concurrency"] = replay_args["replay_concurrency"]
         elif replay_args.get("arrival_interval_ms") is not None:
@@ -686,19 +783,24 @@ class SurrogatePrediction:
                 **common_replay_args,
             )
 
-        return self.canonicalize_aic_dynosim_output(raw_report)
+        return self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
 
-    def canonicalize_aic_dynosim_output(self, raw_report):
+    def canonicalize_aic_dynosim_output(self, raw_report, expected_requests):
         # TODO - general helper, can be moved out of this file/class
         # Convert raw DynoSim report keys into DAG V/Y names.
-        completed_requests = (
-            raw_report.get("completed_requests") or raw_report.get("num_requests") or 1
-        )
+        if "completed_requests" not in raw_report:
+            raise SurrogateExecutionError("DynoSim report missing completed_requests")
+        completed_requests = int(raw_report["completed_requests"])
+        if completed_requests != int(expected_requests):
+            raise SurrogateExecutionError(
+                f"completed {completed_requests}/{int(expected_requests)} requests"
+            )
 
         v_hat_direct = {
             "input_length_observed": raw_report.get("total_input_tokens", 0) / completed_requests,
             "output_length_observed": raw_report.get("total_output_tokens", 0) / completed_requests,
             "kvcache_hit_rate": raw_report.get("prefix_cache_reused_ratio"),
+            "completed_requests": completed_requests,
         }
 
         y_hat_direct = {
@@ -718,6 +820,7 @@ class SurrogatePrediction:
         job_config,
         job_features,
         price_vector,
+        replay_args=None,
     ):
         # Use direct DynoSim outputs + known config/features to compute extra DAG V/Y.
         v_hat_derived = {}
@@ -762,7 +865,9 @@ class SurrogatePrediction:
         if "cost_per_token" in requested_y:
             price_per_hour = self.get_price_per_hour(price_vector)
             if price_per_hour is not None and throughput:
-                y_hat_derived["cost_per_token"] = price_per_hour / (throughput * 3600.0)
+                n_replicas = int((replay_args or {}).get("num_workers") or 1)
+                rank_price_per_hour = price_per_hour * n_replicas
+                y_hat_derived["cost_per_token"] = rank_price_per_hour / (throughput * 3600.0)
 
         if "slo_margin" in requested_y:
             ttft_target = job_features.get("target_p99_ttft_ms") or job_config.get(
