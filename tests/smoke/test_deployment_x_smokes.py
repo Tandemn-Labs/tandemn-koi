@@ -32,6 +32,7 @@ def _x_fields():
         "flops_per_param",
         "gpu_watts",
         "request_arrival_rate",
+        "multi_turn_avg_turns",
         "total_token_budget",
         "deadline_hrs",
         "target_p99_ttft_ms",
@@ -67,6 +68,7 @@ def _snapshot():
         "type": "online",
         "model_id": "Qwen/Qwen2.5-72B-Instruct",
         "request_arrival_rate": 100,
+        "multi_turn_avg_turns": 2.0,
         "total_token_budget": 1000,
         "deadline_hours": 2,
         "target_p99_ttft_ms": 200,
@@ -266,6 +268,7 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(x["gpu_tflops_fp16"], 989.5)
         self.assertEqual(x["internode_bandwidth_gbps"], 3200)
         self.assertEqual(x["request_arrival_rate"], 50)
+        self.assertEqual(x["multi_turn_avg_turns"], 2.0)
         self.assertEqual(x["total_token_budget"], 500)
         self.assertEqual(x["deadline_hrs"], 2)
         self.assertEqual(x["num_nodes_per_chain"], 1)

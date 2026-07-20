@@ -1,10 +1,13 @@
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from src.agent.tools import agent_tools
 from src.core.candidate_graph import CandidateGraph
 from src.core.mechanism_registry import MechanismRegistry
-from src.core.models import Edge, EdgeMetadata, Mechanism, Node, PlanAction
+from src.core.models import Edge, EdgeMetadata, Mechanism, Node, PlanAction, RankSpec
 from src.infra.resource_map import ClusterResourceSnapshot, ResourceMapManager
+from src.prediction.surrogate import SurrogateExecutionError, SurrogateMemoryNoFit
 
 
 class _DRO:
@@ -109,7 +112,7 @@ class _RecordingSurrogate:
         self.calls = []
 
     def compose_prediction(
-        self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",)
+        self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",), scenario="mean"
     ):
         self.calls.append((dict(job_config), dict(job_features)))
         return (
@@ -123,6 +126,51 @@ class _RecordingSurrogate:
 
 
 class AgentToolsSmokeTests(unittest.TestCase):
+    def test_rank_prediction_payload_attaches_allocation_price(self):
+        class PricedResourceMap(_ResourceMap):
+            def resources_summary(self):
+                resources = super().resources_summary()
+                resources["reserved|aws|us-east-1|use1-az1|H100"]["pools"][0][
+                    "price_per_instance_hour"
+                ] = 55.04
+                return resources
+
+            def rank_allocation_summary(self, rank, resources=None):
+                summary = super().rank_allocation_summary(rank, resources)
+                summary["price_per_unit_hour"] = 55.04
+                return summary
+
+        saved = agent_tools._CTX.resource_map
+        try:
+            agent_tools._CTX.resource_map = PricedResourceMap()
+            rank = RankSpec.from_dict(
+                {
+                    "role": "aggregate",
+                    "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                    "config": {
+                        "instance_type": "p5.48xlarge",
+                        "gpu_count": 8,
+                        "tp": 8,
+                        "pp": 1,
+                    },
+                    "n_replicas": 3,
+                }
+            )
+
+            payload = agent_tools._rank_prediction_payload(
+                rank,
+                {
+                    "model_id": "Qwen/Qwen2.5-72B-Instruct",
+                    "request_arrival_rate": 1.0,
+                    "isl_token_avg": 100,
+                    "osl_token_avg": 100,
+                },
+            )
+        finally:
+            agent_tools._CTX.resource_map = saved
+
+        self.assertEqual(payload["job_config"]["price_per_hour"], 55.04)
+
     def test_set_new_mechanisms_uses_canonical_validation(self):
         xv = Edge("tp->kv_cache_util", "tp", "kv_cache_util", "X", "V")
         vy = Edge(
@@ -540,6 +588,125 @@ class AgentToolsSmokeTests(unittest.TestCase):
             for name, value in saved_context.items():
                 setattr(agent_tools._CTX, name, value)
 
+    def test_size_ladder_marks_aic_memory_preflight_failure_no_fit(self):
+        env = "reserved|aws|us-east-1|us-east-1b|H100"
+
+        class ResourceMap:
+            def resources_summary(self):
+                return {
+                    env: {
+                        "free": 1,
+                        "gpu_type": "H100",
+                        "pools": [
+                            {
+                                "instance_type": "p5.4xlarge",
+                                "gpus_per_instance": 1,
+                                "free_instances": 1,
+                                "free": 1,
+                            }
+                        ],
+                    }
+                }
+
+            def rank_allocation_summary(self, rank, resources=None):
+                return {
+                    "allocation_kind": "instance",
+                    "instance_type": "p5.4xlarge",
+                    "gpus_per_unit": 1,
+                    "price_per_unit_hour": 6.88,
+                    "capacity_per_replica": 1,
+                    "free_capacity_gpus": 1,
+                    "engine_gpus": rank.gpus_per_chain(),
+                }
+
+        class FailingSurrogate:
+            @staticmethod
+            def compose_prediction(**_kwargs):
+                raise SurrogateMemoryNoFit("AIC memory preflight no-fit: no KV budget")
+
+        saved_context = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("resource_map", "surrogate", "candidate_graph", "dro")
+        }
+        saved_payload = agent_tools._rank_prediction_payload
+        try:
+            agent_tools.bind_tools(
+                resource_map=ResourceMap(),
+                surrogate=FailingSurrogate(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            agent_tools._rank_prediction_payload = lambda rank, features: {
+                "job_config": {},
+                "job_features": {},
+            }
+
+            result = agent_tools.size_ladder(
+                [
+                    {
+                        "role": "aggregate",
+                        "env": env.split("|"),
+                        "config": {
+                            "instance_type": "p5.4xlarge",
+                            "gpu_count": 1,
+                            "tp": 1,
+                            "pp": 1,
+                        },
+                    }
+                ],
+                {"type": "online", "target_p99_ttft_ms": 100.0, "target_p99_tpot_ms": 10.0},
+                target_tps=100,
+            )
+        finally:
+            agent_tools._rank_prediction_payload = saved_payload
+            for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertEqual(result["ranks"], [])
+        self.assertEqual(result["per_rank"][0]["n_replicas"], 0)
+        self.assertIn(
+            "AIC memory preflight no-fit", result["per_rank"][0]["physical_violations"][0]
+        )
+
+    def test_size_ladder_propagates_surrogate_execution_error(self):
+        class FailingSurrogate:
+            @staticmethod
+            def compose_prediction(**_kwargs):
+                raise SurrogateExecutionError("AIC database unavailable")
+
+        saved_context = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("resource_map", "surrogate", "candidate_graph", "dro")
+        }
+        saved_payload = agent_tools._rank_prediction_payload
+        try:
+            agent_tools.bind_tools(
+                resource_map=_ResourceMap(),
+                surrogate=FailingSurrogate(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            agent_tools._rank_prediction_payload = lambda rank, features: {
+                "job_config": {},
+                "job_features": {},
+            }
+            with self.assertRaisesRegex(SurrogateExecutionError, "database unavailable"):
+                agent_tools.size_ladder(
+                    [
+                        {
+                            "role": "aggregate",
+                            "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                            "config": {"instance_type": "p5.48xlarge", "gpu_count": 1},
+                        }
+                    ],
+                    {"type": "online", "target_p99_ttft_ms": 100.0, "target_p99_tpot_ms": 10.0},
+                    target_tps=100,
+                )
+        finally:
+            agent_tools._rank_prediction_payload = saved_payload
+            for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
     def test_budget_book_tracks_and_enforces_instance_pools(self):
         env = "reserved|aws|us-east-1|us-east-1b|L40S"
         resources = {
@@ -742,6 +909,149 @@ class AgentToolsSmokeTests(unittest.TestCase):
         finally:
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
+
+    def test_predictions_are_not_cached(self):
+        class ScenarioSurrogate:
+            def __init__(self):
+                self.calls = []
+
+            def compose_prediction(self, **kwargs):
+                scenario = kwargs["scenario"]
+                self.calls.append(scenario)
+                return ({"throughput_token_per_sec": 10.0 if scenario == "mean" else 20.0}, {})
+
+        saved = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("surrogate", "candidate_graph", "dro")
+        }
+        surrogate = ScenarioSurrogate()
+        saved_calls = agent_tools._surrogate_calls
+        try:
+            agent_tools.bind_tools(surrogate=surrogate, candidate_graph=object(), dro=_DRO())
+            agent_tools._surrogate_calls = 0
+            mean = agent_tools._predict_outcome_core({}, {}, scenario="mean")
+            peak = agent_tools._predict_outcome_core({}, {}, scenario="peak")
+            stress = agent_tools._predict_outcome_core({}, {}, scenario="peak_all_multiturn_stress")
+            mean_cached = agent_tools._predict_outcome_core({}, {}, scenario="mean")
+            calls_after = agent_tools._surrogate_calls
+        finally:
+            agent_tools._surrogate_calls = saved_calls
+            for name, value in saved.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertEqual(mean["y_hat"]["throughput_token_per_sec"], 10.0)
+        self.assertEqual(peak["y_hat"]["throughput_token_per_sec"], 20.0)
+        self.assertEqual(stress["y_hat"]["throughput_token_per_sec"], 20.0)
+        self.assertEqual(mean_cached["y_hat"]["throughput_token_per_sec"], 10.0)
+        self.assertEqual(calls_after, 3)
+        self.assertEqual(
+            surrogate.calls,
+            ["mean", "peak", "peak_all_multiturn_stress", "mean"],
+        )
+
+    def test_surrogate_calls_are_serialized(self):
+        class SlowSurrogate:
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+                self.calls = 0
+
+            def compose_prediction(self, **_kwargs):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self.calls += 1
+                time.sleep(0.01)
+                self.active -= 1
+                return ({"throughput_token_per_sec": 1.0}, {})
+
+        saved = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("surrogate", "candidate_graph", "dro")
+        }
+        saved_calls = agent_tools._surrogate_calls
+        surrogate = SlowSurrogate()
+        try:
+            agent_tools.bind_tools(surrogate=surrogate, candidate_graph=object(), dro=_DRO())
+            agent_tools._surrogate_calls = 0
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(lambda _: agent_tools._predict_outcome_core({}, {}), range(4)))
+        finally:
+            agent_tools._surrogate_calls = saved_calls
+            for name, value in saved.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertEqual(surrogate.calls, 4)
+        self.assertEqual(surrogate.max_active, 1)
+
+    def test_multiturn_stress_diagnostic_skip_and_failure_are_non_selecting(self):
+        action = {"sigma": 7.0, "meets_target": True, "ladder": []}
+        agent_tools._attach_peak_multiturn_stress(action, {"multi_turn_ratio": 0})
+        self.assertNotIn("selection_diagnostics", action)
+
+        def fail_stress(*_args, **_kwargs):
+            raise SurrogateExecutionError("stress replay failed")
+
+        saved_predict = agent_tools._predict_outcome_core
+        saved_payload = agent_tools._rank_prediction_payload
+        try:
+            agent_tools._predict_outcome_core = fail_stress
+            agent_tools._rank_prediction_payload = lambda rank, features: {
+                "job_config": {},
+                "job_features": features,
+            }
+            stressed = {
+                "sigma": 7.0,
+                "meets_target": True,
+                "ladder": [
+                    {
+                        "role": "aggregate",
+                        "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                        "config": {"instance_type": "p5.48xlarge", "gpu_count": 1},
+                        "n_replicas": 1,
+                    }
+                ],
+            }
+            agent_tools._attach_peak_multiturn_stress(stressed, {"multi_turn_ratio": 0.5})
+        finally:
+            agent_tools._predict_outcome_core = saved_predict
+            agent_tools._rank_prediction_payload = saved_payload
+
+        diag = stressed["selection_diagnostics"]["peak_all_multiturn_stress"]
+        self.assertEqual(stressed["sigma"], 7.0)
+        self.assertTrue(stressed["meets_target"])
+        self.assertEqual(len(stressed["ladder"]), 1)
+        self.assertIn("stress replay failed", diag["error"])
+
+        def predict_stress(*_args, **_kwargs):
+            return {
+                "y_hat_raw": {
+                    "p99_ttft_ms": 11.0,
+                    "p99_tpot_ms": 2.0,
+                    "throughput_token_per_sec": 33.0,
+                },
+                "v_hat": {"completed_requests": 21},
+            }
+
+        ok = {"sigma": 7.0, "meets_target": True, "ladder": stressed["ladder"]}
+        saved_predict = agent_tools._predict_outcome_core
+        saved_payload = agent_tools._rank_prediction_payload
+        try:
+            agent_tools._predict_outcome_core = predict_stress
+            agent_tools._rank_prediction_payload = lambda rank, features: {
+                "job_config": {},
+                "job_features": features,
+            }
+            agent_tools._attach_peak_multiturn_stress(ok, {"multi_turn_ratio": 0.5})
+        finally:
+            agent_tools._predict_outcome_core = saved_predict
+            agent_tools._rank_prediction_payload = saved_payload
+
+        ok_diag = ok["selection_diagnostics"]["peak_all_multiturn_stress"]
+        self.assertEqual(ok_diag["p99_ttft_ms"], 11.0)
+        self.assertEqual(ok_diag["p99_tpot_ms"], 2.0)
+        self.assertEqual(ok_diag["throughput_token_per_sec"], 33.0)
+        self.assertEqual(ok_diag["completed_requests"], 21)
+        self.assertIsNone(ok_diag["error"])
 
     def test_predict_outcome_derives_gpu_type_from_env(self):
         saved = {
