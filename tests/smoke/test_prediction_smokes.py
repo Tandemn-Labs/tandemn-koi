@@ -615,6 +615,21 @@ class PredictionSmokeTests(unittest.TestCase):
         )
         self.assertNotIn("total_token_budget", v_hat)
 
+    def test_kv_cache_v_outputs_are_explicit_placeholders(self):
+        predictor = SurrogatePrediction()
+        _y_hat, v_hat = predictor.derive_outputs(
+            derive_v=["kv_pressure_score", "kv_cache_util"],
+            derive_y=[],
+            y_hat_direct={},
+            v_hat_direct={"input_length_observed": 10.0, "output_length_observed": 5.0},
+            job_config={"max_num_batched_tokens": 100},
+            job_features={},
+            price_vector=None,
+        )
+
+        self.assertEqual(v_hat["kv_pressure_score"], 0.0)
+        self.assertEqual(v_hat["kv_cache_util"], 0.0)
+
     def test_aic_replay_completed_requests_must_match_expected(self):
         predictor = SurrogatePrediction()
         raw_report = {
@@ -622,7 +637,7 @@ class PredictionSmokeTests(unittest.TestCase):
             "total_input_tokens": 10,
             "total_output_tokens": 6,
             "p99_ttft_ms": 1.0,
-            "p99_itl_ms": 2.0,
+            "p99_tpot_ms": 2.0,
             "output_throughput_tok_s": 100.0,
         }
 
@@ -645,6 +660,31 @@ class PredictionSmokeTests(unittest.TestCase):
                 {key: value for key, value in raw_report.items() if key != "completed_requests"},
                 expected_requests=2,
             )
+
+    def test_aic_replay_required_outputs_must_be_valid(self):
+        predictor = SurrogatePrediction()
+        raw_report = {
+            "completed_requests": 1,
+            "total_input_tokens": 10,
+            "total_output_tokens": 6,
+            "p99_ttft_ms": 1.0,
+            "p99_tpot_ms": 2.0,
+            "output_throughput_tok_s": 100.0,
+        }
+
+        invalid_cases = (
+            ("p99_ttft_ms", None),
+            ("p99_tpot_ms", -1.0),
+            ("p99_tpot_ms", float("nan")),
+            ("output_throughput_tok_s", 0.0),
+            ("output_throughput_tok_s", float("inf")),
+        )
+        for key, value in invalid_cases:
+            with self.subTest(key=key, value=value):
+                report = dict(raw_report)
+                report[key] = value
+                with self.assertRaisesRegex(SurrogateExecutionError, f"invalid {key}"):
+                    predictor.canonicalize_aic_dynosim_output(report, expected_requests=1)
 
     def test_surrogate_full_dynosim_smoke(self):
         predictor = SurrogatePrediction(objective="batch")
