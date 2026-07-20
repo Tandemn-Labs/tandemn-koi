@@ -595,6 +595,26 @@ class PredictionSmokeTests(unittest.TestCase):
         )
         self.assertNotIn("cost_per_token", no_price)
 
+    def test_total_token_budget_stays_x_not_derived_v(self):
+        predictor = SurrogatePrediction()
+        direct_x, _derive_x, _direct_v, derive_v, _direct_y, _derive_y = (
+            predictor.resolve_prediction_scope(MockCandidateGraph(), "AIC_DynoSim")
+        )
+        self.assertIn("total_token_budget", MockCandidateGraph.x)
+        self.assertNotIn("total_token_budget", direct_x)
+        self.assertNotIn("total_token_budget", derive_v)
+
+        _y_hat, v_hat = predictor.derive_outputs(
+            derive_v=["total_token_budget"],
+            derive_y=[],
+            y_hat_direct={},
+            v_hat_direct={"input_length_observed": 10.0, "output_length_observed": 5.0},
+            job_config={"max_num_batched_tokens": 100},
+            job_features={},
+            price_vector=None,
+        )
+        self.assertNotIn("total_token_budget", v_hat)
+
     def test_aic_replay_completed_requests_must_match_expected(self):
         predictor = SurrogatePrediction()
         raw_report = {
