@@ -1,8 +1,12 @@
+import logging
 import math
 
 from aiconfigurator.sdk.memory import (  # type: ignore[import-untyped]
     estimate_num_gpu_blocks,
 )
+
+for _logger_name in ("aiconfigurator", "aiconfigurator_core"):
+    logging.getLogger(_logger_name).setLevel(logging.ERROR)
 
 ONLINE_REPLAY_WINDOW_S = 1
 ONLINE_MIN_REQUESTS = 20

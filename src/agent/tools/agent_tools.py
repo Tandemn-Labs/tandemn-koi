@@ -90,7 +90,7 @@ from threading import Lock
 from typing import Any
 
 import numpy as np
-from src.config.hyperparameters import GAMMA_SLO, UTILIZATION_TARGET_ONLINE
+from src.config.hyperparameters import GAMMA_SLO
 from src.core.models import (
     LADDER_ACTIONS,
     SWAP_BUDGET_ACTIONS,
@@ -211,7 +211,11 @@ def _sanitize_agent_features(features: dict[str, Any]) -> dict[str, Any]:
 DEFAULT_TYPICAL_RANGES = {
     "p99_ttft_ms": 500.0,
     "p99_tpot_ms": 50.0,
-    "cost_per_token": 5e-6,
+    # Typical SPREAD of $/token from the ideal (~1e-4) to an inefficient config
+    # (~5e-3), used to normalize the cost gap to a ~[0,1] fraction. Was 5e-6 -
+    # SMALLER than the ideal itself, which blew the cost gap up ~1000x and let cost
+    # swamp the SLO signal. The slow loop overwrites this with the learned range.
+    "cost_per_token": 5e-3,
     "throughput_token_per_sec": 1000.0,
     "slo_margin": 1.0,
 }
@@ -672,8 +676,19 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
     #     return dict(action.predicted_y)
     samples: list[tuple[int, dict]] = []
     for rank in action.ladder or []:
+        # Predict each rank at ITS arrival share (recorded by size_ladder), not the
+        # whole job's rate - so a heterogeneous composite is not scored as if every
+        # rank carried the full traffic (that double-counts demand and over-loads
+        # each rank's predicted latency). Single-rank jobs carry the full share, so
+        # they are unaffected.
+        share_rps = (rank.config or {}).get("_arrival_share_rps")
+        feats = (
+            {**(job_features or {}), "request_arrival_rate": float(share_rps)}
+            if share_rps is not None
+            else job_features
+        )
         try:
-            payload = _rank_prediction_payload(rank, job_features)
+            payload = _rank_prediction_payload(rank, feats)
             y = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
                 "y_hat", {}
             )
@@ -695,35 +710,47 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
 
 
 def _roll_up_ranks(samples: list[tuple[int, dict]]) -> dict[str, Any]:
-    """Roll up per-rank (n_replicas, y_hat) samples into one job y_hat."""
+    """Roll up per-rank y_hat samples into one job y_hat.
+
+    Each rank's y_hat is ALREADY the DP-aggregate the surrogate simulated for that
+    rank (num_workers = n_replicas), so we compose ACROSS RANKS only - we do NOT
+    scale by n_replicas again (that was the throughput double-count that surfaced
+    once the surrogate started honoring dp):
+      throughput -> SUM across ranks (parallel ranks add up)
+      latency    -> MAX across ranks (a request hits one rank; every serving rank
+                    must clear its SLO)
+      cost/token -> throughput-weighted mean (= total $ / total tokens)
+      slo_margin -> MIN across ranks (worst headroom)
+      other      -> throughput-weighted mean
+    The n_replicas in each sample is ignored for scaling; it is left in the tuple
+    only for backward compatibility with callers.
+    """
 
     def _tput(y: dict) -> float:
         return float(y.get(_THROUGHPUT_OBJ) or 0.0)
 
-    objectives = set().union(*[set(y) for _, y in samples])
-    tput_weight_total = sum(n * _tput(y) for n, y in samples)
+    ys = [y for _, y in samples]
+    if not ys:
+        return {}
+    objectives = set().union(*[set(y) for y in ys])
     composed: dict[str, Any] = {}
     for obj in objectives:
-        present = [(n, float(y[obj]), _tput(y)) for n, y in samples if y.get(obj) is not None]
+        present = [(float(y[obj]), _tput(y)) for y in ys if y.get(obj) is not None]
         if not present:
             continue
         if obj == _THROUGHPUT_OBJ:
-            # Data-parallel replicas serve IN PARALLEL, so aggregate throughput is
-            # the SUM over replicas (n_replicas * per_chain_tps), NOT an average.
-            # Scoring per-chain here under-counted delivered throughput by the
-            # replica factor - it made every multi-replica job's J far too negative
-            # (big models, which need the most replicas, hit hardest -> deferred).
-            # size_ladder already scales by replicas for meets_target; J must match.
-            composed[obj] = sum(n * v for n, v, _ in present)
+            composed[obj] = sum(v for v, _ in present)
         elif obj in _LATENCY_OBJS:
-            composed[obj] = max(v for _, v, _ in present)
+            composed[obj] = max(v for v, _ in present)
         elif obj in _MARGIN_OBJS:
-            composed[obj] = min(v for _, v, _ in present)
-        elif obj in _COST_OBJS and tput_weight_total > 0:
-            composed[obj] = sum(n * t * v for n, v, t in present) / tput_weight_total
+            composed[obj] = min(v for v, _ in present)
         else:
-            weight = sum(n for n, _, _ in present) or 1
-            composed[obj] = sum(n * v for n, v, _ in present) / weight
+            weight = sum(t for _, t in present)
+            composed[obj] = (
+                sum(v * t for v, t in present) / weight
+                if weight > 0
+                else sum(v for v, _ in present) / len(present)
+            )
     return composed
 
 
@@ -1585,21 +1612,22 @@ def size_ladder(
     replicas, not a series). v0 is aggregate-only; the disaggregated
     prefill->decode SERIES case (achieved = min across roles) is deferred.
 
-        target_tps    = required throughput (batch: budget/deadline*headroom;
+        target        = required throughput (batch: budget/deadline*headroom;
                         online: arrival_rate * output_len * headroom)
-        per_chain_eff = per_chain_raw * utilization_target  (online derates
-                        below saturation so queue wait ~ rho/(1-rho) and thus
-                        p99 TTFT stay bounded; batch uses 1.0)
-        per rank      : needed = ceil(remaining / per_chain_eff), capped by
-                        the selected pool's free capacity;
-                        remaining -= achieved
-        achieved_tps  = SUM over ranks of n_replicas * per_chain_eff
+        per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap. At each d the
+                        surrogate simulates the rank at num_workers=d serving its
+                        share of the arrival rate and returns the DP-aggregate
+                        throughput + real p99 latency (queue included). Take the
+                        min d whose p99 TTFT/TPOT clear the SLO AND that keeps up
+                        with the share; the rest of the demand spills to the next
+                        rank. NO per-chain*util derate, NO linear scaling.
+        achieved_tps  = demand actually served within SLO (SUM across ranks).
 
-    Online latency gate: a rank whose predicted p99 TTFT or TPOT exceeds
-    target is EXCLUDED (n_replicas = 0) - latency is per-replica and replicas
-    cannot fix it - and its share spills to the remaining ranks. A
-    capacity-bound rank reports its GPU shortfall in marginal_value; unmet_tps
-    reports any target the whole ladder could not cover.
+    Online latency GATES the replica count (queueing latency FALLS with more
+    replicas), it does not veto the rank. A rank that cannot clear the SLO even at
+    max capacity serves the partial throughput it can push (marked not-slo_ok) and
+    the shortfall spills; unmet_tps reports demand the whole ladder could not cover.
+    meets_target requires the whole demand covered AND every serving rank in SLO.
 
     Args:
         ranks: rank dicts (RankSpec.from_dict form) with role, env, config.
@@ -1623,23 +1651,74 @@ def size_ladder(
     job_features = _sanitize_agent_features(dict(job_features or {}))
     regime = str(job_features.get("type", "online")).lower()
     is_online = regime != "batch"
+    # utilization_target is accepted for backward compatibility but no longer used:
+    # the surrogate now simulates the DP queue directly (num_workers=dp), so we do
+    # NOT derate a per-chain estimate - we SEARCH the replica count against the
+    # surrogate's own p99 latency.
+    _ = utilization_target
     target = (
         float(target_tps)
         if target_tps is not None
         else float(required_throughput_enumerator(job_features))
     )
-    util = (
-        float(utilization_target)
-        if utilization_target is not None
-        else (UTILIZATION_TARGET_ONLINE if is_online else 1.0)
-    )
+    osl = _feature_value(job_features, "osl_token_avg", "output_len_tokens_avg") or 0.0
     ttft_target = _feature_value(job_features, "target_p99_ttft_ms", "target_p99_TTFT_ms")
     tpot_target = _feature_value(job_features, "target_p99_tpot_ms", "target_p99_TPOT_ms")
+
+    def _slo_ok(y: dict) -> bool:
+        # Online latency gate. Batch has no per-request latency SLO -> always passes
+        # here and is sized on throughput alone.
+        if not is_online:
+            return True
+        if not y:
+            return False
+        ttft = _y_value(y, "p99_ttft_ms", "p99_TTFT_ms")
+        tpot = _y_value(y, "p99_tpot_ms", "p99_TPOT_ms")
+        if ttft_target is not None and ttft > ttft_target:
+            return False
+        return not (tpot_target is not None and tpot > tpot_target)
+
+    def _dp_candidates(cap: int) -> list[int]:
+        ds, d = [], 1
+        while d <= cap:
+            ds.append(d)
+            d *= 2
+        if cap >= 1 and (not ds or ds[-1] != cap):
+            ds.append(cap)
+        return ds
+
+    def _predict_at(rank: RankSpec, d: int, share_tps: float) -> dict | None:
+        # Predict this rank at DP=d workers carrying `share_tps` tokens/s of demand.
+        # For online we hand that demand in as an arrival rate (share_tps/osl); the
+        # surrogate splits it across the d workers (num_workers=dp), so more workers
+        # -> less per-worker queue -> lower p99. Returns:
+        #   dict y_hat -> the DP-aggregate prediction,
+        #   {}         -> overloaded/incomplete at this DP (try more replicas),
+        #   None       -> physical/memory no-fit (no replica count fixes it).
+        feats = dict(job_features)
+        if is_online and osl > 0:
+            feats["request_arrival_rate"] = float(share_tps) / osl
+        r = RankSpec.from_dict(rank.to_dict())
+        r.n_replicas = int(d)
+        payload = _rank_prediction_payload(r, feats)
+        if not config_runnable(dict(r.config), payload["job_features"])[0]:
+            return None
+        try:
+            return _predict_outcome_core(
+                payload["job_config"], payload["job_features"], scenario="peak"
+            ).get("y_hat", {})
+        except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
+            log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
+            return None
+        except SurrogateExecutionError as exc:
+            # e.g. requests did not all complete at this replica count -> overloaded;
+            # more replicas may fix it, so signal "try more DP", do not crash.
+            log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
+            return {}
 
     sized: list[dict[str, Any]] = []
     per_rank: list[dict[str, Any]] = []
     marginal: dict[str, int] = {}
-    achieved_total = 0.0
     remaining = target
     remaining_by_pool: dict[tuple[str, str | None], int] = {}
     resources = (
@@ -1648,9 +1727,14 @@ def size_ladder(
         else None
     )
 
-    # Fill ranks in the order given, each covering the REMAINING target, so a
-    # heterogeneous parallel ladder shares one target and achieved throughput
-    # SUMS across ranks.
+    # Cover the demand rank by rank. Each rank tries to serve the REMAINING demand;
+    # size_ladder SEARCHES its replica count (DP) against the surrogate's own p99, so
+    # latency GATES the replica count instead of vetoing the rank up front (queueing
+    # latency DOES fall with more replicas). A rank that clears TTFT+TPOT+keep-up at
+    # some DP takes the whole remaining share; one that cannot even at max capacity
+    # takes the throughput it can push and the shortfall spills to the next rank
+    # (heterogeneous ladder). meets_target needs the whole demand covered AND every
+    # serving rank within SLO.
     for raw in ranks:
         rank = RankSpec.from_dict(raw)
         gpus_per_chain = rank.gpus_per_chain()
@@ -1680,134 +1764,103 @@ def size_ladder(
         )
         max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
 
-        payload = _rank_prediction_payload(rank, job_features)
-        pred_error = None
-        runnable, validity_reason = config_runnable(dict(rank.config), payload["job_features"])
+        runnable, validity_reason = config_runnable(
+            dict(rank.config), _rank_prediction_payload(rank, job_features)["job_features"]
+        )
+        share = remaining
+        n_replicas = 0
+        served = 0.0
+        slo_ok = False
+        reason: str | None = None
+        y_hat: dict[str, Any] = {}
+        dp_tried = 0
+
         if not runnable:
-            # Physically unrunnable (parallelism vs GPUs, model sharding): reject
-            # in code with a reason and SKIP the surrogate - no wasted sim, no
-            # crash. Replaces hand-checking divisibility in the prompt.
-            pred_error = validity_reason
-            y_hat = {}
+            reason = f"config not runnable: {validity_reason}"
+        elif max_by_cap < 1:
+            reason = "no free capacity in pool"
+        elif share <= 0:
+            reason = "demand already covered by earlier ranks"
         else:
-            try:
-                y_hat = _predict_outcome_core(
-                    payload["job_config"], payload["job_features"], scenario="peak"
-                ).get("y_hat", {})
-            except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
-                log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
-                pred_error = str(exc)
-                y_hat = {}
-            except SurrogateExecutionError:
-                raise
-            except Exception as exc:
-                # Backstop for anything the pre-check couldn't evaluate (missing
-                # catalog arch, other engine rejection): infeasible, don't crash.
-                log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
-                pred_error = str(exc)
-                y_hat = {}
-        per_chain_raw = _y_value(y_hat, "throughput_token_per_sec")
-        per_chain_eff = per_chain_raw * util
-
-        slo_violations: list[str] = []
-        if is_online:
-            ttft_pred = _y_value(y_hat, "p99_ttft_ms", "p99_TTFT_ms")
-            tpot_pred = _y_value(y_hat, "p99_tpot_ms", "p99_TPOT_ms")
-            if ttft_target is not None and ttft_pred > ttft_target:
-                slo_violations.append(f"p99_ttft {ttft_pred:.0f}ms > {ttft_target:.0f}ms target")
-            if tpot_target is not None and tpot_pred > tpot_target:
-                slo_violations.append(f"p99_tpot {tpot_pred:.1f}ms > {tpot_target:.1f}ms target")
-        slo_ok = not slo_violations
-        physical_violations: list[str] = []
-        if allocation_error:
-            physical_violations.append(allocation_error)
-        elif (
-            allocation["allocation_kind"] != "gpu" and gpus_per_chain > allocation["gpus_per_unit"]
-        ):
-            physical_violations.append(
-                f"engine needs {gpus_per_chain} GPUs but {allocation['instance_type']} "
-                f"has {allocation['gpus_per_unit']}"
-            )
-        if pred_error:
-            physical_violations.append(f"config not runnable: {pred_error}")
-        physical_ok = not physical_violations
-
-        # An SLO-infeasible online config is not viable at ANY replica count
-        # (p99 TPOT is per-replica; replicas cannot fix it): give it 0 and let
-        # its share spill to the remaining ranks.
-        excluded = (is_online and not slo_ok) or not physical_ok
-        if excluded:
-            needed = 0
-            n_replicas = 0
-            no_prediction = per_chain_eff <= 0
-        elif per_chain_eff > 0:
-            needed = max(0, math.ceil(remaining / per_chain_eff)) if remaining > 0 else 0
-            n_replicas = min(needed, max_by_cap) if max_by_cap >= 1 else 0
-            no_prediction = False
-        else:
-            needed = max_by_cap  # no throughput signal: use what capacity allows
-            n_replicas = max_by_cap
-            no_prediction = True
+            met = False
+            for d in _dp_candidates(max_by_cap):
+                dp_tried = d
+                y = _predict_at(rank, d, share)
+                if y is None:
+                    reason = "does not fit (memory/physical)"
+                    break
+                if not y:
+                    # overloaded / requests did not all complete at this DP - add
+                    # replicas and retry (this is the queue that DP relieves).
+                    reason = "overloaded at max DP" if d == max_by_cap else reason
+                    continue
+                y_hat = y
+                tp = _y_value(y, "throughput_token_per_sec")
+                keeps_up = tp >= 0.99 * share if share > 0 else tp > 0
+                if _slo_ok(y) and keeps_up:
+                    n_replicas, served, slo_ok, reason, met = d, share, True, "ok", True
+                    break
+            if not met and y_hat:
+                # No DP up to capacity cleared SLO+keep-up at the full share. Take max
+                # capacity and serve the throughput it can push; the rest spills to
+                # the next rank. slo_ok=False here keeps meets_target honest.
+                tp = _y_value(y_hat, "throughput_token_per_sec")
+                partial = min(share, tp)
+                if partial > 0:
+                    n_replicas = _dp_candidates(max_by_cap)[-1]
+                    served = partial
+                    slo_ok = _slo_ok(y_hat)
+                    reason = "capacity-bound (partial share)" if slo_ok else "under-SLO at max DP"
+            elif not met and reason is None:
+                reason = "cannot meet SLO/keep-up at any replica count"
 
         rank.n_replicas = n_replicas
-        remaining_by_pool[pool_key] = max(0, free - n_replicas * capacity_per_replica)
-        # "ranks" is the DEPLOYABLE ladder: a 0-replica rank (excluded for SLO,
-        # or capacity-starved) is dropped here and shows only in per_rank.
         if n_replicas >= 1:
+            # Record the arrival rate (req/s) this rank actually serves, so downstream
+            # scoring (compute_sigma) predicts each rank at ITS share, not the whole
+            # job's traffic - otherwise a multi-rank composite double-counts demand.
+            if osl > 0:
+                rank.config["_arrival_share_rps"] = served / osl
             sized.append(rank.to_dict())
-
-        contributed = n_replicas * per_chain_eff
-        achieved_total += contributed
-        remaining = max(0.0, remaining - contributed)
-
-        capacity_bound = (not excluded) and needed > n_replicas
-        if capacity_bound:
+            remaining = max(0.0, remaining - served)
+            remaining_by_pool[pool_key] = max(0, free - n_replicas * capacity_per_replica)
+        if dp_tried > n_replicas and not slo_ok:
             marginal[env_key] = (
-                marginal.get(env_key, 0) + (needed - n_replicas) * capacity_per_replica
+                marginal.get(env_key, 0) + max(0, dp_tried - n_replicas) * capacity_per_replica
             )
 
         per_rank.append(
             {
                 "role": rank.role,
                 "env": list(rank.env) if rank.env else None,
-                "per_chain_tps_raw": per_chain_raw,
-                "per_chain_tps_effective": per_chain_eff,
-                "utilization_target": util,
-                "gpus_per_chain": gpus_per_chain,
-                "allocation_kind": allocation["allocation_kind"] if not allocation_error else None,
                 "instance_type": allocation["instance_type"] if not allocation_error else None,
-                "gpus_per_allocation_unit": allocation["gpus_per_unit"]
-                if not allocation_error
-                else None,
+                "gpus_per_chain": gpus_per_chain,
                 "capacity_gpus_per_replica": capacity_per_replica,
                 "free_capacity_gpus": free,
                 "price_per_unit_hour": allocation["price_per_unit_hour"]
                 if not allocation_error
                 else None,
-                "needed_replicas": needed,
                 "max_replicas_by_capacity": max_by_cap,
                 "n_replicas": n_replicas,
-                "capacity_bound": capacity_bound,
+                "share_tps": share,
+                "served_tps": served,
                 "slo_ok": slo_ok,
-                "slo_violations": slo_violations,
-                "physical_ok": physical_ok,
-                "physical_violations": physical_violations,
-                "excluded_slo_infeasible": excluded,
-                "no_throughput_prediction": no_prediction,
+                "reason": reason,
             }
         )
 
-    # Achieved throughput SUMS across parallel ranks; only ranks actually
-    # serving (n_replicas >= 1) gate the latency SLO (excluded ranks serve none).
-    achieved_tps = achieved_total
-    served_slo_ok = all(r["slo_ok"] for r in per_rank if r["n_replicas"] >= 1)
-    meets_target = achieved_tps >= target and served_slo_ok
+    # achieved = demand actually served; meets_target needs the WHOLE demand covered
+    # AND every serving rank inside its latency SLO.
+    achieved_tps = max(0.0, target - remaining)
+    serving = [r for r in per_rank if r["n_replicas"] >= 1]
+    served_slo_ok = bool(serving) and all(r["slo_ok"] for r in serving)
+    meets_target = remaining <= max(1e-6, 1e-3 * target) and served_slo_ok
     return {
         "ranks": sized,
         "regime": regime,
         "target_tps": target,
         "achieved_tps": achieved_tps,
-        "unmet_tps": remaining,
+        "unmet_tps": max(0.0, remaining),
         "meets_target": meets_target,
         "per_rank": per_rank,
         "marginal_value": marginal,
@@ -2711,12 +2764,15 @@ def compute_sigma(plan) -> dict[str, Any]:
     lam = _CTX.slow_loop.get_sss_lambda_switch()
     eps_dro = _CTX.slow_loop.get_sss_radius_dro()
     pricing_map = _switch_pricing_map()
-    # Cost as a weighted OPTIMIZE objective: w_cost is the MARKET knob (0 in a
-    # reserved/sunk fleet, > 0 for pay-per-use), cost_ref normalizes $/token so the
-    # weight is meaningful. Secondary to SLO (applied outside J), so it only ranks
-    # among SLO-meeting frames.
+    # Cost as a weighted OPTIMIZE objective: w_cost is the MARKET knob (0 reserved,
+    # > 0 pay-per-use). Kept SECONDARY to the SLO by scoring the $/token gap ABOVE
+    # the ideal as a FRACTION of the typical cost RANGE (like every other objective),
+    # NOT the raw ratio cost/ideal (unbounded ~1-55x, which swamped the target-
+    # relative J and made a cheap under-target frame beat a pricier one that MEETS
+    # target). cost_ref = ideal $/token; cost_range = typical spread.
     w_cost = float((w_t or {}).get("cost_per_token", 0.0) or 0.0)
     cost_ref = float(_seeded_z_star(get_z_star()).get("cost_per_token", 0.0) or 0.0)
+    cost_range = float(ranges.get("cost_per_token", 0.0) or 0.0)
 
     for action in typed.actions:
         if action.type not in LADDER_ACTIONS or not action.ladder:
@@ -2765,8 +2821,9 @@ def compute_sigma(plan) -> dict[str, Any]:
                 evidence_store=_CTX.evidence_store,
             )
         )
+        prev_ladder = _prev_ladder_for(snapshot, job_id)
         switch_bundle = _CTX.switchcost_module.compute_switch_cost(
-            L_prev=_materialize_chain_list(_prev_ladder_for(snapshot, job_id)),
+            L_prev=_materialize_chain_list(prev_ladder),
             L_new=_materialize_chain_list(ladder_dicts),
             residual_history=_CTX.dro,
             epsilon_dro=eps_dro,
@@ -2774,6 +2831,11 @@ def compute_sigma(plan) -> dict[str, Any]:
             slo_thresholds=slo_thresholds,
             pred_y_new=y_hat,
         )
+        # Churn cost applies only to CHANGING a running deployment. A fresh placement
+        # (waiting -> running) has no prior ladder - nothing to churn - so its
+        # size-proportional spin-up must NOT be charged against the serve decision, or
+        # it dominates the (weak, target-relative) J. Swaps keep the real churn cost.
+        switch_total = switch_bundle.total if prev_ladder else 0.0
         pr_slo = float(
             _CTX.dro.dro_chance_constraint(
                 pred_y=y_hat,
@@ -2781,18 +2843,22 @@ def compute_sigma(plan) -> dict[str, Any]:
             ).get("_any_violated", 0.0)
         )
 
-        # Weighted cost objective (secondary to SLO): penalize $/token relative to
-        # the reference, scaled by the market weight w_cost. w_cost=0 (reserved) ->
-        # no effect; w_cost>0 (pay-per-use) -> cheaper-per-token frames score higher.
+        # Weighted cost objective (secondary to SLO): the $/token gap ABOVE the ideal
+        # as a FRACTION of the typical cost range - bounded and on J's scale, so it
+        # only ranks frames and can never flip a target-MEETING frame below an
+        # under-target one. w_cost=0 (reserved) -> inert; w_cost>0 (pay-per-use) ->
+        # cheaper-per-token frames score higher.
         cost_pred = _y_value(y_hat, "cost_per_token")
-        cost_penalty = w_cost * (cost_pred / cost_ref) if (w_cost and cost_ref > 0) else 0.0
-        sigma_i = (
-            J + beta * eig_value - GAMMA_SLO * pr_slo - lam * switch_bundle.total - cost_penalty
+        cost_penalty = (
+            w_cost * max(0.0, float(cost_pred or 0.0) - cost_ref) / cost_range
+            if (w_cost and cost_range > 0)
+            else 0.0
         )
+        sigma_i = J + beta * eig_value - GAMMA_SLO * pr_slo - lam * switch_total - cost_penalty
         per_job[job_id] = {
             "J": J,
             "eig": eig_value,
-            "switch_cost_total": switch_bundle.total,
+            "switch_cost_total": switch_total,
             "pr_slo_dro": pr_slo,
             "cost_penalty": cost_penalty,
             "sigma": sigma_i,

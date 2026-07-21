@@ -392,11 +392,19 @@ def _allocate_load_x(
     replica_count: int,
     total_replicas: int,
 ) -> None:
-    """Allocate job-level load fields to a per-replica rank average."""
+    """Allocate job-level load to a rank as its FULL traffic share.
+
+    The surrogate now simulates num_workers = dp = replica_count workers and splits
+    this load across them internally (round_robin), so we must pass the rank's whole
+    offered load here and let DynoSim divide it. Dividing by replica_count here too
+    made the simulator see load/replica_count^2 per worker -> queueing/latency were
+    under-predicted by the replica factor. size_ladder searches replica_count against
+    the surrogate's latency, so the load it hands in is already the rank's share.
+    """
     share = _rank_traffic_share(shape, replica_count, total_replicas)
     for field in _LOAD_FIELDS:
         if field in job_values:
-            x[field] = float(job_values[field]) * share / replica_count
+            x[field] = float(job_values[field]) * share
 
 
 def _rank_traffic_share(shape: dict[str, Any], replica_count: int, total_replicas: int) -> float:
