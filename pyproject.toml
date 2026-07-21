@@ -61,6 +61,4 @@ strict_equality = true
 show_error_codes = true
 
 [tool.uv.sources]
-aiconfigurator = { path = "../aiconfigurator", editable = true }
-aiconfigurator-core = { path = "../aiconfigurator/aic-core", editable = true }
 tandemn-store = { path = "../tandemn-store", editable = true }

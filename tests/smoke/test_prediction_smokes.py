@@ -380,12 +380,12 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(captured["system"], "h100_sxm")
         self.assertEqual(captured["backend"], "vllm")
         self.assertEqual(captured["tp_size"], 2)
-        self.assertEqual(captured["attention_dp_size"], 1)
+        self.assertNotIn("attention_dp_size", captured)
         self.assertEqual(captured["memory_fraction_kind"], "of_total")
         self.assertEqual(captured["gpu_memory_capacity_bytes_override"], 80 * (1 << 30))
         self.assertEqual(surrogate_input["replay_args"]["num_workers"], 4)
 
-    def test_aic_attention_dp_requires_explicit_engine_knob(self):
+    def test_aic_attention_dp_is_not_koi_x(self):
         captured = {}
 
         def estimate(**kwargs):
@@ -405,7 +405,7 @@ class PredictionSmokeTests(unittest.TestCase):
             method=("AIC_DynoSim",),
         )
 
-        self.assertEqual(captured["attention_dp_size"], 2)
+        self.assertNotIn("attention_dp_size", captured)
         self.assertEqual(surrogate_input["replay_args"]["num_workers"], 4)
 
     def test_aic_memory_preflight_no_fit_raises_before_replay(self):
@@ -477,8 +477,6 @@ class PredictionSmokeTests(unittest.TestCase):
                 "max_num_batched_tokens": 128,
                 "scheduling_policy": "wspt",
                 "pp": 1,
-                "gemm_quant_mode": "fp8",
-                "kvcache_quant_mode": "fp8",
             },
             job_features={
                 "type": "batch",
@@ -493,35 +491,50 @@ class PredictionSmokeTests(unittest.TestCase):
 
         self.assertEqual(captured_memory["gpu_memory_capacity_bytes_override"], 80 * (1 << 30))
         self.assertEqual(captured_memory["pp_size"], 1)
-        self.assertEqual(captured_memory["gemm_quant_mode"], "fp8")
-        self.assertEqual(captured_memory["kvcache_quant_mode"], "fp8")
+        self.assertNotIn("gemm_quant_mode", captured_memory)
+        self.assertNotIn("kvcache_quant_mode", captured_memory)
         self.assertEqual(captured_surrogate["engine_args"]["router_queue_policy"], "wspt")
 
-    def test_compose_prediction_rejects_pp_until_dynosim_supports_it(self):
-        predictor = SurrogatePrediction()
-        predictor._estimate_num_gpu_blocks = lambda **_: self.fail(
-            "memory preflight should not run"
-        )
-        predictor.run_surrogate = lambda *_: self.fail("surrogate should not run")
+    def test_compose_prediction_routes_pp_to_aic_only(self):
+        captured_memory = {}
+        captured_surrogate = {}
 
-        with self.assertRaisesRegex(SurrogateUnsupportedConfig, "pp=1"):
-            predictor.compose_prediction(
-                job_config={
-                    "model_id": "m",
-                    "max_num_seq": 8,
-                    "max_num_batched_tokens": 128,
-                    "pp": 2,
-                },
-                job_features={
-                    "type": "batch",
-                    "gpu_type": "H100",
-                    "gpu_mem_gb": 80,
-                    "isl_token_avg": 1,
-                    "osl_token_avg": 1,
-                },
-                candidate_graph=MockCandidateGraph(),
-                method=("AIC_DynoSim",),
+        def estimate(**kwargs):
+            captured_memory.update(kwargs)
+            return 1234
+
+        def run_surrogate(surrogate_input, _method):
+            captured_surrogate.update(surrogate_input)
+            return (
+                {"p99_ttft_ms": 10.0, "p99_tpot_ms": 1.0, "throughput_token_per_sec": 100.0},
+                {"input_length_observed": 1.0, "output_length_observed": 1.0},
             )
+
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = estimate
+        predictor.run_surrogate = run_surrogate
+
+        predictor.compose_prediction(
+            job_config={
+                "model_id": "m",
+                "max_num_seq": 8,
+                "max_num_batched_tokens": 128,
+                "pp": 2,
+            },
+            job_features={
+                "type": "batch",
+                "gpu_type": "H100",
+                "gpu_mem_gb": 80,
+                "isl_token_avg": 1,
+                "osl_token_avg": 1,
+            },
+            candidate_graph=MockCandidateGraph(),
+            method=("AIC_DynoSim",),
+        )
+
+        self.assertEqual(captured_memory["pp_size"], 2)
+        self.assertTrue(captured_surrogate["aic_only"])
+        self.assertEqual(captured_surrogate["aic_args"]["pp_size"], 2)
 
     def test_compose_prediction_resolves_regime_per_job_not_instance(self):
         replay_args = []
@@ -726,7 +739,7 @@ class PredictionSmokeTests(unittest.TestCase):
             predictor.resolve_prediction_scope(MockCandidateGraph(), "AIC_DynoSim")
         )
         job_config = {
-            "model_id": "nvidia/Llama-3.1-8B-Instruct-FP8",
+            "model_id": "Qwen/Qwen2.5-7B-Instruct",
             "engine_name": "vllm",
             "engine_version": "0.19.0",
             "tp": 1,
@@ -741,6 +754,7 @@ class PredictionSmokeTests(unittest.TestCase):
             "decode_worker_count": 1,
             "preemption_policy": "lifo",
             "router_policy": "round_robin",
+            "price_per_hour": 98.32,
         }
         job_features = {
             "type": "batch",
@@ -835,6 +849,60 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertIn("slo_margin", y_hat_cp)
         self.assertIn("kv_pressure_score", v_hat_cp)
         self.assertGreater(len(direct_x), 0)
+
+    def test_surrogate_full_aic_only_pp_smoke(self):
+        predictor = SurrogatePrediction(objective="batch")
+        job_config = {
+            "model_id": "nvidia/Llama-3.1-8B-Instruct-FP8",
+            "engine_name": "vllm",
+            "tp": 1,
+            "pp": 2,
+            "ep": 1,
+            "block_size": 64,
+            "max_num_seq": 8,
+            "max_num_batched_tokens": 512,
+            "gpu_mem_util": 0.9,
+            "price_per_hour": 98.32,
+        }
+        job_features = {
+            "type": "batch",
+            "cloud": "aws",
+            "region": "us-east-1",
+            "market": "reserved",
+            "zone": "use1-az1",
+            "gpu_type": "H200",
+            "instance_type": "p5e.48xlarge",
+            "isl_token_avg": 128,
+            "osl_token_avg": 32,
+            "target_p99_ttft_ms": 200,
+            "target_p99_tpot_ms": 10,
+        }
+        real_aic_estimate = predictor._aic_estimate
+
+        def sol_aic_estimate(**kwargs):
+            return real_aic_estimate(**{**kwargs, "database_mode": "SOL"})
+
+        predictor._aic_estimate = sol_aic_estimate
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            y_hat, v_hat = predictor.compose_prediction(
+                job_config=job_config,
+                job_features=job_features,
+                candidate_graph=MockCandidateGraph(),
+                method=("AIC_DynoSim",),
+            )
+
+        self.assertGreater(y_hat["p99_ttft_ms"], 0.0)
+        self.assertGreater(y_hat["p99_tpot_ms"], 0.0)
+        self.assertGreater(y_hat["throughput_token_per_sec"], 0.0)
+        self.assertTrue(math.isfinite(y_hat["p99_ttft_ms"]))
+        self.assertTrue(math.isfinite(y_hat["p99_tpot_ms"]))
+        self.assertTrue(math.isfinite(y_hat["throughput_token_per_sec"]))
+        self.assertIn("cost_per_token", y_hat)
+        self.assertEqual(v_hat["input_length_observed"], 128.0)
+        self.assertEqual(v_hat["output_length_observed"], 32.0)
+        self.assertGreater(v_hat["completed_requests"], 0)
+        self.assertEqual(v_hat["kv_pressure_score"], 0.0)
 
 
 if __name__ == "__main__":
