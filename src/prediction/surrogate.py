@@ -1,6 +1,6 @@
 import math
 
-from aiconfigurator_core.sdk.memory import (  # type: ignore[import-untyped]
+from aiconfigurator.sdk.memory import (  # type: ignore[import-untyped]
     estimate_num_gpu_blocks,
 )
 
@@ -168,24 +168,6 @@ class SurrogatePrediction:
         v_hat = self.merge_outputs(v_hat_direct, v_hat_derived)
         # final output
         return y_hat, v_hat
-
-    # def get_model_config(self, model_id):
-    #     # Fetch model architecture from Huggingface or a similar place
-    #     # Inputs: model_id
-    #     # Outputs: config.json
-    #     load_dotenv()
-    #     hf_token = os.getenv("HF_TOKEN")
-    #     if not hf_token:
-    #         raise ValueError("HF_TOKEN is not set")
-
-    #     config_path = hf_hub_download(
-    #         repo_id=model_id,
-    #         filename="config.json",
-    #         token=hf_token,
-    #     )
-
-    #     with open(config_path) as f:
-    #         return json.load(f)
 
     def get_env_row(self, job_features):
         # Fetch the Env and the cloud we want for the prediction
@@ -559,8 +541,11 @@ class SurrogatePrediction:
             raise SurrogateUnsupportedConfig("AIC_DynoSim needs gpu_type")
 
         pp = int(direct_x_values.get("pp") or 1)
-        if pp != 1:
-            raise SurrogateUnsupportedConfig("DynoSim AIC replay supports pp=1 only")
+        aic_only = pp != 1
+        if aic_only and direct_x_values.get("pd_enabled", False):
+            raise SurrogateUnsupportedConfig(
+                "AIC-only PP prediction supports aggregate serving only"
+            )
 
         engine_args = {
             "engine_type": direct_x_values.get("engine_name", "vllm"),
@@ -626,9 +611,14 @@ class SurrogatePrediction:
 
         engine_args = {key: value for key, value in engine_args.items() if value is not None}
         replay_args = {key: value for key, value in replay_args.items() if value is not None}
+        aic_args = {
+            "pp_size": pp,
+        }
 
         return {
             "method": method_name,
+            "aic_only": aic_only,
+            "aic_args": aic_args,
             "engine_args": engine_args,
             "replay_args": replay_args,
         }
@@ -655,13 +645,15 @@ class SurrogatePrediction:
                 memory_fraction_value=float(memory_x_values.get("gpu_mem_util") or 0.9),
                 tp_size=int(engine_args.get("aic_tp_size") or 1),
                 pp_size=int(memory_x_values.get("pp") or 1),
-                attention_dp_size=int(memory_x_values.get("aic_attention_dp_size") or 1),
+                # Not Koi X today; AIC uses attention_dp=1 unless explicitly injected.
+                # attention_dp_size=int(memory_x_values.get("aic_attention_dp_size") or 1),
                 moe_ep_size=engine_args.get("aic_moe_ep_size"),
-                gemm_quant_mode=memory_x_values.get("gemm_quant_mode"),
-                moe_quant_mode=memory_x_values.get("moe_quant_mode"),
-                kvcache_quant_mode=memory_x_values.get("kvcache_quant_mode"),
-                fmha_quant_mode=memory_x_values.get("fmha_quant_mode"),
-                comm_quant_mode=memory_x_values.get("comm_quant_mode"),
+                # Not Koi X today; AIC infers these from the model config or defaults.
+                # gemm_quant_mode=memory_x_values.get("gemm_quant_mode"),
+                # moe_quant_mode=memory_x_values.get("moe_quant_mode"),
+                # kvcache_quant_mode=memory_x_values.get("kvcache_quant_mode"),
+                # fmha_quant_mode=memory_x_values.get("fmha_quant_mode"),
+                # comm_quant_mode=memory_x_values.get("comm_quant_mode"),
                 gpu_memory_capacity_bytes_override=self._gpu_memory_capacity_bytes(memory_x_values),
                 allow_naive_fallback=False,
                 allow_hf_config_download=False,
@@ -726,7 +718,81 @@ class SurrogatePrediction:
         # Outputs: y_hat, v_hat
         if len(method) == 1 and method[0] == "AIC_DynoSim":
             # dont accumulate, just run the surrogate model
+            if surrogate_input.get("aic_only"):
+                return self.run_aic_only(surrogate_input)
             return self.run_aic_dynosim(surrogate_input)
+
+    def run_aic_only(self, surrogate_input):
+        engine_args = surrogate_input["engine_args"]
+        replay_args = surrogate_input["replay_args"]
+        aic_args = surrogate_input.get("aic_args") or {}
+
+        input_tokens = int(replay_args["input_tokens"])
+        output_tokens = int(replay_args["output_tokens"])
+        request_count = int(replay_args["request_count"])
+        expected_requests = int(
+            replay_args.get("expected_completed_requests")
+            or request_count * int(replay_args.get("turns_per_session") or 1)
+        )
+        num_workers = int(replay_args.get("num_workers") or 1)
+
+        try:
+            estimate = self._aic_estimate(
+                model_path=engine_args["aic_model_path"],
+                system_name=engine_args["aic_system"],
+                mode="agg",
+                backend_name=engine_args["aic_backend"],
+                backend_version=engine_args.get("aic_backend_version"),
+                isl=input_tokens,
+                osl=output_tokens,
+                batch_size=self._aic_batch_size(engine_args, replay_args),
+                ctx_tokens=int(engine_args.get("max_num_batched_tokens") or input_tokens),
+                tp_size=int(engine_args.get("aic_tp_size") or 1),
+                pp_size=int(aic_args.get("pp_size") or 1),
+                moe_ep_size=engine_args.get("aic_moe_ep_size"),
+            )
+        except Exception as exc:
+            raise self._aic_only_error(exc) from exc
+
+        raw = estimate.raw or {}
+        throughput = float(raw.get("tokens/s") or 0.0) * num_workers
+        raw_report = {
+            "completed_requests": expected_requests,
+            "total_input_tokens": input_tokens * expected_requests,
+            "total_output_tokens": output_tokens * expected_requests,
+            "p99_ttft_ms": estimate.ttft,
+            "p99_tpot_ms": estimate.tpot,
+            "output_throughput_tok_s": throughput,
+            "prefix_cache_reused_ratio": None,
+        }
+        return self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
+
+    @staticmethod
+    def _aic_batch_size(engine_args, replay_args):
+        if replay_args.get("replay_concurrency") is not None:
+            return max(1, int(replay_args["replay_concurrency"]))
+        max_num_seqs = int(engine_args.get("max_num_seqs") or 1)
+        max_num_tokens = int(engine_args.get("max_num_batched_tokens") or 0)
+        input_tokens = int(replay_args.get("input_tokens") or 0)
+        output_tokens = int(replay_args.get("output_tokens") or 0)
+        if max_num_tokens > 0 and input_tokens + output_tokens > 0:
+            return max(1, min(max_num_seqs, max_num_tokens // (input_tokens + output_tokens)))
+        return max(1, max_num_seqs)
+
+    @staticmethod
+    def _aic_estimate(**kwargs):
+        from aiconfigurator.cli.api import cli_estimate  # type: ignore[import-untyped]
+
+        return cli_estimate(**kwargs)
+
+    @staticmethod
+    def _aic_only_error(exc):
+        text = str(exc).lower()
+        if "oom" in text or "kv cache" in text or "kv-cache" in text or "does not fit" in text:
+            return SurrogateMemoryNoFit(f"AIC-only PP no-fit: {exc}")
+        if "unsupported" in text or "not supported" in text or "no database" in text:
+            return SurrogateUnsupportedConfig(f"AIC-only PP unsupported config: {exc}")
+        return SurrogateExecutionError(f"AIC-only PP execution failed: {exc}")
 
     def run_aic_dynosim(self, surrogate_input):
         # Run the AIC DynoSim model.
