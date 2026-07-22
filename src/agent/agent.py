@@ -125,6 +125,7 @@ class RLMRuntime:
         self.trace = trace or AgentTrace()
         self.namespace: dict[str, Any] = {}
         self._final: Any | None = None
+        self.last_joint: dict[str, Any] | None = None
         self.namespace["FINAL_VAR"] = self._final_var
 
     def _final_var(self, value):
@@ -828,6 +829,21 @@ class KoiAgentHarness:
         """
         self._current_tick = tick
         runtime = RLMRuntime(stdout_limit=self.stdout_limit, trace=self.trace)
+        # Capture the LLM's OWN jointly_select_placements result (side-effect-free)
+        # so the commit-time placement floor can hold the committed plan to at least
+        # what the solver handed it - without recomputing the pipeline or mutating
+        # _CTX. This is the net for the observed weak-root failure: solver returns
+        # chosen placements, then the root commits all-defer with rationale=null.
+        callables = agent_tools.all_callables()
+        _orig_joint = callables.get("jointly_select_placements")
+        if callable(_orig_joint):
+
+            def _joint_capture(*a, __orig=_orig_joint, __rt=runtime, **kw):
+                result = __orig(*a, **kw)
+                __rt.last_joint = result
+                return result
+
+            callables["jointly_select_placements"] = _joint_capture
         runtime.bind(
             cluster_snapshot=cluster_snapshot,
             state=cluster_snapshot,
@@ -838,7 +854,7 @@ class KoiAgentHarness:
             user_registry=self.user_registry,
             plan=None,
             tick=tick,
-            **agent_tools.all_callables(),
+            **callables,
         )
 
         history = [
@@ -872,7 +888,7 @@ class KoiAgentHarness:
             if not blocks:
                 final = runtime.extract_final_from_text(response)
                 if final is not None:
-                    return self._try_materialize(final, cluster_snapshot)
+                    return self._try_materialize(final, cluster_snapshot, runtime.last_joint)
                 history.append(
                     {
                         "role": "user",
@@ -892,7 +908,9 @@ class KoiAgentHarness:
                 if "ERROR:" in shown:
                     turn_had_error = True
                 if runtime.final_value is not None:
-                    return self._try_materialize(runtime.final_value, cluster_snapshot)
+                    return self._try_materialize(
+                        runtime.final_value, cluster_snapshot, runtime.last_joint
+                    )
 
             consecutive_errors = consecutive_errors + 1 if turn_had_error else 0
             if consecutive_errors >= self.consecutive_error_limit:
@@ -909,7 +927,7 @@ class KoiAgentHarness:
 
         leftover = runtime.namespace.get("plan")
         if leftover is not None:
-            return self._try_materialize(leftover, cluster_snapshot)
+            return self._try_materialize(leftover, cluster_snapshot, runtime.last_joint)
         return None
 
     def _compact_history(self, history: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -940,16 +958,16 @@ class KoiAgentHarness:
     # Plan materialization and fallback
     # ------------------------------------------------------------------
 
-    def _try_materialize(self, raw_plan, cluster_snapshot) -> Plan | None:
+    def _try_materialize(self, raw_plan, cluster_snapshot, baseline_joint=None) -> Plan | None:
         """Materialize a raw plan into a typed Plan, None when malformed."""
         try:
-            return self.materialize_plan(raw_plan, cluster_snapshot)
+            return self.materialize_plan(raw_plan, cluster_snapshot, baseline_joint)
         except (PlanMaterializationError, ValueError) as exc:
             self.trace.add("plan_materialization_failed", reason=str(exc))
             log.warning("plan materialization failed: %s", exc)
             return None
 
-    def materialize_plan(self, raw_plan, cluster_snapshot) -> Plan:
+    def materialize_plan(self, raw_plan, cluster_snapshot, baseline_joint=None) -> Plan:
         """Parse and validate the LLM's committed plan into a typed Plan.
 
         Parsing (Plan.from_raw) accepts the Plan-shaped dict, a plain
@@ -1011,6 +1029,14 @@ class KoiAgentHarness:
 
         if states is not None:
             self._autofill_coverage(plan, states)
+            # Placement floor: never SILENTLY discard a placement the solver found.
+            # Wrapped so a floor failure can only no-op (today's behavior), never
+            # break the commit.
+            if baseline_joint:
+                try:
+                    self._apply_placement_floor(plan, states, baseline_joint, cluster_snapshot)
+                except Exception as exc:
+                    log.warning("placement floor skipped (error): %s", exc)
 
         # Empty is valid only when the snapshot explicitly exposes an empty
         # job inventory. If inventory is unavailable, an empty commit gives us
@@ -1096,6 +1122,79 @@ class KoiAgentHarness:
                 job_id,
                 "DEFER" if state == "waiting" else "KEEP",
             )
+
+    def _apply_placement_floor(
+        self, plan: Plan, states: dict[str, str], baseline_joint, cluster_snapshot
+    ) -> None:
+        """Never SILENTLY discard a placement the solver already found.
+
+        The floor: a waiting job the plan defers WITHOUT a rationale is treated as a
+        fumbled commit - the observed weak-root failure, where the solver returned
+        chosen placements and the root then committed all-defer with rationale=null.
+        Such a job is back-filled from ``baseline_joint`` - the LLM's OWN last
+        jointly_select_placements result this trajectory - so the committed plan
+        serves at least what the solver handed it. This does NOT cap agency:
+
+          - A DEFER that carries an explicit rationale is an intentional
+            domain-knowledge call (e.g. saving capacity for an incoming job) and is
+            left untouched.
+          - The LLM may place MORE than the solver's baseline (enriched candidates);
+            the floor only prevents serving strictly FEWER by accident.
+          - No recompute and no _CTX mutation - we reuse the result the LLM already
+            produced, so there are no pipeline side effects at commit time.
+        """
+        chosen = (baseline_joint or {}).get("chosen") or []
+        if not chosen:
+            return
+        unexplained_ids = {
+            a.job_id
+            for a in plan.actions
+            if a.type == ActionType.DEFER
+            and states.get(a.job_id) == "waiting"
+            and not str(getattr(a, "rationale", "") or "").strip()
+        }
+        if not unexplained_ids:
+            return
+        baseline_plan = Plan.from_raw(chosen, tick=self._current_tick)
+        book = agent_tools._CTX.validated_budget_book
+        baseline_by_job = {
+            a.job_id: a
+            for a in baseline_plan.actions
+            if a.type in LADDER_ACTIONS and a.job_id in unexplained_ids
+        }
+        if not baseline_by_job:
+            return
+        patched: list = []
+        filled: list = []
+        for a in plan.actions:
+            repl = baseline_by_job.get(a.job_id) if a.type == ActionType.DEFER else None
+            if repl is None:
+                patched.append(a)
+                continue
+            try:
+                self._validate_ladder(repl, book, cluster_snapshot)
+            except PlanMaterializationError as exc:
+                # Baseline placement no longer validates (rare) - keep the defer.
+                log.warning(
+                    "placement floor: baseline placement for %s failed validation, "
+                    "leaving deferred: %s",
+                    a.job_id,
+                    exc,
+                )
+                patched.append(a)
+                continue
+            patched.append(repl)
+            filled.append(a.job_id)
+        if not filled:
+            return
+        plan.actions = patched
+        note = (
+            f"[placement-floor] {len(filled)} job(s) deferred with no rationale but "
+            f"already placed by the solver; back-filled from the solver result: "
+            f"{', '.join(filled)}."
+        )
+        plan.tick_rationale = ((plan.tick_rationale or "") + " " + note).strip()
+        log.warning("placement floor applied: %s", note)
 
     @staticmethod
     def _job_states(cluster_snapshot) -> dict[str, str] | None:
@@ -1236,7 +1335,17 @@ class KoiAgentHarness:
             "Placements sitting on the SLO edge cost you here.\n"
             "  - SwitchCost (weighted by lambda, churn): cost of moving a job "
             "off its current ladder (migration, reprice, disruption). Keeping "
-            "a good-enough config beats churning for a tiny gain.\n\n"
+            "a good-enough config beats churning for a tiny gain.\n"
+            "  - Beyond-target optimization (bounded secondary, per workload MODE): "
+            "once a job MEETS its SLO/demand target (J saturates at 0), Koi keeps "
+            "optimizing the mode-relevant axis - BATCH maximizes aggregate throughput, "
+            "ONLINE minimizes latency (ttft/tpot) - plus cost for both. This reward is "
+            "CAPPED (like cost): it ranks target-MEETING frames toward more throughput "
+            "/ lower latency / cheaper, but can NEVER outrank another job's target "
+            "MISS. So Koi satisfices EVERY job's target first (fairness), then spends "
+            "leftover capacity optimizing the mode axis. The per-mode objective "
+            "weights set the emphasis; SLO/demand targets stay HARD constraints "
+            "regardless of weights.\n\n"
             # ---------- WHEN TO DEFER ----------
             "WHEN TO DEFER - READ THIS. Do NOT gate placement on 'sigma > 0'. J "
             "is a distance to the ideal, so a good placement's sigma is typically "
@@ -1280,17 +1389,32 @@ class KoiAgentHarness:
             "then choose exactly one final Plan P_t and call "
             "FINAL_VAR(plan).\n\n"
             # ---------- MANDATORY ORDER ----------
-            "MANDATORY ORDER (budgets before specialists; cross-job GPU "
-            "competition is resolved JOINTLY afterward via "
-            "jointly_select_placements, NOT by the permissive budget). "
-            "Use this exact sequence, with no extra arguments: "
+            "MANDATORY ORDER. plan_tick() is your SAFE BASELINE - it runs the whole "
+            "pipeline below and returns a ready, feasible plan from the joint solver's "
+            "chosen placements: a guaranteed non-defer FLOOR you can commit as-is when "
+            "you have nothing to add. Your DOMAIN KNOWLEDGE and creativity belong in "
+            "the CANDIDATE SET, not in overriding the solver: propose "
+            "creative/heterogeneous ranks (spill a job across pools, pair a "
+            "low-latency rank with a cheap high-throughput one, try a quant or GPU the "
+            "mechanical menu skipped), size and score them, and ADD them to the pool "
+            "the solver chooses from - that is how you shape the decision. The solver "
+            "then makes the serve-vs-defer PICK; that arithmetic is ITS job. What you "
+            "must NEVER do is regress BELOW the baseline - do not commit a plan that "
+            "defers a job the solver placed feasibly just because its sigma is "
+            "negative (negative sigma is NORMAL and expected). If you enrich the "
+            "candidates, commit the solver's chosen from the enriched set (it serves "
+            "at least what plan_tick serves); otherwise commit FINAL_VAR(plan_tick()). "
+            "The pipeline (budgets before specialists; cross-job GPU "
+            "competition is resolved JOINTLY via "
+            "jointly_select_placements, NOT by the permissive budget), "
+            "with no extra arguments: "
             "build_user_envelopes(); priority = get_priority(); "
             "budget_book = allocate_budget_book(); "
             "validation = validate_budget_book(budget_book); "
             "if validation['ok']: specialist_results = run_job_specialists(); "
             "scored = build_scored_candidates(budget_book, specialist_results); "
-            "joint = jointly_select_placements(scored['candidates']); build the plan "
-            "from joint['chosen'] and check_feasibility it before FINAL_VAR. "
+            "joint = jointly_select_placements(scored['candidates']); the plan is "
+            "built from joint['chosen'] and check_feasibility'd before FINAL_VAR. "
             "budget_book is NOT a pre-existing REPL variable and NOT an "
             "object - you CREATE it by calling allocate_budget_book(); do not "
             "call budget_book.allocate(). It returns a dict shaped: "
@@ -1380,11 +1504,16 @@ class KoiAgentHarness:
             "cross-GPU-type frames, sizes them, drops only unrunnable/infeasible "
             "ones, and scores per-job sigma. Returns {'candidates': [...], "
             "'exhausted': {job_id: reason}, 'diagnostics': {job_id: [...]}}.\n"
-            "Worked pipeline (deterministic - you SUPERVISE, you do NOT write the loop):\n"
+            "Worked pipeline (you SUPERVISE and may ENRICH; the solver owns the pick):\n"
+            "    # Baseline floor - one call, guaranteed feasible non-defer plan:\n"
+            "    plan = plan_tick()\n"
+            "    # To inject domain knowledge, ENRICH the candidate pool, then let the\n"
+            "    # solver pick - do NOT hand-write defers:\n"
             "    scored = build_scored_candidates(budget_book, specialist_results)\n"
-            "    # candidates are sized, feasibility-passed, sigma-scored (incl. under-target)\n"
-            "    result = jointly_select_placements(scored['candidates'])\n"
-            "    plan = {'tick_rationale': '...', 'actions': result['chosen']}\n"
+            "    # candidates are sized, feasibility-passed, sigma-scored (incl. under-target);\n"
+            "    # append your own creative frames here (size_ladder + compute_sigma them first)\n"
+            "    result = jointly_select_placements(scored['candidates'])  # solver makes the pick\n"
+            "    plan = {'tick_rationale': '...', 'actions': result['chosen']}  # commit chosen, never all-defer\n"
             "    if check_feasibility(plan)['feasible']: FINAL_VAR(plan)\n"
             "COMMIT result['chosen'] AS-IS. The solver already made the "
             "serve-vs-defer call for every job (weighing each frame's sigma against "
@@ -1393,7 +1522,13 @@ class KoiAgentHarness:
             "ONLY jobs left unplaced are result['deferred'] / scored['exhausted']. "
             "Do not replace a non-empty result['chosen'] with an all-defer plan. "
             "A job in scored['exhausted'] has NO runnable frame at all; record the "
-            "reason in tick_rationale. Guard tool outputs before indexing.\n\n"
+            "reason in tick_rationale. Guard tool outputs before indexing. "
+            "DEFER CONTRACT: if you deliberately defer a job the solver COULD place "
+            "(domain-knowledge call - e.g. saving capacity for an incoming job), you "
+            "MUST put your reason in that action's 'rationale' field; it is then "
+            "honored. An UNEXPLAINED defer of a placeable job is treated as a mistake "
+            "and is automatically back-filled from the solver's placement, so silence "
+            "is never a way to drop a servable job.\n\n"
             f"{self._plan_schema_section()}"
             # ---------- MECHANICS ----------
             "Write Python in ```repl blocks. Print what you need to see. Think "
