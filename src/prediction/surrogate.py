@@ -213,6 +213,8 @@ class SurrogatePrediction:
             "GB10": "gb10",
             "B200": "b200_sxm",
             "B200_SXM": "b200_sxm",
+            "B300": "b300_sxm",
+            "B300_SXM": "b300_sxm",
             "H200": "h200_sxm",
             "H200_SXM": "h200_sxm",
             "H100": "h100_sxm",
@@ -558,7 +560,7 @@ class SurrogatePrediction:
             "max_num_batched_tokens": direct_x_values.get("max_num_batched_tokens"),
             "aic_backend": direct_x_values.get("engine_name", "vllm"),
             # AIC's bundled performance database currently supports this version.
-            "aic_backend_version": "0.14.0",
+            "aic_backend_version": "0.22.0",
             "aic_system": self.map_gpu_to_aic_system(gpu_type),
             "aic_model_path": model_id,
             "aic_tp_size": direct_x_values.get("tp", 1),
