@@ -273,6 +273,7 @@ class TickRunner:
                 next_state = FSMState.ABORT
             finally:
                 ctx.state_durations_ms[state.value] = (time.time() - t0) * 1000.0
+                self._persist_state(state, ctx)
             state = next_state
 
         ctx.state_history.append(state)
@@ -294,6 +295,16 @@ class TickRunner:
             FSMState.S6_DEPLOY: self.S6,
         }
         return handlers[state](ctx)
+
+    def _persist_state(self, state: FSMState, ctx: TickContext) -> None:
+        """Persist optional per-state debug events without affecting the FSM."""
+        sink = getattr(self.trace, "persist_state", None)
+        if not callable(sink):
+            return
+        try:
+            sink(state, ctx)
+        except Exception:
+            log.exception("state trace persist failed for %s at tick %d", state.value, ctx.tick)
 
     # ------------------------------------------------------------------
     # S0 - S6
@@ -585,8 +596,11 @@ class TickRunner:
         self._last_active_count = self._active_job_count(ctx)
 
         if self.trace is not None:
+            persist_tick = getattr(self.trace, "persist_tick", None)
+            if not callable(persist_tick):
+                return FSMState.S7_EXIT_TICK
             try:
-                self.trace.persist_tick(ctx)
+                persist_tick(ctx)
             except Exception:
                 log.exception("trace persist failed at tick %d", ctx.tick)
         return FSMState.S7_EXIT_TICK
@@ -614,8 +628,11 @@ class TickRunner:
         except Exception:
             log.exception("keep-all fallback deploy failed; cluster held this tick")
         if self.trace is not None:
+            persist_tick = getattr(self.trace, "persist_tick", None)
+            if not callable(persist_tick):
+                return
             try:
-                self.trace.persist_tick(ctx)
+                persist_tick(ctx)
             except Exception:
                 log.exception("trace persist failed at tick %d (abort)", ctx.tick)
 

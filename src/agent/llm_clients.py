@@ -42,6 +42,7 @@ For an 8K-context model (Gemma 2), set config={"k_max": 24,
 """
 
 import logging
+import time
 from typing import Any, cast
 
 log = logging.getLogger("koi.llm_clients")
@@ -131,6 +132,59 @@ class OpenAICompatClient:
             first["content"] = f"{prefix}\n\n{first['content']}"
             return [first, *rest[1:]]
         return [{"role": "user", "content": prefix}, *rest]
+
+
+class RecordingLLMClient:
+    """Wrap an LLM client and retain request/response transcripts."""
+
+    def __init__(
+        self,
+        inner,
+        *,
+        live: bool = False,
+        print_messages: bool = False,
+        log_string_limit: int = 1200,
+    ):
+        """Create a recording wrapper around an object exposing ``complete``."""
+        self.inner = inner
+        self.live = bool(live)
+        self.print_messages = bool(print_messages)
+        self.log_string_limit = int(log_string_limit)
+        self.calls: list[dict[str, Any]] = []
+
+    def complete(self, messages: list[dict[str, str]]) -> str:
+        """Run one completion, record it, and return the assistant text."""
+        call_index = len(self.calls)
+        copied_messages = [dict(message) for message in messages]
+        if self.live:
+            log.info("LLM call %d started", call_index)
+            if self.print_messages:
+                for message in copied_messages:
+                    log.info(
+                        "LLM call %d [%s]\n%s",
+                        call_index,
+                        message.get("role", "unknown"),
+                        self._compact(message.get("content", "")),
+                    )
+
+        started = time.time()
+        try:
+            response = self.inner.complete(messages)
+        except Exception:
+            raise
+
+        elapsed = round(time.time() - started, 3)
+        call = {"elapsed_sec": elapsed, "messages": copied_messages, "response": response}
+        self.calls.append(call)
+        if self.live:
+            log.info("LLM response %d (%.3fs)\n%s", call_index, elapsed, self._compact(response))
+        return response
+
+    def _compact(self, text: str) -> str:
+        """Return a bounded text preview for live logs."""
+        if self.log_string_limit <= 0 or len(text) <= self.log_string_limit:
+            return text
+        return text[: self.log_string_limit] + f"\n... [truncated at {self.log_string_limit} chars]"
 
 
 class MockLLMClient:

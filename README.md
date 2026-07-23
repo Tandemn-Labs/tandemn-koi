@@ -110,6 +110,32 @@ src/
   bootstrap/     seed tables · initialization
 ```
 
+## Running Koi
+
+Run the real Store-backed control loop from this repo root:
+
+```bash
+OPENAI_API_KEY='...' TANDEMN_USER_ID='usr_...' \
+.venv/bin/python -m src.orchestrator.runner \
+  --ticks 0 \
+  --tick-interval-sec 300 \
+  --telemetry-window-sec 300 \
+  --trace full \
+  --rust-log warn
+```
+
+Use `--ticks 1 --tick-interval-sec 0` for one debug tick. Koi writes validated
+plans to Tandemn Store; Tandemn-System/Orca and the metrics collector are still
+separate processes.
+
+Runner logs are written under `logs/koi/<run-id>/`:
+
+- `runner.log`: process log and compact tick summaries.
+- `events.jsonl`: structured tick, state, LLM, and agent debug events.
+
+`--trace summary` keeps logs compact. `--trace full` also records full LLM calls
+and agent REPL/tool traces before the runner clears per-tick memory buffers.
+
 Koi's DynoSim/AIC surrogate requires `aiconfigurator>=0.10.0` because Koi uses AIC's memory estimator before replay.
 
 ---
