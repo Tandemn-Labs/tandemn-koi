@@ -10,28 +10,36 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-STATE_FIELDS = {
+RAW_STATE_FIELDS = {
     "S0_ENTER_TICK": ("cluster_snapshot",),
-    "S1_OBSERVE": ("telemetry", "deployment_x"),
-    "S2_VALIDATE": ("evidence_rows",),
-    "S3_SLOW_UPDATE": ("new_slow_state",),
+    "S1_OBSERVE": ("telemetry", "deployment_x", "telemetry_diagnostics"),
+    "S2_VALIDATE": ("evidence_rows", "mechanism_diagnostics"),
+    "S3_SLOW_UPDATE": ("new_slow_state", "confidence_diagnostics", "slow_update_diagnostics"),
     "S4_AGENTIC_PLAN": ("candidate_plan",),
     "S5_VALIDATE_PLAN": ("validated_plan", "s5_repair_count"),
     "S6_DEPLOY": ("validated_plan", "deploy_acks"),
 }
+CURATED_STATE_FIELDS = {
+    "S1_OBSERVE": ("telemetry_diagnostics",),
+    "S2_VALIDATE": ("mechanism_diagnostics",),
+    "S3_SLOW_UPDATE": ("confidence_diagnostics", "slow_update_diagnostics"),
+    "S5_VALIDATE_PLAN": ("s5_repair_count",),
+    "S6_DEPLOY": ("deploy_acks",),
+}
 _COMPACT_LIMITS = {
-    "summary": {"depth": 4, "items": 8, "string": 500},
-    "full": {"depth": 8, "items": 80, "string": 5000},
+    "no-llm": {"depth": 4, "items": 8, "string": 500},
+    "errors": {"depth": 4, "items": 8, "string": 500},
+    "all": {"depth": 1_000_000, "items": 1_000_000, "string": 1_000_000_000},
 }
 
 
 class DebugLogger:
     """Write runner debug events to a per-run JSONL file."""
 
-    def __init__(self, log_dir: str | Path, trace: str = "summary", run_id: str | None = None):
+    def __init__(self, log_dir: str | Path, trace: str = "no-llm", run_id: str | None = None):
         """Create the run log directory and event paths."""
-        if trace not in {"summary", "full"}:
-            raise ValueError("trace must be 'summary' or 'full'")
+        if trace not in {"no-llm", "errors", "all"}:
+            raise ValueError("trace must be 'no-llm', 'errors', or 'all'")
         self.trace = trace
         self.run_id = run_id or self._default_run_id()
         self.run_dir = Path(log_dir) / self.run_id
@@ -42,11 +50,27 @@ class DebugLogger:
     def persist_runner_tick(self, ctx: Any, agent: Any, llm: Any) -> None:
         """Persist one tick's runner, agent, and LLM debug records."""
         self.write_event("tick_summary", self._tick_summary(ctx), tick=getattr(ctx, "tick", None))
-        self.write_event("llm_summary", self._llm_summary(llm), tick=getattr(ctx, "tick", None))
+        self.write_event(
+            "llm_summary",
+            self._llm_summary(llm, include_responses=self.trace == "all"),
+            tick=getattr(ctx, "tick", None),
+        )
         self.write_event(
             "agent_summary", self._agent_summary(agent), tick=getattr(ctx, "tick", None)
         )
-        if self.trace == "full":
+        if self.trace == "errors":
+            errors = [
+                {
+                    "call_index": call.get("call_index"),
+                    "elapsed_sec": call.get("elapsed_sec"),
+                    "error": call["error"],
+                }
+                for call in getattr(llm, "calls", []) or []
+                if call.get("error")
+            ]
+            if errors:
+                self.write_event("llm_errors", {"calls": errors}, tick=getattr(ctx, "tick", None))
+        if self.trace == "all":
             self.write_event(
                 "llm_calls",
                 {"calls": list(getattr(llm, "calls", []) or [])},
@@ -85,28 +109,34 @@ class DebugLogger:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         return f"{stamp}-pid{os.getpid()}"
 
-    @staticmethod
-    def _tick_summary(ctx: Any) -> dict[str, Any]:
+    def _tick_summary(self, ctx: Any) -> dict[str, Any]:
         """Return the compact tick outcome payload."""
-        return {
+        summary: dict[str, Any] = {
             "states": [state.value for state in getattr(ctx, "state_history", [])],
             "evidence_rows": len(getattr(ctx, "evidence_rows", []) or []),
-            "candidate_plan": _plan_summary(getattr(ctx, "candidate_plan", None)),
-            "validated_plan": _plan_summary(getattr(ctx, "validated_plan", None)),
             "deploy_acks": getattr(ctx, "deploy_acks", []) or [],
             "error": repr(getattr(ctx, "error", None)) if getattr(ctx, "error", None) else None,
             "state_durations_ms": getattr(ctx, "state_durations_ms", {}) or {},
         }
+        if self.trace == "all":
+            summary["candidate_plan"] = _compact(getattr(ctx, "candidate_plan", None), self.trace)
+            summary["validated_plan"] = _compact(getattr(ctx, "validated_plan", None), self.trace)
+        else:
+            summary["submitted_plan"] = _plan_summary(getattr(ctx, "validated_plan", None))
+        return summary
 
     @staticmethod
-    def _llm_summary(llm: Any) -> dict[str, Any]:
-        """Return call counts and response previews without full prompts."""
+    def _llm_summary(llm: Any, *, include_responses: bool) -> dict[str, Any]:
+        """Return LLM call metadata without leaking responses unless requested."""
         calls = list(getattr(llm, "calls", []) or [])
-        return {
+        summary: dict[str, Any] = {
             "call_count": len(calls),
             "elapsed_sec": round(sum(float(call.get("elapsed_sec", 0.0)) for call in calls), 3),
-            "responses": [_preview(call.get("response", "")) for call in calls],
+            "failed_call_count": sum(1 for call in calls if call.get("error")),
         }
+        if include_responses:
+            summary["responses"] = [_preview(call.get("response", "")) for call in calls]
+        return summary
 
     @staticmethod
     def _agent_summary(agent: Any) -> dict[str, Any]:
@@ -143,19 +173,22 @@ def _plan_summary(plan: Any) -> dict[str, Any] | None:
     }
 
 
-# TODO: REVIEW - add more fields, text, and compaction rules if traces are too large or insufficient.
 def _state_summary(state_name: str, ctx: Any, trace: str) -> dict[str, Any]:
-    """Return a compact debug payload for one FSM state."""
+    """Return raw or curated state fields for one FSM state."""
     out = {}
-    for field in STATE_FIELDS.get(state_name, ()):
+    fields = RAW_STATE_FIELDS if trace == "all" else CURATED_STATE_FIELDS
+    for field in fields.get(state_name, ()):
         value = getattr(ctx, field, None)
-        out[field] = _plan_summary(value) if field.endswith("plan") else _compact(value, trace)
+        if trace == "all" or not field.endswith("plan"):
+            out[field] = _compact(value, trace)
+        else:
+            out[field] = _plan_summary(value)
     return out
 
 
 def _compact(value: Any, trace: str, depth: int = 0) -> Any:
     """Convert runtime objects into bounded JSON-friendly debug values."""
-    limits = _COMPACT_LIMITS["full" if trace == "full" else "summary"]
+    limits = _COMPACT_LIMITS[trace]
     if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):

@@ -79,7 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-level", default=os.getenv("KOI_LOG_LEVEL", "INFO"))
     parser.add_argument("--log-dir", default=os.getenv("KOI_LOG_DIR", "logs/koi"))
     parser.add_argument("--run-id", default=os.getenv("KOI_RUN_ID"))
-    parser.add_argument("--trace", choices=("summary", "full"), default="summary")
+    parser.add_argument("--trace", choices=("no-llm", "errors", "all"), default="no-llm")
     parser.add_argument("--rust-log", default=os.getenv("RUST_LOG", "warn"))
     return parser.parse_args(argv)
 

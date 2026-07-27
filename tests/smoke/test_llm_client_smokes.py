@@ -22,13 +22,16 @@ class RecordingLLMClientSmokeTests(unittest.TestCase):
         self.assertIn("elapsed_sec", client.calls[0])
 
     def test_reraises_inner_client_errors(self):
-        """A failing inner client re-raises and records no transcript."""
+        """A failing inner client re-raises and records error metadata only."""
         client = RecordingLLMClient(_FailingLLMClient())
 
         with self.assertRaises(RuntimeError):
             client.complete([{"role": "user", "content": "question"}])
 
-        self.assertEqual(client.calls, [])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["call_index"], 0)
+        self.assertEqual(client.calls[0]["error"], "RuntimeError('boom')")
+        self.assertNotIn("messages", client.calls[0])
 
 
 class _FailingLLMClient:

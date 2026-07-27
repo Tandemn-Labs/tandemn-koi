@@ -3,11 +3,16 @@ from types import SimpleNamespace
 
 import numpy as np
 from src.core.candidate_graph import CandidateGraph
+from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
-from src.core.models import Mechanism, Node
+from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node
+from src.cost.dro import DRO
 from src.infra.deployment_x import build_deployment_x_index
 from src.infra.resource_map import ClusterResourceSnapshot
 from src.orchestrator.fsm_states import TickContext, TickRunner
+from src.validation.cusum import Cusum
+from src.validation.icp import ICP, ICPResult
+from src.validation.quadrants import Quadrant, QuadrantValidator
 
 ENV = "reserved|aws|us-east-2|use2-az3|H100"
 ENV_LABEL = tuple(ENV.split("|"))
@@ -191,6 +196,29 @@ def _candidate_graph():
     return CandidateGraph(nodes, {}, {})
 
 
+def _diagnostic_graph():
+    nodes = {name: Node(name, "X") for name in _x_fields()}
+    nodes["kv_cache_util"] = Node("kv_cache_util", "V")
+    nodes["p99_ttft_ms"] = Node("p99_ttft_ms", "Y")
+    x_to_v = Edge("gpu_mem_util->kv_cache_util", "gpu_mem_util", "kv_cache_util", "X", "V")
+    v_to_y = Edge("kv_cache_util->p99_ttft_ms", "kv_cache_util", "p99_ttft_ms", "V", "Y")
+    graph = CandidateGraph(
+        nodes,
+        {x_to_v.edge_id: x_to_v, v_to_y.edge_id: v_to_y},
+        {
+            x_to_v.edge_id: EdgeMetadata(x_to_v.edge_id),
+            v_to_y.edge_id: EdgeMetadata(v_to_y.edge_id),
+        },
+    )
+    mechanism = Mechanism(
+        mechanism_id="M_diagnostic",
+        edge_ids=[x_to_v.edge_id, v_to_y.edge_id],
+        scope={},
+        narrative="Diagnostic mechanism.",
+    )
+    return graph, mechanism
+
+
 def _catalog_x_assertions():
     return {
         "engine_name": "vllm",
@@ -337,6 +365,12 @@ class DeploymentXSmokeTests(unittest.TestCase):
         ctx = TickContext(tick=1, cluster_snapshot=_snapshot())
 
         runner.S1(ctx)
+        self.assertEqual(ctx.telemetry_diagnostics["expected_rank_count"], 1)
+        self.assertEqual(ctx.telemetry_diagnostics["observed_rank_count"], 1)
+        self.assertEqual(
+            ctx.telemetry_diagnostics["observed_ranks"][0]["v_sample_counts"],
+            {"kv_cache_util": 2},
+        )
         runner.S2(ctx)
 
         self.assertEqual(len(evidence_store.rows), 1)
@@ -398,6 +432,100 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(matched, {exact_id, partial_id})
         self.assertEqual(committed, {exact_id, partial_id, false_id})
 
+    def test_s2_records_mechanism_cusum_and_icp_diagnostics(self):
+        graph, mechanism = _diagnostic_graph()
+        evidence_store = _EvidenceStore()
+        runner = TickRunner(
+            evidence_store=evidence_store,
+            telemetry=_Telemetry(),
+            cusum=Cusum(),
+            icp=ICP(),
+            quadrant_validator=QuadrantValidator(),
+            confidence_service=SimpleNamespace(candidate_graph=graph),
+            slow_loop=_SlowLoop(),
+            dro=_Dro(),
+            mechanism_registry=_MechanismRegistry([mechanism]),
+            resource_map=_ResourceMap(),
+            agent=object(),
+            plan_validator=object(),
+            executor=object(),
+            candidate_graph=graph,
+        )
+        ctx = TickContext(tick=1, cluster_snapshot=_snapshot())
+
+        runner.S1(ctx)
+        runner.S2(ctx)
+
+        diagnostic = ctx.mechanism_diagnostics[0]
+        self.assertEqual(diagnostic["status"], "evaluated")
+        self.assertEqual(diagnostic["q_label"].value, "Q4")
+        self.assertEqual(diagnostic["cusum"]["V"][0]["name"], "kv_cache_util")
+        self.assertEqual(diagnostic["cusum"]["V"][0]["observed"], [0.2, 0.3])
+        self.assertEqual(diagnostic["cusum"]["V"][0]["predicted"], 0.1)
+        self.assertTrue(diagnostic["cusum"]["V"][0]["fired"])
+        self.assertEqual(diagnostic["icp"][0]["result"].value, "undecided")
+        self.assertEqual(diagnostic["icp"][0]["reason"], "no_evidence")
+
+    def test_s3_records_confidence_and_slow_dro_diagnostics(self):
+        graph, mechanism = _diagnostic_graph()
+        registry = MechanismRegistry(
+            mechanism_table={mechanism.mechanism_id: mechanism},
+            mechanism_metadata_table={
+                mechanism.mechanism_id: MechanismMetadata(mechanism.mechanism_id)
+            },
+        )
+        confidence = ConfidenceService(graph, registry)
+        dro = DRO()
+        slow_loop = _S3SlowLoop(dro)
+        runner = TickRunner(
+            evidence_store=object(),
+            telemetry=object(),
+            cusum=object(),
+            icp=object(),
+            quadrant_validator=object(),
+            confidence_service=confidence,
+            slow_loop=slow_loop,
+            dro=dro,
+            mechanism_registry=registry,
+            resource_map=object(),
+            agent=object(),
+            plan_validator=object(),
+            executor=object(),
+            candidate_graph=graph,
+            recalibrate_every=0,
+        )
+        ctx = TickContext(
+            tick=1,
+            evidence_rows=[
+                SimpleNamespace(
+                    row_id="1_job_1_rank_a",
+                    job_id="job_1",
+                    rank_id="rank_a",
+                    env_label=ENV_LABEL,
+                    q_label_per_mechanism={mechanism.mechanism_id: Quadrant.Q4},
+                    icp_result_per_edge=dict.fromkeys(mechanism.edge_ids, ICPResult.UNDECIDED),
+                    y_observed_mean={"p99_ttft_ms": 100.0},
+                    y_predicted={"p99_ttft_ms": 100.0},
+                )
+            ],
+        )
+
+        runner.S3(ctx)
+
+        confidence_change = ctx.confidence_diagnostics[0]
+        self.assertEqual(confidence_change["mechanism"]["before"]["beta"], 1.0)
+        self.assertEqual(confidence_change["mechanism"]["delta"], {"alpha": 0.0, "beta": 1.5})
+        self.assertEqual(confidence_change["mechanism"]["after"]["beta"], 2.5)
+        self.assertEqual(confidence_change["edges"][0]["icp_result"], "undecided")
+        self.assertEqual(confidence_change["edges"][0]["delta"], {"alpha": 0.0, "beta": 0.5})
+
+        slow_change = ctx.slow_update_diagnostics
+        self.assertEqual(slow_change["before"]["beta_t"], 0.5)
+        self.assertEqual(slow_change["after"]["beta_t"], 0.6)
+        self.assertEqual(slow_change["dro"]["coverage"]["inside_rows"], 1)
+        self.assertAlmostEqual(slow_change["dro"]["before"]["epsilon"], 0.15)
+        self.assertAlmostEqual(slow_change["dro"]["after"]["epsilon"], 0.1425)
+
 
 class _Telemetry:
     def collect_telemetry(self, tick_start, tick_end, snapshot):
@@ -419,6 +547,9 @@ class _EvidenceStore:
     def append_row(self, row):
         self.rows.append(row)
 
+    def get_rows_for_edge(self, edge_id, limit=None):
+        return []
+
 
 class _SlowLoop:
     def __init__(self):
@@ -437,6 +568,49 @@ class _SlowLoop:
         return {}
 
 
+class _S3SlowLoop:
+    def __init__(self, dro):
+        self.dro = dro
+        self.state = SimpleNamespace(
+            w_t={"p99_ttft_ms": 1.0},
+            z_star_t={"p99_ttft_ms": 100.0},
+            lambda_swit=0.05,
+            beta_t=0.5,
+            B_t=1,
+            epsilon_dro=0.15,
+            regret_slope=0.0,
+            q1_rate=0.0,
+            observed_swap_rate=0.0,
+            observed_coverage=0.9,
+            cusum_params_v={},
+            cusum_params_y={},
+            tick=0,
+        )
+
+    @staticmethod
+    def anneal_targets(tick):
+        return {"target_swap_rate": 0.1, "target_slope": 0.1}
+
+    def slow_update_all(
+        self,
+        tick,
+        observed_swap_rate,
+        observed_coverage,
+        r2_gradient,
+        target_overrides,
+    ):
+        self.state.tick = tick
+        self.state.observed_swap_rate = observed_swap_rate
+        self.state.observed_coverage = observed_coverage
+        self.state.beta_t = 0.6
+        self.state.B_t = 10
+        self.state.lambda_swit = 0.04
+        self.state.epsilon_dro = self.dro.update_epsilon_dro(
+            self.state.epsilon_dro, observed_coverage
+        )
+        return self.state
+
+
 class _Cusum:
     def cusum_params_per_v(self, name, residuals):
         return 0.0, 1.0
@@ -448,9 +622,12 @@ class _Dro:
 
 
 class _MechanismRegistry:
+    def __init__(self, mechanisms=()):
+        self.mechanisms = list(mechanisms)
+
     def find_applicable(self, context):
         self.context = context
-        return []
+        return [(mechanism, 1.0) for mechanism in self.mechanisms]
 
 
 class _ResourceMap:

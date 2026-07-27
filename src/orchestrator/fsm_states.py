@@ -110,8 +110,12 @@ class TickContext:
 
     cluster_snapshot: Any = None
     telemetry: Any = None
+    telemetry_diagnostics: dict[str, Any] = field(default_factory=dict)
     deployment_x: Any = None
     evidence_rows: list[Any] = field(default_factory=list)
+    mechanism_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    confidence_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    slow_update_diagnostics: dict[str, Any] = field(default_factory=dict)
     new_slow_state: Any = None
     candidate_plan: Any = None
     validated_plan: Any = None
@@ -334,6 +338,7 @@ class TickRunner:
             snapshot=ctx.cluster_snapshot,
         )
         ctx.deployment_x = self._build_deployment_x_index(ctx)
+        ctx.telemetry_diagnostics = self._telemetry_diagnostics(ctx)
         return FSMState.S2_VALIDATE
 
     def S2(self, ctx: TickContext) -> FSMState:
@@ -395,11 +400,23 @@ class TickRunner:
             cusum_per_mech: dict[str, Any] = {}
             q_per_mech: dict[str, Any] = {}
             touched_edge_ids: set = set()
+            rank_diagnostics: list[dict[str, Any]] = []
 
             for mech in applicable:
                 bundle = self._bundle(mech)
-                if not self._bundle_observable(bundle, v_obs, v_pred, y_obs, y_pred):
+                missing = self._missing_bundle_inputs(bundle, v_obs, v_pred, y_obs, y_pred)
+                if any(missing.values()):
                     q_per_mech[mech.mechanism_id] = None
+                    rank_diagnostics.append(
+                        {
+                            "job_id": job_id,
+                            "rank_id": rank_id,
+                            "mechanism_id": mech.mechanism_id,
+                            "status": "skipped",
+                            "missing": missing,
+                            "icp": [],
+                        }
+                    )
                     continue
                 touched_edge_ids.update(bundle.edge_ids)
                 v_verdict, y_verdict = self.cusum.cusum_per_mechanism(
@@ -414,15 +431,37 @@ class TickRunner:
                 )
                 cusum_per_mech[mech.mechanism_id] = (v_verdict, y_verdict)
                 q_per_mech[mech.mechanism_id] = self.qv.classify_quadrant(v_verdict, y_verdict)
+                rank_diagnostics.append(
+                    {
+                        "job_id": job_id,
+                        "rank_id": rank_id,
+                        "mechanism_id": mech.mechanism_id,
+                        "status": "evaluated",
+                        "cusum": self._cusum_diagnostics(
+                            bundle, v_obs, v_pred, y_obs, y_pred, v_params, y_params
+                        ),
+                        "q_label": q_per_mech[mech.mechanism_id],
+                        "_edge_ids": bundle.edge_ids,
+                    }
+                )
 
             icp_per_edge: dict[str, Any] = {}
+            icp_diagnostics: dict[str, dict[str, Any]] = {}
             for edge_id in sorted(touched_edge_ids):
                 edge = self._resolve_edge(edge_id)
                 if edge is None:
                     continue
-                icp_per_edge[edge_id] = self.icp.compute_icp_per_edge(
+                details = self.icp.compute_icp_details_per_edge(
                     edge=edge, evidence_store=self.evidence_store
                 )
+                icp_per_edge[edge_id] = details["result"]
+                icp_diagnostics[edge_id] = details
+
+            for diagnostic in rank_diagnostics:
+                edge_ids = diagnostic.pop("_edge_ids", [])
+                if edge_ids:
+                    diagnostic["icp"] = [icp_diagnostics[edge_id] for edge_id in edge_ids]
+            ctx.mechanism_diagnostics.extend(rank_diagnostics)
 
             j_realized = self._j_realized(y_observed_mean, w_t_snapshot, z_star_snapshot)
             deploy_timestamp = getattr(rank_telem, "deploy_timestamp_utc", None)
@@ -481,45 +520,105 @@ class TickRunner:
         accumulated residual history every recalibrate_every ticks.
         """
         did_confidence_update = False
+        ctx.confidence_diagnostics = []
+        slow_before = self._slow_state_snapshot()
         for row in ctx.evidence_rows:
             for mid, q in row.q_label_per_mechanism.items():
                 if q is None:
                     continue
+                mechanism_before = self._mechanism_confidence_snapshot(mid)
+                mechanism_delta = self.confidence_service.get_delta_c_mechanism(q)
                 self.confidence_service.apply_delta_c_mechanism(
                     mid, q, env_label=row.env_label, tick=ctx.tick
                 )
                 did_confidence_update = True
+                diagnostic = {
+                    "evidence_row_id": row.row_id,
+                    "job_id": row.job_id,
+                    "rank_id": row.rank_id,
+                    "mechanism_id": mid,
+                    "q_label": getattr(q, "value", q),
+                    "mechanism": {
+                        "before": mechanism_before,
+                        "delta": self._confidence_delta(mechanism_delta),
+                        "after": self._mechanism_confidence_snapshot(mid),
+                    },
+                    "edges": [],
+                }
                 try:
                     mech = self.mechanism_registry.get_mechanism(mid)
                 except KeyError:
                     log.warning("row %s references unknown mechanism %s", row.row_id, mid)
+                    ctx.confidence_diagnostics.append(diagnostic)
                     continue
                 for edge_id in mech.edge_ids:
                     icp_result = row.icp_result_per_edge.get(edge_id, ICPResult.UNDECIDED)
+                    edge_before = self._edge_confidence_snapshot(edge_id)
+                    edge_delta = self.confidence_service.get_delta_c_edge(q, icp_result)
                     self.confidence_service.apply_delta_c_edge(
                         edge_id, q, icp_result, env_label=row.env_label, tick=ctx.tick
                     )
+                    diagnostic["edges"].append(
+                        {
+                            "edge_id": edge_id,
+                            "icp_result": getattr(icp_result, "value", icp_result),
+                            "before": edge_before,
+                            "delta": self._confidence_delta(edge_delta),
+                            "after": self._edge_confidence_snapshot(edge_id),
+                        }
+                    )
+                ctx.confidence_diagnostics.append(diagnostic)
 
         flush_confidence = getattr(self.confidence_service, "flush", None)
         if did_confidence_update and callable(flush_confidence):
             flush_confidence()
 
+        observed_swap_rate = self._observed_swap_rate(ctx)
+        coverage = self._observed_coverage_details(ctx)
+        r2_gradient = self._r2_gradient(ctx)
+        target_overrides = self.slow_loop.anneal_targets(ctx.tick)
+        dro_before = self._dro_parameters()
         ctx.new_slow_state = self.slow_loop.slow_update_all(
             tick=ctx.tick,
-            observed_swap_rate=self._observed_swap_rate(ctx),
-            observed_coverage=self._observed_coverage(ctx),
-            r2_gradient=self._r2_gradient(ctx),
-            target_overrides=self.slow_loop.anneal_targets(ctx.tick),
+            observed_swap_rate=observed_swap_rate,
+            observed_coverage=coverage["value"],
+            r2_gradient=r2_gradient,
+            target_overrides=target_overrides,
         )
 
+        recalibration = {"ran": False}
         if (
             self.recalibrate_every > 0
             and ctx.tick > 0
             and ctx.tick % self.recalibrate_every == 0
             and hasattr(self.slow_loop, "recalibrate_cusum_params")
         ):
-            self.slow_loop.recalibrate_cusum_params()
+            recalibration = {
+                "ran": True,
+                "before_v": slow_before.get("cusum_params_v", {}),
+                "before_y": slow_before.get("cusum_params_y", {}),
+            }
+            params_v, params_y = self.slow_loop.recalibrate_cusum_params()
+            recalibration["after_v"] = params_v
+            recalibration["after_y"] = params_y
             log.info("CUSUM (delta, h) recalibrated at tick %d", ctx.tick)
+
+        ctx.slow_update_diagnostics = {
+            "inputs": {
+                "observed_swap_rate": observed_swap_rate,
+                "observed_coverage": coverage["value"],
+                "r2_gradient": r2_gradient,
+                "target_overrides": target_overrides,
+            },
+            "before": slow_before,
+            "after": self._slow_state_snapshot(),
+            "dro": {
+                "before": dro_before,
+                "after": self._dro_parameters(),
+                "coverage": coverage,
+            },
+            "cusum_recalibration": recalibration,
+        }
 
         return FSMState.S4_AGENTIC_PLAN
 
@@ -671,6 +770,42 @@ class TickRunner:
         )
         return any(job.get("active_chains") for job in jobs or [])
 
+    def _telemetry_diagnostics(self, ctx: TickContext) -> dict[str, Any]:
+        """Summarize S1 coverage without embedding raw telemetry rows."""
+        by_rank = getattr(ctx.deployment_x, "by_rank", {}) or {}
+        expected = {(str(job_id), str(rank_id)) for job_id, rank_id in by_rank}
+        observed = list(self.telemetry.iter_per_rank(ctx.telemetry))
+        observed_by_rank = {(str(rank.job_id), str(rank.rank_id)): rank for rank in observed}
+        return {
+            "window": {
+                "start": getattr(ctx.telemetry, "start", None),
+                "end": getattr(ctx.telemetry, "end", None),
+            },
+            "expected_rank_count": len(expected),
+            "observed_rank_count": len(observed_by_rank),
+            "missing_ranks": [
+                {"job_id": job_id, "rank_id": rank_id}
+                for job_id, rank_id in sorted(expected - set(observed_by_rank))
+            ],
+            "unexpected_ranks": [
+                {"job_id": job_id, "rank_id": rank_id}
+                for job_id, rank_id in sorted(set(observed_by_rank) - expected)
+            ],
+            "observed_ranks": [
+                {
+                    "job_id": job_id,
+                    "rank_id": rank_id,
+                    "v_sample_counts": {
+                        name: len(values) for name, values in rank.v_observed.items()
+                    },
+                    "y_sample_counts": {
+                        name: len(values) for name, values in rank.y_observed.items()
+                    },
+                }
+                for (job_id, rank_id), rank in sorted(observed_by_rank.items())
+            ],
+        }
+
     def _hardware_catalog(self) -> dict[str, Any]:
         getter = getattr(self.resource_map, "hardware_catalog", None)
         if not callable(getter):
@@ -767,13 +902,64 @@ class TickRunner:
     @staticmethod
     def _bundle_observable(bundle, v_obs, v_pred, y_obs, y_pred) -> bool:
         """True iff every bundle variable has observed AND predicted data."""
-        for name in bundle.bundle_v_variables:
-            if name not in v_obs or name not in v_pred:
-                return False
-        for name in bundle.bundle_y_outcomes:
-            if name not in y_obs or name not in y_pred:
-                return False
-        return True
+        return not any(
+            TickRunner._missing_bundle_inputs(bundle, v_obs, v_pred, y_obs, y_pred).values()
+        )
+
+    @staticmethod
+    def _missing_bundle_inputs(bundle, v_obs, v_pred, y_obs, y_pred) -> dict[str, list[str]]:
+        """Return missing CUSUM inputs grouped by trajectory type."""
+        return {
+            "v_observed": [name for name in bundle.bundle_v_variables if name not in v_obs],
+            "v_predicted": [name for name in bundle.bundle_v_variables if name not in v_pred],
+            "y_observed": [name for name in bundle.bundle_y_outcomes if name not in y_obs],
+            "y_predicted": [name for name in bundle.bundle_y_outcomes if name not in y_pred],
+        }
+
+    def _cusum_diagnostics(self, bundle, v_obs, v_pred, y_obs, y_pred, v_params, y_params):
+        """Return the exact per-variable CUSUM calculations for one mechanism."""
+        return {
+            "V": self._cusum_axis_diagnostics(bundle.bundle_v_variables, v_obs, v_pred, v_params),
+            "Y": self._cusum_axis_diagnostics(bundle.bundle_y_outcomes, y_obs, y_pred, y_params),
+        }
+
+    def _cusum_axis_diagnostics(self, names, observed, predicted, params):
+        """Return one CUSUM trace per named variable."""
+        traces = []
+        for name in sorted(names):
+            obs = np.asarray(observed[name], dtype=float)
+            prediction = predicted[name]
+            if np.isscalar(prediction):
+                pred = np.full_like(obs, float(prediction))
+                logged_prediction: float | list[float] = float(prediction)
+            else:
+                pred = np.asarray(prediction, dtype=float)
+                if pred.shape != obs.shape:
+                    raise ValueError(
+                        f"shape mismatch: observed {obs.shape} vs predicted {pred.shape}"
+                    )
+                logged_prediction = pred.tolist()
+            delta, h = params[name]
+            residuals = obs - pred
+            s_plus, s_minus, (direction, fired, fire_tick) = self.cusum.compute_cusum_statistic(
+                residuals, delta, h
+            )
+            traces.append(
+                {
+                    "name": name,
+                    "observed": obs.tolist(),
+                    "predicted": logged_prediction,
+                    "residual": residuals.tolist(),
+                    "delta": float(delta),
+                    "h": float(h),
+                    "s_plus": s_plus.tolist(),
+                    "s_minus": s_minus.tolist(),
+                    "direction": direction.value,
+                    "fired": fired,
+                    "first_fire_sample": fire_tick,
+                }
+            )
+        return traces
 
     def _resolve_cusum_params(
         self,
@@ -833,6 +1019,51 @@ class TickRunner:
     # S3 helpers
     # ------------------------------------------------------------------
 
+    def _mechanism_confidence_snapshot(self, mechanism_id: str) -> dict[str, float | int]:
+        """Return the current Beta posterior for one mechanism."""
+        alpha, beta = self.confidence_service.get_mechanism_alpha_beta(mechanism_id)
+        return {
+            "alpha": alpha,
+            "beta": beta,
+            "confidence": self.confidence_service.get_mechanism_confidence(mechanism_id),
+            "visit_count": self.confidence_service.get_mechanism_visit_count(mechanism_id),
+        }
+
+    def _edge_confidence_snapshot(self, edge_id: str) -> dict[str, float | int]:
+        """Return the current Beta posterior for one edge."""
+        alpha, beta = self.confidence_service.get_edge_alpha_beta(edge_id)
+        return {
+            "alpha": alpha,
+            "beta": beta,
+            "confidence": self.confidence_service.get_edge_confidence(edge_id),
+            "visit_count": self.confidence_service.get_edge_visit_count(edge_id),
+        }
+
+    @staticmethod
+    def _confidence_delta(delta: tuple[float, float]) -> dict[str, float]:
+        """Name the configured Beta increments for a log record."""
+        return {"alpha": float(delta[0]), "beta": float(delta[1])}
+
+    def _slow_state_snapshot(self) -> dict[str, Any]:
+        """Copy the slow-loop state before or after an S3 mutation."""
+        state = getattr(self.slow_loop, "state", None)
+        if state is None:
+            return {}
+        return dict(vars(state))
+
+    def _dro_parameters(self) -> dict[str, float | None]:
+        """Return the DRO controller values that affect epsilon updates."""
+        return {
+            "epsilon": self._float_or_none(getattr(self.dro, "epsilon", None)),
+            "target_coverage": self._float_or_none(getattr(self.dro, "target", None)),
+            "dead_band": self._float_or_none(getattr(self.dro, "dead_band", None)),
+        }
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        """Convert an optional numeric debug value without affecting control flow."""
+        return None if value is None else float(value)
+
     def _observed_swap_rate(self, ctx: TickContext) -> float:
         """Fraction of active jobs swapped by LAST tick's deployed plan.
 
@@ -846,8 +1077,8 @@ class TickRunner:
             return float(snapshot.observed_swap_rate())
         return 0.0
 
-    def _observed_coverage(self, ctx: TickContext) -> float:
-        """Fraction of this tick's outcomes inside their predicted DRO band.
+    def _observed_coverage_details(self, ctx: TickContext) -> dict[str, Any]:
+        """Return this tick's DRO coverage and the bands used to compute it.
 
         Bands are recomputed from each row's stored y_predicted with the
         current epsilon - one tick of epsilon drift versus the band that
@@ -856,13 +1087,47 @@ class TickRunner:
         """
         rows = [r for r in ctx.evidence_rows if r.y_observed_mean]
         if not rows:
-            return float(getattr(self.dro, "target", 0.90))
+            return {
+                "value": float(getattr(self.dro, "target", 0.90)),
+                "inside_rows": 0,
+                "row_count": 0,
+                "reason": "no_evidence",
+                "rows": [],
+            }
         inside = 0
+        row_details = []
         for row in rows:
             band = self.dro.compute_dro_band(row.y_predicted)
-            if self.dro._all_objectives_inside(row.y_observed_mean, band):
+            row_inside = self.dro._all_objectives_inside(row.y_observed_mean, band)
+            if row_inside:
                 inside += 1
-        return inside / len(rows)
+            objectives = {}
+            for name, observed in row.y_observed_mean.items():
+                objective_band = band.get(name)
+                if objective_band is None:
+                    objectives[name] = {"observed": float(observed), "band": None}
+                    continue
+                objectives[name] = {
+                    "observed": float(observed),
+                    "point": objective_band["point"],
+                    "lower": objective_band["lower"],
+                    "upper": objective_band["upper"],
+                    "inside": objective_band["lower"] <= observed <= objective_band["upper"],
+                }
+            row_details.append(
+                {
+                    "row_id": row.row_id,
+                    "inside": row_inside,
+                    "objectives": objectives,
+                }
+            )
+        return {
+            "value": inside / len(rows),
+            "inside_rows": inside,
+            "row_count": len(rows),
+            "reason": "measured",
+            "rows": row_details,
+        }
 
     def _r2_gradient(self, ctx: TickContext) -> dict[str, float] | None:
         """R2 Pareto-coverage gradient. None until implemented (v0).

@@ -170,11 +170,20 @@ class RecordingLLMClient:
         started = time.time()
         try:
             response = self.inner.complete(messages)
-        except Exception:
+        except Exception as exc:
+            elapsed = round(time.time() - started, 3)
+            self.calls.append(
+                {"call_index": call_index, "elapsed_sec": elapsed, "error": repr(exc)}
+            )
             raise
 
         elapsed = round(time.time() - started, 3)
-        call = {"elapsed_sec": elapsed, "messages": copied_messages, "response": response}
+        call = {
+            "call_index": call_index,
+            "elapsed_sec": elapsed,
+            "messages": copied_messages,
+            "response": response,
+        }
         self.calls.append(call)
         if self.live:
             log.info("LLM response %d (%.3fs)\n%s", call_index, elapsed, self._compact(response))
