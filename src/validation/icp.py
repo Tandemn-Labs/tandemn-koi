@@ -70,9 +70,43 @@ class ICP:
             at deploy time. This function just groups them by env and runs
             the chosen statistical test.
         """
+        return self.compute_icp_details_per_edge(
+            edge=edge,
+            evidence_store=evidence_store,
+            alpha_icp=alpha_icp,
+            min_envs=min_envs,
+            n_b=n_b,
+            test=test,
+            n_permutations=n_permutations,
+        )["result"]
+
+    def compute_icp_details_per_edge(
+        self,
+        edge,
+        evidence_store,
+        alpha_icp: float = 0.05,
+        min_envs: int = 3,
+        n_b: int = 15,
+        test: str = "f_test",
+        n_permutations: int = 1000,
+    ) -> dict:
+        """Return an ICP result with the statistics needed to interpret it."""
         rows = evidence_store.get_rows_for_edge(edge.edge_id, limit=None)
+        details = {
+            "edge_id": edge.edge_id,
+            "result": ICPResult.UNDECIDED,
+            "reason": "no_evidence",
+            "test": test,
+            "alpha": alpha_icp,
+            "minimum_environments": min_envs,
+            "minimum_samples_per_environment": n_b,
+            "source_row_count": len(rows),
+            "powered_environment_count": 0,
+            "environments": [],
+            "p_value": None,
+        }
         if not rows:
-            return ICPResult.UNDECIDED
+            return details
 
         by_env: dict[Hashable, list[float]] = defaultdict(list)
         for r in rows:
@@ -84,9 +118,20 @@ class ICP:
                 continue
             by_env[r.env_label].extend(np.asarray(residuals, dtype=float).ravel())
 
-        envs_with_power = [e for e, lst in by_env.items() if len(lst) >= n_b]
+        details["environments"] = [
+            {
+                "label": list(env) if isinstance(env, tuple) else env,
+                "sample_count": len(residuals),
+                "residual_mean": float(np.mean(residuals)),
+                "residual_std": float(np.std(residuals)),
+            }
+            for env, residuals in sorted(by_env.items(), key=lambda item: str(item[0]))
+        ]
+        envs_with_power = [env for env, residuals in by_env.items() if len(residuals) >= n_b]
+        details["powered_environment_count"] = len(envs_with_power)
         if len(envs_with_power) < min_envs:
-            return ICPResult.UNDECIDED
+            details["reason"] = "insufficient_environments"
+            return details
 
         residuals_by_env = {e: np.array(by_env[e], dtype=float) for e in envs_with_power}
 
@@ -97,11 +142,13 @@ class ICP:
         else:
             raise ValueError(f"Unknown test backend: {test!r}")
 
+        details["reason"] = "tested"
+        details["p_value"] = p_value
         if p_value < alpha_icp:
-            return ICPResult.REJECT
-        if p_value > 1.0 - alpha_icp:
-            return ICPResult.ACCEPT
-        return ICPResult.UNDECIDED
+            details["result"] = ICPResult.REJECT
+        elif p_value > 1.0 - alpha_icp:
+            details["result"] = ICPResult.ACCEPT
+        return details
 
     def compute_icp_for_mechanism(
         self,

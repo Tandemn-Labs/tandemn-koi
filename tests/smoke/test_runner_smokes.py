@@ -110,8 +110,8 @@ class RunnerSmokeTests(unittest.TestCase):
         self.assertEqual(agent.trace.events, [])
         self.assertEqual(llm.calls, [])
 
-    def test_run_ticks_writes_debug_logs_before_clearing_buffers(self):
-        """Full trace mode persists LLM calls and agent events."""
+    def test_run_ticks_all_trace_persists_llm_calls_and_agent_events(self):
+        """All trace mode persists LLM calls and agent events."""
         agent = _Agent()
         llm = _LLM()
 
@@ -121,7 +121,7 @@ class RunnerSmokeTests(unittest.TestCase):
             return _Context(tick)
 
         with tempfile.TemporaryDirectory() as log_dir:
-            debug_logger = DebugLogger(log_dir, trace="full", run_id="test-run")
+            debug_logger = DebugLogger(log_dir, trace="all", run_id="test-run")
             code = runner.run_ticks(
                 evidence_store=_Evidence(current_tick=0),
                 agent=agent,
@@ -144,6 +144,61 @@ class RunnerSmokeTests(unittest.TestCase):
         )
         self.assertEqual(events[3]["payload"]["calls"][0]["response"], "ok")
         self.assertEqual(events[4]["payload"]["events"][0]["kind"], "repl_exec")
+
+    def test_run_ticks_no_llm_trace_omits_llm_output(self):
+        """No-LLM trace mode retains decision metadata without transcripts."""
+        agent = _Agent()
+        llm = _LLM()
+
+        def run_tick(tick):
+            agent.trace.events.append({"kind": "repl_exec", "tick": tick})
+            llm.calls.append({"elapsed_sec": 0.1, "messages": [], "response": "secret"})
+            return _Context(tick)
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            debug_logger = DebugLogger(log_dir, trace="no-llm", run_id="no-llm-test")
+            runner.run_ticks(
+                evidence_store=_Evidence(current_tick=0),
+                agent=agent,
+                llm=llm,
+                requested_tick=None,
+                ticks=1,
+                run_tick_fn=run_tick,
+                debug_logger=debug_logger,
+            )
+            events = [
+                json.loads(line) for line in debug_logger.events_path.read_text().splitlines()
+            ]
+
+        self.assertEqual(
+            [event["kind"] for event in events], ["tick_summary", "llm_summary", "agent_summary"]
+        )
+        self.assertNotIn("responses", events[1]["payload"])
+
+    def test_errors_trace_writes_failed_llm_metadata_only(self):
+        """Error trace mode excludes prompts and responses from failed calls."""
+        llm = types.SimpleNamespace(
+            calls=[
+                {
+                    "call_index": 0,
+                    "elapsed_sec": 0.1,
+                    "error": "RuntimeError('boom')",
+                }
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            debug_logger = DebugLogger(log_dir, trace="errors", run_id="errors-test")
+            debug_logger.persist_runner_tick(_Context(1), _Agent(), llm)
+            events = [
+                json.loads(line) for line in debug_logger.events_path.read_text().splitlines()
+            ]
+
+        self.assertEqual(
+            [event["kind"] for event in events],
+            ["tick_summary", "llm_summary", "agent_summary", "llm_errors"],
+        )
+        self.assertEqual(events[3]["payload"]["calls"][0]["error"], "RuntimeError('boom')")
 
     def test_debug_logger_writes_state_snapshot(self):
         """State logging captures Store snapshot counts and resources."""
@@ -169,7 +224,7 @@ class RunnerSmokeTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as log_dir:
-            debug_logger = DebugLogger(log_dir, run_id="state-test")
+            debug_logger = DebugLogger(log_dir, trace="all", run_id="state-test")
             debug_logger.persist_state(FSMState.S0_ENTER_TICK, ctx)
             event = json.loads(debug_logger.events_path.read_text().splitlines()[0])
 
@@ -180,6 +235,50 @@ class RunnerSmokeTests(unittest.TestCase):
             snapshot["resources"]["reserved|aws|us-east-1|use1-az1|H100"]["gpu_type"], "H100"
         )
         self.assertEqual(snapshot["active_jobs"][0]["job_id"], "job_running")
+
+    def test_debug_logger_all_trace_preserves_raw_state_and_plan(self):
+        """All trace mode does not compact state fields or plan ladders."""
+        ctx = _Context(3)
+        ctx.cluster_snapshot = types.SimpleNamespace(
+            samples=list(range(81)),
+            long_value="x" * 5001,
+        )
+        ctx.candidate_plan = types.SimpleNamespace(
+            actions=[
+                types.SimpleNamespace(
+                    job_id="job_1",
+                    type="place",
+                    ladder=[
+                        types.SimpleNamespace(
+                            env=[
+                                "reserved",
+                                "aws",
+                                "us-east-1",
+                                "us-east-1a",
+                                "L40S",
+                            ],
+                            config={"gpu_count": 1, "tp": 1},
+                            n_replicas=2,
+                        )
+                    ],
+                )
+            ],
+            tick_rationale="place job_1",
+        )
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            debug_logger = DebugLogger(log_dir, trace="all", run_id="all-test")
+            debug_logger.persist_state(FSMState.S0_ENTER_TICK, ctx)
+            debug_logger.persist_state(FSMState.S4_AGENTIC_PLAN, ctx)
+            events = [
+                json.loads(line) for line in debug_logger.events_path.read_text().splitlines()
+            ]
+
+        self.assertEqual(events[0]["payload"]["cluster_snapshot"]["samples"], list(range(81)))
+        self.assertEqual(len(events[0]["payload"]["cluster_snapshot"]["long_value"]), 5001)
+        ladder = events[1]["payload"]["candidate_plan"]["actions"][0]["ladder"][0]
+        self.assertEqual(ladder["config"], {"gpu_count": 1, "tp": 1})
+        self.assertEqual(ladder["n_replicas"], 2)
 
     def test_tick_runner_persist_state_uses_trace_logger(self):
         """TickRunner forwards state events to trace_logger.persist_state."""
