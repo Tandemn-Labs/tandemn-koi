@@ -102,3 +102,45 @@ python -m dynamo.replay \
 ```
 uv pip install -r requirements.txt
 ```
+
+### 9. Koi-native composer
+
+`SurrogatePrediction` remains the authoritative AIC backend for DP, scenarios, memory preflight,
+PP, and structured errors. `SurrogateComposer` enriches that result without replacing the primary:
+
+```python
+from src.prediction.composer import SurrogateComposer
+from src.prediction.surrogate import SurrogatePrediction
+
+surrogate = SurrogateComposer(
+    primary=SurrogatePrediction(),
+    peer_mode="shadow",  # off | shadow | enabled
+    evidence_store=evidence_store,
+)
+```
+
+PerfDB correction defaults to `enabled`. `init_surrogate_stack` reads its CSV path from
+`KOI_PERFDB_PATH` when no explicit `perfdb_path` is passed. Without a configured path, the
+component remains `unconfigured` and does not alter AIC output.
+
+The composer preserves `compose_prediction(..., scenario=...)` and
+`compose_prediction_with_trace(...)`. Its order is:
+
+1. Direct AIC primary and structured safety failures.
+2. Omission-safe analytic memory/KV and TP/PP mediator V.
+3. Optional PerfDB correction, default off.
+4. Versioned Solver/BLIS peers, default shadow.
+5. Evidence-gated throughput fusion.
+6. One residual-calibration pass for eligible V/Y nodes.
+7. Re-derived cost and SLO outcomes.
+
+Analytic parallelism never applies a second PP correction to AIC Y. Learned fusion throughput is
+not residual-calibrated again. Cost and SLO margin are derived after any eligible correction.
+Schema-v3 lineage records normalized inputs, component statuses/versions/coverage, raw/final
+values, fusion/calibration decisions, timings, and the failure stage. Structured primary failures
+still propagate unchanged and prevent all later stages from running.
+
+The local EvidenceService preserves new lineage fields in a process-local sidecar when the
+installed Tandemn Store wire model lacks them. Restart-durable learned fusion therefore requires
+the Store schema to add `deployment_id`, `evidence_available_timestamp_utc`, and
+`prediction_lineage`.

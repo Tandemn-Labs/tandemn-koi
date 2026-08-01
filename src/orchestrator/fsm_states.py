@@ -65,6 +65,7 @@ lives in agent.py; the tools live in agent_tools.py.
 
 import logging
 import time
+import traceback
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -78,6 +79,7 @@ from src.core.models import (
     PlanAction,
 )
 from src.infra.deployment_x import build_deployment_x_index
+from src.observability.events import EventSink
 from src.validation.icp import ICPResult
 
 log = logging.getLogger("koi.fsm")
@@ -119,11 +121,13 @@ class TickContext:
 
     s5_repair_count: int = 0
     max_s5_repairs: int = 1
+    validation_attempts: list[Any] = field(default_factory=list)
 
     state_durations_ms: dict[str, float] = field(default_factory=dict)
     state_history: list[FSMState] = field(default_factory=list)
 
     error: Exception | None = None
+    error_traceback: str | None = None
     aborted_from_state: FSMState | None = None
 
 
@@ -180,6 +184,7 @@ class TickRunner:
         tchebycheff: Optional module exposing compute_tchebycheff, used to
             stamp J_realized on evidence rows. None -> J_realized = 0.0.
         trace_logger: Optional sink with persist_tick(ctx).
+        event_sink: Optional generic Koi event destination.
         tick_interval_sec: Tick period; S7 sleeps the remainder.
         recalibrate_every: Meta-cadence (ticks) for CUSUM (delta, h)
             recalibration. 0 disables.
@@ -208,6 +213,7 @@ class TickRunner:
         candidate_graph=None,
         tchebycheff=None,
         trace_logger=None,
+        event_sink: EventSink | None = None,
         tick_interval_sec: int = 300,
         recalibrate_every: int = 100,
         on_tick_start=None,
@@ -231,6 +237,7 @@ class TickRunner:
         )
         self.tchebycheff = tchebycheff
         self.trace = trace_logger
+        self.event_sink = event_sink
         self.tick_interval_sec = int(tick_interval_sec)
         self.recalibrate_every = int(recalibrate_every)
         self.on_tick_start = on_tick_start
@@ -260,19 +267,68 @@ class TickRunner:
         """
         ctx = TickContext(tick=tick_id, tick_started_at=time.time())
         state = FSMState.S0_ENTER_TICK
+        tick_started_ns = time.perf_counter_ns()
+        self._emit(
+            {
+                "event": "tick.started",
+                "component": "orchestrator.tick_runner",
+                "tick": tick_id,
+                "purpose": "run one closed Koi observation, learning, planning, and deployment loop",
+                "runner_configuration": {
+                    "tick_interval_sec": self.tick_interval_sec,
+                    "recalibrate_every": self.recalibrate_every,
+                    "max_s5_repairs": ctx.max_s5_repairs,
+                    "candidate_graph": self.candidate_graph,
+                    "components": {
+                        "telemetry": type(self.telemetry).__name__,
+                        "agent": type(self.agent).__name__,
+                        "validator": type(self.plan_validator).__name__,
+                        "executor": type(self.executor).__name__,
+                    },
+                },
+                "intended_first_state": state,
+            }
+        )
 
         while state not in (FSMState.S7_EXIT_TICK, FSMState.ABORT):
             ctx.state_history.append(state)
-            t0 = time.time()
+            state_input = self._state_input(state, ctx)
+            self._emit(
+                {
+                    "event": "tick.state.started",
+                    "component": "orchestrator.tick_runner",
+                    "tick": tick_id,
+                    "state": state,
+                    "purpose": self._state_purpose(state),
+                    "intended_operation": self._state_operation(state),
+                    "input": state_input,
+                }
+            )
+            state_started_ns = time.perf_counter_ns()
             try:
                 next_state = self._dispatch(state, ctx)
             except Exception as exc:
                 log.exception("FSM error in %s at tick %d", state.value, tick_id)
                 ctx.error = exc
+                ctx.error_traceback = "".join(traceback.format_exception(exc))
                 ctx.aborted_from_state = state
                 next_state = FSMState.ABORT
-            finally:
-                ctx.state_durations_ms[state.value] = (time.time() - t0) * 1000.0
+            elapsed_ms = (time.perf_counter_ns() - state_started_ns) / 1_000_000.0
+            ctx.state_durations_ms[state.value] = elapsed_ms
+            self._emit(
+                {
+                    "event": "tick.state.completed",
+                    "component": "orchestrator.tick_runner",
+                    "tick": tick_id,
+                    "state": state,
+                    "purpose": self._state_purpose(state),
+                    "elapsed_ms": elapsed_ms,
+                    "input": state_input,
+                    "output": self._state_output(state, ctx),
+                    "next_state": next_state,
+                    "error": ctx.error if next_state == FSMState.ABORT else None,
+                }
+            )
             state = next_state
 
         ctx.state_history.append(state)
@@ -280,6 +336,33 @@ class TickRunner:
             self._handle_abort(ctx)
         else:
             self._handle_s7(ctx)
+        self._persist_trace(ctx)
+        total_duration_ms = (time.perf_counter_ns() - tick_started_ns) / 1_000_000.0
+        self._emit(
+            {
+                "event": "tick.completed",
+                "component": "orchestrator.tick_runner",
+                "tick": tick_id,
+                "purpose": "record the complete tick outcome and next scheduling intent",
+                "status": "aborted" if ctx.error is not None else "completed",
+                "total_duration_ms": total_duration_ms,
+                "state_durations_ms": ctx.state_durations_ms,
+                "state_history": ctx.state_history,
+                "candidate_plan": ctx.candidate_plan,
+                "validated_plan": ctx.validated_plan,
+                "deploy_acks": ctx.deploy_acks,
+                "evidence_count": len(ctx.evidence_rows),
+                "validation_attempts": ctx.validation_attempts,
+                "error": ctx.error,
+                "error_traceback": ctx.error_traceback,
+                "aborted_from_state": ctx.aborted_from_state,
+                "next_tick_intent": {
+                    "tick": tick_id + 1,
+                    "delay_sec": self.tick_interval_sec,
+                    "operation": "observe runtime effects and repeat S0-S6",
+                },
+            }
+        )
         return ctx
 
     def _dispatch(self, state: FSMState, ctx: TickContext) -> FSMState:
@@ -358,7 +441,11 @@ class TickRunner:
         # if ctx.deployment_x is None:
         #     ctx.deployment_x = self._build_deployment_x_index(ctx)
 
+        rank_count = 0
+        observable_mechanism_count = 0
+        missing_bundle_count = 0
         for rank_telem in self.telemetry.iter_per_rank(ctx.telemetry):
+            rank_count += 1
             job_id = str(rank_telem.job_id)
             raw_rank_id = getattr(rank_telem, "rank_id", None)
             deployment = ctx.deployment_x.resolve(job_id, raw_rank_id)
@@ -384,10 +471,58 @@ class TickRunner:
             cusum_per_mech: dict[str, Any] = {}
             q_per_mech: dict[str, Any] = {}
             touched_edge_ids: set = set()
+            bundle_observability: dict[str, Any] = {}
 
             for mech in applicable:
                 bundle = self._bundle(mech)
-                if not self._bundle_observable(bundle, v_obs, v_pred, y_obs, y_pred):
+                missing_v = sorted(
+                    name
+                    for name in bundle.bundle_v_variables
+                    if name not in v_obs or name not in v_pred
+                )
+                missing_y = sorted(
+                    name
+                    for name in bundle.bundle_y_outcomes
+                    if name not in y_obs or name not in y_pred
+                )
+                observable = not missing_v and not missing_y
+                bundle_observability[mech.mechanism_id] = {
+                    "bundle_v_variables": bundle.bundle_v_variables,
+                    "bundle_y_outcomes": bundle.bundle_y_outcomes,
+                    "observable": observable,
+                    "missing_v": missing_v,
+                    "missing_y": missing_y,
+                }
+                if observable:
+                    observable_mechanism_count += 1
+                else:
+                    missing_bundle_count += 1
+
+            self._emit(
+                {
+                    "event": "evidence.rank.started",
+                    "component": "validation.evidence",
+                    "tick": ctx.tick,
+                    "job_id": job_id,
+                    "rank_id": rank_id,
+                    "purpose": "turn one deployed rank's observations into mechanism and edge evidence",
+                    "telemetry": rank_telem,
+                    "deployment": deployment,
+                    "deployment_x": x,
+                    "environment": env_label,
+                    "observed": {"v": v_obs, "y": y_obs},
+                    "predicted": {"v": v_pred, "y": y_pred},
+                    "residuals": {"v": residuals_per_v, "y": residuals_per_y},
+                    "cusum_parameters": {"v": v_params, "y": y_params},
+                    "committed_mechanism_id": committed,
+                    "applicable_mechanisms": applicable,
+                    "bundle_observability": bundle_observability,
+                }
+            )
+
+            for mech in applicable:
+                bundle = self._bundle(mech)
+                if not bundle_observability[mech.mechanism_id]["observable"]:
                     q_per_mech[mech.mechanism_id] = None
                     continue
                 touched_edge_ids.update(bundle.edge_ids)
@@ -442,11 +577,52 @@ class TickRunner:
                 # forward-looking sigma terms (EIG, switch cost) are zero at
                 # observation time; v0 stamps the realized exploit term only
                 sigma_realized=j_realized,
+                deployment_id=(deployment.prediction_lineage or {}).get("deployment_id"),
+                evidence_available_timestamp_utc=time.time(),
+                prediction_lineage=deployment.prediction_lineage,
             )
             self.evidence_store.append_row(row)
             ctx.evidence_rows.append(row)
 
             self.dro.append_residual_history(pred_y=y_pred, obs_y=y_observed_mean)
+
+            self._emit(
+                {
+                    "event": "evidence.rank.completed",
+                    "component": "validation.evidence",
+                    "tick": ctx.tick,
+                    "job_id": job_id,
+                    "rank_id": rank_id,
+                    "purpose": "record the complete evidence decision and durable append result",
+                    "applicable_mechanisms": applicable,
+                    "bundle_observability": bundle_observability,
+                    "residuals": {"v": residuals_per_v, "y": residuals_per_y},
+                    "cusum_outputs": cusum_per_mech,
+                    "quadrant_decisions": q_per_mech,
+                    "icp_results": icp_per_edge,
+                    "evidence_row": row,
+                    "append_result": {
+                        "appended": True,
+                        "row_id": row.row_id,
+                        "context_evidence_count": len(ctx.evidence_rows),
+                    },
+                    "dro_residual_history_appended": True,
+                }
+            )
+
+        self._emit(
+            {
+                "event": "evidence.tick.completed",
+                "component": "validation.evidence",
+                "tick": ctx.tick,
+                "purpose": "summarize evidence generation for the tick",
+                "rank_count": rank_count,
+                "evidence_row_count": len(ctx.evidence_rows),
+                "observable_mechanism_count": observable_mechanism_count,
+                "missing_bundle_count": missing_bundle_count,
+                "row_ids": [row.row_id for row in ctx.evidence_rows],
+            }
+        )
 
         return FSMState.S3_SLOW_UPDATE
 
@@ -470,12 +646,33 @@ class TickRunner:
         accumulated residual history every recalibrate_every ticks.
         """
         did_confidence_update = False
+        mechanism_update_count = 0
+        edge_update_count = 0
         for row in ctx.evidence_rows:
             for mid, q in row.q_label_per_mechanism.items():
                 if q is None:
                     continue
-                self.confidence_service.apply_delta_c_mechanism(
+                mechanism_input = {
+                    "mechanism_id": mid,
+                    "quadrant": q,
+                    "env_label": row.env_label,
+                    "tick": ctx.tick,
+                    "evidence_row_id": row.row_id,
+                }
+                mechanism_result = self.confidence_service.apply_delta_c_mechanism(
                     mid, q, env_label=row.env_label, tick=ctx.tick
+                )
+                mechanism_update_count += 1
+                self._emit(
+                    {
+                        "event": "confidence.mechanism.updated",
+                        "component": "learning.confidence_service",
+                        "tick": ctx.tick,
+                        "mechanism_id": mid,
+                        "purpose": "update mechanism confidence from decided rank evidence",
+                        "input": mechanism_input,
+                        "result": mechanism_result,
+                    }
                 )
                 did_confidence_update = True
                 try:
@@ -485,20 +682,69 @@ class TickRunner:
                     continue
                 for edge_id in mech.edge_ids:
                     icp_result = row.icp_result_per_edge.get(edge_id, ICPResult.UNDECIDED)
-                    self.confidence_service.apply_delta_c_edge(
+                    edge_input = {
+                        "edge_id": edge_id,
+                        "mechanism_id": mid,
+                        "quadrant": q,
+                        "icp_result": icp_result,
+                        "env_label": row.env_label,
+                        "tick": ctx.tick,
+                        "evidence_row_id": row.row_id,
+                    }
+                    edge_result = self.confidence_service.apply_delta_c_edge(
                         edge_id, q, icp_result, env_label=row.env_label, tick=ctx.tick
+                    )
+                    edge_update_count += 1
+                    self._emit(
+                        {
+                            "event": "confidence.edge.updated",
+                            "component": "learning.confidence_service",
+                            "tick": ctx.tick,
+                            "mechanism_id": mid,
+                            "edge_id": edge_id,
+                            "purpose": "update edge confidence using quadrant and ICP evidence",
+                            "input": edge_input,
+                            "result": edge_result,
+                        }
                     )
 
         flush_confidence = getattr(self.confidence_service, "flush", None)
         if did_confidence_update and callable(flush_confidence):
             flush_confidence()
 
-        ctx.new_slow_state = self.slow_loop.slow_update_all(
-            tick=ctx.tick,
-            observed_swap_rate=self._observed_swap_rate(ctx),
-            observed_coverage=self._observed_coverage(ctx),
-            r2_gradient=self._r2_gradient(ctx),
-            target_overrides=self.slow_loop.anneal_targets(ctx.tick),
+        slow_input = {
+            "tick": ctx.tick,
+            "observed_swap_rate": self._observed_swap_rate(ctx),
+            "observed_coverage": self._observed_coverage(ctx),
+            "r2_gradient": self._r2_gradient(ctx),
+            "target_overrides": self.slow_loop.anneal_targets(ctx.tick),
+        }
+        slow_started_ns = time.perf_counter_ns()
+        self._emit(
+            {
+                "event": "slow_loop.update.started",
+                "component": "learning.slow_loop",
+                "tick": ctx.tick,
+                "purpose": "refresh Koi's slow-timescale control state",
+                "input": slow_input,
+            }
+        )
+        ctx.new_slow_state = self.slow_loop.slow_update_all(**slow_input)
+        self._emit(
+            {
+                "event": "slow_loop.update.completed",
+                "component": "learning.slow_loop",
+                "tick": ctx.tick,
+                "purpose": "record refreshed slow-timescale control state",
+                "input": slow_input,
+                "output": ctx.new_slow_state,
+                "elapsed_ms": (time.perf_counter_ns() - slow_started_ns) / 1_000_000.0,
+                "confidence_update_counts": {
+                    "mechanisms": mechanism_update_count,
+                    "edges": edge_update_count,
+                    "flushed": bool(did_confidence_update and callable(flush_confidence)),
+                },
+            }
         )
 
         if (
@@ -520,12 +766,60 @@ class TickRunner:
         safety. On a repair iteration (from S5) the harness already holds
         the violations via receive_validator_feedback.
         """
-        ctx.candidate_plan = self.agent.run_agent_loop(
-            cluster_snapshot=ctx.cluster_snapshot,
-            slow_state=ctx.new_slow_state,
-            evidence_store=self.evidence_store,
-            mechanism_registry=self.mechanism_registry,
-            tick=ctx.tick,
+        call_input = {
+            "cluster_snapshot": ctx.cluster_snapshot,
+            "slow_state": ctx.new_slow_state,
+            "evidence_store": self.evidence_store,
+            "evidence_rows_this_tick": ctx.evidence_rows,
+            "mechanism_registry": self.mechanism_registry,
+            "tick": ctx.tick,
+            "repair_count": ctx.s5_repair_count,
+        }
+        started_ns = time.perf_counter_ns()
+        self._emit(
+            {
+                "event": "agent.call.started",
+                "component": "planning.agent",
+                "tick": ctx.tick,
+                "purpose": "produce a whole-cluster candidate plan from current evidence and slow state",
+                "input": call_input,
+                "next_validation": "S5 deterministic plan validation",
+            }
+        )
+        try:
+            ctx.candidate_plan = self.agent.run_agent_loop(
+                cluster_snapshot=ctx.cluster_snapshot,
+                slow_state=ctx.new_slow_state,
+                evidence_store=self.evidence_store,
+                mechanism_registry=self.mechanism_registry,
+                tick=ctx.tick,
+            )
+        except Exception as exc:
+            self._emit(
+                {
+                    "event": "agent.call.failed",
+                    "component": "planning.agent",
+                    "tick": ctx.tick,
+                    "purpose": "record a planner failure before tick fallback",
+                    "input": call_input,
+                    "error": exc,
+                    "traceback": "".join(traceback.format_exception(exc)),
+                    "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
+                    "next_step": "abort tick and submit keep-all fallback",
+                }
+            )
+            raise
+        self._emit(
+            {
+                "event": "agent.call.completed",
+                "component": "planning.agent",
+                "tick": ctx.tick,
+                "purpose": "record the candidate plan returned by the planner",
+                "input": call_input,
+                "candidate_plan": ctx.candidate_plan,
+                "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
+                "next_validation": "S5 deterministic plan validation",
+            }
         )
         return FSMState.S5_VALIDATE_PLAN
 
@@ -540,12 +834,86 @@ class TickRunner:
         if ctx.candidate_plan is None:
             log.warning("S4 returned no plan at tick %d; keep-all fallback", ctx.tick)
             ctx.validated_plan = self._fallback_keep_all(ctx)
+            decision = {
+                "attempt": len(ctx.validation_attempts) + 1,
+                "plan": None,
+                "result": None,
+                "decision": "fallback_keep_all",
+                "reason": "agent returned no candidate plan",
+                "fallback_plan": ctx.validated_plan,
+            }
+            ctx.validation_attempts.append(decision)
+            self._emit(
+                {
+                    "event": "plan.validation.fallback",
+                    "component": "validation.plan_validator",
+                    "tick": ctx.tick,
+                    "purpose": "preserve safety when the planner returns no usable plan",
+                    **decision,
+                    "next_step": FSMState.S6_DEPLOY,
+                }
+            )
             return FSMState.S6_DEPLOY
 
-        result = self.plan_validator.val_plan(
-            plan=ctx.candidate_plan,
-            cluster_snapshot=ctx.cluster_snapshot,
-            slow_state=ctx.new_slow_state,
+        attempt = len(ctx.validation_attempts) + 1
+        validation_started_ns = time.perf_counter_ns()
+        self._emit(
+            {
+                "event": "plan.validation.started",
+                "component": "validation.plan_validator",
+                "tick": ctx.tick,
+                "purpose": "check candidate plan constraints before executor submission",
+                "attempt": attempt,
+                "plan": ctx.candidate_plan,
+                "cluster_snapshot": ctx.cluster_snapshot,
+                "slow_state": ctx.new_slow_state,
+            }
+        )
+        try:
+            result = self.plan_validator.val_plan(
+                plan=ctx.candidate_plan,
+                cluster_snapshot=ctx.cluster_snapshot,
+                slow_state=ctx.new_slow_state,
+            )
+        except Exception as exc:
+            failed_attempt = {
+                "attempt": attempt,
+                "plan": ctx.candidate_plan,
+                "error": exc,
+                "traceback": "".join(traceback.format_exception(exc)),
+                "elapsed_ms": (time.perf_counter_ns() - validation_started_ns) / 1_000_000.0,
+            }
+            ctx.validation_attempts.append(failed_attempt)
+            self._emit(
+                {
+                    "event": "plan.validation.failed",
+                    "component": "validation.plan_validator",
+                    "tick": ctx.tick,
+                    "purpose": "record an unexpected validator failure before tick fallback",
+                    **failed_attempt,
+                    "next_step": "abort tick and submit keep-all fallback",
+                }
+            )
+            raise
+        attempt_record = {
+            "attempt": attempt,
+            "plan": ctx.candidate_plan,
+            "validation_result": result,
+            "feasible": bool(result.feasible),
+            "by_constraint": getattr(result, "by_constraint", None),
+            "violations": list(getattr(result, "violations", []) or []),
+            "elapsed_ms": (time.perf_counter_ns() - validation_started_ns) / 1_000_000.0,
+        }
+        ctx.validation_attempts.append(attempt_record)
+        self._emit(
+            {
+                "event": "plan.validation.completed",
+                "component": "validation.plan_validator",
+                "tick": ctx.tick,
+                "purpose": "record the complete constraint verdict for one plan attempt",
+                **attempt_record,
+                "next_step": "deploy" if result.feasible else "repair_or_fallback",
+            }
         )
         if result.feasible:
             ctx.validated_plan = ctx.candidate_plan
@@ -559,7 +927,52 @@ class TickRunner:
                 ctx.s5_repair_count,
                 result.violations,
             )
-            self.agent.receive_validator_feedback(result.violations)
+            feedback_started_ns = time.perf_counter_ns()
+            self._emit(
+                {
+                    "event": "plan.repair_feedback.started",
+                    "component": "planning.agent",
+                    "tick": ctx.tick,
+                    "purpose": "return deterministic violations to the planner for one repair",
+                    "attempt": attempt,
+                    "violations": result.violations,
+                    "candidate_plan": ctx.candidate_plan,
+                }
+            )
+            try:
+                feedback_result = self.agent.receive_validator_feedback(result.violations)
+            except Exception as exc:
+                self._emit(
+                    {
+                        "event": "plan.repair_feedback.failed",
+                        "component": "planning.agent",
+                        "tick": ctx.tick,
+                        "purpose": "record failure to deliver validation feedback",
+                        "attempt": attempt,
+                        "violations": result.violations,
+                        "error": exc,
+                        "traceback": "".join(traceback.format_exception(exc)),
+                        "elapsed_ms": (
+                            time.perf_counter_ns() - feedback_started_ns
+                        )
+                        / 1_000_000.0,
+                        "next_step": "abort tick and submit keep-all fallback",
+                    }
+                )
+                raise
+            self._emit(
+                {
+                    "event": "plan.repair_feedback.completed",
+                    "component": "planning.agent",
+                    "tick": ctx.tick,
+                    "purpose": "record planner acknowledgement of validation feedback",
+                    "attempt": attempt,
+                    "violations": result.violations,
+                    "result": feedback_result,
+                    "elapsed_ms": (time.perf_counter_ns() - feedback_started_ns) / 1_000_000.0,
+                    "next_step": FSMState.S4_AGENTIC_PLAN,
+                }
+            )
             return FSMState.S4_AGENTIC_PLAN
 
         log.warning(
@@ -569,6 +982,20 @@ class TickRunner:
             result.violations,
         )
         ctx.validated_plan = self._fallback_keep_all(ctx)
+        self._emit(
+            {
+                "event": "plan.validation.fallback",
+                "component": "validation.plan_validator",
+                "tick": ctx.tick,
+                "purpose": "preserve the running cluster after the repair budget is exhausted",
+                "attempt": attempt,
+                "candidate_plan": ctx.candidate_plan,
+                "validation_result": result,
+                "fallback_plan": ctx.validated_plan,
+                "decision": "fallback_keep_all",
+                "next_step": FSMState.S6_DEPLOY,
+            }
+        )
         return FSMState.S6_DEPLOY
 
     def S6(self, ctx: TickContext) -> FSMState:
@@ -579,16 +1006,62 @@ class TickRunner:
         The swap count recorded here feeds next tick's observed_swap_rate,
         which drives lambda_swit.
         """
-        ctx.deploy_acks = self.executor.send_to_executor(ctx.validated_plan)
+        started_ns = time.perf_counter_ns()
+        identifiers = self._plan_identifiers(ctx.validated_plan)
+        self._emit(
+            {
+                "event": "executor.call.started",
+                "component": "deployment.executor",
+                "tick": ctx.tick,
+                "purpose": "submit the fully validated plan to the deterministic executor",
+                "validated_plan": ctx.validated_plan,
+                **identifiers,
+                "acknowledgement_semantics": (
+                    "Store acknowledgements may confirm submission only; runtime effect is observed "
+                    "by later telemetry"
+                ),
+            }
+        )
+        try:
+            ctx.deploy_acks = self.executor.send_to_executor(ctx.validated_plan)
+        except Exception as exc:
+            self._emit(
+                {
+                    "event": "executor.call.failed",
+                    "component": "deployment.executor",
+                    "tick": ctx.tick,
+                    "purpose": "record executor submission failure before tick fallback",
+                    "validated_plan": ctx.validated_plan,
+                    **identifiers,
+                    "error": exc,
+                    "traceback": "".join(traceback.format_exception(exc)),
+                    "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
+                    "next_step": "abort tick and attempt keep-all submission",
+                }
+            )
+            raise
 
         self._last_swap_count = self._count_plan_swaps(ctx)
         self._last_active_count = self._active_job_count(ctx)
-
-        if self.trace is not None:
-            try:
-                self.trace.persist_tick(ctx)
-            except Exception:
-                log.exception("trace persist failed at tick %d", ctx.tick)
+        self._emit(
+            {
+                "event": "executor.call.completed",
+                "component": "deployment.executor",
+                "tick": ctx.tick,
+                "purpose": "record plan submission acknowledgements and next-tick bookkeeping",
+                "validated_plan": ctx.validated_plan,
+                "acknowledgements": ctx.deploy_acks,
+                **identifiers,
+                "acknowledgement_semantics": (
+                    "Store acknowledgements may confirm submission only; runtime effect is observed "
+                    "by later telemetry"
+                ),
+                "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
+                "swap_count": self._last_swap_count,
+                "active_job_count": self._last_active_count,
+                "next_step": FSMState.S7_EXIT_TICK,
+            }
+        )
         return FSMState.S7_EXIT_TICK
 
     # ------------------------------------------------------------------
@@ -608,16 +1081,277 @@ class TickRunner:
 
     def _handle_abort(self, ctx: TickContext) -> None:
         """Deploy the keep-all fallback after an unrecoverable error."""
+        self._emit(
+            {
+                "event": "tick.abort.started",
+                "component": "orchestrator.tick_runner",
+                "tick": ctx.tick,
+                "state": ctx.aborted_from_state,
+                "purpose": "recover to the safe running-cluster state after an unhandled error",
+                "error": ctx.error,
+                "traceback": ctx.error_traceback,
+                "next_step": "build and submit keep-all fallback plan",
+            }
+        )
         try:
             ctx.validated_plan = self._fallback_keep_all(ctx)
+            self._emit(
+                {
+                    "event": "tick.abort.fallback_plan.created",
+                    "component": "orchestrator.tick_runner",
+                    "tick": ctx.tick,
+                    "state": ctx.aborted_from_state,
+                    "purpose": "record the safe fallback decision",
+                    "original_error": ctx.error,
+                    "fallback_plan": ctx.validated_plan,
+                    "next_step": "submit fallback plan to executor",
+                }
+            )
+            started_ns = time.perf_counter_ns()
             ctx.deploy_acks = self.executor.send_to_executor(ctx.validated_plan)
-        except Exception:
+            self._emit(
+                {
+                    "event": "tick.abort.fallback_executor.completed",
+                    "component": "deployment.executor",
+                    "tick": ctx.tick,
+                    "state": ctx.aborted_from_state,
+                    "purpose": "record fallback plan submission acknowledgements",
+                    "fallback_plan": ctx.validated_plan,
+                    "acknowledgements": ctx.deploy_acks,
+                    "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
+                    "acknowledgement_semantics": (
+                        "Store acknowledgements may confirm submission only; runtime effect is observed "
+                        "by later telemetry"
+                    ),
+                }
+            )
+        except Exception as exc:
             log.exception("keep-all fallback deploy failed; cluster held this tick")
-        if self.trace is not None:
-            try:
-                self.trace.persist_tick(ctx)
-            except Exception:
-                log.exception("trace persist failed at tick %d (abort)", ctx.tick)
+            self._emit(
+                {
+                    "event": "tick.abort.fallback_executor.failed",
+                    "component": "deployment.executor",
+                    "tick": ctx.tick,
+                    "state": ctx.aborted_from_state,
+                    "purpose": "record failure of the safe fallback submission",
+                    "fallback_plan": ctx.validated_plan,
+                    "original_error": ctx.error,
+                    "fallback_error": exc,
+                    "traceback": "".join(traceback.format_exception(exc)),
+                    "next_step": "hold current cluster state until the next tick",
+                }
+            )
+
+    # ------------------------------------------------------------------
+    # Observability helpers
+    # ------------------------------------------------------------------
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.event_sink is None:
+            return
+        try:
+            self.event_sink.emit(event)
+        except Exception:
+            log.exception("tick event sink failed at tick %s", event.get("tick"))
+
+    def _persist_trace(self, ctx: TickContext) -> None:
+        if self.trace is None:
+            return
+        try:
+            self.trace.persist_tick(ctx)
+        except Exception as exc:
+            log.exception("trace persist failed at tick %d", ctx.tick)
+            self._emit(
+                {
+                    "event": "tick.trace_persistence.failed",
+                    "component": "orchestrator.tick_runner",
+                    "tick": ctx.tick,
+                    "purpose": "record failure to persist the existing per-tick artifact",
+                    "error": exc,
+                    "traceback": "".join(traceback.format_exception(exc)),
+                }
+            )
+
+    @staticmethod
+    def _state_purpose(state: FSMState) -> str:
+        return {
+            FSMState.S0_ENTER_TICK: "freeze one consistent cluster view and reset tick caches",
+            FSMState.S1_OBSERVE: "collect runtime telemetry and reconstruct deployment-time X",
+            FSMState.S2_VALIDATE: "convert rank observations into causal evidence",
+            FSMState.S3_SLOW_UPDATE: "update confidence and slow-timescale control state",
+            FSMState.S4_AGENTIC_PLAN: "produce a candidate whole-cluster plan",
+            FSMState.S5_VALIDATE_PLAN: "validate, repair, or safely replace the candidate plan",
+            FSMState.S6_DEPLOY: "submit the validated plan and retain executor acknowledgements",
+        }[state]
+
+    @staticmethod
+    def _state_operation(state: FSMState) -> str:
+        return {
+            FSMState.S0_ENTER_TICK: "snapshot_cluster_state",
+            FSMState.S1_OBSERVE: "collect_telemetry and build_deployment_x_index",
+            FSMState.S2_VALIDATE: "residuals, CUSUM, quadrants, ICP, EvidenceRow append",
+            FSMState.S3_SLOW_UPDATE: "confidence fan-out and slow_update_all",
+            FSMState.S4_AGENTIC_PLAN: "agent.run_agent_loop",
+            FSMState.S5_VALIDATE_PLAN: "plan_validator.val_plan and bounded repair",
+            FSMState.S6_DEPLOY: "executor.send_to_executor",
+        }[state]
+
+    def _state_input(self, state: FSMState, ctx: TickContext) -> dict[str, Any]:
+        try:
+            if state == FSMState.S0_ENTER_TICK:
+                return {
+                    "tick": ctx.tick,
+                    "on_tick_start_configured": self.on_tick_start is not None,
+                    "resource_map": self.resource_map,
+                }
+            if state == FSMState.S1_OBSERVE:
+                return {
+                    "telemetry_request": {
+                        "tick_start": ctx.tick - 1,
+                        "tick_end": ctx.tick,
+                    },
+                    "cluster_snapshot": ctx.cluster_snapshot,
+                    "candidate_graph_x_nodes": getattr(self.candidate_graph, "x", None),
+                }
+            if state == FSMState.S2_VALIDATE:
+                return {
+                    "cluster_snapshot": ctx.cluster_snapshot,
+                    "telemetry_bundle": ctx.telemetry,
+                    "deployment_x": ctx.deployment_x,
+                }
+            if state == FSMState.S3_SLOW_UPDATE:
+                return {
+                    "evidence_rows": ctx.evidence_rows,
+                    "previous_swap_count": self._last_swap_count,
+                    "previous_active_count": self._last_active_count,
+                }
+            if state == FSMState.S4_AGENTIC_PLAN:
+                return {
+                    "cluster_snapshot": ctx.cluster_snapshot,
+                    "slow_state": ctx.new_slow_state,
+                    "evidence_rows": ctx.evidence_rows,
+                    "mechanism_registry": self.mechanism_registry,
+                    "repair_count": ctx.s5_repair_count,
+                }
+            if state == FSMState.S5_VALIDATE_PLAN:
+                return {
+                    "candidate_plan": ctx.candidate_plan,
+                    "cluster_snapshot": ctx.cluster_snapshot,
+                    "slow_state": ctx.new_slow_state,
+                    "repair_count": ctx.s5_repair_count,
+                    "max_repairs": ctx.max_s5_repairs,
+                }
+            return {"validated_plan": ctx.validated_plan}
+        except Exception as exc:
+            return {"summary_error": exc, "context": ctx}
+
+    def _state_output(self, state: FSMState, ctx: TickContext) -> dict[str, Any]:
+        try:
+            if state == FSMState.S0_ENTER_TICK:
+                snapshot = ctx.cluster_snapshot
+                active = self._snapshot_collection(snapshot, "active_jobs_summary", "active_jobs")
+                pending = self._snapshot_collection(snapshot, "pending_jobs_summary", "pending_jobs")
+                resources = self._snapshot_value(snapshot, "resources_summary", "resources")
+                return {
+                    "cluster_snapshot": snapshot,
+                    "snapshot_version": getattr(snapshot, "state_version", None),
+                    "resources": resources,
+                    "active_jobs": active,
+                    "pending_jobs": pending,
+                    "counts": {
+                        "active_jobs": len(active),
+                        "pending_jobs": len(pending),
+                        "resource_environments": len(resources or {}),
+                    },
+                }
+            if state == FSMState.S1_OBSERVE:
+                deployments = getattr(ctx.deployment_x, "by_rank", {}) or {}
+                return {
+                    "telemetry_bundle": ctx.telemetry,
+                    "telemetry_summary": {
+                        "type": type(ctx.telemetry).__name__,
+                        "rank_count": self._rank_count(ctx.telemetry),
+                    },
+                    "deployment_x": ctx.deployment_x,
+                    "deployment_rank_identities": list(deployments.keys()),
+                    "deployment_catalog_use": {
+                        "hardware_catalog_required": bool(deployments),
+                        "model_catalogs_required": bool(deployments),
+                    },
+                }
+            if state == FSMState.S2_VALIDATE:
+                return {
+                    "evidence_rows": ctx.evidence_rows,
+                    "artifact_counts": {"evidence_rows": len(ctx.evidence_rows)},
+                }
+            if state == FSMState.S3_SLOW_UPDATE:
+                return {"new_slow_state": ctx.new_slow_state}
+            if state == FSMState.S4_AGENTIC_PLAN:
+                return {"candidate_plan": ctx.candidate_plan}
+            if state == FSMState.S5_VALIDATE_PLAN:
+                return {
+                    "validated_plan": ctx.validated_plan,
+                    "validation_attempts": ctx.validation_attempts,
+                    "repair_count": ctx.s5_repair_count,
+                }
+            return {
+                "validated_plan": ctx.validated_plan,
+                "deploy_acks": ctx.deploy_acks,
+                "artifact_counts": {"acknowledgements": len(ctx.deploy_acks)},
+            }
+        except Exception as exc:
+            return {"summary_error": exc, "context": ctx}
+
+    def _rank_count(self, telemetry_bundle: Any) -> int | None:
+        for attribute in ("ranks", "per_rank", "rank_telemetry"):
+            value = getattr(telemetry_bundle, attribute, None)
+            if value is not None:
+                try:
+                    return len(value)
+                except TypeError:
+                    return None
+        if isinstance(telemetry_bundle, list | tuple | dict):
+            return len(telemetry_bundle)
+        return None
+
+    @staticmethod
+    def _snapshot_collection(snapshot: Any, method: str, attribute: str) -> list[Any]:
+        if snapshot is None:
+            return []
+        accessor = getattr(snapshot, method, None)
+        value = accessor() if callable(accessor) else getattr(snapshot, attribute, [])
+        return list(value or [])
+
+    @staticmethod
+    def _snapshot_value(snapshot: Any, method: str, attribute: str) -> Any:
+        if snapshot is None:
+            return {}
+        accessor = getattr(snapshot, method, None)
+        return accessor() if callable(accessor) else getattr(snapshot, attribute, {})
+
+    @staticmethod
+    def _plan_identifiers(plan: Any) -> dict[str, Any]:
+        try:
+            actions = list(getattr(plan, "actions", []) or [])
+            ranks = [
+                rank
+                for action in actions
+                for rank in (getattr(action, "ladder", None) or [])
+            ]
+            deployment_ids = []
+            for rank in ranks:
+                lineage = getattr(rank, "prediction_lineage", None)
+                deployment_ids.append(
+                    lineage.get("deployment_id") if isinstance(lineage, dict) else None
+                )
+            return {
+                "action_ids": [getattr(action, "action_id", None) for action in actions],
+                "job_ids": [getattr(action, "job_id", None) for action in actions],
+                "rank_ids": [getattr(rank, "rank_id", None) for rank in ranks],
+                "deployment_ids": deployment_ids,
+            }
+        except Exception as exc:
+            return {"identifier_summary_error": exc}
 
     # ------------------------------------------------------------------
     # S2 helpers
@@ -696,7 +1430,7 @@ class TickRunner:
             if pred is None:
                 continue
             obs_arr = np.asarray(obs, dtype=float)
-            if isinstance(pred, (int, float)):
+            if isinstance(pred, int | float):
                 pred_arr = np.full_like(obs_arr, float(pred))
             else:
                 pred_arr = np.asarray(pred, dtype=float)

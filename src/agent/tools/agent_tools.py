@@ -84,12 +84,12 @@ Tool catalog:
 import logging
 import math
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from threading import Lock
 from typing import Any
 
-import numpy as np
 from src.config.hyperparameters import GAMMA_SLO
 from src.core.models import (
     LADDER_ACTIONS,
@@ -101,24 +101,11 @@ from src.core.models import (
     env_gpu_type,
 )
 from src.infra.deployment_x import build_rank_x
+from src.observability.events import EventSink
 from src.prediction.surrogate import (
     SurrogateExecutionError,
     SurrogateMemoryNoFit,
     SurrogateUnsupportedConfig,
-)
-
-# Residual calibration: debias the surrogate with observed (observed-predicted)
-# residuals from similar past deployments, so scoring uses reality-corrected
-# predictions as the performance database grows.
-CALIBRATION_WINDOW = 50  # ticks of evidence to draw similar rows from
-CALIBRATION_MIN_SAMPLES = 5  # below this, leave the objective uncorrected
-_NONNEGATIVE_Y = frozenset(
-    {
-        "throughput_token_per_sec",
-        "p99_ttft_ms",
-        "p99_tpot_ms",
-        "cost_per_token",
-    }
 )
 
 # The ONLY knobs the planner may propose: placement (where), topology, model
@@ -281,7 +268,7 @@ def _seeded_z_star(z_star: dict[str, Any] | None) -> dict[str, float]:
     numeric = [
         v
         for v in merged.values()
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+        if isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v)
     ]
     placeholder = _is_placeholder_z_star(numeric)
     for obj, default in DEFAULT_COLD_START_Z_STAR.items():
@@ -289,7 +276,7 @@ def _seeded_z_star(z_star: dict[str, Any] | None) -> dict[str, float]:
         degenerate = (
             v is None
             or isinstance(v, bool)
-            or not isinstance(v, (int, float))
+            or not isinstance(v, int | float)
             or not math.isfinite(v)
             or v <= 0
             or float(v) in _Z_STAR_UNSET_SENTINELS
@@ -327,6 +314,7 @@ class _ToolContext:
     user_registry = None
     specialist_runner = None
     tool_call_logger = None
+    event_sink: EventSink | None = None
     cluster_snapshot = None
 
     # Per-tick caches written by the budget tools.
@@ -346,7 +334,7 @@ def bind_tools(**components) -> None:
             confidence_service, candidate_graph, resource_map, surrogate,
             telemetry, cusum, icp, quadrant_validator, eig_module,
             tchebycheff_module, switchcost_module, plan_validator,
-            regret_calculator, user_registry, specialist_runner).
+            regret_calculator, user_registry, specialist_runner, event_sink).
             None values are ignored so partial rebinds are safe.
 
     Raises:
@@ -357,6 +345,14 @@ def bind_tools(**components) -> None:
             raise ValueError(f"bind_tools: unknown component {name!r}")
         if value is not None:
             setattr(_CTX, name, value)
+    surrogate = getattr(_CTX, "surrogate", None)
+    evidence_store = getattr(_CTX, "evidence_store", None)
+    if (
+        surrogate is not None
+        and evidence_store is not None
+        and hasattr(surrogate, "bind_evidence_store")
+    ):
+        surrogate.bind_evidence_store(evidence_store)
 
 
 def _require(*names: str) -> None:
@@ -514,7 +510,7 @@ def _logged_tool(name, fn, logger):
 
 def _env_key(env) -> str:
     """Normalize an env identifier (tuple or string) to a flat string key."""
-    if isinstance(env, (tuple, list)):
+    if isinstance(env, tuple | list):
         return "|".join(str(part) for part in env)
     return str(env)
 
@@ -568,7 +564,7 @@ def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None
     features = _sanitize_agent_features(dict(job_features or {}))
     env = None
     if rank.env is not None:
-        env = list(rank.env) if isinstance(rank.env, (list, tuple)) else str(rank.env).split("|")
+        env = list(rank.env) if isinstance(rank.env, list | tuple) else str(rank.env).split("|")
         if len(env) >= 5:
             features.update(
                 {
@@ -1678,6 +1674,11 @@ def size_ladder(
             return False
         return not (tpot_target is not None and tpot > tpot_target)
 
+    def _capacity_tps(y: dict) -> float:
+        point = _y_value(y, "throughput_token_per_sec")
+        lower = y.get("_throughput_token_per_sec_lower")
+        return min(point, float(lower)) if lower is not None and float(lower) > 0 else point
+
     def _dp_candidates(cap: int) -> list[int]:
         ds, d = [], 1
         while d <= cap:
@@ -1704,9 +1705,14 @@ def size_ladder(
         if not config_runnable(dict(r.config), payload["job_features"])[0]:
             return None
         try:
-            return _predict_outcome_core(
+            prediction = _predict_outcome_core(
                 payload["job_config"], payload["job_features"], scenario="peak"
-            ).get("y_hat", {})
+            )
+            y_hat = dict(prediction.get("y_hat", {}))
+            lower = prediction.get("throughput_token_per_sec_lower")
+            if lower is not None:
+                y_hat["_throughput_token_per_sec_lower"] = lower
+            return y_hat
         except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
             log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
             return None
@@ -1795,7 +1801,7 @@ def size_ladder(
                     reason = "overloaded at max DP" if d == max_by_cap else reason
                     continue
                 y_hat = y
-                tp = _y_value(y, "throughput_token_per_sec")
+                tp = _capacity_tps(y)
                 keeps_up = tp >= 0.99 * share if share > 0 else tp > 0
                 if _slo_ok(y) and keeps_up:
                     n_replicas, served, slo_ok, reason, met = d, share, True, "ok", True
@@ -1804,7 +1810,7 @@ def size_ladder(
                 # No DP up to capacity cleared SLO+keep-up at the full share. Take max
                 # capacity and serve the throughput it can push; the rest spills to
                 # the next rank. slo_ok=False here keeps meets_target honest.
-                tp = _y_value(y_hat, "throughput_token_per_sec")
+                tp = _capacity_tps(y_hat)
                 partial = min(share, tp)
                 if partial > 0:
                     n_replicas = _dp_candidates(max_by_cap)[-1]
@@ -2193,76 +2199,6 @@ def val_new_mechanisms(m_new) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
-def _similar_rows(
-    job_features: dict[str, Any], window: int = CALIBRATION_WINDOW, top_k: int = 80
-) -> list:
-    """Evidence rows from deployments similar to this job (for calibration).
-
-    Prefers the store's retrieval helper when present;
-    otherwise scans the recent window and filters by gpu_type / workload
-    type. Returns raw EvidenceRow objects (so callers can read residuals).
-    """
-    store = _CTX.evidence_store
-    if store is None:
-        return []
-    if hasattr(store, "retrieve_similar_rows"):
-        try:
-            return list(store.retrieve_similar_rows(job_features, top_k=top_k))
-        except Exception:
-            log.exception("retrieve_similar_rows failed; falling back to scan")
-    if not (hasattr(store, "get_rows_in_window") and hasattr(store, "current_tick")):
-        return []
-    current = store.current_tick()
-    rows = store.get_rows_in_window((max(0, current - window), current))
-    gpu = job_features.get("gpu_type")
-    typ = job_features.get("type")
-    if gpu or typ:
-        rows = [
-            r
-            for r in rows
-            if (gpu is None or env_gpu_type(r.env_label) == gpu)
-            and (typ is None or r.X.get("type") == typ or r.X.get("workload_type") == typ)
-        ]
-    return rows[-top_k:]
-
-
-def _residual_offsets(job_features: dict[str, Any], objectives) -> dict[str, float]:
-    """Mean observed residual (observed - predicted) per objective over
-    similar deployments. Objectives with < CALIBRATION_MIN_SAMPLES are
-    omitted (too noisy to correct)."""
-    rows = _similar_rows(job_features)
-    offsets: dict[str, float] = {}
-    for obj in objectives:
-        samples = []
-        for r in rows:
-            arr = getattr(r, "residuals_per_y", {}).get(obj)
-            if arr is not None and len(arr) > 0:
-                samples.append(float(np.mean(np.asarray(arr, dtype=float))))
-        if len(samples) >= CALIBRATION_MIN_SAMPLES:
-            offsets[obj] = float(np.mean(samples))
-    return offsets
-
-
-def _calibrate_y_hat(y_hat: dict[str, float], job_features: dict[str, Any]):
-    """Debias the surrogate's y_hat with empirical residual offsets.
-
-    calibrated = surrogate + mean(observed - predicted over similar rows),
-    clamped >= 0 for physically non-negative objectives. Returns
-    (calibrated_y_hat, offsets_applied).
-    """
-    offsets = _residual_offsets(job_features, list(y_hat.keys()))
-    calibrated: dict[str, float] = {}
-    for obj, val in y_hat.items():
-        if val is None:
-            calibrated[obj] = val
-            continue
-        corrected = float(val) + offsets.get(obj, 0.0)
-        if obj in _NONNEGATIVE_Y:
-            corrected = max(0.0, corrected)
-        calibrated[obj] = corrected
-    return calibrated, offsets
-
-
 def predict_outcome(
     config: dict[str, Any],
     mechanism: dict[str, Any] | None = None,
@@ -2270,24 +2206,19 @@ def predict_outcome(
     calibrate: bool = True,
     scenario: str = "mean",
 ) -> dict[str, Any]:
-    """Run the surrogate, debias it with evidence, attach the DRO band.
+    """Run the composed surrogate and attach the DRO band.
 
-    The mechanistic surrogate (Calculon/DynoSim) is kept pure; the
-    empirical residual correction is applied HERE as a thin calibration
-    layer so every scoring path (compute_sigma, size_ladder,
-    optimize_config) optimizes against reality-corrected numbers. As the
-    evidence database grows the surrogate's systematic error is learned
-    away. Cold start (no similar residuals) returns the raw surrogate.
+    SurrogateComposer exclusively owns fusion and residual calibration.
 
     Args:
         config: X variables for the candidate. May embed job_config and
             job_features sub-dicts; otherwise the whole dict is job_config.
         mechanism: Optional mechanism context, informational only.
         env: Optional canonical [market, cloud, region, zone, gpu_type].
-        calibrate: Apply the residual correction (default True).
+        calibrate: Allow composer calibration using evidence available now.
 
     Returns:
-        {"y_hat": calibrated dict, "y_hat_raw": surrogate dict,
+        {"y_hat": composed dict, "y_hat_raw": primary dict,
          "calibration_offsets": dict, "v_hat": dict, "dro_band": dict}.
     """
     if not isinstance(config, dict):
@@ -2313,41 +2244,141 @@ def _predict_outcome_core(
     """Run prediction with already trusted or sanitized inputs."""
     _require("candidate_graph", "dro", "surrogate")
     global _surrogate_calls
-    with _SURROGATE_EXECUTION_LOCK:
-        if scenario != "peak_all_multiturn_stress":
-            _surrogate_calls += 1
-            if _surrogate_calls > SURROGATE_CALL_BUDGET:
+    started_ns = time.perf_counter_ns()
+    stage = "budget"
+    call_index = _surrogate_calls
+    try:
+        with _SURROGATE_EXECUTION_LOCK:
+            budget_exempt = scenario == "peak_all_multiturn_stress"
+            if not budget_exempt:
+                _surrogate_calls += 1
+            call_index = _surrogate_calls
+            _emit_prediction_tool_event(
+                {
+                    "event": "prediction.tool.started",
+                    "component": "agent.tools.predict_outcome",
+                    "purpose": "score one candidate configuration for agent planning",
+                    **_prediction_tool_context(),
+                    "scenario": scenario,
+                    "calibrate": calibrate,
+                    "job_config": job_config,
+                    "job_features": job_features,
+                    "call_index": call_index,
+                    "call_budget": SURROGATE_CALL_BUDGET,
+                    "budget_exempt": budget_exempt,
+                }
+            )
+            if not budget_exempt and _surrogate_calls > SURROGATE_CALL_BUDGET:
                 raise SurrogateBudgetExceeded(
                     f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
                     "narrow to your best few candidate configs and reuse scored results."
                 )
-        result = _CTX.surrogate.compose_prediction(
-            job_config=job_config,
-            job_features=job_features,
-            candidate_graph=_CTX.candidate_graph,
-            method=("AIC_DynoSim",),
-            scenario=scenario,
+            stage = "surrogate"
+            if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
+                y_hat, v_hat, prediction_lineage = _CTX.surrogate.compose_prediction_with_trace(
+                    job_config=job_config,
+                    job_features=job_features,
+                    candidate_graph=_CTX.candidate_graph,
+                    method=("AIC_DynoSim",),
+                    scenario=scenario,
+                    as_of_timestamp_utc=time.time() if calibrate else None,
+                )
+            else:
+                result = _CTX.surrogate.compose_prediction(
+                    job_config=job_config,
+                    job_features=job_features,
+                    candidate_graph=_CTX.candidate_graph,
+                    method=("AIC_DynoSim",),
+                    scenario=scenario,
+                )
+                prediction_lineage = None
+                if isinstance(result, tuple) and len(result) == 2:
+                    y_hat, v_hat = result
+                else:
+                    y_hat = getattr(result, "y_hat", {}) or {}
+                    v_hat = getattr(result, "v_hat", {}) or {}
+        y_hat = y_hat or {}
+        y_hat_raw = ((prediction_lineage or {}).get("raw") or {}).get("y_hat") or dict(y_hat)
+        offsets = ((prediction_lineage or {}).get("calibration") or {}).get("offsets_y") or {}
+        lower_throughput = ((prediction_lineage or {}).get("fusion") or {}).get(
+            "lower_throughput"
         )
-    if isinstance(result, tuple) and len(result) == 2:
-        y_hat_raw, v_hat = result
-    else:
-        y_hat_raw = getattr(result, "y_hat", {}) or {}
-        v_hat = getattr(result, "v_hat", {}) or {}
-    y_hat_raw = y_hat_raw or {}
 
-    if calibrate and y_hat_raw:
-        y_hat, offsets = _calibrate_y_hat(y_hat_raw, job_features)
-    else:
-        y_hat, offsets = dict(y_hat_raw), {}
+        stage = "dro"
+        dro_band = _CTX.dro.compute_dro_band(y_hat or {})
+        output = {
+            "y_hat": y_hat or {},
+            "y_hat_raw": y_hat_raw,
+            "calibration_offsets": offsets,
+            "v_hat": v_hat or {},
+            "prediction_lineage": prediction_lineage,
+            "throughput_token_per_sec_lower": lower_throughput,
+            "dro_band": dro_band,
+        }
+        _emit_prediction_tool_event(
+            {
+                "event": "prediction.tool.completed",
+                "component": "agent.tools.predict_outcome",
+                "purpose": "return calibrated outcomes and uncertainty to agent planning",
+                **_prediction_tool_context(),
+                "scenario": scenario,
+                "calibrate": calibrate,
+                "job_config": job_config,
+                "job_features": job_features,
+                "call_index": call_index,
+                "call_budget": SURROGATE_CALL_BUDGET,
+                "y_hat": output["y_hat"],
+                "v_hat": output["v_hat"],
+                "prediction_lineage": prediction_lineage,
+                "lower_throughput": lower_throughput,
+                "dro_band": dro_band,
+                "duration_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
+            }
+        )
+        return output
+    except Exception as exc:
+        _emit_prediction_tool_event(
+            {
+                "event": "prediction.tool.failed",
+                "component": "agent.tools.predict_outcome",
+                "purpose": "record a failed candidate prediction without obscuring its inputs",
+                **_prediction_tool_context(),
+                "scenario": scenario,
+                "calibrate": calibrate,
+                "job_config": job_config,
+                "job_features": job_features,
+                "call_index": call_index,
+                "call_budget": SURROGATE_CALL_BUDGET,
+                "stage": stage,
+                "error": exc,
+                "traceback": "".join(traceback.format_exception(exc)),
+                "duration_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
+            }
+        )
+        raise
 
-    dro_band = _CTX.dro.compute_dro_band(y_hat or {})
-    return {
-        "y_hat": y_hat or {},
-        "y_hat_raw": y_hat_raw,
-        "calibration_offsets": offsets,
-        "v_hat": v_hat or {},
-        "dro_band": dro_band,
-    }
+
+def _emit_prediction_tool_event(event: dict[str, Any]) -> None:
+    sink = getattr(_CTX, "event_sink", None)
+    if sink is None:
+        return
+    try:
+        sink.emit(event)
+    except Exception:
+        log.exception("prediction tool event sink failed")
+
+
+def _prediction_tool_context() -> dict[str, Any]:
+    try:
+        snapshot = getattr(_CTX, "cluster_snapshot", None)
+        tick = getattr(snapshot, "tick", None)
+        if tick is None:
+            tick = getattr(
+                getattr(getattr(_CTX, "slow_loop", None), "state", None), "tick", None
+            )
+        return {"tick": tick}
+    except Exception:
+        return {"tick": None}
 
 
 def _attach_peak_multiturn_stress(action: dict[str, Any], job_features: dict[str, Any]) -> None:
@@ -2410,6 +2441,12 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
             )
             rank.predicted_y = dict(pred.get("y_hat_raw") or pred.get("y_hat") or {})
             rank.predicted_v = dict(pred.get("v_hat") or {})
+            lineage = dict(pred.get("prediction_lineage") or {})
+            if lineage:
+                lineage["deployment_id"] = (
+                    f"deploy:{action.job_id}:{rank.rank_id or 'rank'}:{time.time_ns()}"
+                )
+            rank.prediction_lineage = lineage or None
     return typed
 
 
@@ -2975,7 +3012,7 @@ def _applicable_mechanism_id(rank: dict[str, Any], features: dict[str, Any]) -> 
         vals = apps.get("mechanisms") or apps.get("applicable") or []
         if vals:
             return vals[0] if isinstance(vals[0], str) else vals[0].get("mechanism_id")
-    elif isinstance(apps, (list, tuple)) and apps:
+    elif isinstance(apps, list | tuple) and apps:
         return apps[0] if isinstance(apps[0], str) else apps[0].get("mechanism_id")
     return None
 
@@ -2996,7 +3033,7 @@ def _normalize_candidate_rank(raw: Any) -> dict[str, Any] | None:
         return None
     env = raw.get("env")
     cfg = raw.get("config")
-    if not (isinstance(env, (list, tuple)) and len(env) == 5 and isinstance(cfg, dict)):
+    if not (isinstance(env, list | tuple) and len(env) == 5 and isinstance(cfg, dict)):
         return None
     keep = (
         "instance_type",
@@ -3277,7 +3314,7 @@ def build_scored_candidates(
             spec_by_job[specialist_results["job_id"]] = specialist_results
         else:
             spec_by_job = {k: v for k, v in specialist_results.items() if isinstance(v, dict)}
-    elif isinstance(specialist_results, (list, tuple)):
+    elif isinstance(specialist_results, list | tuple):
         for result in specialist_results:
             if isinstance(result, dict) and result.get("job_id"):
                 spec_by_job[result["job_id"]] = result
@@ -3837,7 +3874,7 @@ def _materialize_ladder(ladder_ranks):
         env = r.get("env")
         # env arrives as a list from RankSpec.to_dict; envs() puts these in
         # a set, so coerce to a hashable tuple here.
-        rank.env = tuple(env) if isinstance(env, (list, tuple)) else env
+        rank.env = tuple(env) if isinstance(env, list | tuple) else env
         ladder.ranks.append(rank)
 
     applicable = {}
@@ -3874,7 +3911,7 @@ def _materialize_chain_list(chain_list):
         shape = c.get("shape_json") or {}
         config = c.get("config") or shape
         env = c.get("env") or c.get("target_node") or shape.get("env") or shape.get("target_node")
-        env = tuple(env) if isinstance(env, (list, tuple)) else env
+        env = tuple(env) if isinstance(env, list | tuple) else env
         chain_id = c.get("chain_id")
         if not chain_id:
             import hashlib

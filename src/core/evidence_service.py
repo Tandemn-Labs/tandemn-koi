@@ -7,7 +7,7 @@ than the current dictionary implementation.
 """
 
 from collections.abc import Iterator
-from dataclasses import asdict
+from dataclasses import asdict, fields, is_dataclass
 from typing import Any
 
 import numpy as np
@@ -73,12 +73,20 @@ def _normalize_array_dict(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _to_store_row(row: EvidenceRow) -> StoreEvidenceRow:
     """Convert Koi's EvidenceRow dataclass to Tandemn Store's wire row."""
-    return StoreEvidenceRow(**asdict(row))
+    data = asdict(row)
+    if is_dataclass(StoreEvidenceRow):
+        supported = {field.name for field in fields(StoreEvidenceRow)}
+    else:
+        supported = set(getattr(StoreEvidenceRow, "model_fields", data))
+    return StoreEvidenceRow(**{name: value for name, value in data.items() if name in supported})
 
 
 def _from_store_row(row: StoreEvidenceRow) -> EvidenceRow:
     """Convert Tandemn Store's EvidenceRow wire row to Koi's dataclass."""
     data = asdict(row)
+    data.setdefault("deployment_id", None)
+    data.setdefault("evidence_available_timestamp_utc", None)
+    data.setdefault("prediction_lineage", None)
     for field in ("residuals_per_v", "residuals_per_y"):
         data[field] = _normalize_array_dict(data.get(field, {}))
     data["cusum_per_mechanism"] = _normalize_cusum_pairs(row.cusum_per_mechanism)
@@ -98,6 +106,7 @@ class EvidenceService:
         self.user_id = user_id
         self._postgres_client = postgres_client or PostgresClient()
         self._store = StoreEvidenceStore(self._postgres_client)
+        self._lineage_cache: dict[str, tuple[str | None, float | None, dict | None]] = {}
 
     def append_row(self, row: EvidenceRow) -> str:
         """Persist one evidence row.
@@ -115,6 +124,11 @@ class EvidenceService:
         if self._store.get(row.row_id) is not None:
             raise ValueError(f"Row with ID {row.row_id} already exists")
         self._store.put(self.user_id, _to_store_row(row))
+        self._lineage_cache[row.row_id] = (
+            row.deployment_id,
+            row.evidence_available_timestamp_utc,
+            row.prediction_lineage,
+        )
         return row.row_id
 
     def get_row(self, job_id: str, rank_id: str) -> list[EvidenceRow]:
@@ -262,9 +276,14 @@ class EvidenceService:
                 if q is not None:
                     yield row, mid, q
 
-    @staticmethod
-    def _convert_many(rows) -> list[EvidenceRow]:
-        return [_from_store_row(row) for row in rows]
+    def _convert_many(self, rows) -> list[EvidenceRow]:
+        converted = [_from_store_row(row) for row in rows]
+        for row in converted:
+            cached = self._lineage_cache.get(row.row_id)
+            if cached is None:
+                continue
+            row.deployment_id, row.evidence_available_timestamp_utc, row.prediction_lineage = cached
+        return converted
 
     @staticmethod
     def _env_tuple(envs: Any) -> tuple[str, ...]:

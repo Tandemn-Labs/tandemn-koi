@@ -99,7 +99,7 @@ This repo — **Tandemn Intelligence (Koi)** — is the planning brain. **Tandem
 ```
 src/
   core/          data model · causal candidate graph · confidence · evidence · mechanism registry
-  prediction/    surrogate predictor (DynoSim/AIC) · Tchebycheff scalarization
+  prediction/    AIC composer · analytic V · PerfDB/peers · calibration · Tchebycheff
   cost/          DRO chance constraints · switch cost
   exploration/   EIG (expected information gain)
   validation/    CUSUM · ICP · four-quadrant classifier · C0–C7 plan validator
@@ -111,6 +111,61 @@ src/
 ```
 
 Koi's DynoSim/AIC surrogate requires `aiconfigurator>=0.10.0` because Koi uses AIC's memory estimator before replay.
+
+### Unified surrogate stack
+
+The direct AIC/DynoSim surrogate remains authoritative for DP, traffic scenarios, memory
+preflight, PP, and structured failures. `SurrogateComposer` adds canonical normalization,
+analytic memory/KV and communication mediators, optional PerfDB correction, Solver/BLIS peers,
+and one leakage-safe fusion/calibration stage. No sidecar bypasses the primary's safety checks.
+
+```python
+from src.bootstrap.initialization import init_surrogate_stack
+
+surrogate = init_surrogate_stack(
+    evidence_store=evidence_store,
+    peer_mode="shadow",  # off | shadow | enabled
+    # PerfDB correction defaults to enabled when KOI_PERFDB_PATH is configured.
+)
+```
+
+Configure the measured database with `KOI_PERFDB_PATH=/path/to/perfdb_all.csv`. If no path is
+configured, PerfDB reports `unconfigured` and the authoritative AIC result passes through.
+
+Analytic V is always omission-safe and never derates AIC outcomes. Shadow modes record measured
+and peer estimates without changing outcomes. Enabled fusion/calibration requires exact
+model/GPU/precision/workload/engine/scenario/DP context, matching versions, an explicit evidence
+cutoff, and at least five independent deployment groups. Every prediction carries schema-v3
+component statuses, coverage, versions, timings, raw/final values, and failure stage.
+
+### Detailed chronological events
+
+Koi can emit one durable JSONL stream containing full tick inputs/outputs, state transitions,
+telemetry and evidence, confidence/slow-loop updates, agent calls, validation attempts, executor
+acknowledgements, prediction-tool calls, and schema-v3 surrogate traces.
+
+```python
+from src.agent.tools import agent_tools
+from src.observability.events import ChronologicalEventLogger
+
+events = ChronologicalEventLogger(
+    "results/koi-events.jsonl",
+    run_id="experiment-001",
+)
+surrogate = init_surrogate_stack(
+    evidence_store=evidence_store,
+    event_sink=events,
+)
+agent_tools.bind_tools(event_sink=events, surrogate=surrogate)
+runner = TickRunner(
+    # Existing dependencies ...
+    event_sink=events,
+)
+```
+
+Each line has a monotonic sequence, UTC and monotonic timestamps, component, purpose, tick/state
+identity, full serializable input/output, timing, result, and next-step information. Logging is
+fail-open: serialization or sink errors never change a Koi decision.
 
 ---
 

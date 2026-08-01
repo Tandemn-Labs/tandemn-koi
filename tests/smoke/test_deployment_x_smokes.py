@@ -88,6 +88,7 @@ def _snapshot():
         "target_p99_tpot_ms": 40,
         "predicted_y": {"p99_ttft_ms": 90.0},
         "predicted_v": {"kv_cache_util": 0.1},
+        "prediction_lineage": {"schema_version": 2, "deployment_id": "deploy-a"},
     }
     return ClusterResourceSnapshot(
         tick=1,
@@ -287,6 +288,7 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(x["flops_per_param"], 989.5 / 70)
         self.assertEqual(deployment.y_predicted, {"p99_ttft_ms": 90.0})
         self.assertEqual(deployment.v_predicted, {"kv_cache_util": 0.1})
+        self.assertEqual(deployment.prediction_lineage["deployment_id"], "deploy-a")
         self.assertNotIn("predicted_y", x)
         with self.assertRaises(ValueError):
             index.resolve("job_1")
@@ -347,6 +349,8 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(row.X["gpu_generation"], "Hopper")
         self.assertEqual(row.y_predicted, {"p99_ttft_ms": 90.0})
         self.assertEqual(row.V_predicted_trajectory, {"kv_cache_util": 0.1})
+        self.assertEqual(row.deployment_id, "deploy-a")
+        self.assertEqual(row.prediction_lineage["schema_version"], 2)
         self.assertEqual(mechanism_registry.context["type"], "online")
         self.assertEqual(mechanism_registry.context["request_arrival_rate"], 50)
 

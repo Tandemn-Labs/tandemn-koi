@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from src.core.candidate_graph import CandidateGraph
@@ -185,6 +186,29 @@ def init_evidence_store(user_id: str, postgres_client=None):
     return EvidenceService(
         user_id=user_id,
         postgres_client=postgres_client,
+    )
+
+
+def init_surrogate_stack(
+    evidence_store=None,
+    peer_mode: str = "shadow",
+    *,
+    perfdb_path: str | Path | None = None,
+    perfdb_mode: str = "enabled",
+    event_sink=None,
+):
+    """Build the Koi-native composer around the authoritative direct AIC path."""
+    from src.prediction.backends.perfdb import PerfDBBackend
+    from src.prediction.composer import SurrogateComposer
+
+    resolved_perfdb_path = perfdb_path or os.environ.get("KOI_PERFDB_PATH")
+    perfdb = PerfDBBackend(resolved_perfdb_path) if resolved_perfdb_path is not None else None
+    return SurrogateComposer(
+        evidence_store=evidence_store,
+        peer_mode=peer_mode,
+        perfdb_backend=perfdb,
+        perfdb_mode=perfdb_mode,
+        event_sink=event_sink,
     )
 
 

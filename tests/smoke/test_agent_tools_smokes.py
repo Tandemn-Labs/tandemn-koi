@@ -124,6 +124,30 @@ class _RecordingSurrogate:
             {"kv_cache_util": 0.4},
         )
 
+    def compose_prediction_with_trace(
+        self,
+        job_config,
+        job_features,
+        candidate_graph,
+        method=("AIC_DynoSim",),
+        scenario="mean",
+        as_of_timestamp_utc=None,
+    ):
+        y_hat, v_hat = self.compose_prediction(
+            job_config, job_features, candidate_graph, method=method, scenario=scenario
+        )
+        return (
+            y_hat,
+            v_hat,
+            {
+                "schema_version": 3,
+                "raw": {"y_hat": y_hat, "v_hat": v_hat},
+                "backends": {"primary": {"version": "recording-v1", "y_hat": y_hat}},
+                "fusion": {"status": "insufficient_evidence", "lower_throughput": None},
+                "calibration": {"offsets_y": {}},
+            },
+        )
+
 
 class AgentToolsSmokeTests(unittest.TestCase):
     def test_rank_prediction_payload_attaches_allocation_price(self):
@@ -910,6 +934,49 @@ class AgentToolsSmokeTests(unittest.TestCase):
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
 
+    def test_prediction_tool_emits_full_started_and_completed_events(self):
+        class Sink:
+            def __init__(self):
+                self.events = []
+
+            def emit(self, event):
+                self.events.append(event)
+
+        saved = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("surrogate", "candidate_graph", "dro", "event_sink")
+        }
+        saved_calls = agent_tools._surrogate_calls
+        sink = Sink()
+        try:
+            agent_tools.bind_tools(
+                surrogate=_RecordingSurrogate(),
+                candidate_graph=object(),
+                dro=_DRO(),
+                event_sink=sink,
+            )
+            agent_tools._surrogate_calls = 0
+            output = agent_tools._predict_outcome_core(
+                {"model_id": "model", "tp": 2},
+                {"type": "online"},
+                scenario="peak",
+            )
+        finally:
+            agent_tools._surrogate_calls = saved_calls
+            for name, value in saved.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertEqual(
+            [event["event"] for event in sink.events],
+            ["prediction.tool.started", "prediction.tool.completed"],
+        )
+        self.assertEqual(sink.events[0]["job_config"]["tp"], 2)
+        self.assertEqual(sink.events[0]["call_index"], 1)
+        self.assertEqual(sink.events[1]["y_hat"], output["y_hat"])
+        self.assertEqual(sink.events[1]["v_hat"], output["v_hat"])
+        self.assertIn("prediction_lineage", sink.events[1])
+        self.assertIn("dro_band", sink.events[1])
+
     def test_predictions_are_not_cached(self):
         class ScenarioSurrogate:
             def __init__(self):
@@ -1169,6 +1236,8 @@ class AgentToolsSmokeTests(unittest.TestCase):
             rank = plan.actions[0].ladder[0]
             self.assertEqual(rank.predicted_y["p99_ttft_ms"], 10.0)
             self.assertEqual(rank.predicted_v, {"kv_cache_util": 0.4})
+            self.assertEqual(rank.prediction_lineage["schema_version"], 3)
+            self.assertTrue(rank.prediction_lineage["deployment_id"].startswith("deploy:"))
         finally:
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)

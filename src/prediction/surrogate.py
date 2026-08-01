@@ -252,7 +252,7 @@ class SurrogatePrediction:
         # in the prediction model.
         # Inputs: CandidateGraph, Method
         # Outputs: (Direct_X, Derive_X, Direct_V, Derive_V, Direct_Y, Derive_Y)
-        method_name = method[0] if isinstance(method, (list, tuple)) else method
+        method_name = method[0] if isinstance(method, list | tuple) else method
         candidate_x = set(candidate_graph.x)
         candidate_v = set(candidate_graph.v)
         candidate_y = set(candidate_graph.y)
@@ -528,7 +528,7 @@ class SurrogatePrediction:
         # Inputs: direct_x_values, simulator_controls, method
         # Outputs: SurrogateInput
         method_name = (
-            method[0] if isinstance(method, (list, tuple)) and len(method) == 1 else method
+            method[0] if isinstance(method, list | tuple) and len(method) == 1 else method
         )
 
         if method_name != "AIC_DynoSim":
@@ -986,7 +986,7 @@ class SurrogatePrediction:
         # Accept a few common pricing shapes until the real pricing helper exists.
         if price_vector is None:
             return None
-        if isinstance(price_vector, (int, float)):
+        if isinstance(price_vector, int | float):
             return float(price_vector)
         if not isinstance(price_vector, dict):
             return None
