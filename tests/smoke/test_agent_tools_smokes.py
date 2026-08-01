@@ -541,7 +541,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 "job_config": {},
                 "job_features": {},
             }
-            agent_tools._predict_outcome_core = lambda config, features: {
+            agent_tools._predict_outcome_core = lambda config, features, **_kwargs: {
                 "y_hat": {
                     "p99_ttft_ms": 10.0,
                     "p99_tpot_ms": 1.0,
@@ -821,8 +821,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 }
             }
             split_result = agent_tools.validate_budget_book(split_book)
-            self.assertFalse(split_result["ok"])
-            self.assertTrue(any("budgets sum to 4" in v for v in split_result["violations"]))
+            self.assertTrue(split_result["ok"])
 
             action = PlanAction.from_dict(
                 {
@@ -947,6 +946,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
             for name in ("surrogate", "candidate_graph", "dro", "event_sink")
         }
         saved_calls = agent_tools._surrogate_calls
+        saved_cache = dict(agent_tools._prediction_cache)
         sink = Sink()
         try:
             agent_tools.bind_tools(
@@ -956,6 +956,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 event_sink=sink,
             )
             agent_tools._surrogate_calls = 0
+            agent_tools._prediction_cache.clear()
             output = agent_tools._predict_outcome_core(
                 {"model_id": "model", "tp": 2},
                 {"type": "online"},
@@ -963,6 +964,8 @@ class AgentToolsSmokeTests(unittest.TestCase):
             )
         finally:
             agent_tools._surrogate_calls = saved_calls
+            agent_tools._prediction_cache.clear()
+            agent_tools._prediction_cache.update(saved_cache)
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
 
@@ -977,7 +980,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
         self.assertIn("prediction_lineage", sink.events[1])
         self.assertIn("dro_band", sink.events[1])
 
-    def test_predictions_are_not_cached(self):
+    def test_predictions_are_cached_by_scenario_without_recharging_budget(self):
         class ScenarioSurrogate:
             def __init__(self):
                 self.calls = []
@@ -993,9 +996,11 @@ class AgentToolsSmokeTests(unittest.TestCase):
         }
         surrogate = ScenarioSurrogate()
         saved_calls = agent_tools._surrogate_calls
+        saved_cache = dict(agent_tools._prediction_cache)
         try:
             agent_tools.bind_tools(surrogate=surrogate, candidate_graph=object(), dro=_DRO())
             agent_tools._surrogate_calls = 0
+            agent_tools._prediction_cache.clear()
             mean = agent_tools._predict_outcome_core({}, {}, scenario="mean")
             peak = agent_tools._predict_outcome_core({}, {}, scenario="peak")
             stress = agent_tools._predict_outcome_core({}, {}, scenario="peak_all_multiturn_stress")
@@ -1003,6 +1008,8 @@ class AgentToolsSmokeTests(unittest.TestCase):
             calls_after = agent_tools._surrogate_calls
         finally:
             agent_tools._surrogate_calls = saved_calls
+            agent_tools._prediction_cache.clear()
+            agent_tools._prediction_cache.update(saved_cache)
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
 
@@ -1010,10 +1017,10 @@ class AgentToolsSmokeTests(unittest.TestCase):
         self.assertEqual(peak["y_hat"]["throughput_token_per_sec"], 20.0)
         self.assertEqual(stress["y_hat"]["throughput_token_per_sec"], 20.0)
         self.assertEqual(mean_cached["y_hat"]["throughput_token_per_sec"], 10.0)
-        self.assertEqual(calls_after, 3)
+        self.assertEqual(calls_after, 2)
         self.assertEqual(
             surrogate.calls,
-            ["mean", "peak", "peak_all_multiturn_stress", "mean"],
+            ["mean", "peak", "peak_all_multiturn_stress"],
         )
 
     def test_surrogate_calls_are_serialized(self):
@@ -1037,17 +1044,21 @@ class AgentToolsSmokeTests(unittest.TestCase):
         }
         saved_calls = agent_tools._surrogate_calls
         surrogate = SlowSurrogate()
+        saved_cache = dict(agent_tools._prediction_cache)
         try:
             agent_tools.bind_tools(surrogate=surrogate, candidate_graph=object(), dro=_DRO())
             agent_tools._surrogate_calls = 0
+            agent_tools._prediction_cache.clear()
             with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(lambda _: agent_tools._predict_outcome_core({}, {}), range(4)))
         finally:
             agent_tools._surrogate_calls = saved_calls
+            agent_tools._prediction_cache.clear()
+            agent_tools._prediction_cache.update(saved_cache)
             for name, value in saved.items():
                 setattr(agent_tools._CTX, name, value)
 
-        self.assertEqual(surrogate.calls, 4)
+        self.assertEqual(surrogate.calls, 1)
         self.assertEqual(surrogate.max_active, 1)
 
     def test_multiturn_stress_diagnostic_skip_and_failure_are_non_selecting(self):

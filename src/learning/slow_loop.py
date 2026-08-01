@@ -181,6 +181,36 @@ class SlowLoop:
         n_obj = max(1, len(self.objectives))
         initial_weights = dict.fromkeys(self.objectives, 1.0 / n_obj)
 
+        # Per-workload-mode objective weights (POLICY, operator-set - NOT learned).
+        # batch favors throughput + cost (maximize served tokens/s, minimize $/token);
+        # online favors latency (minimize ttft/tpot). get_sss_wt(job_type) returns
+        # these so compute_sigma scores each job by its mode. Override via
+        # cfg["w_by_mode"]; these are STARTING defaults to tune. SLO/demand targets
+        # remain HARD constraints regardless of any weight.
+        self.w_by_mode: dict[str, dict[str, float]] = dict(
+            cfg.get("w_by_mode")
+            or {
+                "online": self._mode_weight_profile(
+                    {
+                        "p99_ttft_ms": 0.25,
+                        "p99_tpot_ms": 0.25,
+                        "cost_per_token": 0.25,
+                        "throughput_token_per_sec": 0.10,
+                        "slo_margin": 0.15,
+                    }
+                ),
+                "batch": self._mode_weight_profile(
+                    {
+                        "throughput_token_per_sec": 0.35,
+                        "cost_per_token": 0.35,
+                        "p99_ttft_ms": 0.10,
+                        "p99_tpot_ms": 0.10,
+                        "slo_margin": 0.10,
+                    }
+                ),
+            }
+        )
+
         # TODO - HACK
         # initial_z_star = dict.fromkeys(self.objectives, 0.0)
         initial_z_star = dict.fromkeys(self.objectives, 999999.0)
@@ -205,16 +235,33 @@ class SlowLoop:
     # Readers (O(1) cached lookups)
     # ------------------------------------------------------------------
 
+    def _mode_weight_profile(self, emphasis: dict[str, float]) -> dict[str, float]:
+        """Normalize an emphasis dict onto this loop's objective set (sums to 1).
+
+        Objectives not named get a small baseline so none is exactly 0 (keeps every
+        gradient alive). Used to build the per-mode w_by_mode defaults.
+        """
+        base = {obj: float(emphasis.get(obj, 0.02)) for obj in self.objectives}
+        total = sum(base.values()) or 1.0
+        return {obj: value / total for obj, value in base.items()}
+
     def get_sss_wt(self, job_type: str | None = None) -> dict[str, float]:
-        """Return the current Tchebycheff weight vector w_t.
+        """Return the Tchebycheff weight vector w_t for a workload mode.
+
+        Per-mode POLICY weights (w_by_mode): batch favors throughput + cost, online
+        favors latency. Falls back to the global learned w_t when job_type is None or
+        has no profile, so callers that pass nothing keep the previous behavior.
 
         Args:
-            job_type: Reserved for forward-compat with per-job-type w_t.
-                Currently ignored.
+            job_type: "online" / "batch"; selects the per-mode weight profile.
 
         Returns:
             Dict mapping each objective to its weight. Sums to 1.
         """
+        if job_type is not None:
+            profile = self.w_by_mode.get(str(job_type).lower())
+            if profile:
+                return dict(profile)
         return dict(self.state.w_t)
 
     def get_sss_z_star_t(self, job_features: dict | None = None) -> dict[str, float]:

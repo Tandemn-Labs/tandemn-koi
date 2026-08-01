@@ -81,6 +81,8 @@ Tool catalog:
         simulate_outcome_trajectory predicted outcomes for each plan action
 """
 
+import copy
+import json
 import logging
 import math
 import time
@@ -198,21 +200,28 @@ def _sanitize_agent_features(features: dict[str, Any]) -> dict[str, Any]:
 DEFAULT_TYPICAL_RANGES = {
     "p99_ttft_ms": 500.0,
     "p99_tpot_ms": 50.0,
-    # Typical SPREAD of $/token from the ideal (~1e-4) to an inefficient config
-    # (~5e-3), used to normalize the cost gap to a ~[0,1] fraction. Was 5e-6 -
-    # SMALLER than the ideal itself, which blew the cost gap up ~1000x and let cost
-    # swamp the SLO signal. The slow loop overwrites this with the learned range.
-    "cost_per_token": 5e-3,
+    # Divisor that normalizes the cost gap (cost - ideal). It should be ~the observed
+    # cost SPREAD (~1e-6 cheap to ~2e-5 pricey), so gaps land O(0.1-2) and cost
+    # DIFFERENTIATES frames. COST_PENALTY_CAP bounds the top regardless, so a small
+    # divisor no longer risks cost dominating J - that's what the cap is for. (An
+    # earlier 5e-2 made gaps ~1e-5 -> cost went silent -> the latency bonus
+    # over-provisioned onto premium GPUs.) Slow loop overwrites this with the learned
+    # spread once it has cost evidence.
+    "cost_per_token": 1e-5,
     "throughput_token_per_sec": 1000.0,
     "slo_margin": 1.0,
 }
 DEFAULT_COLD_START_Z_STAR = {
-    "p99_ttft_ms": 100.0,
-    "p99_tpot_ms": 20.0,
-    # Reference $/token the cost objective normalizes against (a realistic "good"
-    # per-token cost, ~near the cheapest hardware). Placeholder until the slow loop
-    # learns z*_cost from history; kept realistic so w_cost is a meaningful weight.
-    "cost_per_token": 1e-4,
+    "p99_ttft_ms": 300.0,
+    "p99_tpot_ms": 50.0,
+    # IDEAL (best-case) $/token the cost objective measures the gap ABOVE. It must sit
+    # BELOW the CHEAPEST achievable real cost, or those frames read as "at/below ideal"
+    # -> gap 0 -> cost cannot differentiate them. This bit us: 7B frames predicted
+    # ~9e-7, BELOW the old 1e-6 ideal, so cost went silent and the latency opt_bonus
+    # over-provisioned them onto premium H100. 1e-8 is a near-zero floor below any
+    # realistic per-token cost, so EVERY frame carries a positive, differentiating
+    # (bounded, capped) cost gap -> cheapest-that-meets wins. Slow loop learns the min.
+    "cost_per_token": 1e-8,
     "throughput_token_per_sec": 3000.0,
     "slo_margin": 1.0,
 }
@@ -226,6 +235,22 @@ UNSERVED_PENALTY = 1.0
 # wins, which can be H100 since it is cheaper PER TOKEN when fast enough). SLO stays
 # PRIMARY (target-relative, saturating); cost is a secondary additive term, so it
 # only optimizes AMONG SLO-meeting frames and never overrides a real SLO need.
+# HARD INVARIANT enforced in code (not trusted to the slow loop): the cost term is
+# soft-capped at COST_PENALTY_CAP in compute_sigma, so no matter how TIGHT a cost
+# range the slow loop learns (it learns the observed spread, which can be ~1e-5 and
+# would otherwise blow cost_penalty up to ~0.4 - rivaling J), cost can never outrank
+# a meaningful SLO gap. J for a clearly under-target frame is ~-0.15..-0.20; the cap
+# sits well below that, so "satisfice SLO, THEN minimize cost" holds structurally.
+# The cap is a soft saturation (monotonic), so cheaper-per-token frames still win
+# AMONG meeters - it only bites when a tiny learned range would make cost dominate.
+COST_PENALTY_CAP = 0.05
+# Soft-cap on the beyond-target OPTIMIZATION bonus (see compute_sigma). Same role as
+# COST_PENALTY_CAP: once a job MEETS its SLO/demand target, Koi may still be rewarded
+# for BEATING it on the mode-relevant axis (batch -> more throughput, online -> lower
+# latency), but that reward saturates here so it can NEVER outrank another job's
+# target MISS. That IS the fairness guard: satisfice every target first (primary J),
+# then optimize the mode axis with leftover capacity only (bounded secondary).
+OPT_BONUS_CAP = 0.05
 
 
 def _seeded_ranges(ranges: dict[str, Any] | None) -> dict[str, float]:
@@ -246,7 +271,7 @@ def _seeded_ranges(ranges: dict[str, Any] | None) -> dict[str, float]:
 # and value-agnostic (a z* that is uniform across every objective is a
 # placeholder, whatever the constant); the explicit sentinel set is documented
 # insurance for a PARTIALLY-degenerate vector.
-_Z_STAR_UNSET_SENTINELS = frozenset({0.0, 99999.0})
+_Z_STAR_UNSET_SENTINELS = frozenset({0.0, 99999.0, 999999.0})
 
 
 def _is_placeholder_z_star(values: list[float]) -> bool:
@@ -411,6 +436,14 @@ def assert_planning_ready() -> None:
 # is generous by design (a normal tick uses far fewer).
 SURROGATE_CALL_BUDGET = 100
 _surrogate_calls = 0
+# Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
+# scenario). DynoSim is deterministic, so re-probing a config the LLM already
+# evaluated THIS tick returns the identical numbers - we serve them from here
+# instead of re-running the surrogate. Reads are lock-free (atomic dict.get under
+# the GIL); writes happen under _SURROGATE_EXECUTION_LOCK (see _predict_outcome_core).
+# Cleared every tick by reset_tick_caches so calibration / z* / evidence updates are
+# never stale, and so a cache hit never leaks across capacity/telemetry boundaries.
+_prediction_cache: dict[str, dict[str, Any]] = {}
 
 
 class SurrogateBudgetExceeded(RuntimeError):
@@ -430,6 +463,7 @@ def reset_tick_caches() -> None:
     _CTX.validated_budget_book = None
     with _SURROGATE_EXECUTION_LOCK:
         _surrogate_calls = 0
+        _prediction_cache.clear()
 
 
 # Public module functions that are NOT LLM tools (infrastructure/boot).
@@ -1688,6 +1722,8 @@ def size_ladder(
             ds.append(cap)
         return ds
 
+    physical_rejections: list[str] = []
+
     def _predict_at(rank: RankSpec, d: int, share_tps: float) -> dict | None:
         # Predict this rank at DP=d workers carrying `share_tps` tokens/s of demand.
         # For online we hand that demand in as an arrival rate (share_tps/osl); the
@@ -1715,12 +1751,14 @@ def size_ladder(
             return y_hat
         except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
             log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
+            physical_rejections.append(str(exc))
             return None
         except SurrogateExecutionError as exc:
-            # e.g. requests did not all complete at this replica count -> overloaded;
-            # more replicas may fix it, so signal "try more DP", do not crash.
-            log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
-            return {}
+            message = str(exc)
+            if message.startswith("completed ") and message.endswith(" requests"):
+                log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
+                return {}
+            raise
 
     sized: list[dict[str, Any]] = []
     per_rank: list[dict[str, Any]] = []
@@ -1742,6 +1780,7 @@ def size_ladder(
     # (heterogeneous ladder). meets_target needs the whole demand covered AND every
     # serving rank within SLO.
     for raw in ranks:
+        physical_rejection_start = len(physical_rejections)
         rank = RankSpec.from_dict(raw)
         gpus_per_chain = rank.gpus_per_chain()
         gpu_type = env_gpu_type(rank.env)
@@ -1852,6 +1891,7 @@ def size_ladder(
                 "served_tps": served,
                 "slo_ok": slo_ok,
                 "reason": reason,
+                "physical_violations": physical_rejections[physical_rejection_start:],
             }
         )
 
@@ -2235,69 +2275,128 @@ def predict_outcome(
     return _predict_outcome_core(job_config, job_features, calibrate=calibrate, scenario=scenario)
 
 
+def _prediction_cache_key(
+    job_config: dict[str, Any],
+    job_features: dict[str, Any],
+    scenario: str,
+    calibrate: bool,
+) -> str | None:
+    """Canonical, order-stable key for the composed-prediction memo.
+
+    Calibration mode is part of the key because deploy stamping deliberately asks
+    for an uncalibrated prediction while candidate scoring normally asks for the
+    evidence-calibrated result. The cache is reset at every tick boundary.
+    """
+    try:
+        return json.dumps(
+            [job_config, job_features, scenario, bool(calibrate)],
+            sort_keys=True,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _predict_outcome_core(
     job_config: dict[str, Any],
     job_features: dict[str, Any],
     calibrate: bool = True,
     scenario: str = "mean",
 ) -> dict[str, Any]:
-    """Run prediction with already trusted or sanitized inputs."""
+    """Run or reuse one composed prediction with detailed chronological events."""
     _require("candidate_graph", "dro", "surrogate")
     global _surrogate_calls
     started_ns = time.perf_counter_ns()
-    stage = "budget"
+    stage = "cache"
+    key = _prediction_cache_key(job_config, job_features, scenario, calibrate)
+    cached = _prediction_cache.get(key) if key is not None else None
+    cache_hit = cached is not None
+    budget_exempt = scenario == "peak_all_multiturn_stress"
     call_index = _surrogate_calls
+    started_event = {
+        "event": "prediction.tool.started",
+        "component": "agent.tools.predict_outcome",
+        "purpose": "score one candidate configuration for agent planning",
+        **_prediction_tool_context(),
+        "scenario": scenario,
+        "calibrate": calibrate,
+        "job_config": job_config,
+        "job_features": job_features,
+        "call_budget": SURROGATE_CALL_BUDGET,
+        "budget_exempt": budget_exempt,
+        "cache_key": key,
+    }
+    started_emitted = False
     try:
-        with _SURROGATE_EXECUTION_LOCK:
-            budget_exempt = scenario == "peak_all_multiturn_stress"
-            if not budget_exempt:
-                _surrogate_calls += 1
+        if cached is None:
+            with _SURROGATE_EXECUTION_LOCK:
+                cached = _prediction_cache.get(key) if key is not None else None
+                cache_hit = cached is not None
+                if cached is None:
+                    stage = "budget"
+                    if not budget_exempt:
+                        _surrogate_calls += 1
+                    call_index = _surrogate_calls
+                    _emit_prediction_tool_event(
+                        {
+                            **started_event,
+                            "call_index": call_index,
+                            "cache_hit": False,
+                        }
+                    )
+                    started_emitted = True
+                    if not budget_exempt and _surrogate_calls > SURROGATE_CALL_BUDGET:
+                        raise SurrogateBudgetExceeded(
+                            f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
+                            "narrow to your best few candidate configs and reuse scored results."
+                        )
+                    stage = "surrogate"
+                    if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
+                        y_hat, v_hat, prediction_lineage = (
+                            _CTX.surrogate.compose_prediction_with_trace(
+                                job_config=job_config,
+                                job_features=job_features,
+                                candidate_graph=_CTX.candidate_graph,
+                                method=("AIC_DynoSim",),
+                                scenario=scenario,
+                                as_of_timestamp_utc=time.time() if calibrate else None,
+                            )
+                        )
+                    else:
+                        result = _CTX.surrogate.compose_prediction(
+                            job_config=job_config,
+                            job_features=job_features,
+                            candidate_graph=_CTX.candidate_graph,
+                            method=("AIC_DynoSim",),
+                            scenario=scenario,
+                        )
+                        prediction_lineage = None
+                        if isinstance(result, tuple) and len(result) == 2:
+                            y_hat, v_hat = result
+                        else:
+                            y_hat = getattr(result, "y_hat", {}) or {}
+                            v_hat = getattr(result, "v_hat", {}) or {}
+                    cached = {
+                        "y_hat": dict(y_hat or {}),
+                        "v_hat": dict(v_hat or {}),
+                        "prediction_lineage": copy.deepcopy(prediction_lineage),
+                    }
+                    if key is not None:
+                        _prediction_cache[key] = cached
+
+        if not started_emitted:
             call_index = _surrogate_calls
             _emit_prediction_tool_event(
                 {
-                    "event": "prediction.tool.started",
-                    "component": "agent.tools.predict_outcome",
-                    "purpose": "score one candidate configuration for agent planning",
-                    **_prediction_tool_context(),
-                    "scenario": scenario,
-                    "calibrate": calibrate,
-                    "job_config": job_config,
-                    "job_features": job_features,
+                    **started_event,
                     "call_index": call_index,
-                    "call_budget": SURROGATE_CALL_BUDGET,
-                    "budget_exempt": budget_exempt,
+                    "cache_hit": True,
                 }
             )
-            if not budget_exempt and _surrogate_calls > SURROGATE_CALL_BUDGET:
-                raise SurrogateBudgetExceeded(
-                    f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
-                    "narrow to your best few candidate configs and reuse scored results."
-                )
-            stage = "surrogate"
-            if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
-                y_hat, v_hat, prediction_lineage = _CTX.surrogate.compose_prediction_with_trace(
-                    job_config=job_config,
-                    job_features=job_features,
-                    candidate_graph=_CTX.candidate_graph,
-                    method=("AIC_DynoSim",),
-                    scenario=scenario,
-                    as_of_timestamp_utc=time.time() if calibrate else None,
-                )
-            else:
-                result = _CTX.surrogate.compose_prediction(
-                    job_config=job_config,
-                    job_features=job_features,
-                    candidate_graph=_CTX.candidate_graph,
-                    method=("AIC_DynoSim",),
-                    scenario=scenario,
-                )
-                prediction_lineage = None
-                if isinstance(result, tuple) and len(result) == 2:
-                    y_hat, v_hat = result
-                else:
-                    y_hat = getattr(result, "y_hat", {}) or {}
-                    v_hat = getattr(result, "v_hat", {}) or {}
-        y_hat = y_hat or {}
+
+        y_hat = dict(cached["y_hat"])
+        v_hat = dict(cached["v_hat"])
+        prediction_lineage = copy.deepcopy(cached.get("prediction_lineage"))
         y_hat_raw = ((prediction_lineage or {}).get("raw") or {}).get("y_hat") or dict(y_hat)
         offsets = ((prediction_lineage or {}).get("calibration") or {}).get("offsets_y") or {}
         lower_throughput = ((prediction_lineage or {}).get("fusion") or {}).get(
@@ -2327,6 +2426,8 @@ def _predict_outcome_core(
                 "job_features": job_features,
                 "call_index": call_index,
                 "call_budget": SURROGATE_CALL_BUDGET,
+                "cache_hit": cache_hit,
+                "budget_charged": not cache_hit and not budget_exempt,
                 "y_hat": output["y_hat"],
                 "v_hat": output["v_hat"],
                 "prediction_lineage": prediction_lineage,
@@ -2349,6 +2450,7 @@ def _predict_outcome_core(
                 "job_features": job_features,
                 "call_index": call_index,
                 "call_budget": SURROGATE_CALL_BUDGET,
+                "cache_hit": cache_hit,
                 "stage": stage,
                 "error": exc,
                 "traceback": "".join(traceback.format_exception(exc)),
@@ -2761,6 +2863,37 @@ def _clamp_to_reference(y_hat: dict[str, Any], reference: dict[str, float]) -> d
     return out
 
 
+# Per-mode OPTIMIZE axis: which objective Koi pushes PAST its target once the target
+# is met. Batch maximizes aggregate throughput; online minimizes latency (online
+# throughput is pinned to demand, so there is nothing to maximize there). Cost is
+# always optimized separately (the cost term), for both modes.
+_BATCH_OPTIMIZE_AXES: tuple[str, ...] = (_THROUGHPUT_OBJ,)
+_ONLINE_OPTIMIZE_AXES: tuple[str, ...] = ("p99_ttft_ms", "p99_tpot_ms")
+
+
+def _job_mode(job_features: dict[str, Any] | None) -> str:
+    """Normalized workload mode: 'batch' or 'online' (default)."""
+    jf = job_features or {}
+    mode = jf.get("type") or jf.get("workload_type") or jf.get("kind") or "online"
+    return "batch" if str(mode).lower() == "batch" else "online"
+
+
+def _optimize_axes_for_mode(job_mode: str) -> tuple[str, ...]:
+    return _BATCH_OPTIMIZE_AXES if job_mode == "batch" else _ONLINE_OPTIMIZE_AXES
+
+
+def _axis_headroom(y_value: float, target: float, axis: str) -> float:
+    """Fraction by which y BEATS its target on `axis` (>0 beating, <=0 missing).
+
+    Maximized axis (throughput): (y - target)/|target|.
+    Minimized axis (latency):    (target - y)/|target|.
+    """
+    if not target:
+        return 0.0
+    beat = (float(y_value) - target) if axis == _THROUGHPUT_OBJ else (target - float(y_value))
+    return beat / abs(target)
+
+
 def compute_sigma(plan) -> dict[str, Any]:
     """Score a plan: per-job sigma and the cluster aggregate.
 
@@ -2793,7 +2926,8 @@ def compute_sigma(plan) -> dict[str, Any]:
     per_job: dict[str, dict[str, float]] = {}
     aggregate = 0.0
 
-    w_t = _CTX.slow_loop.get_sss_wt()
+    # w_t (objective weights) is fetched PER JOB in the loop below - it is per-workload-
+    # mode (batch favors throughput+cost, online favors latency), so it is NOT global.
     # z_star is fetched PER JOB in the loop; z*/ranges are seeded against domain
     # priors so an unseeded slow loop (z*=0, range=1.0) cannot collapse J to ~-50.
     ranges = _seeded_ranges(_CTX.slow_loop.typical_ranges)
@@ -2807,7 +2941,7 @@ def compute_sigma(plan) -> dict[str, Any]:
     # NOT the raw ratio cost/ideal (unbounded ~1-55x, which swamped the target-
     # relative J and made a cheap under-target frame beat a pricier one that MEETS
     # target). cost_ref = ideal $/token; cost_range = typical spread.
-    w_cost = float((w_t or {}).get("cost_per_token", 0.0) or 0.0)
+    # w_cost is per-job (per-mode weights) -> computed inside the loop alongside w_t.
     cost_ref = float(_seeded_z_star(get_z_star()).get("cost_per_token", 0.0) or 0.0)
     cost_range = float(ranges.get("cost_per_token", 0.0) or 0.0)
 
@@ -2817,6 +2951,11 @@ def compute_sigma(plan) -> dict[str, Any]:
         job_id = action.job_id
         ladder_dicts = _ranks_as_dicts(action)
         job_features = _job_features_for(snapshot, job_id)
+        # Per-workload-mode objective weights: batch favors throughput+cost, online
+        # favors latency (get_sss_wt honors the mode; falls back to global if unset).
+        job_mode = _job_mode(job_features)
+        w_t = _CTX.slow_loop.get_sss_wt(job_type=job_mode)
+        w_cost = float((w_t or {}).get("cost_per_token", 0.0) or 0.0)
         y_hat = _compose_job_y_hat(action, job_features)
         if not y_hat:
             continue
@@ -2886,18 +3025,52 @@ def compute_sigma(plan) -> dict[str, Any]:
         # under-target one. w_cost=0 (reserved) -> inert; w_cost>0 (pay-per-use) ->
         # cheaper-per-token frames score higher.
         cost_pred = _y_value(y_hat, "cost_per_token")
-        cost_penalty = (
+        raw_cost = (
             w_cost * max(0.0, float(cost_pred or 0.0) - cost_ref) / cost_range
             if (w_cost and cost_range > 0)
             else 0.0
         )
-        sigma_i = J + beta * eig_value - GAMMA_SLO * pr_slo - lam * switch_total - cost_penalty
+        # Soft-cap to COST_PENALTY_CAP: monotonic (cheaper-per-token still wins AMONG
+        # meeters), ~= raw_cost when raw_cost << cap (a well-scaled range passes through
+        # untouched), and saturates toward the cap as raw_cost grows - so however tight
+        # a range the slow loop learns, cost can never outrank a meaningful SLO gap.
+        cost_penalty = (
+            COST_PENALTY_CAP * raw_cost / (raw_cost + COST_PENALTY_CAP) if raw_cost > 0.0 else 0.0
+        )
+        # Beyond-target OPTIMIZATION bonus (bounded secondary, like cost): once the
+        # job MEETS its target (J saturates at 0), reward BEATING it on the mode axis -
+        # batch maximizes throughput, online minimizes latency. One-sided (no credit
+        # below target; the shortfall is already penalized in J) and soft-capped at
+        # OPT_BONUS_CAP so it can NEVER outrank another job's target MISS: satisfice
+        # every target first (fairness), then optimize the mode axis with leftover.
+        opt_raw = 0.0
+        if target_ref:
+            for axis in _optimize_axes_for_mode(job_mode):
+                tgt = target_ref.get(axis)
+                yv = y_hat.get(axis)
+                if tgt and yv is not None:
+                    hr = _axis_headroom(float(yv), float(tgt), axis)
+                    if hr > 0.0:
+                        opt_raw += float((w_t or {}).get(axis, 0.0) or 0.0) * hr
+        opt_bonus = OPT_BONUS_CAP * opt_raw / (opt_raw + OPT_BONUS_CAP) if opt_raw > 0.0 else 0.0
+        # Net VALUE secondary = beating the mode target (opt_bonus) MINUS cost, FLOORED
+        # at 0. A target-MEETING frame (J=0) must NEVER be pushed negative by the
+        # cost/opt tradeoff: a forced-expensive meeter (e.g. the 72B, whose only fit is
+        # 8xH100) would otherwise score cost_penalty > opt_bonus -> sigma < 0 -> read as
+        # defer-worthy -> the whole plan collapsed to defer. Floored, cheaper+faster
+        # frames still rank higher (they live in the positive band), while an
+        # expensive-but-meeting frame bottoms out at 0 (met, no extra value) instead of
+        # looking worse than defer. cost and opt_bonus stay in the diagnostics.
+        value_bonus = max(0.0, opt_bonus - cost_penalty)
+        sigma_i = J + value_bonus + beta * eig_value - GAMMA_SLO * pr_slo - lam * switch_total
         per_job[job_id] = {
             "J": J,
             "eig": eig_value,
             "switch_cost_total": switch_total,
             "pr_slo_dro": pr_slo,
             "cost_penalty": cost_penalty,
+            "opt_bonus": opt_bonus,
+            "value_bonus": value_bonus,
             "sigma": sigma_i,
         }
         aggregate += sigma_i
@@ -3398,27 +3571,57 @@ def build_scored_candidates(
             for jid, scored in pool.map(_run, tasks):
                 scored_by_job[jid].append(scored)
 
-    # Phase 2.5 (heterogeneous composites): if NO single frame meets a job's target
-    # (every pool caps out below it), add one data-parallel ladder that SPANS pools
-    # so the solver can serve the job heterogeneously. Skip jobs already met by a
-    # single pool (that is strictly cheaper). Order runnable frames best-throughput
-    # first (each single frame is already sized to its pool's full capacity, so its
-    # achieved_tps is that pool's ceiling); size_ladder then fills them in order and
-    # sums the achieved. scored_by_job[jid] aligns with frames_by_job[jid] (thread
-    # pool preserves task order).
+    # Phase 2.5 (heterogeneous composites). Two motivations:
+    #  - CAPACITY: if NO single pool meets the target, span pools (fill the
+    #    highest-throughput ones first) so a big job is served across pools.
+    #  - COST (on-demand market only, w_cost>0): ALSO try a cheapest-$/token-first
+    #    mix even when a single pool already meets, so a heterogeneous placement
+    #    (cheap pool + top-up) can beat the single-pool winner on cost. In reserved
+    #    (w_cost=0) the fleet is sunk - a "cheaper" mix saves nothing - so we only do
+    #    the capacity fallback.
+    # size_ladder fills each ordering and sums achieved; the joint solver ranks EVERY
+    # candidate by sigma (which includes the bounded cost term), so if no mix is both
+    # cheaper AND SLO-meeting, the single pool still wins. A cheapest-first ordering
+    # whose cheapest pool already meets alone collapses to <2 ranks -> no composite.
+    # scored_by_job[jid] aligns with frames_by_job[jid] (thread pool preserves order).
+    try:
+        w_cost = float((_CTX.slow_loop.get_sss_wt() or {}).get("cost_per_token", 0.0) or 0.0)
+    except Exception:
+        w_cost = 0.0
     for jid, frames in frames_by_job.items():
         results = scored_by_job.get(jid) or []
         runnable = [
             (f, r) for f, r in zip(frames, results, strict=False) if r.get("candidate") is not None
         ]
-        if not runnable or any(r.get("meets_target") for _, r in runnable):
+        if not runnable:
             continue
-        runnable.sort(key=lambda fr: fr[1]["diag"].get("achieved_tps") or 0.0, reverse=True)
-        ordered = [f for f, _ in runnable]
         user_id, slice_id, features = ctx_by_job[jid]
-        composite = _score_composite(jid, user_id, slice_id, ordered, features)
-        if composite is not None:
-            scored_by_job[jid].append(composite)
+        single_meets = any(r.get("meets_target") for _, r in runnable)
+        orders: list[list[dict[str, Any]]] = []
+        if not single_meets:
+            orders.append(
+                [
+                    f
+                    for f, _ in sorted(
+                        runnable,
+                        key=lambda fr: fr[1]["diag"].get("achieved_tps") or 0.0,
+                        reverse=True,
+                    )
+                ]
+            )
+        if w_cost > 0:
+            orders.append(
+                [
+                    f
+                    for f, _ in sorted(
+                        runnable, key=lambda fr: fr[1]["diag"].get("cost_penalty") or 0.0
+                    )
+                ]
+            )
+        for order in orders:
+            composite = _score_composite(jid, user_id, slice_id, order, features)
+            if composite is not None:
+                scored_by_job[jid].append(composite)
 
     # Phase 3 (cheap): group into candidates / exhausted / diagnostics. Every
     # feasible frame is a candidate - INCLUDING under-target ones (placing beats
@@ -3665,6 +3868,63 @@ def check_feasibility(plan) -> dict[str, Any]:
         "ok": feasible,
         "violations": violations,
     }
+
+
+def plan_tick() -> dict[str, Any]:
+    """Run the FULL deterministic tick pipeline and return a ready-to-commit plan.
+
+    The root's entire job is ``FINAL_VAR(plan_tick())``. This closes the weak-root
+    failure mode observed in the wild: the LLM re-runs the pipeline itself, sees the
+    (perfectly normal) negative sigmas, panics, and commits an all-defer plan even
+    though ``jointly_select_placements`` already PLACED every job feasibly. plan_tick
+    makes the serve-vs-defer call non-negotiable - the returned plan IS the joint
+    solver's decision, built straight from ``chosen``. Negative sigma is expected and
+    is NOT a defer reason; do not rebuild this plan, add defers, or re-judge sigma.
+
+    Sequence is byte-for-byte the documented MANDATORY ORDER:
+      build_user_envelopes -> get_priority -> allocate_budget_book ->
+      validate_budget_book -> run_job_specialists -> build_scored_candidates ->
+      jointly_select_placements -> plan from chosen (feasibility-checked).
+
+    Jobs the solver leaves out (``deferred`` / ``exhausted``) are omitted; the harness
+    auto-defers omitted waiting jobs. Returns ``{"tick_rationale", "actions"}``.
+    """
+    build_user_envelopes()
+    get_priority()
+    budget_book = allocate_budget_book()
+    validation = validate_budget_book(budget_book)
+    if not validation.get("ok", False):
+        return {
+            "tick_rationale": (
+                "plan_tick: budget book failed validation "
+                f"({validation.get('violations')}); no placements this tick."
+            ),
+            "actions": [],
+        }
+    specialist_results = run_job_specialists()
+    scored = build_scored_candidates(budget_book, specialist_results)
+    joint = jointly_select_placements(scored.get("candidates", []) or [])
+    chosen = list(joint.get("chosen", []) or [])
+    deferred = list(joint.get("deferred", []) or [])
+    exhausted = scored.get("exhausted", {}) or {}
+    plan: dict[str, Any] = {
+        "tick_rationale": (
+            f"plan_tick: joint solver placed {len(chosen)} job(s) "
+            f"(objective={joint.get('objective')}); deferred={deferred}; "
+            f"exhausted={list(exhausted.keys())}. Committed AS-IS from "
+            "jointly_select_placements - negative sigma is normal, NOT a defer reason."
+        ),
+        "actions": chosen,
+    }
+    feas = check_feasibility(plan)
+    if not feas.get("feasible", False):
+        # Surface the violation in the rationale but keep the solver's placements:
+        # the solver already enforced capacity, so a violation here is a config/
+        # physical-shard issue worth seeing, not a reason to silently defer all.
+        plan["tick_rationale"] += (
+            f" WARNING: feasibility violations on chosen plan: {feas.get('violations')}."
+        )
+    return plan
 
 
 def swap_counter(plan) -> int:
