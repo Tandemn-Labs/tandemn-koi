@@ -362,17 +362,11 @@ class Validator:
                                 f"C6 physics: job {action.job_id} rank {i}: {allocation_error}"
                             )
                             continue
-                        unit_gpus = int(allocation.get("gpus_per_unit", per_chain))
-                        if allocation.get("allocation_kind") != "gpu" and per_chain > unit_gpus:
-                            inst = allocation.get("instance_type")
-                            violations.append(
-                                f"C6 physics: job {action.job_id} rank {i} needs {per_chain} "
-                                f"engine GPUs but {inst} has {unit_gpus}"
-                            )
+                        reserved_gpus = int(allocation.get("capacity_per_replica", per_chain))
                         total = int(info.get("total", 0))
-                        if total and unit_gpus > total:
+                        if total and reserved_gpus > total:
                             violations.append(
-                                f"C6 physics: job {action.job_id} rank {i} reserves {unit_gpus} "
+                                f"C6 physics: job {action.job_id} rank {i} reserves {reserved_gpus} "
                                 f"GPUs/replica but env total is {total}"
                             )
         return violations

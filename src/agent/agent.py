@@ -44,6 +44,7 @@ import logging
 import re
 import time
 import traceback
+from collections import defaultdict, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -56,6 +57,7 @@ from src.core.models import (
     ActionType,
     Plan,
     PlanAction,
+    rank_config_key,
 )
 
 log = logging.getLogger("koi.agent")
@@ -1044,7 +1046,42 @@ class KoiAgentHarness:
         if not plan.actions and states is None:
             raise PlanMaterializationError("plan has no actions and no job inventory to cover")
 
+        self._assign_rank_ids(plan, cluster_snapshot)
         return plan
+
+    def _assign_rank_ids(self, plan: Plan, snapshot) -> None:
+        """Reuse continuously active config identities; mint all other rank ids."""
+        active: dict[str, dict[tuple, deque[str]]] = defaultdict(lambda: defaultdict(deque))
+        jobs = (
+            snapshot.active_jobs_summary()
+            if snapshot is not None and hasattr(snapshot, "active_jobs_summary")
+            else getattr(snapshot, "active_jobs", [])
+            if snapshot is not None
+            else []
+        )
+        for job in jobs or []:
+            job_id = str(job["job_id"])
+            for rank in job.get("active_ranks") or []:
+                rank_id = rank.get("rank_id")
+                if rank_id:
+                    active[job_id][rank_config_key(rank)].append(str(rank_id))
+
+        new_rank_id = getattr(self.resource_map, "new_rank_id", None)
+        for action in plan.actions:
+            if action.type not in LADDER_ACTIONS:
+                continue
+            for rank in action.ladder or []:
+                matches = active[action.job_id][rank_config_key(rank)]
+                if matches:
+                    rank.rank_id = matches.popleft()
+                elif callable(new_rank_id):
+                    rank.rank_id = str(new_rank_id())
+                else:
+                    raise PlanMaterializationError("resource_map must expose new_rank_id()")
+            try:
+                PlanAction.validate_rank_ids(action.job_id, action.ladder)
+            except ValueError as exc:
+                raise PlanMaterializationError(str(exc)) from exc
 
     def _validate_ladder(self, action: PlanAction, book, cluster_snapshot=None) -> None:
         """Validate a ladder-bearing action; raise on hard violations."""
@@ -1055,7 +1092,7 @@ class KoiAgentHarness:
             raise PlanMaterializationError(f"job {jid}: ladder is empty")
 
         try:
-            PlanAction.assign_rank_ids(jid, action.ladder)
+            PlanAction.validate_rank_ids(jid, action.ladder)
         except ValueError as exc:
             raise PlanMaterializationError(str(exc)) from exc
 
@@ -1567,7 +1604,7 @@ class KoiAgentHarness:
             "   'rationale': str}\n"
             "Rank dict (each entry of ladder):\n"
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
-            "   'rank_id': 'rank_0',      # omit rank_id; Koi auto-fills rank_0, rank_1, ...\n"
+            "   # rank_id is assigned by Koi after matching the active Store ranks.\n"
             "   'env': [market, cloud, region, zone, gpu_type],   # REQUIRED - launch target + ICP key\n"
             "   'config': {instance_type, gpu_count, tp, pp, sp, ep, cp,\n"
             "              num_nodes_per_chain, interconnect_type},  # the ONLY config knobs you set\n"
@@ -1601,8 +1638,9 @@ class KoiAgentHarness:
             "  defer    waiting->waiting    (no ladder)\n"
             "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
             "  diagnose  no change          (no ladder; record a theory only)\n"
-            "Every ladder rank MUST carry a unique rank_id (or let Koi auto-fill one), "
-            "MUST carry a 5-element env, and MUST resolve a "
+            "Do not set rank_id or chain_index; Koi assigns persistent rank ULIDs and "
+            "the runtime assigns replica indices. Every rank MUST carry a 5-element env "
+            "and MUST resolve a "
             "mechanism_id, either on the rank or inherited from the action. "
             "config.instance_type, gpu_count, tp, and pp are required; sp/ep/cp "
             "default to 1 when omitted. For cloud instance pools, "

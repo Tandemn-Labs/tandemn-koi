@@ -16,7 +16,15 @@ from src.core.models import EnvLabel
 RankKey = tuple[str, str]
 
 # ponytail: predictions ride in shape_json, but they are evidence inputs, not X.
-_X_SKIP = {"env", "rank_id", "replica_index", "mechanism_id", "predicted_y", "predicted_v"}
+_X_SKIP = {
+    "env",
+    "rank_id",
+    "chain_index",
+    "n_replicas",
+    "mechanism_id",
+    "predicted_y",
+    "predicted_v",
+}
 _LOAD_FIELDS = ("request_arrival_rate", "total_token_budget")
 _MODEL_IDENTITY_FIELDS = {"model_id", "updated_at"}
 _PER_GPU_MODEL_FIELDS = {"max_num_seq", "max_num_batched_tokens", "block_size", "kvcache_dtype"}
@@ -107,7 +115,7 @@ def build_deployment_x_index(
         raise ValueError("candidate graph X fields are required")
 
     active_jobs = list(snapshot.active_jobs_summary())
-    if not any(job.get("active_chains") for job in active_jobs):
+    if not any(job.get("active_ranks") for job in active_jobs):
         return DeploymentXIndex({})
     if not hardware_catalog:
         raise ValueError("hardware catalog is required to build deployment X")
@@ -118,14 +126,18 @@ def build_deployment_x_index(
 
     for job in active_jobs:
         job_id = str(job["job_id"])
-        groups = _groups_by_rank(job["active_chains"])
-        total_replicas = sum(len(chains) for chains in groups.values())
-        for rank_id, chains in groups.items():
+        ranks = list(job["active_ranks"])
+        total_replicas = sum(_replica_count(rank) for rank in ranks)
+        for rank in ranks:
+            rank_id = rank.get("rank_id")
+            if not rank_id:
+                raise ValueError("active rank missing rank_id")
+            rank_id = str(rank_id)
             by_rank[(job_id, rank_id)] = _rank_deployment(
                 job=job,
                 job_id=job_id,
                 rank_id=rank_id,
-                chains=chains,
+                rank=rank,
                 total_replicas=total_replicas,
                 resources=resources,
                 catalog=catalog,
@@ -159,24 +171,12 @@ def build_rank_x(
     )
 
 
-def _groups_by_rank(chains: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Group chain replicas by explicit rank id."""
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for chain in chains:
-        shape = dict(chain["shape_json"])
-        rank_id = shape.get("rank_id")
-        if not rank_id:
-            raise ValueError(f"chain {chain.get('chain_id')!r} missing rank_id")
-        groups.setdefault(str(rank_id), []).append(chain)
-    return groups
-
-
 def _rank_deployment(
     *,
     job: dict[str, Any],
     job_id: str,
     rank_id: str,
-    chains: list[dict[str, Any]],
+    rank: dict[str, Any],
     total_replicas: int,
     resources: dict[str, Any],
     catalog: dict[tuple[str, str, str], dict[str, Any]],
@@ -184,12 +184,9 @@ def _rank_deployment(
     x_fields: list[str] | tuple[str, ...],
 ) -> RankDeployment:
     """Assemble, enrich, derive, and filter X for one rank."""
-    shape = dict(chains[0]["shape_json"])
-    env = _env(chains[0])
-    replica_count = len(chains)
-    for chain in chains[1:]:
-        if _env(chain) != env:
-            raise ValueError(f"rank {rank_id!r} has mixed env labels")
+    shape = dict(rank["shape_json"])
+    env = _env(rank)
+    replica_count = _replica_count(rank)
 
     job_values = _job_x(job)
     model_id = _model_id(job_values, shape)
@@ -299,13 +296,20 @@ def _per_gpu_model_value(value: Any, gpu_type: str, field: str) -> Any:
     raise ValueError(f"model catalog field {field!r} missing gpu_type {gpu_type!r}")
 
 
-def _env(chain: dict[str, Any]) -> EnvLabel:
-    """Resolve the five-part Koi environment label for a deployed chain."""
-    shape = dict(chain["shape_json"])
-    target_env = _parse_env(chain["target_node"]) if chain.get("target_node") else None
+def _replica_count(rank: dict[str, Any]) -> int:
+    value = rank.get("n_replicas")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"rank {rank.get('rank_id')!r} has invalid n_replicas {value!r}")
+    return value
+
+
+def _env(rank: dict[str, Any]) -> EnvLabel:
+    """Resolve the five-part Koi environment label for a deployed rank."""
+    shape = dict(rank["shape_json"])
+    target_env = _parse_env(rank["target_node"]) if rank.get("target_node") else None
     shape_env = _parse_env(shape["env"])
     if target_env is not None and target_env != shape_env:
-        raise ValueError(f"chain {chain.get('chain_id')!r} has conflicting env labels")
+        raise ValueError(f"rank {rank.get('rank_id')!r} has conflicting env labels")
     return shape_env
 
 

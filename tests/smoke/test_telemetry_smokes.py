@@ -19,8 +19,8 @@ def _graph():
     return CandidateGraph(nodes, {}, {})
 
 
-def _snapshot():
-    shape = {"rank_id": "rank_0", "mechanism_id": "mech_1", "model_id": "m"}
+def _snapshot(n_replicas=2):
+    shape = {"mechanism_id": "mech_1", "model_id": "m"}
     return ClusterResourceSnapshot(
         tick=1,
         resources={},
@@ -28,9 +28,12 @@ def _snapshot():
             {
                 "job_id": "job_1",
                 "job_features": {"type": "online"},
-                "active_chains": [
-                    {"chain_id": "chain_a", "shape_json": dict(shape)},
-                    {"chain_id": "chain_b", "shape_json": dict(shape)},
+                "active_ranks": [
+                    {
+                        "rank_id": "rank_01K00000000000000000000000",
+                        "n_replicas": n_replicas,
+                        "shape_json": dict(shape),
+                    },
                 ],
             }
         ],
@@ -38,10 +41,11 @@ def _snapshot():
     )
 
 
-def _row(chain_id, rank_id="rank_0", **metrics):
+def _row(chain_index, rank_id="rank_01K00000000000000000000000", **metrics):
     return SimpleNamespace(
         ts=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
-        chain_id=chain_id,
+        job_id="job_1",
+        chain_index=chain_index,
         rank_id=rank_id,
         **metrics,
     )
@@ -62,7 +66,7 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
             gpu_metric_store=_Store(
                 [
                     _row(
-                        "chain_a",
+                        0,
                         throughput_token_per_sec=10.0,
                         kv_cache_util=0.2,
                         p99_ttft_ms=100.0,
@@ -71,7 +75,7 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
                         depth_req_q=999.0,
                     ),
                     _row(
-                        "chain_a",
+                        0,
                         throughput_token_per_sec=10.0,
                         kv_cache_util=0.4,
                         p99_ttft_ms=100.0,
@@ -79,14 +83,14 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
                         cost_per_token=0.01,
                     ),
                     _row(
-                        "chain_b",
+                        1,
                         throughput_token_per_sec=20.0,
                         kv_cache_util=0.9,
                         p99_ttft_ms=120.0,
                         slo_margin=2.0,
                         cost_per_token=0.02,
                     ),
-                    _row("stale_chain", throughput_token_per_sec=999.0),
+                    _row(0, rank_id="rank_stale", throughput_token_per_sec=999.0),
                 ]
             ),
             candidate_graph=_graph(),
@@ -97,7 +101,7 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
         rank = next(telemetry.iter_per_rank(bundle))
 
         self.assertEqual(rank.job_id, "job_1")
-        self.assertEqual(rank.rank_id, "rank_0")
+        self.assertEqual(rank.rank_id, "rank_01K00000000000000000000000")
         self.assertEqual(rank.committed_mechanism_id, "mech_1")
         self.assertAlmostEqual(rank.v_observed["kv_cache_util"][0], 0.6)
         self.assertAlmostEqual(rank.y_observed["throughput_token_per_sec"][0], 30.0)
@@ -108,17 +112,37 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
         self.assertEqual(rank.v_predicted, {})
         self.assertEqual(rank.y_predicted, {})
 
-    def test_rank_mismatch_is_contract_error(self):
+    def test_invalid_chain_index_is_contract_error(self):
+        for chain_index in (-1, "0", True):
+            with self.subTest(chain_index=chain_index):
+                telemetry = StoreTelemetry(
+                    user_id="user_1",
+                    gpu_metric_store=_Store([_row(chain_index, kv_cache_util=0.2)]),
+                    candidate_graph=_graph(),
+                    now_fn=lambda: datetime(2026, 1, 1, 0, 5, 0, tzinfo=UTC),
+                )
+                bundle = telemetry.collect_telemetry(0, 1, _snapshot())
+                with self.assertRaises(ValueError):
+                    list(telemetry.iter_per_rank(bundle))
+
+    def test_ignores_stale_indices_after_scale_down(self):
         telemetry = StoreTelemetry(
             user_id="user_1",
-            gpu_metric_store=_Store([_row("chain_a", rank_id="rank_bad", kv_cache_util=0.2)]),
+            gpu_metric_store=_Store(
+                [
+                    _row(0, throughput_token_per_sec=10.0),
+                    _row(1, throughput_token_per_sec=20.0),
+                    _row(2, throughput_token_per_sec=30.0),
+                ]
+            ),
             candidate_graph=_graph(),
             now_fn=lambda: datetime(2026, 1, 1, 0, 5, 0, tzinfo=UTC),
         )
 
-        bundle = telemetry.collect_telemetry(0, 1, _snapshot())
-        with self.assertRaises(ValueError):
-            list(telemetry.iter_per_rank(bundle))
+        bundle = telemetry.collect_telemetry(0, 1, _snapshot(n_replicas=1))
+        rank = next(telemetry.iter_per_rank(bundle))
+
+        self.assertEqual(rank.y_observed["throughput_token_per_sec"].tolist(), [10.0])
 
 
 if __name__ == "__main__":

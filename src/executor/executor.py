@@ -1,4 +1,8 @@
+import re
+
 from src.core.models import Plan
+
+_RANK_ID_RE = re.compile(r"rank_[0-7][0-9A-HJKMNP-TV-Z]{25}\Z")
 
 
 class Executor:
@@ -36,6 +40,9 @@ class StorePlanExecutor(Executor):
 
         actions = []
         for action in plan.actions:
+            for rank in action.ladder or []:
+                if not rank.rank_id or not _RANK_ID_RE.fullmatch(rank.rank_id):
+                    raise ValueError(f"job {action.job_id}: executor requires rank_<ULID> rank_id")
             actions.append(
                 store_models.PlanAction(
                     job_id=action.job_id,

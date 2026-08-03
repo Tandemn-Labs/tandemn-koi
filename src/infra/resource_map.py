@@ -12,7 +12,7 @@ from tandemn_system_data.clients import (  # type: ignore[import-untyped]
     ResourceMapStore,
 )
 
-ACTIVE_CHAIN_STATUSES = ("launching", "running")
+ACTIVE_RANK_STATUSES = ("launching", "running")
 WAITING_JOB_STATUSES = ("waiting",)
 
 
@@ -35,7 +35,7 @@ class ClusterResourceSnapshot:
     def current_ladder(self, job_id: str) -> list[dict[str, Any]]:
         for job in self.active_jobs:
             if job.get("job_id", job.get("id")) == job_id:
-                return list(job.get("current_ladder") or job.get("active_chains") or [])
+                return list(job.get("current_ladder") or job.get("active_ranks") or [])
         return []
 
 
@@ -98,7 +98,7 @@ class ResourceMapManager:
         return JobStore(self._client())
 
     # ------------------------------------------------------------------
-    # Jobs and chains
+    # Jobs and ranks
     # ------------------------------------------------------------------
 
     def get_submitted_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
@@ -106,7 +106,7 @@ class ResourceMapManager:
         return self.get_waiting_jobs(user_id=user_id)
 
     def get_running_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return running jobs plus active chain allocations."""
+        """Return running jobs plus active rank allocations."""
         effective_user_id = self._effective_user_id(user_id)
         return [
             self._running_job_to_summary(running_job)
@@ -127,13 +127,13 @@ class ResourceMapManager:
             self._job_to_summary(job) for job in self._job_store().paused_jobs(effective_user_id)
         ]
 
-    def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return active chains with owning job context."""
-        chains: list[dict[str, Any]] = []
+    def get_running_ranks(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Return active ranks with owning job context."""
+        ranks: list[dict[str, Any]] = []
         for job in self.get_running_jobs(user_id=user_id):
-            for chain in job.get("active_chains", []):
-                chains.append({"job_id": job["job_id"], "user_id": job["user_id"], **chain})
-        return chains
+            for rank in job.get("active_ranks", []):
+                ranks.append({"job_id": job["job_id"], "user_id": job["user_id"], **rank})
+        return ranks
 
     @staticmethod
     def _model_dump(model) -> dict[str, Any]:
@@ -162,23 +162,28 @@ class ResourceMapManager:
         }
 
     @classmethod
-    def _chain_to_summary(cls, chain) -> dict[str, Any]:
-        raw = cls._model_dump(chain)
+    def _rank_to_summary(cls, rank) -> dict[str, Any]:
+        raw = cls._model_dump(rank)
         return {
-            "chain_id": raw.get("chain_id"),
+            "rank_id": raw.get("rank_id"),
             "plan_id": raw.get("plan_id"),
             "role": raw.get("role"),
-            "chain_status": raw.get("status"),
+            "status": raw.get("status"),
             "shape_json": raw.get("shape_json") or {},
+            "n_replicas": raw.get("n_replicas"),
             "target_node": raw.get("target_node"),
         }
 
     @classmethod
     def _running_job_to_summary(cls, running_job) -> dict[str, Any]:
         job = cls._job_to_summary(running_job.job)
-        chains = [cls._chain_to_summary(chain) for chain in running_job.chains]
-        job["active_chains"] = chains
-        job["current_ladder"] = chains
+        ranks = [
+            summary
+            for rank in running_job.ranks
+            if (summary := cls._rank_to_summary(rank))["status"] in ACTIVE_RANK_STATUSES
+        ]
+        job["active_ranks"] = ranks
+        job["current_ladder"] = ranks
         return job
 
     # ------------------------------------------------------------------
@@ -277,7 +282,7 @@ class ResourceMapManager:
         inferred by subtracting this from each env's total. One chain row is
         one launched serving unit. GPU-granular pools consume
         ``shape_json["count"]``; instance-atomic pools consume the full
-        instance capacity that row reserved.
+        instance capacity that each replica reserved.
 
         The chain's placement env is resolved with precedence
         ``target_node`` -> ``shape_json["env"]`` -> ``shape_json["pool_id"]``;
@@ -290,10 +295,10 @@ class ResourceMapManager:
         used_gpus: dict[str, int] = {}
         used_instances: dict[tuple[str, str], int] = {}
         used_pool_gpus: dict[tuple[str, str], int] = {}
-        for chain in self.get_running_chains(user_id=user_id):
-            shape = chain.get("shape_json") or {}
+        for rank in self.get_running_ranks(user_id=user_id):
+            shape = rank.get("shape_json") or {}
             raw_env = (
-                chain.get("target_node")
+                rank.get("target_node")
                 or shape.get("env")
                 or shape.get("pool_id")
                 or shape.get("target_node")
@@ -301,20 +306,29 @@ class ResourceMapManager:
             if raw_env is None:
                 continue
             env_key = self._normalize_env_key(raw_env, default_market)
-            # tandemn-store guarantees a positive int 'count' at launch; read
-            # it directly with no parallelism-derived fallback.
             count = shape.get("count")
             if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
                 raise ValueError(
-                    f"chain {chain.get('chain_id')} shape_json missing positive int "
+                    f"rank {rank.get('rank_id')} shape_json missing positive int "
                     f"'count'; got {count!r}"
                 )
             unit = self.resolve_allocation_unit(env_key, shape, resources)
-            footprint = count if unit.allocation_kind == "gpu" else unit.gpus_per_unit
+            n_replicas = rank.get("n_replicas")
+            if not isinstance(n_replicas, int) or isinstance(n_replicas, bool) or n_replicas <= 0:
+                raise ValueError(
+                    f"rank {rank.get('rank_id')} missing positive int n_replicas; "
+                    f"got {n_replicas!r}"
+                )
+            units_per_replica = (
+                count
+                if unit.allocation_kind == "gpu"
+                else (count + unit.gpus_per_unit - 1) // unit.gpus_per_unit
+            )
+            footprint = units_per_replica * unit.gpus_per_unit * n_replicas
             used_gpus[env_key] = used_gpus.get(env_key, 0) + footprint
             if unit.allocation_kind == "instance" and unit.instance_type:
                 key = (env_key, unit.instance_type)
-                used_instances[key] = used_instances.get(key, 0) + 1
+                used_instances[key] = used_instances.get(key, 0) + units_per_replica * n_replicas
             elif unit.instance_type:
                 key = (env_key, unit.instance_type)
                 used_pool_gpus[key] = used_pool_gpus.get(key, 0) + footprint
@@ -359,7 +373,7 @@ class ResourceMapManager:
             "running_jobs": self.get_running_jobs(user_id=user_id),
             "waiting_jobs": self.get_waiting_jobs(user_id=user_id),
             "paused_jobs": self.get_paused_jobs(user_id=user_id),
-            "running_chains": self.get_running_chains(user_id=user_id),
+            "running_ranks": self.get_running_ranks(user_id=user_id),
         }
 
     def build_keep_all_plan(self, snapshot: ClusterResourceSnapshot) -> dict[str, dict[str, str]]:
@@ -379,6 +393,12 @@ class ResourceMapManager:
 
     def refresh_resource_map(self, TandemnStore=None):
         return self.get_resource_map()
+
+    @staticmethod
+    def new_rank_id() -> str:
+        from tandemn_system_data.ids import new_rank_id  # type: ignore[import-untyped]
+
+        return new_rank_id()
 
     def get_avail_capacity(self, env, gpu_type):
         env_key = self._env_key(env)
@@ -448,14 +468,24 @@ class ResourceMapManager:
         resources = resources if resources is not None else self.resources_summary()
         engine_gpus = rank.gpus_per_chain()
         unit = self.resolve_allocation_unit(rank.env, rank.config, resources)
-        capacity = engine_gpus if unit.allocation_kind == "gpu" else unit.gpus_per_unit
+        units_per_replica = (
+            engine_gpus
+            if unit.allocation_kind == "gpu"
+            else (engine_gpus + unit.gpus_per_unit - 1) // unit.gpus_per_unit
+        )
+        capacity = units_per_replica * unit.gpus_per_unit
         info = resources[unit.env_key]
         pool = self._select_pool(unit.env_key, info, rank.config)
         return {
             "allocation_kind": unit.allocation_kind,
             "instance_type": unit.instance_type,
             "gpus_per_unit": unit.gpus_per_unit,
-            "price_per_unit_hour": unit.price_per_unit_hour,
+            "units_per_replica": units_per_replica,
+            "price_per_unit_hour": (
+                unit.price_per_unit_hour * units_per_replica
+                if unit.price_per_unit_hour is not None
+                else None
+            ),
             "capacity_per_replica": capacity,
             "free_capacity_gpus": int((pool or info).get("free", 0)),
             "engine_gpus": engine_gpus,
@@ -515,7 +545,9 @@ class ResourceMapManager:
                 key = (env, str(instance_type))
                 requested = by_pool.setdefault(key, {"units": 0, "gpus": 0})
                 requested["units"] += (
-                    gpus if allocation.get("allocation_kind") == "gpu" else int(rank.n_replicas)
+                    gpus
+                    if allocation.get("allocation_kind") == "gpu"
+                    else int(rank.n_replicas) * int(allocation["units_per_replica"])
                 )
                 requested["gpus"] += gpus
         return by_env, by_pool
@@ -525,15 +557,23 @@ class ResourceMapManager:
         pricing: dict[str, dict[str, Any]] = {}
         for env, info in resources.items():
             by_instance = {}
+            gpus_per_instance = {}
             prices = []
             for pool in info.get("pools") or []:
                 inst = pool.get("instance_type")
                 price = pool.get("price_per_instance_hour") or pool.get("price_per_unit_hour")
                 if inst and price is not None:
                     by_instance[str(inst)] = float(price)
+                    gpus_per_instance[str(inst)] = int(
+                        pool.get("gpus_per_instance") or pool.get("gpus_per_unit") or 1
+                    )
                     prices.append(float(price))
             if by_instance:
-                pricing[env] = {"by_instance_type": by_instance, "default": max(prices)}
+                pricing[env] = {
+                    "by_instance_type": by_instance,
+                    "gpus_per_instance": gpus_per_instance,
+                    "default": max(prices),
+                }
         return pricing
 
     def check_resource_feasibility(self, plan):
@@ -702,7 +742,7 @@ class _SmokeResourceMapManager(ResourceMapManager):
     def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
         return []
 
-    def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
+    def get_running_ranks(self, user_id: str | None = None) -> list[dict[str, Any]]:
         return []
 
 
@@ -768,10 +808,10 @@ def _run_smoke(manager: ResourceMapManager, label: str) -> dict[str, Any]:
 
 
 class _UsedCapacitySmokeManager(ResourceMapManager):
-    """80 total A100 GPUs with one running 8-GPU chain placed via target_node.
+    """80 total A100 GPUs with one two-replica 8-GPU rank.
 
-    Pins the used-capacity contract: free = total - count = 80 - 8 = 72.
-    The chain carries its env in the first-class ``target_node`` field (not
+    Pins the used-capacity contract: free = total - count * replicas = 80 - 16 = 64.
+    The rank carries its env in the first-class ``target_node`` field (not
     ``shape_json['env']``), exercising the resolution precedence.
     """
 
@@ -816,10 +856,11 @@ class _UsedCapacitySmokeManager(ResourceMapManager):
         }
         return ResourceMap(market=["reserved"], clouds=clouds)
 
-    def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
+    def get_running_ranks(self, user_id: str | None = None) -> list[dict[str, Any]]:
         return [
             {
-                "chain_id": "chain_used_capacity_smoke",
+                "rank_id": "rank_used_capacity_smoke",
+                "n_replicas": 2,
                 "target_node": self._ENV,
                 "shape_json": {"gpu_count": 8, "count": 8},
             }
@@ -833,8 +874,8 @@ def _run_used_capacity_check() -> dict[str, Any]:
     info = resources[env]
     if int(info["total"]) != 80:
         raise AssertionError(f"used-capacity: expected total=80, got {info['total']}")
-    if int(info["free"]) != 72:
-        raise AssertionError(f"used-capacity: expected free=72 (80-8), got {info['free']}")
+    if int(info["free"]) != 64:
+        raise AssertionError(f"used-capacity: expected free=64 (80-16), got {info['free']}")
     result = {"label": "used-capacity", "env_key": env, "total": 80, "free": int(info["free"])}
     print(json.dumps(result, indent=2, default=str))
     return result

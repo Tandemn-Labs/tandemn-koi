@@ -76,7 +76,6 @@ def _snapshot():
         "gpu_mem_util": 0.99,
     }
     shape = {
-        "rank_id": "rank_a",
         "env": list(ENV_LABEL),
         "model_id": "Qwen/Qwen2.5-72B-Instruct",
         "count": 8,
@@ -117,9 +116,13 @@ def _snapshot():
                 "user_id": "user_1",
                 "job_features": features,
                 "spec_json": {"job_features": features},
-                "active_chains": [
-                    {"chain_id": "chain_1", "target_node": ENV, "shape_json": dict(shape)},
-                    {"chain_id": "chain_2", "target_node": ENV, "shape_json": dict(shape)},
+                "active_ranks": [
+                    {
+                        "rank_id": "rank_a",
+                        "n_replicas": 2,
+                        "target_node": ENV,
+                        "shape_json": dict(shape),
+                    },
                 ],
             }
         ],
@@ -267,9 +270,9 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(x["gpu_mem_gb"], 80)
         self.assertEqual(x["gpu_tflops_fp16"], 989.5)
         self.assertEqual(x["internode_bandwidth_gbps"], 3200)
-        self.assertEqual(x["request_arrival_rate"], 50)
+        self.assertEqual(x["request_arrival_rate"], 100)
         self.assertEqual(x["multi_turn_avg_turns"], 2.0)
-        self.assertEqual(x["total_token_budget"], 500)
+        self.assertEqual(x["total_token_budget"], 1000)
         self.assertEqual(x["deadline_hrs"], 2)
         self.assertEqual(x["num_nodes_per_chain"], 1)
         self.assertEqual(x["dp"], 2)
@@ -295,8 +298,7 @@ class DeploymentXSmokeTests(unittest.TestCase):
 
     def test_missing_rank_id_is_contract_error(self):
         snapshot = _snapshot()
-        shape = snapshot.active_jobs[0]["active_chains"][0]["shape_json"]
-        shape.pop("rank_id")
+        snapshot.active_jobs[0]["active_ranks"][0].pop("rank_id")
 
         with self.assertRaises(ValueError):
             build_deployment_x_index(
@@ -343,12 +345,12 @@ class DeploymentXSmokeTests(unittest.TestCase):
         row = evidence_store.rows[0]
         self.assertEqual(row.rank_id, "rank_a")
         self.assertEqual(row.env_label, ENV_LABEL)
-        self.assertEqual(row.X["request_arrival_rate"], 50)
+        self.assertEqual(row.X["request_arrival_rate"], 100)
         self.assertEqual(row.X["gpu_generation"], "Hopper")
         self.assertEqual(row.y_predicted, {"p99_ttft_ms": 90.0})
         self.assertEqual(row.V_predicted_trajectory, {"kv_cache_util": 0.1})
         self.assertEqual(mechanism_registry.context["type"], "online")
-        self.assertEqual(mechanism_registry.context["request_arrival_rate"], 50)
+        self.assertEqual(mechanism_registry.context["request_arrival_rate"], 100)
 
     def test_s2_applicability_uses_values_and_preserves_committed(self):
         registry = MechanismRegistry()

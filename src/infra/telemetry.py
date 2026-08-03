@@ -8,8 +8,7 @@ One collection pass is deliberately small:
 
     1. S1 passes the frozen cluster snapshot into ``collect_telemetry``.
     2. The adapter reads raw ``GpuMetric`` rows from Tandemn Store per active job.
-    3. Rows are validated against active snapshot chains by ``chain_id`` and
-       ``rank_id``.
+    3. Rows are validated by ``(job_id, rank_id, chain_index)``.
     4. GPU/worker rows collapse into rank-level V/Y trajectories.
     5. ``iter_per_rank`` yields ``RankTelemetry`` objects consumed by S2.
 
@@ -60,8 +59,8 @@ METRIC_POLICIES = {
 
 RankKey = tuple[str, str]
 Bucket = int
-ChainID = str
-RowsByRank = dict[RankKey, dict[Bucket, dict[ChainID, list[Any]]]]
+ChainIndex = int
+RowsByRank = dict[RankKey, dict[Bucket, dict[ChainIndex, list[Any]]]]
 
 
 @dataclass(frozen=True)
@@ -84,27 +83,13 @@ class RankTelemetry:
 
 
 @dataclass(frozen=True)
-class _ChainRef:
-    """Snapshot identity for one active chain.
-
-    Raw Store rows are accepted only when their ``chain_id`` and ``rank_id``
-    match this frozen S0 view.
-    """
-
-    job_id: str
-    chain_id: str
-    rank_id: str
-    shape: dict[str, Any]
-    job_features: dict[str, Any]
-
-
-@dataclass(frozen=True)
 class _RankRef:
-    """Snapshot identity for one rank and all active chain replicas in it."""
+    """Snapshot identity and runtime replica range for one active rank."""
 
     job_id: str
     rank_id: str
-    chains: list[_ChainRef]
+    n_replicas: int
+    shape: dict[str, Any]
     job_features: dict[str, Any]
 
 
@@ -115,7 +100,7 @@ class _TelemetryBundle:
     start: datetime
     end: datetime
     rows_by_job: dict[str, list[Any]]
-    chains_by_id: dict[str, _ChainRef]
+    ranks_by_key: dict[RankKey, _RankRef]
     ranks: list[_RankRef]
 
 
@@ -182,12 +167,12 @@ class StoreTelemetry:
         start = self._last_end or end - timedelta(seconds=self.tick_interval_sec)
         self._last_end = end
 
-        chains_by_id, ranks = self._active_refs(snapshot)
+        ranks_by_key, ranks = self._active_refs(snapshot)
         rows_by_job = {
             job_id: self.store.rows_for_job_window(self.user_id, job_id, start, end)
             for job_id in sorted({rank.job_id for rank in ranks})
         }
-        return _TelemetryBundle(start, end, rows_by_job, chains_by_id, ranks)
+        return _TelemetryBundle(start, end, rows_by_job, ranks_by_key, ranks)
 
     def iter_per_rank(self, bundle: _TelemetryBundle):
         """Yield one ``RankTelemetry`` per active rank with observed rows.
@@ -225,67 +210,69 @@ class StoreTelemetry:
             return list(snapshot.active_jobs_summary() or [])
         return list(getattr(snapshot, "active_jobs", []) or [])
 
-    def _active_refs(self, snapshot) -> tuple[dict[str, _ChainRef], list[_RankRef]]:
-        """Return active chain/rank identities from the frozen snapshot."""
+    def _active_refs(self, snapshot) -> tuple[dict[RankKey, _RankRef], list[_RankRef]]:
+        """Return active rank identities from the frozen snapshot."""
 
-        chains_by_id: dict[str, _ChainRef] = {}
-        rank_groups: dict[tuple[str, str], list[_ChainRef]] = defaultdict(list)
+        refs: dict[RankKey, _RankRef] = {}
         for job in self._active_jobs(snapshot):
             job_id = str(job["job_id"])
             job_features = dict(job.get("job_features") or {})
-            for chain in job.get("active_chains") or job.get("current_ladder") or []:
-                chain_id = chain.get("chain_id")
-                shape = dict(chain.get("shape_json") or {})
-                rank_id = shape.get("rank_id")
-                if not chain_id:
-                    raise ValueError(f"active chain for job {job_id!r} missing chain_id")
+            for rank in job.get("active_ranks") or []:
+                rank_id = rank.get("rank_id")
                 if not rank_id:
-                    raise ValueError(f"chain {chain_id!r} missing rank_id")
-                ref = _ChainRef(job_id, str(chain_id), str(rank_id), shape, job_features)
-                chains_by_id[ref.chain_id] = ref
-                rank_groups[(ref.job_id, ref.rank_id)].append(ref)
-        ranks = [
-            _RankRef(job_id, rank_id, chains, chains[0].job_features)
-            for (job_id, rank_id), chains in sorted(rank_groups.items())
-        ]
-        return chains_by_id, ranks
+                    raise ValueError(f"active rank for job {job_id!r} missing rank_id")
+                n_replicas = rank.get("n_replicas")
+                if (
+                    not isinstance(n_replicas, int)
+                    or isinstance(n_replicas, bool)
+                    or n_replicas < 1
+                ):
+                    raise ValueError(f"rank {rank_id!r} has invalid n_replicas {n_replicas!r}")
+                ref = _RankRef(
+                    job_id,
+                    str(rank_id),
+                    n_replicas,
+                    dict(rank.get("shape_json") or {}),
+                    job_features,
+                )
+                refs[(ref.job_id, ref.rank_id)] = ref
+        return refs, [refs[key] for key in sorted(refs)]
 
     def _rows_by_rank(self, bundle: _TelemetryBundle) -> RowsByRank:
-        """Validate raw rows and group them by rank, time bucket, and chain."""
+        """Validate rows and group them by rank, time bucket, and runtime index."""
 
         out: RowsByRank = {}
         for ref, row in self._validated_rows(bundle):
             rank_rows = out.setdefault((ref.job_id, ref.rank_id), {})
             bucket_rows = rank_rows.setdefault(self._bucket(row), {})
-            bucket_rows.setdefault(ref.chain_id, []).append(row)
+            bucket_rows.setdefault(int(row.chain_index), []).append(row)
         return out
 
     def _validated_rows(self, bundle: _TelemetryBundle):
-        """Yield Store rows that belong to active snapshot chains."""
+        """Yield Store rows that belong to active snapshot ranks."""
 
         for rows in bundle.rows_by_job.values():
             for row in rows:
-                ref = self._chain_ref_for_row(bundle, row)
+                ref = self._rank_ref_for_row(bundle, row)
                 if ref is not None:
                     yield ref, row
 
     @staticmethod
-    def _chain_ref_for_row(bundle: _TelemetryBundle, row) -> _ChainRef | None:
-        chain_id = getattr(row, "chain_id", None)
-        if chain_id is None:
+    def _rank_ref_for_row(bundle: _TelemetryBundle, row) -> _RankRef | None:
+        job_id = getattr(row, "job_id", None)
+        rank_id = getattr(row, "rank_id", None)
+        if job_id is None or rank_id is None:
             return None
-        ref = bundle.chains_by_id.get(str(chain_id))
+        ref = bundle.ranks_by_key.get((str(job_id), str(rank_id)))
         if ref is None:
             return None
-
-        row_rank_id = getattr(row, "rank_id", None)
-        if row_rank_id is None:
-            raise ValueError(f"metric row for chain {chain_id!r} missing rank_id")
-        if str(row_rank_id) != ref.rank_id:
+        chain_index = getattr(row, "chain_index", None)
+        if not isinstance(chain_index, int) or isinstance(chain_index, bool) or chain_index < 0:
             raise ValueError(
-                f"metric row for chain {chain_id!r} has rank_id {row_rank_id!r}, "
-                f"expected {ref.rank_id!r}"
+                f"metric row for rank {rank_id!r} has invalid chain_index {chain_index!r}"
             )
+        if chain_index >= ref.n_replicas:
+            return None
         return ref
 
     def _bucket(self, row) -> int:
@@ -294,7 +281,7 @@ class StoreTelemetry:
 
     def _rank_observed(
         self,
-        bucket_rows: dict[Bucket, dict[ChainID, list[Any]]],
+        bucket_rows: dict[Bucket, dict[ChainIndex, list[Any]]],
         metric_names: set[str],
     ) -> dict[str, np.ndarray]:
         """Collapse bucketed chain rows into rank-level metric trajectories."""
@@ -307,7 +294,7 @@ class StoreTelemetry:
 
     def _rank_sample(
         self,
-        chain_rows: dict[ChainID, list[Any]],
+        chain_rows: dict[ChainIndex, list[Any]],
         metric_names: set[str],
     ) -> dict[str, float]:
         """Build one rank sample for one time bucket."""
@@ -326,15 +313,15 @@ class StoreTelemetry:
     def _chain_values(
         self,
         metric: str,
-        chain_rows: dict[ChainID, list[Any]],
-    ) -> dict[ChainID, float]:
+        chain_rows: dict[ChainIndex, list[Any]],
+    ) -> dict[ChainIndex, float]:
         """Collapse every chain's rows for one metric."""
 
         out = {}
-        for chain_id, rows in chain_rows.items():
+        for chain_index, rows in chain_rows.items():
             value = self._chain_value(metric, rows)
             if value is not None:
-                out[chain_id] = value
+                out[chain_index] = value
         return out
 
     def _chain_value(self, metric: str, rows: list[Any]) -> float | None:
@@ -355,8 +342,8 @@ class StoreTelemetry:
     @staticmethod
     def _rank_value(
         metric: str,
-        chain_values: dict[str, float],
-        chain_throughput: dict[str, float],
+        chain_values: dict[int, float],
+        chain_throughput: dict[int, float],
     ) -> float | None:
         """Collapse chain bucket values into one rank bucket value."""
 
@@ -371,8 +358,8 @@ class StoreTelemetry:
         if policy == "weighted_by_throughput" and chain_throughput:
             weighted = [
                 (value, weight)
-                for chain_id, value in chain_values.items()
-                if (weight := chain_throughput.get(chain_id)) is not None
+                for chain_index, value in chain_values.items()
+                if (weight := chain_throughput.get(chain_index)) is not None
             ]
             total = sum(weight for _, weight in weighted)
             if total > 0:
@@ -381,11 +368,8 @@ class StoreTelemetry:
 
     @staticmethod
     def _committed_mechanism_id(rank: _RankRef) -> str | None:
-        for chain in rank.chains:
-            mechanism_id = chain.shape.get("mechanism_id")
-            if mechanism_id is not None:
-                return str(mechanism_id)
-        return None
+        mechanism_id = rank.shape.get("mechanism_id")
+        return str(mechanism_id) if mechanism_id is not None else None
 
 
 def _metric_value(row: Any, metric: str) -> float | None:

@@ -7,14 +7,17 @@ from typing import Any
 from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
-from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node
+from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node, Plan, RankSpec
+from src.cost.switch_cost import RankEntry, hourly_rate
 from src.exploration.eig import aggregate_cluster_eig, compute_eig
 from src.infra.resource_map import (
+    ClusterResourceSnapshot,
     ResourceMapManager,
     _run_smoke,
     _run_used_capacity_check,
     _SmokeResourceMapManager,
 )
+from src.validation.validator import Validator
 
 
 @dataclass
@@ -121,7 +124,7 @@ class EigResourceSmokeTests(unittest.TestCase):
         self.assertEqual(result["label"], "in-memory")
         self.assertEqual(result["active_jobs"], 0)
         self.assertEqual(result["pending_jobs"], 0)
-        self.assertEqual(used["free"], 72)
+        self.assertEqual(used["free"], 64)
         self.assertEqual(used["total"], 80)
 
     def test_underfilled_cloud_instances_consume_full_instance_capacity(self):
@@ -158,11 +161,15 @@ class EigResourceSmokeTests(unittest.TestCase):
             def get_resource_map(self, user_id=None):
                 return FakeResourceMap()
 
-            def get_running_chains(self, user_id=None):
+            def get_running_ranks(self, user_id=None):
                 shape = {"count": 2, "gpu_count": 2, "instance_type": "p4d.24xlarge"}
                 return [
-                    {"chain_id": "chain_a", "target_node": env, "shape_json": dict(shape)},
-                    {"chain_id": "chain_b", "target_node": env, "shape_json": dict(shape)},
+                    {
+                        "rank_id": "rank_a",
+                        "n_replicas": 2,
+                        "target_node": env,
+                        "shape_json": dict(shape),
+                    },
                 ]
 
             def get_running_jobs(self, user_id=None):
@@ -203,6 +210,75 @@ class EigResourceSmokeTests(unittest.TestCase):
             ],
         )
 
+    def test_multi_instance_replica_reserves_and_prices_every_instance(self):
+        env = "reserved|aws|us-east-2|use2-az3|A100"
+        resources = {
+            env: {
+                "gpu_type": "A100",
+                "total": 24,
+                "free": 24,
+                "pools": [
+                    {
+                        "instance_type": "p4d.24xlarge",
+                        "gpus_per_instance": 8,
+                        "allocation_kind": "instance",
+                        "price_per_instance_hour": 10.0,
+                        "free": 24,
+                    }
+                ],
+            }
+        }
+        rank = RankSpec.from_dict(
+            {
+                "role": "aggregate",
+                "env": env.split("|"),
+                "config": {
+                    "instance_type": "p4d.24xlarge",
+                    "gpu_count": 16,
+                    "tp": 16,
+                    "pp": 1,
+                },
+            }
+        )
+        manager = ResourceMapManager(user_id="multi_instance_smoke")
+
+        allocation = manager.rank_allocation_summary(rank, resources)
+        by_env, by_pool = manager.requested_capacity(
+            {
+                "actions": [
+                    {
+                        "job_id": "job_1",
+                        "type": "place",
+                        "ladder": [rank.to_dict()],
+                    }
+                ]
+            },
+            resources,
+        )
+        pricing = manager.switch_pricing_map(resources)
+        switch_rank = RankEntry(("aggregate", tuple(env.split("|")), ""), rank.config, env, 1)
+
+        self.assertEqual(allocation["units_per_replica"], 2)
+        self.assertEqual(allocation["capacity_per_replica"], 16)
+        self.assertEqual(allocation["price_per_unit_hour"], 20.0)
+        self.assertEqual(by_env[env], 16)
+        self.assertEqual(by_pool[(env, "p4d.24xlarge")], {"units": 2, "gpus": 16})
+        self.assertEqual(hourly_rate(switch_rank, pricing), 20.0)
+        typed = Plan.from_raw(
+            {
+                "actions": [
+                    {
+                        "job_id": "job_1",
+                        "type": "place",
+                        "ladder": [rank.to_dict()],
+                    }
+                ]
+            },
+            tick=1,
+        )
+        snapshot = ClusterResourceSnapshot(1, resources, [], [])
+        self.assertEqual(Validator(resource_map=manager)._check_chain_physics(typed, snapshot), [])
+
     def test_mixed_instance_pools_expose_free_instances(self):
         env = "reserved|aws|us-east-1|us-east-1b|L40S"
 
@@ -237,7 +313,7 @@ class EigResourceSmokeTests(unittest.TestCase):
             def get_resource_map(self, user_id=None):
                 return FakeResourceMap()
 
-            def get_running_chains(self, user_id=None):
+            def get_running_ranks(self, user_id=None):
                 return []
 
         manager = SmokeManager()
@@ -316,10 +392,11 @@ class EigResourceSmokeTests(unittest.TestCase):
             def get_resource_map(self, user_id=None):
                 return FakeResourceMap()
 
-            def get_running_chains(self, user_id=None):
+            def get_running_ranks(self, user_id=None):
                 return [
                     {
-                        "chain_id": "chain_1",
+                        "rank_id": "rank_1",
+                        "n_replicas": 1,
                         "target_node": env,
                         "shape_json": {"instance_type": "gpu-pool", "count": 2},
                     }

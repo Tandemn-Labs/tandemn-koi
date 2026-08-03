@@ -24,17 +24,29 @@ class StorePlanExecutorSmokeTests(unittest.TestCase):
         self.assertEqual(ack, [{"plan_id": store.plan.plan_id, "status": "created"}])
         self.assertEqual(store.plan.user_id, "user_1")
         self.assertEqual(store.plan.tick_rationale, "place one rank")
-        self.assertEqual(store.plan.actions[0].ladder[0]["rank_id"], "rank_0")
+        self.assertEqual(
+            store.plan.actions[0].ladder[0]["rank_id"], "rank_01K00000000000000000000000"
+        )
         self.assertEqual(store.plan.actions[0].ladder[0]["predicted_y"], {"p99_ttft_ms": 120.0})
         self.assertEqual(store.plan.actions[0].ladder[0]["predicted_v"], {"kv_cache_util": 0.4})
 
-    def test_accepts_raw_plan_input(self):
+    def test_rejects_raw_plan_without_rank_id(self):
         store = _PlanStore()
+        raw = _raw_place_plan()
+        raw["actions"][0]["ladder"][0].pop("rank_id")
+        with self.assertRaisesRegex(ValueError, "executor requires rank_<ULID>"):
+            StorePlanExecutor("user_1", plan_store=store).send_to_executor(raw)
 
-        StorePlanExecutor("user_1", plan_store=store).send_to_executor(_raw_place_plan())
+    def test_rank_ulid_timestamp_boundary_matches_orca(self):
+        for first in ("0", "7"):
+            raw = _raw_place_plan()
+            raw["actions"][0]["ladder"][0]["rank_id"] = f"rank_{first}{'Z' * 25}"
+            StorePlanExecutor("user_1", plan_store=_PlanStore()).send_to_executor(raw)
 
-        self.assertEqual(store.plan.actions[0].job_id, "job_1")
-        self.assertEqual(store.plan.actions[0].ladder[0]["rank_id"], "rank_0")
+        raw = _raw_place_plan()
+        raw["actions"][0]["ladder"][0]["rank_id"] = f"rank_8{'0' * 25}"
+        with self.assertRaisesRegex(ValueError, "executor requires rank_<ULID>"):
+            StorePlanExecutor("user_1", plan_store=_PlanStore()).send_to_executor(raw)
 
 
 def _raw_place_plan():
@@ -50,6 +62,7 @@ def _raw_place_plan():
                 "ladder": [
                     {
                         "role": "aggregate",
+                        "rank_id": "rank_01K00000000000000000000000",
                         "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
                         "config": {"gpu_count": 1},
                         "n_replicas": 1,

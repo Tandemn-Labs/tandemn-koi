@@ -1,8 +1,10 @@
 import unittest
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import numpy as np
 from sqlalchemy import text
+from src.agent.agent import KoiAgentHarness
 from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
 from src.core.evidence_service import EvidenceService
@@ -60,6 +62,93 @@ def make_row(
 
 
 class CoreSmokeTests(unittest.TestCase):
+    def test_final_rank_identity_reuses_config_not_position_replica_count_or_traffic(self):
+        env = ["reserved", "aws", "us-east-1", "use1-az1", "H100"]
+        proposed = {
+            "role": "aggregate",
+            "env": env,
+            "config": {
+                "instance_type": "p5.48xlarge",
+                "count": 2,
+                "tp": 2,
+                "pp": 1,
+                "_arrival_share_rps": 15.0,
+            },
+            "n_replicas": 3,
+        }
+        plan = Plan.from_raw(
+            {
+                "actions": [
+                    {
+                        "job_id": "job_online",
+                        "type": "swap",
+                        "ladder": [
+                            proposed,
+                            {
+                                **proposed,
+                                "config": {**proposed["config"], "tp": 4},
+                            },
+                        ],
+                    }
+                ]
+            },
+            tick=1,
+        )
+        snapshot = SimpleNamespace(
+            active_jobs_summary=lambda: [
+                {
+                    "job_id": "job_online",
+                    "active_ranks": [
+                        {
+                            "rank_id": "rank_existing",
+                            "role": "aggregate",
+                            "status": "running",
+                            "target_node": "|".join(env),
+                            "shape_json": {
+                                "instance_type": "p5.48xlarge",
+                                "gpu_type": "H100",
+                                "gpu_count": 2,
+                                "count": 2,
+                                "tp": 2,
+                                "pp": 1,
+                                "sp": 1,
+                                "ep": 1,
+                                "cp": 1,
+                                "rank_id": "rank_existing",
+                                "chain_index": 0,
+                                "n_replicas": 1,
+                                "mechanism_id": "mech_1",
+                                "predicted_y": {"p99_ttft_ms": 120.0},
+                                "predicted_v": {"kv_cache_util": 0.4},
+                                "status": "running",
+                                "reason": "active",
+                                "model_id": "Qwen/Qwen3-0.6B",
+                                "engine_name": "vllm",
+                                "target_p99_ttft_ms": 500.0,
+                                "target_p99_tpot_ms": 50.0,
+                                "max_num_seq": 256,
+                                "max_num_batched_tokens": 8192,
+                                "block_size": 16,
+                                "_arrival_share_rps": 10.0,
+                                "router_endpoint": "https://rank.example.internal",
+                                "maximum_requests": 64,
+                                "env": list(env),
+                            },
+                            "n_replicas": 1,
+                        }
+                    ],
+                }
+            ]
+        )
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        harness.resource_map = SimpleNamespace(new_rank_id=lambda: "rank_new")
+
+        harness._assign_rank_ids(plan, snapshot)
+
+        self.assertEqual(
+            [rank.rank_id for rank in plan.actions[0].ladder], ["rank_existing", "rank_new"]
+        )
+
     def test_plan_action_preserves_online_targets(self):
         plan = Plan.from_raw(
             {
@@ -83,7 +172,7 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(action.to_dict()["target_p99_ttft_ms"], 500.0)
         self.assertEqual(action.to_dict()["target_p99_tpot_ms"], 50.0)
 
-    def test_plan_action_autofills_and_preserves_rank_ids(self):
+    def test_plan_action_preserves_explicit_and_leaves_missing_rank_ids(self):
         plan = Plan.from_raw(
             {
                 "actions": [
@@ -114,10 +203,10 @@ class CoreSmokeTests(unittest.TestCase):
         )
 
         action = plan.actions[0]
-        self.assertEqual([rank.rank_id for rank in action.ladder], ["rank_0", "latency_rank"])
+        self.assertEqual([rank.rank_id for rank in action.ladder], [None, "latency_rank"])
         self.assertEqual(
             [rank["rank_id"] for rank in action.to_dict()["ladder"]],
-            ["rank_0", "latency_rank"],
+            [None, "latency_rank"],
         )
         self.assertEqual(action.ladder[0].predicted_y, {"p99_ttft_ms": 120.0})
         self.assertEqual(action.ladder[0].predicted_v, {"kv_cache_util": 0.4})

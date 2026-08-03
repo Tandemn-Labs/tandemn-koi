@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -181,6 +182,26 @@ REQUIRED_JOB_STATE = {
 KNOWN_ROLES = frozenset({"aggregate"})
 _V0_DISABLED_ROLES = frozenset({"prefill", "decode"})  # rejected until PD lands
 _ENGINE_AUTOTUNED_CONFIG_KEYS = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
+_RANK_IDENTITY_SKIP = frozenset(
+    {
+        "rank_id",
+        "chain_index",
+        "n_replicas",
+        "mechanism_id",
+        "predicted_y",
+        "predicted_v",
+        "_arrival_share_rps",
+        "router_endpoint",
+        "maximum_requests",
+        "status",
+        "reason",
+        "reason_code",
+        "model_id",
+        "engine_name",
+        "gpu_type",
+        *_ENGINE_AUTOTUNED_CONFIG_KEYS,
+    }
+)
 
 
 def _strip_engine_knobs(config) -> dict:
@@ -212,6 +233,37 @@ def env_gpu_type(env) -> str | None:
     return str(env_tuple[ENV_GPU_TYPE_INDEX])
 
 
+def rank_config_key(rank) -> tuple[str, tuple[str, ...], str]:
+    """Return stable deployment identity, excluding runtime and rank state."""
+    if isinstance(rank, RankSpec):
+        role, env, config = rank.role, rank.env, rank.config
+    else:
+        shape = dict(rank.get("shape_json") or {})
+        role = rank.get("role") or shape.get("role") or ""
+        env = rank.get("env") or rank.get("target_node") or shape.get("env")
+        config = rank.get("config") or shape.get("config") or shape
+    normalized = {
+        key: value
+        for key, value in dict(config or {}).items()
+        if key not in _RANK_IDENTITY_SKIP and not key.startswith("target_")
+    }
+    normalized.pop("env", None)
+    normalized.pop("role", None)
+    gpu_count = normalized.pop("gpu_count", None)
+    count = normalized.pop("count", None)
+    if gpu_count is None:
+        gpu_count = count
+    if gpu_count is not None:
+        normalized["gpu_count"] = gpu_count
+    for key in ("sp", "ep", "cp"):
+        normalized.setdefault(key, 1)
+    return (
+        str(role),
+        tuple(str(part) for part in (_as_env_tuple(env) or ())),
+        json.dumps(normalized, sort_keys=True, separators=(",", ":")),
+    )
+
+
 @dataclass
 class RankSpec:
     """One rank in a ladder: a role-tagged chain config in one environment.
@@ -233,7 +285,6 @@ class RankSpec:
     n_replicas: int = 1  # "chains" in the shorthand
     rank_id: str | None = None  # Koi logical rank id; Orca preserves it into chains/pods
     mechanism_id: str | None = None
-    chain_id: str | None = None  # stable fingerprint for switch-cost delta matching
     predicted_y: dict | None = None
     predicted_v: dict | None = None
 
@@ -270,7 +321,6 @@ class RankSpec:
                 env = inner.pop("env", None)
                 rank_id = inner.pop("rank_id", None)
                 mech = inner.pop("mechanism_id", None)
-                chain_id = inner.pop("chain_id", None)
                 predicted_y = inner.pop("predicted_y", None)
                 predicted_v = inner.pop("predicted_v", None)
                 n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1)) or 1
@@ -282,7 +332,6 @@ class RankSpec:
                     n_replicas=n_rep,
                     rank_id=rank_id,
                     mechanism_id=mech,
-                    chain_id=chain_id,
                     predicted_y=predicted_y,
                     predicted_v=predicted_v,
                 )
@@ -300,7 +349,6 @@ class RankSpec:
             n_replicas=int(n_rep_raw or 1),
             rank_id=raw.get("rank_id"),
             mechanism_id=raw.get("mechanism_id"),
-            chain_id=raw.get("chain_id"),
             predicted_y=raw.get("predicted_y"),
             predicted_v=raw.get("predicted_v"),
         )
@@ -313,7 +361,6 @@ class RankSpec:
             "n_replicas": self.n_replicas,
             "rank_id": self.rank_id,
             "mechanism_id": self.mechanism_id,
-            "chain_id": self.chain_id,
             "predicted_y": self.predicted_y,
             "predicted_v": self.predicted_v,
         }
@@ -390,7 +437,7 @@ class PlanAction:
         ladder = (
             [RankSpec.from_dict(r) for r in ladder_raw] if isinstance(ladder_raw, list) else None
         )
-        cls.assign_rank_ids(str(jid), ladder)
+        cls.validate_rank_ids(str(jid), ladder)
         return cls(
             job_id=str(jid),
             type=action_type,
@@ -407,13 +454,14 @@ class PlanAction:
         )
 
     @staticmethod
-    def assign_rank_ids(job_id: str, ladder: list[RankSpec] | None) -> None:
-        """Fill missing rank ids and reject duplicates within one job action."""
+    def validate_rank_ids(job_id: str, ladder: list[RankSpec] | None) -> None:
+        """Reject duplicate explicit rank ids without inventing positional ids."""
         if not ladder:
             return
         seen: set[str] = set()
-        for i, rank in enumerate(ladder):
-            rank.rank_id = rank.rank_id or f"rank_{i}"
+        for rank in ladder:
+            if rank.rank_id is None:
+                continue
             if rank.rank_id in seen:
                 raise ValueError(f"job {job_id}: duplicate rank_id {rank.rank_id!r}")
             seen.add(rank.rank_id)

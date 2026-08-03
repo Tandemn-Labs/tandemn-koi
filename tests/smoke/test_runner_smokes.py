@@ -162,7 +162,7 @@ class RunnerSmokeTests(unittest.TestCase):
                     "job_id": "job_running",
                     "status": "running",
                     "spec_json": {"model_id": "model_a"},
-                    "active_chains": [{"chain_id": "chain_1"}],
+                    "active_ranks": [{"rank_id": "rank_1", "n_replicas": 1}],
                 }
             ],
             pending_jobs=[{"job_id": "job_waiting", "status": "waiting"}],

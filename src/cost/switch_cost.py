@@ -15,7 +15,7 @@ Architecture:
       - DRO-bounded risk that the transition fails SLO during the test
 
 Notation:
-    L_prev : current ladder for the job (List[ChainEntry])
+    L_prev : current ladder for the job (List[RankEntry])
     L_new  : proposed ladder for next tick
     delta_L_plus  = L_new  \\  L_prev    chains being ADDED (canary)
     delta_L_minus = L_prev \\  L_new     chains being KILLED (decommissioned)
@@ -47,10 +47,10 @@ DEFAULT_LAMBDA_RISK: float = 50.0  # $ per SLO breach
 
 
 @dataclass
-class ChainEntry:
-    """One (chain_config, replica_count) entry inside a ladder."""
+class RankEntry:
+    """One deployment configuration and replica count inside a ladder."""
 
-    chain_id: str  # stable id (e.g., config fingerprint)
+    config_key: tuple[str, tuple[str, ...], str]
     config: dict  # X variables defining the chain
     env: str  # env_label (market, cloud, region, zone, gpu)
     n_replicas: int
@@ -83,8 +83,8 @@ class SwitchCostBundle:
 
 
 def compute_switch_cost(
-    L_prev: list[ChainEntry],
-    L_new: list[ChainEntry],
+    L_prev: list[RankEntry],
+    L_new: list[RankEntry],
     residual_history,
     epsilon_dro: float,
     *,
@@ -112,7 +112,7 @@ def compute_switch_cost(
         lambda_risk      : $ value of an SLO breach during transition
         cost_funcs       : optional overrides {"image_pull", "weight_load",
                            "kv_init", "kill", "hourly_rate"}; hourly_rate
-                           receives the full ChainEntry, others receive config
+                           receives the full RankEntry, others receive config
         slo_thresholds   : per-objective thresholds for c_risk DRO calculation
         pred_y_new       : surrogate's y_hat for L_new - required for path-1 DRO risk
     Outputs:
@@ -153,32 +153,32 @@ def compute_switch_cost(
 
 
 def compute_delta_L_plus(
-    L_prev: list[ChainEntry],
-    L_new: list[ChainEntry],
-) -> list[ChainEntry]:
+    L_prev: list[RankEntry],
+    L_new: list[RankEntry],
+) -> list[RankEntry]:
     """
     Definition: delta_L_plus = L_new \\ L_prev - chains being ADDED this tick.
-                Two entries match iff their chain_id is identical.
-                Replica-count INCREASES of an existing chain count as
+                Two entries match iff their canonical config_key is identical.
+                Replica-count INCREASES of an existing rank count as
                 additions of the difference (canary expansion case).
     Usage:      Inner helper for compute_switch_cost.
     Inputs:
-        L_prev, L_new : List[ChainEntry]
+        L_prev, L_new : List[RankEntry]
     Outputs:
-        List[ChainEntry] - canary additions only
+        List[RankEntry] - canary additions only
     """
-    prev_by_id = _chains_by_id(L_prev)
-    out: list[ChainEntry] = []
-    for ce in _chains_by_id(L_new).values():
-        prev = prev_by_id.get(ce.chain_id)
+    prev_by_id = _ranks_by_config(L_prev)
+    out: list[RankEntry] = []
+    for ce in _ranks_by_config(L_new).values():
+        prev = prev_by_id.get(ce.config_key)
         if prev is None:
             out.append(ce)
             continue
         diff = ce.n_replicas - prev.n_replicas
         if diff > 0:
             out.append(
-                ChainEntry(
-                    chain_id=ce.chain_id,
+                RankEntry(
+                    config_key=ce.config_key,
                     config=ce.config,
                     env=ce.env,
                     n_replicas=diff,
@@ -188,31 +188,31 @@ def compute_delta_L_plus(
 
 
 def compute_delta_L_minus(
-    L_prev: list[ChainEntry],
-    L_new: list[ChainEntry],
-) -> list[ChainEntry]:
+    L_prev: list[RankEntry],
+    L_new: list[RankEntry],
+) -> list[RankEntry]:
     """
     Definition: delta_L_minus = L_prev \\ L_new - chains being KILLED this tick.
                 Same matching rule as delta_L_plus; replica-count DECREASES count
                 as kills of the difference.
     Usage:      Inner helper for compute_switch_cost.
     Inputs:
-        L_prev, L_new : List[ChainEntry]
+        L_prev, L_new : List[RankEntry]
     Outputs:
-        List[ChainEntry] - decommissions only
+        List[RankEntry] - decommissions only
     """
-    new_by_id = _chains_by_id(L_new)
-    out: list[ChainEntry] = []
-    for ce in _chains_by_id(L_prev).values():
-        new = new_by_id.get(ce.chain_id)
+    new_by_id = _ranks_by_config(L_new)
+    out: list[RankEntry] = []
+    for ce in _ranks_by_config(L_prev).values():
+        new = new_by_id.get(ce.config_key)
         if new is None:
             out.append(ce)
             continue
         diff = ce.n_replicas - new.n_replicas
         if diff > 0:
             out.append(
-                ChainEntry(
-                    chain_id=ce.chain_id,
+                RankEntry(
+                    config_key=ce.config_key,
                     config=ce.config,
                     env=ce.env,
                     n_replicas=diff,
@@ -221,22 +221,22 @@ def compute_delta_L_minus(
     return out
 
 
-def _chains_by_id(chains: list[ChainEntry]) -> dict[str, ChainEntry]:
-    merged: dict[str, ChainEntry] = {}
-    for ce in chains:
+def _ranks_by_config(ranks: list[RankEntry]) -> dict[tuple, RankEntry]:
+    merged: dict[tuple, RankEntry] = {}
+    for ce in ranks:
         n_replicas = _positive_replicas(ce)
-        existing = merged.get(ce.chain_id)
+        existing = merged.get(ce.config_key)
         if existing is None:
-            merged[ce.chain_id] = ChainEntry(ce.chain_id, ce.config, ce.env, n_replicas)
+            merged[ce.config_key] = RankEntry(ce.config_key, ce.config, ce.env, n_replicas)
             continue
         existing.n_replicas += n_replicas
     return merged
 
 
-def _positive_replicas(chain: ChainEntry) -> int:
-    n_replicas = int(chain.n_replicas)
+def _positive_replicas(rank: RankEntry) -> int:
+    n_replicas = int(rank.n_replicas)
     if n_replicas < 1:
-        raise ValueError(f"chain {chain.chain_id}: n_replicas must be >= 1")
+        raise ValueError(f"rank config {rank.config_key}: n_replicas must be >= 1")
     return n_replicas
 
 
@@ -244,7 +244,7 @@ def _positive_replicas(chain: ChainEntry) -> int:
 
 
 def c_cold_start(
-    delta_L_plus: list[ChainEntry],
+    delta_L_plus: list[RankEntry],
     image_pull_fn: Callable[[dict], float] | None = None,
     weight_load_fn: Callable[[dict], float] | None = None,
     kv_init_fn: Callable[[dict], float] | None = None,
@@ -254,7 +254,7 @@ def c_cold_start(
                     c_coldstart = sum_{(c, n) in delta_L_plus} n * (img + wt + kv)(c)
     Usage:      Inner helper for compute_switch_cost.
     Inputs:
-        delta_L_plus    : List[ChainEntry] - canary additions
+        delta_L_plus    : List[RankEntry] - canary additions
         image_pull_fn   : config -> $ image pull (default: cached -> $0)
         weight_load_fn  : config -> $ weight load (default: proportional to model_size_gb)
         kv_init_fn      : config -> $ kv allocator init (default: $0.003)
@@ -272,9 +272,9 @@ def c_cold_start(
 
 
 def c_parallel(
-    delta_L_plus: list[ChainEntry],
+    delta_L_plus: list[RankEntry],
     ab_cost: float = DEFAULT_TAU_AB_HOURS,
-    hourly_rate_fn: Callable[[ChainEntry], float] | None = None,
+    hourly_rate_fn: Callable[[RankEntry], float] | None = None,
 ) -> float:
     """
     Definition: Parallel-running cost during the A/B test window.
@@ -283,9 +283,9 @@ def c_parallel(
                 that run alongside production during validation.
     Usage:      Inner helper for compute_switch_cost.
     Inputs:
-        delta_L_plus    : List[ChainEntry]
+        delta_L_plus    : List[RankEntry]
         ab_cost         : canary test window in HOURS (default 1/12 = 5 min)
-        hourly_rate_fn  : ChainEntry -> $/hour
+        hourly_rate_fn  : RankEntry -> $/hour
     Outputs:
         float >= 0
     """
@@ -297,7 +297,7 @@ def c_parallel(
 
 
 def c_kill(
-    delta_L_minus: list[ChainEntry],
+    delta_L_minus: list[RankEntry],
     kill_cost_fn: Callable[[dict], float] | None = None,
 ) -> float:
     """
@@ -308,7 +308,7 @@ def c_kill(
                 redistribute capacity across the cluster.
     Usage:      Inner helper for compute_switch_cost.
     Inputs:
-        delta_L_minus : List[ChainEntry]
+        delta_L_minus : List[RankEntry]
         kill_cost_fn  : config -> $ per-chain drain cost (default $0.02)
     Outputs:
         float >= 0
@@ -318,7 +318,7 @@ def c_kill(
 
 
 def c_risk(
-    L_new: list[ChainEntry],
+    L_new: list[RankEntry],
     dro_band: dict[str, dict[str, float]] | None = None,
     residual_history=None,
     *,
@@ -371,7 +371,7 @@ def hourly_rate(chain, pricing_map: dict | None = None) -> float:
                   4. $1.00/hour
     Usage:      c_parallel default rate function; standalone budgeting.
     Inputs:
-        chain        : ChainEntry OR a dict (config-like)
+        chain        : RankEntry OR a dict (config-like)
         pricing_map  : optional pricing table
     Outputs:
         float >= 0 ($/hour)
@@ -385,7 +385,12 @@ def hourly_rate(chain, pricing_map: dict | None = None) -> float:
         if env and env in pricing_map and isinstance(pricing_map[env], dict):
             by_instance = pricing_map[env].get("by_instance_type") or {}
             if instance_type and instance_type in by_instance:
-                return float(by_instance[instance_type])
+                rate = float(by_instance[instance_type])
+                gpu_capacity = (pricing_map[env].get("gpus_per_instance") or {}).get(instance_type)
+                gpu_count = cfg.get("gpu_count", cfg.get("count"))
+                if gpu_capacity and gpu_count:
+                    rate *= (int(gpu_count) + int(gpu_capacity) - 1) // int(gpu_capacity)
+                return rate
             if "default" in pricing_map[env]:
                 return float(pricing_map[env]["default"])
         if gpu and gpu in pricing_map:
@@ -403,7 +408,7 @@ def _env_key(env) -> str | None:
 
 
 def probability_transition_fails_dro(
-    L_new: list[ChainEntry] | None = None,
+    L_new: list[RankEntry] | None = None,
     *,
     dro_band: dict[str, dict[str, float]] | None = None,
     residual_history=None,

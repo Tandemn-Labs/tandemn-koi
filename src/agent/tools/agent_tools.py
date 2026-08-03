@@ -2717,8 +2717,8 @@ def compute_switching_cost(
         {"c_coldstart", "c_parallel", "c_kill", "c_risk", "total"}.
     """
     _require("switchcost_module", "dro", "slow_loop")
-    L_prev = _materialize_chain_list(ladder_prev)
-    L_new = _materialize_chain_list(ladder_new)
+    L_prev = _materialize_rank_list(ladder_prev)
+    L_new = _materialize_rank_list(ladder_new)
     bundle = _CTX.switchcost_module.compute_switch_cost(
         L_prev=L_prev,
         L_new=L_new,
@@ -2938,8 +2938,8 @@ def compute_sigma(plan) -> dict[str, Any]:
         )
         prev_ladder = _prev_ladder_for(snapshot, job_id)
         switch_bundle = _CTX.switchcost_module.compute_switch_cost(
-            L_prev=_materialize_chain_list(prev_ladder),
-            L_new=_materialize_chain_list(ladder_dicts),
+            L_prev=_materialize_rank_list(prev_ladder),
+            L_new=_materialize_rank_list(ladder_dicts),
             residual_history=_CTX.dro,
             epsilon_dro=eps_dro,
             pricing_map=pricing_map,
@@ -4090,43 +4090,32 @@ def _materialize_ladder(ladder_ranks):
     return ladder
 
 
-def _materialize_chain_list(chain_list):
-    """Adapt rank/store-chain dicts into ChainEntry objects for switchcost.py.
-
-    Synthesizes a stable chain_id when one is absent (role + env +
-    sorted config), because switch cost matches delta_L+/delta_L- by chain_id -
-    None ids would collapse every distinct rank into one and break the
-    add/kill diff. Store rows use shape_json/target_node; planner ranks use
-    config/env. env is coerced to a hashable tuple for pricing lookups.
-    """
-    if not chain_list:
+def _materialize_rank_list(rank_list):
+    """Adapt planner and Store rank rows for config-based switch cost."""
+    if not rank_list:
         return []
-    if hasattr(chain_list[0], "chain_id"):
-        return list(chain_list)
-    from src.cost.switch_cost import ChainEntry
+    if hasattr(rank_list[0], "config_key"):
+        return list(rank_list)
+    from src.core.models import rank_config_key
+    from src.cost.switch_cost import RankEntry
 
     out = []
-    for c in chain_list:
-        shape = c.get("shape_json") or {}
-        config = c.get("config") or shape
-        env = c.get("env") or c.get("target_node") or shape.get("env") or shape.get("target_node")
+    for rank in rank_list:
+        shape = rank.get("shape_json") or {}
+        config = rank.get("config") or shape.get("config") or shape
+        env = (
+            rank.get("env")
+            or rank.get("target_node")
+            or shape.get("env")
+            or shape.get("target_node")
+        )
         env = tuple(env) if isinstance(env, (list, tuple)) else env
-        chain_id = c.get("chain_id")
-        if not chain_id:
-            import hashlib
-
-            # repr over key-sorted config tolerates unhashable values
-            # (nested lists/dicts) while staying deterministic per tick.
-            fingerprint = repr(
-                (c.get("role", ""), env, sorted(config.items(), key=lambda kv: kv[0]))
-            )
-            chain_id = "auto_" + hashlib.sha1(fingerprint.encode()).hexdigest()[:12]
         out.append(
-            ChainEntry(
-                chain_id=chain_id,
+            RankEntry(
+                config_key=rank_config_key(rank),
                 config=config,
                 env=env,
-                n_replicas=int(c.get("n_replicas") or c.get("chains") or 1),
+                n_replicas=int(rank.get("n_replicas") or rank.get("chains") or 1),
             )
         )
     return out

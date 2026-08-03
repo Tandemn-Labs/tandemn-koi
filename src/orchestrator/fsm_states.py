@@ -645,7 +645,7 @@ class TickRunner:
         x_fields = getattr(self.candidate_graph, "x", None)
         if not x_fields:
             raise ValueError("candidate graph X fields are required for deployment X")
-        if not self._has_active_chains(ctx):
+        if not self._has_active_ranks(ctx):
             return build_deployment_x_index(
                 ctx.cluster_snapshot,
                 hardware_catalog={},
@@ -660,7 +660,7 @@ class TickRunner:
         )
 
     @staticmethod
-    def _has_active_chains(ctx: TickContext) -> bool:
+    def _has_active_ranks(ctx: TickContext) -> bool:
         snapshot = ctx.cluster_snapshot
         if snapshot is None:
             return False
@@ -669,7 +669,7 @@ class TickRunner:
             if hasattr(snapshot, "active_jobs_summary")
             else getattr(snapshot, "active_jobs", [])
         )
-        return any(job.get("active_chains") for job in jobs or [])
+        return any(job.get("active_ranks") for job in jobs or [])
 
     def _hardware_catalog(self) -> dict[str, Any]:
         getter = getattr(self.resource_map, "hardware_catalog", None)
@@ -697,8 +697,8 @@ class TickRunner:
             spec = dict(job.get("spec_json") or {})
             features = dict(job.get("job_features") or {})
             job_model = spec.get("model_id") or features.get("model_id")
-            for chain in job.get("active_chains") or []:
-                shape = dict(chain.get("shape_json") or {})
+            for rank in job.get("active_ranks") or []:
+                shape = dict(rank.get("shape_json") or {})
                 model_id = shape.get("model_id") or job_model
                 if model_id:
                     model_ids.add(str(model_id))
