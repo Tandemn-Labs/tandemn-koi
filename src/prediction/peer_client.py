@@ -44,6 +44,7 @@ class PeerPredictorClient:
             return {}
         predict_fn = self._predict_fn
         if predict_fn is None:
+            # Maintained separately in LLM_placement_solver; install it into Koi's environment.
             try:
                 from predictor_compare import predict as default_predict
             except ImportError as exc:

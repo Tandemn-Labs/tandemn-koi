@@ -120,7 +120,7 @@ OPENAI_API_KEY='...' TANDEMN_USER_ID='usr_...' \
   --ticks 0 \
   --tick-interval-sec 300 \
   --telemetry-window-sec 300 \
-  --trace full \
+  --trace all \
   --rust-log warn
 ```
 
@@ -133,10 +133,27 @@ Runner logs are written under `logs/koi/<run-id>/`:
 - `runner.log`: process log and compact tick summaries.
 - `events.jsonl`: structured tick, state, LLM, and agent debug events.
 
-`--trace summary` keeps logs compact. `--trace full` also records full LLM calls
+`--trace no-llm` keeps logs compact. `--trace all` also records full LLM calls
 and agent REPL/tool traces before the runner clears per-tick memory buffers.
 
 Koi's DynoSim/AIC surrogate requires `aiconfigurator>=0.10.0` because Koi uses AIC's memory estimator before replay.
+
+### Optional peer predictors
+
+Peer prediction uses the separate `tandemn-predictors` package from
+`Tandemn-Labs/LLM_placement_solver`; it is not bundled with Koi. For a sibling
+checkout, install it into Koi's environment:
+
+```bash
+uv pip install --python .venv/bin/python -e ../LLM_placement_solver
+.venv/bin/python -c "import predictor_compare"
+```
+
+The package requires Gurobi and a working license. Configure the runner with
+`KOI_SURROGATE_PEER_MODE` or `--surrogate-peer-mode`: `off` disables peers,
+`shadow` records peer output without applying it, and `enabled` permits learned
+fusion. If the optional package is missing, Koi logs one warning and continues
+with non-peer estimates.
 
 ---
 

@@ -85,6 +85,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Conservative fusion residual quantile; defaults to KOI_SURROGATE_LOWER_QUANTILE or 0.05",
     )
+    parser.add_argument(
+        "--surrogate-peer-mode",
+        choices=("off", "shadow", "enabled"),
+        default=os.getenv("KOI_SURROGATE_PEER_MODE", "shadow"),
+        help="External predictor mode; requires the optional tandemn-predictors package",
+    )
     parser.add_argument("--rust-log", default=os.getenv("RUST_LOG", "warn"))
     return parser.parse_args(argv)
 
@@ -144,6 +150,7 @@ def build_runner(args: argparse.Namespace):
     )
     surrogate = init_surrogate_stack(
         evidence_store=evidence_store,
+        peer_mode=args.surrogate_peer_mode,
         lower_quantile=args.surrogate_lower_quantile,
     )
     llm = RecordingLLMClient(
