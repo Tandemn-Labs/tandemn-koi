@@ -13,7 +13,6 @@ dependencies = [
     "scipy>=1.11.0",
     "sqlalchemy>=2.0",
     "tandemn-store",
-    "tandemn-predictors",
 ]
 
 [dependency-groups]
@@ -63,4 +62,3 @@ show_error_codes = true
 
 [tool.uv.sources]
 tandemn-store = { path = "../tandemn-store", editable = true }
-tandemn-predictors = { path = "../LLM_placement_solver", editable = true }
