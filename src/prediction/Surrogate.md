@@ -113,7 +113,14 @@ uv pip install --python .venv/bin/python -e ../LLM_placement_solver
 .venv/bin/python -c "import predictor_compare"
 ```
 
-This package requires Gurobi and a working license. Set
-`KOI_SURROGATE_PEER_MODE=shadow` to record peer results or `enabled` to permit
-learned fusion. Missing peer dependencies produce one warning and Koi continues
-with AIC, analytic, and PerfDB estimates.
+This package requires Gurobi and a working license. Configure peer mode with:
+
+```bash
+export KOI_SURROGATE_PEER_MODE=enabled
+# or: .venv/bin/python -m src.orchestrator.runner --surrogate-peer-mode enabled ...
+```
+
+Modes are `off` (disabled), `shadow` (record only), and `enabled` (permit learned
+fusion). The default is `shadow`; the CLI flag overrides the environment variable.
+Missing peer dependencies produce one warning and Koi continues with AIC,
+analytic, and PerfDB estimates.
