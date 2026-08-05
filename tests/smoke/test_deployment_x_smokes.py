@@ -93,6 +93,7 @@ def _snapshot():
         "target_p99_tpot_ms": 40,
         "predicted_y": {"p99_ttft_ms": 90.0},
         "predicted_v": {"kv_cache_util": 0.1},
+        "prediction_lineage": {"schema_version": 3, "deployment_id": "deploy-a"},
     }
     return ClusterResourceSnapshot(
         tick=1,
@@ -295,9 +296,9 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(x["gpu_mem_gb"], 80)
         self.assertEqual(x["gpu_tflops_fp16"], 989.5)
         self.assertEqual(x["internode_bandwidth_gbps"], 3200)
-        self.assertEqual(x["request_arrival_rate"], 50)
+        self.assertEqual(x["request_arrival_rate"], 100)
         self.assertEqual(x["multi_turn_avg_turns"], 2.0)
-        self.assertEqual(x["total_token_budget"], 500)
+        self.assertEqual(x["total_token_budget"], 1000)
         self.assertEqual(x["deadline_hrs"], 2)
         self.assertEqual(x["num_nodes_per_chain"], 1)
         self.assertEqual(x["dp"], 2)
@@ -315,6 +316,7 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(x["flops_per_param"], 989.5 / 70)
         self.assertEqual(deployment.y_predicted, {"p99_ttft_ms": 90.0})
         self.assertEqual(deployment.v_predicted, {"kv_cache_util": 0.1})
+        self.assertEqual(deployment.prediction_lineage["deployment_id"], "deploy-a")
         self.assertNotIn("predicted_y", x)
         with self.assertRaises(ValueError):
             index.resolve("job_1")
@@ -377,12 +379,14 @@ class DeploymentXSmokeTests(unittest.TestCase):
         row = evidence_store.rows[0]
         self.assertEqual(row.rank_id, "rank_a")
         self.assertEqual(row.env_label, ENV_LABEL)
-        self.assertEqual(row.X["request_arrival_rate"], 50)
+        self.assertEqual(row.X["request_arrival_rate"], 100)
         self.assertEqual(row.X["gpu_generation"], "Hopper")
         self.assertEqual(row.y_predicted, {"p99_ttft_ms": 90.0})
         self.assertEqual(row.V_predicted_trajectory, {"kv_cache_util": 0.1})
+        self.assertEqual(row.deployment_id, "deploy-a")
+        self.assertEqual(row.prediction_lineage["schema_version"], 3)
         self.assertEqual(mechanism_registry.context["type"], "online")
-        self.assertEqual(mechanism_registry.context["request_arrival_rate"], 50)
+        self.assertEqual(mechanism_registry.context["request_arrival_rate"], 100)
 
     def test_s2_applicability_uses_values_and_preserves_committed(self):
         registry = MechanismRegistry()

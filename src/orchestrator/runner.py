@@ -10,7 +10,7 @@ from typing import Any
 from src.agent.agent import KoiAgentHarness
 from src.agent.llm_clients import OpenAICompatClient, RecordingLLMClient
 from src.agent.tools import agent_tools
-from src.bootstrap.initialization import init_causal_graph
+from src.bootstrap.initialization import init_causal_graph, init_surrogate_stack
 from src.core.evidence_service import EvidenceService
 from src.cost import switch_cost as switchcost_module
 from src.cost.dro import DRO
@@ -24,7 +24,6 @@ from src.orchestrator import fsm_states
 from src.orchestrator.debug_logging import DebugLogger
 from src.orchestrator.fsm_states import TickContext, TickRunner
 from src.prediction import tchebycheff as tchebycheff_module
-from src.prediction.surrogate import SurrogatePrediction
 from src.validation.cusum import Cusum
 from src.validation.icp import ICP
 from src.validation.quadrants import QuadrantValidator
@@ -80,6 +79,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-dir", default=os.getenv("KOI_LOG_DIR", "logs/koi"))
     parser.add_argument("--run-id", default=os.getenv("KOI_RUN_ID"))
     parser.add_argument("--trace", choices=("no-llm", "errors", "all"), default="no-llm")
+    parser.add_argument(
+        "--surrogate-lower-quantile",
+        type=float,
+        default=None,
+        help="Conservative fusion residual quantile; defaults to KOI_SURROGATE_LOWER_QUANTILE or 0.05",
+    )
     parser.add_argument("--rust-log", default=os.getenv("RUST_LOG", "warn"))
     return parser.parse_args(argv)
 
@@ -137,7 +142,10 @@ def build_runner(args: argparse.Namespace):
         mechanism_registry=mechanism_registry,
         resource_map=resource_map,
     )
-    surrogate = SurrogatePrediction(objective="online")
+    surrogate = init_surrogate_stack(
+        evidence_store=evidence_store,
+        lower_quantile=args.surrogate_lower_quantile,
+    )
     llm = RecordingLLMClient(
         OpenAICompatClient(
             base_url=args.openai_base_url,
@@ -283,6 +291,7 @@ def main(
     runner, evidence_store, agent, llm = build_runner_fn(args)
     if hasattr(runner, "trace"):
         runner.trace = debug_logger
+    agent_tools.bind_tools(trace_logger=debug_logger)
     fsm_states.bind_runner(runner)
     try:
         return run_ticks(

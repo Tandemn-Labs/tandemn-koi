@@ -27,6 +27,10 @@ class StorePlanExecutorSmokeTests(unittest.TestCase):
         self.assertEqual(store.plan.actions[0].ladder[0]["rank_id"], "rank_0")
         self.assertEqual(store.plan.actions[0].ladder[0]["predicted_y"], {"p99_ttft_ms": 120.0})
         self.assertEqual(store.plan.actions[0].ladder[0]["predicted_v"], {"kv_cache_util": 0.4})
+        self.assertEqual(
+            store.plan.actions[0].ladder[0]["prediction_lineage"]["deployment_id"],
+            "deploy-0",
+        )
 
     def test_accepts_raw_plan_input(self):
         store = _PlanStore()
@@ -55,6 +59,10 @@ def _raw_place_plan():
                         "n_replicas": 1,
                         "predicted_y": {"p99_ttft_ms": 120.0},
                         "predicted_v": {"kv_cache_util": 0.4},
+                        "prediction_lineage": {
+                            "schema_version": 3,
+                            "deployment_id": "deploy-0",
+                        },
                     }
                 ],
             }

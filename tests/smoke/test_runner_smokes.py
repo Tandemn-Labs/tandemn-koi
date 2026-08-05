@@ -13,6 +13,11 @@ from src.orchestrator.fsm_states import FSMState, TickRunner
 class RunnerSmokeTests(unittest.TestCase):
     """Verify runner control flow without touching Tandemn Store."""
 
+    def test_parse_args_accepts_surrogate_lower_quantile(self):
+        args = runner.parse_args(["--surrogate-lower-quantile", "0.1"])
+
+        self.assertEqual(args.surrogate_lower_quantile, 0.1)
+
     def test_main_runs_next_persisted_tick(self):
         """Without --tick, the runner starts at evidence current_tick + 1."""
         captured = {}
@@ -199,6 +204,36 @@ class RunnerSmokeTests(unittest.TestCase):
             ["tick_summary", "llm_summary", "agent_summary", "llm_errors"],
         )
         self.assertEqual(events[3]["payload"]["calls"][0]["error"], "RuntimeError('boom')")
+
+    def test_surrogate_logging_respects_trace_detail(self):
+        trace = {
+            "schema_version": 3,
+            "scenario": "peak",
+            "composite_version": "koi-surrogate-v3:test",
+            "normalized_candidate": {"job_config": {"model_id": "secret-model"}},
+            "components": {"primary": {"status": "success", "version": "aic-v1"}},
+            "backends": {"primary": {"status": "success", "version": "aic-v1"}},
+            "fusion": {"status": "insufficient_evidence", "lower_quantile": 0.05},
+            "calibration": {"status": "insufficient_evidence", "offsets_y": {}},
+            "timings_ms": {"total": 1.0},
+        }
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            compact = DebugLogger(log_dir, trace="no-llm", run_id="surrogate-compact")
+            compact.persist_surrogate_prediction(trace, tick=4)
+            compact_event = json.loads(compact.events_path.read_text().splitlines()[0])
+
+            full = DebugLogger(log_dir, trace="all", run_id="surrogate-full")
+            full.persist_surrogate_prediction(trace, tick=4)
+            full_event = json.loads(full.events_path.read_text().splitlines()[0])
+
+        self.assertEqual(compact_event["kind"], "surrogate_prediction")
+        self.assertEqual(compact_event["tick"], 4)
+        self.assertNotIn("normalized_candidate", compact_event["payload"])
+        self.assertEqual(
+            full_event["payload"]["normalized_candidate"]["job_config"]["model_id"],
+            "secret-model",
+        )
 
     def test_debug_logger_writes_state_snapshot(self):
         """State logging captures Store snapshot counts and resources."""

@@ -91,6 +91,15 @@ class DebugLogger:
         payload.update(_state_summary(state_name, ctx, self.trace))
         self.write_event("state", payload, tick=getattr(ctx, "tick", None))
 
+    def persist_surrogate_prediction(
+        self, trace: dict[str, Any], *, tick: int | None = None
+    ) -> None:
+        """Persist one actual surrogate execution under the active trace policy."""
+        failed = bool(trace.get("failure"))
+        payload = _compact(trace, self.trace) if self.trace == "all" else _surrogate_summary(trace)
+        kind = "surrogate_prediction_failed" if failed else "surrogate_prediction"
+        self.write_event(kind, payload, tick=tick)
+
     def write_event(self, kind: str, payload: dict[str, Any], tick: int | None = None) -> None:
         """Append one structured event to ``events.jsonl``."""
         record = {
@@ -170,6 +179,60 @@ def _plan_summary(plan: Any) -> dict[str, Any] | None:
         "action_count": len(actions),
         "actions": actions,
         "tick_rationale": getattr(plan, "tick_rationale", None),
+    }
+
+
+def _surrogate_summary(trace: dict[str, Any]) -> dict[str, Any]:
+    """Return prediction provenance without candidate inputs or full backend outputs."""
+    components = trace.get("components") or {}
+    backends = trace.get("backends") or {}
+    fusion = trace.get("fusion") or {}
+    calibration = trace.get("calibration") or {}
+    failure = trace.get("failure") or None
+    return {
+        "schema_version": trace.get("schema_version"),
+        "scenario": trace.get("scenario"),
+        "composite_version": trace.get("composite_version"),
+        "components": {
+            name: {
+                "status": component.get("status"),
+                "version": component.get("version"),
+                "timing_ms": component.get("timing_ms"),
+            }
+            for name, component in components.items()
+        },
+        "backends": {
+            name: {"status": backend.get("status"), "version": backend.get("version")}
+            for name, backend in backends.items()
+        },
+        "fusion": {
+            key: fusion.get(key)
+            for key in (
+                "status",
+                "applied",
+                "sample_count",
+                "disagreement",
+                "lower_throughput",
+                "lower_quantile",
+                "reason",
+            )
+        },
+        "calibration": {
+            "status": calibration.get("status"),
+            "reason": calibration.get("reason"),
+            "offset_y_nodes": sorted((calibration.get("offsets_y") or {}).keys()),
+            "offset_v_nodes": sorted((calibration.get("offsets_v") or {}).keys()),
+        },
+        "failure": (
+            {
+                "stage": failure.get("stage"),
+                "error_type": failure.get("error_type"),
+                "message": _preview(failure.get("message", "")),
+            }
+            if failure
+            else None
+        ),
+        "timings_ms": trace.get("timings_ms") or {},
     }
 
 

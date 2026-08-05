@@ -492,6 +492,9 @@ class TickRunner:
                 # forward-looking sigma terms (EIG, switch cost) are zero at
                 # observation time; v0 stamps the realized exploit term only
                 sigma_realized=j_realized,
+                deployment_id=(deployment.prediction_lineage or {}).get("deployment_id"),
+                evidence_available_timestamp_utc=time.time(),
+                prediction_lineage=deployment.prediction_lineage,
             )
             self.evidence_store.append_row(row)
             ctx.evidence_rows.append(row)
