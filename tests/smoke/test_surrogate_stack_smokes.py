@@ -337,6 +337,19 @@ def test_stress_scenario_does_not_run_peers():
     assert peers.calls == []
 
 
+def test_peer_failure_warns_once_and_falls_back():
+    class MissingPeers:
+        def predict(self, *_args, **_kwargs):
+            raise RuntimeError("optional tandemn-predictors package is unavailable")
+
+    composer = SurrogateComposer(_Primary(), peer_client=MissingPeers(), peer_mode="shadow")
+    composer.compose_prediction_with_trace(CONFIG, FEATURES, _Graph())
+    _, _, trace = composer.compose_prediction_with_trace(CONFIG, FEATURES, _Graph())
+
+    assert len(composer._peer_warnings) == 1
+    assert trace["backends"]["peer_client"]["status"] == "failed"
+
+
 def test_rank_lineage_round_trips_without_entering_config_x():
     rank = RankSpec.from_dict(
         {

@@ -62,6 +62,7 @@ class SurrogateComposer:
         self.peer_mode = peer_mode
         self.evidence_store = evidence_store
         self.lower_quantile = lower_quantile
+        self._peer_warnings: set[tuple[str, str]] = set()
         self.last_trace: dict[str, Any] = {}
         self.version = "koi-surrogate-v3"
         self._lock = RLock()
@@ -408,6 +409,14 @@ class SurrogateComposer:
                 scenario=scenario,
             )
         except Exception as exc:
+            warning_key = (type(exc).__name__, str(exc))
+            if warning_key not in self._peer_warnings:
+                log.warning(
+                    "peer prediction unavailable in %s mode; using non-peer estimates: %s",
+                    self.peer_mode,
+                    exc,
+                )
+                self._peer_warnings.add(warning_key)
             results = {
                 "peer_client": {
                     "status": "failed",

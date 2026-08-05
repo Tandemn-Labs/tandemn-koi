@@ -1,5 +1,7 @@
+import sys
 from types import SimpleNamespace
 
+import pytest
 from src.prediction.peer_client import PeerPredictorClient
 
 
@@ -47,3 +49,14 @@ def test_peer_client_preserves_dp_and_scenario_in_shared_query():
     assert query.task == "online"
     assert query.context["scenario"] == "peak"
     assert result["blis"]["output_tps"] == 1000.0
+
+
+def test_peer_client_reports_missing_optional_package(monkeypatch):
+    monkeypatch.setitem(sys.modules, "predictor_compare", None)
+
+    with pytest.raises(RuntimeError, match="optional tandemn-predictors"):
+        PeerPredictorClient._query(
+            {"model_id": "meta-llama/Meta-Llama-3.1-8B-Instruct", "gpu_type": "H100"},
+            {"type": "online", "isl_token_avg": 128, "osl_token_avg": 32},
+            scenario="peak",
+        )

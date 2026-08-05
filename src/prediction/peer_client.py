@@ -26,7 +26,7 @@ _DEVICE_KEYS = {
 
 
 class PeerPredictorClient:
-    """Call external peers for one DP-aggregate Koi rank prediction."""
+    """Call the optional external predictor package for one Koi rank."""
 
     def __init__(self, names=("solver", "blis"), predict_fn=None):
         self.names = tuple(names)
@@ -44,7 +44,13 @@ class PeerPredictorClient:
             return {}
         predict_fn = self._predict_fn
         if predict_fn is None:
-            from predictor_compare import predict as default_predict
+            try:
+                from predictor_compare import predict as default_predict
+            except ImportError as exc:
+                raise RuntimeError(
+                    "peer prediction requires the optional tandemn-predictors package "
+                    "from Tandemn-Labs/LLM_placement_solver"
+                ) from exc
 
             predict_fn = default_predict
 
@@ -55,8 +61,6 @@ class PeerPredictorClient:
 
     @staticmethod
     def _query(job_config: dict[str, Any], job_features: dict[str, Any], *, scenario: str):
-        from predictor_compare import Query
-
         values = {**job_features, **job_config}
         model_id = str(values.get("model_id") or "").strip()
         model = _MODEL_KEYS.get(model_id.lower())
@@ -69,6 +73,13 @@ class PeerPredictorClient:
         output_length = _positive_int(values.get("osl_token_avg"))
         if input_length is None or output_length is None:
             return None
+        try:
+            from predictor_compare import Query
+        except ImportError as exc:
+            raise RuntimeError(
+                "peer prediction requires the optional tandemn-predictors package "
+                "from Tandemn-Labs/LLM_placement_solver"
+            ) from exc
         dp = max(1, int(values.get("dp") or values.get("n_replicas") or 1))
         batch = max(
             1,
