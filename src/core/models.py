@@ -108,6 +108,11 @@ class EvidenceRow:
     J_realized: float  # achieved Tchebycheff scalar
     sigma_realized: float  #
     theory_blob: str | None = None
+    # Groups correlated observations from one immutable deployment epoch.
+    deployment_id: str | None = None
+    evidence_available_timestamp_utc: float | None = None
+    # Lets calibration match persisted residuals to their prediction provenance.
+    prediction_lineage: dict | None = None
 
 
 # ======================================================================
@@ -236,6 +241,7 @@ class RankSpec:
     chain_id: str | None = None  # stable fingerprint for switch-cost delta matching
     predicted_y: dict | None = None
     predicted_v: dict | None = None
+    prediction_lineage: dict | None = None
 
     @classmethod
     def from_dict(cls, raw) -> "RankSpec":
@@ -273,6 +279,7 @@ class RankSpec:
                 chain_id = inner.pop("chain_id", None)
                 predicted_y = inner.pop("predicted_y", None)
                 predicted_v = inner.pop("predicted_v", None)
+                prediction_lineage = inner.pop("prediction_lineage", None)
                 n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1)) or 1
                 n_rep = int(n_rep_raw)
                 return cls(
@@ -285,6 +292,7 @@ class RankSpec:
                     chain_id=chain_id,
                     predicted_y=predicted_y,
                     predicted_v=predicted_v,
+                    prediction_lineage=prediction_lineage,
                 )
 
         role = raw.get("role")
@@ -303,6 +311,7 @@ class RankSpec:
             chain_id=raw.get("chain_id"),
             predicted_y=raw.get("predicted_y"),
             predicted_v=raw.get("predicted_v"),
+            prediction_lineage=raw.get("prediction_lineage"),
         )
 
     def to_dict(self) -> dict:
@@ -316,6 +325,7 @@ class RankSpec:
             "chain_id": self.chain_id,
             "predicted_y": self.predicted_y,
             "predicted_v": self.predicted_v,
+            "prediction_lineage": self.prediction_lineage,
         }
 
     def gpus_per_chain(self) -> int:

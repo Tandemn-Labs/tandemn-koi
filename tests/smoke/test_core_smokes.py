@@ -16,6 +16,7 @@ from src.core.models import (
     Node,
     Plan,
 )
+from src.prediction.calibration import build_prediction_context, calibrate_prediction
 from src.validation.icp import ICPResult
 from src.validation.quadrants import Quadrant
 from tandemn_system_data.clients import PostgresClient
@@ -56,6 +57,9 @@ def make_row(
         z_star_snapshot={"ttft_ms": 100.0},
         J_realized=-5.0,
         sigma_realized=1.0,
+        deployment_id=f"deploy-{row_id}",
+        evidence_available_timestamp_utc=float(tick) + 0.5,
+        prediction_lineage={"schema_version": 3, "composite_version": "test-v1"},
     )
 
 
@@ -358,6 +362,76 @@ class CoreSmokeTests(unittest.TestCase):
                     ("row_3", "M2", Quadrant.Q4),
                 ],
             )
+            reloaded = EvidenceService(user_id=user_id, postgres_client=client)
+            persisted = reloaded.get_row("job_1", "rank_1")[0]
+            self.assertEqual(persisted.deployment_id, "deploy-row_1")
+            self.assertEqual(persisted.evidence_available_timestamp_utc, 1.5)
+            self.assertEqual(persisted.prediction_lineage["composite_version"], "test-v1")
+        finally:
+            with client.begin() as session:
+                session.execute(
+                    text("delete from users where user_id = :user_id"), {"user_id": user_id}
+                )
+
+    def test_persisted_lineage_drives_calibration_after_reload(self):
+        client = PostgresClient()
+        user_id = new_user_id()
+        config = {
+            "model_id": "model",
+            "gpu_type": "H100",
+            "weight_dtype": "bf16",
+            "engine_name": "vllm",
+            "engine_version": "0.22.0",
+            "dp": 1,
+        }
+        features = {"type": "online"}
+        context = build_prediction_context(config, features, scenario="peak")
+        with client.begin() as session:
+            session.add(
+                UserRow(
+                    user_id=user_id,
+                    name="koi calibration smoke",
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+        try:
+            store = EvidenceService(user_id=user_id, postgres_client=client)
+            for index in range(5):
+                row = make_row(f"cal-{index}", index + 1)
+                row.y_predicted = {"throughput_token_per_sec": 100.0}
+                row.y_observed_mean = {"throughput_token_per_sec": 120.0}
+                row.y_observed_trajectory = {
+                    "throughput_token_per_sec": np.array([120.0])
+                }
+                row.residuals_per_y = {"throughput_token_per_sec": np.array([20.0])}
+                row.deployment_id = f"deploy-cal-{index}"
+                row.evidence_available_timestamp_utc = float(index + 1)
+                row.prediction_lineage = {
+                    "schema_version": 3,
+                    "composite_version": "test-v1",
+                    "context": context,
+                    "pre_calibration": {
+                        "y_hat": {"throughput_token_per_sec": 100.0},
+                        "v_hat": {},
+                    },
+                }
+                store.append_row(row)
+
+            reloaded = EvidenceService(user_id=user_id, postgres_client=client)
+            result = calibrate_prediction(
+                {"throughput_token_per_sec": 100.0},
+                {},
+                config,
+                features,
+                reloaded,
+                "test-v1",
+                scenario="peak",
+                as_of_timestamp_utc=100.0,
+            )
+
+            self.assertEqual(result.status, "learned")
+            self.assertGreater(result.y_hat["throughput_token_per_sec"], 100.0)
         finally:
             with client.begin() as session:
                 session.execute(

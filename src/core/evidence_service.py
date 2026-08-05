@@ -128,10 +128,22 @@ class EvidenceService:
 
     def get_all_rows(self, limit: int | None = DEFAULT_ROW_READ_LIMIT) -> list[EvidenceRow]:
         """Return rows in tick order, optionally capped to the latest N rows."""
+        if limit is not None and hasattr(self._store, "latest"):
+            return self._convert_many(self._store.latest(self.user_id, limit=int(limit)))
         rows = self.get_rows_in_window((0, self.current_tick()))
         if limit is not None:
             return rows[-int(limit) :] if int(limit) > 0 else []
         return rows
+
+    def get_rows_available_before(self, timestamp_utc: float, limit: int = 1000) -> list[EvidenceRow]:
+        """Return bounded evidence that was available before a replay cutoff."""
+        return self._convert_many(
+            self._store.latest_before(
+                self.user_id,
+                float(timestamp_utc),
+                limit=int(limit),
+            )
+        )
 
     def retrieve_similar_rows(
         self,
