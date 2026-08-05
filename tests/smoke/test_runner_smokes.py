@@ -13,10 +13,13 @@ from src.orchestrator.fsm_states import FSMState, TickRunner
 class RunnerSmokeTests(unittest.TestCase):
     """Verify runner control flow without touching Tandemn Store."""
 
-    def test_parse_args_accepts_surrogate_lower_quantile(self):
-        args = runner.parse_args(["--surrogate-lower-quantile", "0.1"])
+    def test_parse_args_accepts_surrogate_configuration(self):
+        args = runner.parse_args(
+            ["--surrogate-lower-quantile", "0.1", "--surrogate-peer-mode", "enabled"]
+        )
 
         self.assertEqual(args.surrogate_lower_quantile, 0.1)
+        self.assertEqual(args.surrogate_peer_mode, "enabled")
 
     def test_main_runs_next_persisted_tick(self):
         """Without --tick, the runner starts at evidence current_tick + 1."""

@@ -102,3 +102,18 @@ python -m dynamo.replay \
 ```
 uv pip install -r requirements.txt
 ```
+
+### 9. Optional Tandemn predictors
+
+The solver adapters are maintained in `Tandemn-Labs/LLM_placement_solver`, not
+in this repository. Install a sibling checkout into Koi's environment:
+
+```bash
+uv pip install --python .venv/bin/python -e ../LLM_placement_solver
+.venv/bin/python -c "import predictor_compare"
+```
+
+This package requires Gurobi and a working license. Set
+`KOI_SURROGATE_PEER_MODE=shadow` to record peer results or `enabled` to permit
+learned fusion. Missing peer dependencies produce one warning and Koi continues
+with AIC, analytic, and PerfDB estimates.
