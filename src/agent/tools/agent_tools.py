@@ -1864,6 +1864,7 @@ def size_ladder(
 
         rank.n_replicas = n_replicas
         if n_replicas >= 1:
+            rank.rank_traffic_share = served / target if target > 0 else 1.0
             # Record the arrival rate (req/s) this rank actually serves, so downstream
             # scoring (compute_sigma) predicts each rank at ITS share, not the whole
             # job's traffic - otherwise a multi-rank composite double-counts demand.

@@ -8,8 +8,8 @@ One collection pass is deliberately small:
 
     1. S1 passes the frozen cluster snapshot into ``collect_telemetry``.
     2. The adapter reads raw ``GpuMetric`` rows from Tandemn Store per active job.
-    3. Rows are validated against active snapshot chains by ``chain_id`` and
-       ``rank_id``.
+    3. Rows are validated against active snapshot chains derived from
+       ``rank_id`` and ``chain_index``.
     4. GPU/worker rows collapse into rank-level V/Y trajectories.
     5. ``iter_per_rank`` yields ``RankTelemetry`` objects consumed by S2.
 
@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import numpy as np
+from src.infra.resource_map import chain_id_for_rank
 
 DEFAULT_SAMPLE_BUCKET_SEC = 10
 
@@ -87,7 +88,7 @@ class RankTelemetry:
 class _ChainRef:
     """Snapshot identity for one active chain.
 
-    Raw Store rows are accepted only when their ``chain_id`` and ``rank_id``
+    Raw Store rows are accepted only when their derived chain ID and job ID
     match this frozen S0 view.
     """
 
@@ -271,20 +272,23 @@ class StoreTelemetry:
 
     @staticmethod
     def _chain_ref_for_row(bundle: _TelemetryBundle, row) -> _ChainRef | None:
-        chain_id = getattr(row, "chain_id", None)
-        if chain_id is None:
+        job_id = getattr(row, "job_id", None)
+        rank_id = getattr(row, "rank_id", None)
+        chain_index = getattr(row, "chain_index", None)
+        if job_id is None or rank_id is None or chain_index is None:
             return None
-        ref = bundle.chains_by_id.get(str(chain_id))
+        if not isinstance(chain_index, int) or isinstance(chain_index, bool) or chain_index < 0:
+            raise ValueError(
+                f"metric row for rank {rank_id!r} has invalid chain_index {chain_index!r}"
+            )
+
+        chain_id = chain_id_for_rank(str(rank_id), chain_index)
+        ref = bundle.chains_by_id.get(chain_id)
         if ref is None:
             return None
-
-        row_rank_id = getattr(row, "rank_id", None)
-        if row_rank_id is None:
-            raise ValueError(f"metric row for chain {chain_id!r} missing rank_id")
-        if str(row_rank_id) != ref.rank_id:
+        if str(job_id) != ref.job_id:
             raise ValueError(
-                f"metric row for chain {chain_id!r} has rank_id {row_rank_id!r}, "
-                f"expected {ref.rank_id!r}"
+                f"metric row for chain {chain_id!r} has job_id {job_id!r}, expected {ref.job_id!r}"
             )
         return ref
 

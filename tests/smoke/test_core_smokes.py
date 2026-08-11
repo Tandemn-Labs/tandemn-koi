@@ -118,10 +118,12 @@ class CoreSmokeTests(unittest.TestCase):
         )
 
         action = plan.actions[0]
-        self.assertEqual([rank.rank_id for rank in action.ladder], ["rank_0", "latency_rank"])
+        self.assertTrue(action.ladder[0].rank_id.startswith("rank_"))
+        self.assertNotEqual(action.ladder[0].rank_id, "latency_rank")
+        self.assertEqual(action.ladder[1].rank_id, "latency_rank")
         self.assertEqual(
             [rank["rank_id"] for rank in action.to_dict()["ladder"]],
-            ["rank_0", "latency_rank"],
+            [action.ladder[0].rank_id, "latency_rank"],
         )
         self.assertEqual(action.ladder[0].predicted_y, {"p99_ttft_ms": 120.0})
         self.assertEqual(action.ladder[0].predicted_v, {"kv_cache_util": 0.4})
@@ -150,6 +152,60 @@ class CoreSmokeTests(unittest.TestCase):
                                 },
                             ],
                         }
+                    ]
+                },
+                tick=1,
+            )
+
+    def test_plan_autofilled_rank_ids_are_global(self):
+        plan = Plan.from_raw(
+            {
+                "actions": [
+                    {
+                        "job_id": "job_a",
+                        "type": "place",
+                        "ladder": [
+                            {
+                                "role": "aggregate",
+                                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                "config": {"gpu_count": 1},
+                            }
+                        ],
+                    },
+                    {
+                        "job_id": "job_b",
+                        "type": "place",
+                        "ladder": [
+                            {
+                                "role": "aggregate",
+                                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                                "config": {"gpu_count": 1},
+                            }
+                        ],
+                    },
+                ]
+            },
+            tick=1,
+        )
+
+        rank_ids = [action.ladder[0].rank_id for action in plan.actions]
+        self.assertEqual(len(set(rank_ids)), 2)
+
+    def test_plan_rejects_rank_ids_reused_across_jobs(self):
+        with self.assertRaisesRegex(ValueError, "duplicate rank_id"):
+            Plan.from_raw(
+                {
+                    "actions": [
+                        {
+                            "job_id": "job_a",
+                            "type": "place",
+                            "ladder": [{"role": "aggregate", "rank_id": "rank_shared"}],
+                        },
+                        {
+                            "job_id": "job_b",
+                            "type": "place",
+                            "ladder": [{"role": "aggregate", "rank_id": "rank_shared"}],
+                        },
                     ]
                 },
                 tick=1,

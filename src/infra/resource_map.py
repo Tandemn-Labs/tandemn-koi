@@ -16,6 +16,10 @@ ACTIVE_CHAIN_STATUSES = ("launching", "running")
 WAITING_JOB_STATUSES = ("waiting",)
 
 
+def chain_id_for_rank(rank_id: str, chain_index: int) -> str:
+    return f"{rank_id}_chain_{chain_index}"
+
+
 @dataclass
 class ClusterResourceSnapshot:
     tick: int | None
@@ -162,21 +166,28 @@ class ResourceMapManager:
         }
 
     @classmethod
-    def _chain_to_summary(cls, chain) -> dict[str, Any]:
-        raw = cls._model_dump(chain)
-        return {
-            "chain_id": raw.get("chain_id"),
-            "plan_id": raw.get("plan_id"),
-            "role": raw.get("role"),
-            "chain_status": raw.get("status"),
-            "shape_json": raw.get("shape_json") or {},
-            "target_node": raw.get("target_node"),
-        }
+    def _rank_to_chains(cls, rank) -> list[dict[str, Any]]:
+        raw = cls._model_dump(rank)
+        rank_id = str(raw["rank_id"])
+        n_replicas = raw["n_replicas"]
+        shape = dict(raw.get("shape_json") or {})
+        shape["rank_id"] = rank_id
+        return [
+            {
+                "chain_id": chain_id_for_rank(rank_id, chain_index),
+                "plan_id": raw.get("plan_id"),
+                "role": raw.get("role"),
+                "chain_status": raw.get("status"),
+                "shape_json": dict(shape),
+                "target_node": shape.get("target_node"),
+            }
+            for chain_index in range(n_replicas)
+        ]
 
     @classmethod
     def _running_job_to_summary(cls, running_job) -> dict[str, Any]:
         job = cls._job_to_summary(running_job.job)
-        chains = [cls._chain_to_summary(chain) for chain in running_job.chains]
+        chains = [chain for rank in running_job.ranks for chain in cls._rank_to_chains(rank)]
         job["active_chains"] = chains
         job["current_ladder"] = chains
         return job

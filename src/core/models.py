@@ -236,9 +236,10 @@ class RankSpec:
     env: tuple | None  # (market, cloud, region, zone, gpu_type)
     config: dict  # X decision variables for this chain
     n_replicas: int = 1  # "chains" in the shorthand
-    rank_id: str | None = None  # Koi logical rank id; Orca preserves it into chains/pods
+    rank_id: str | None = None  # globally unique Store rank id
     mechanism_id: str | None = None
     chain_id: str | None = None  # stable fingerprint for switch-cost delta matching
+    rank_traffic_share: float | None = None
     predicted_y: dict | None = None
     predicted_v: dict | None = None
     prediction_lineage: dict | None = None
@@ -277,6 +278,9 @@ class RankSpec:
                 rank_id = inner.pop("rank_id", None)
                 mech = inner.pop("mechanism_id", None)
                 chain_id = inner.pop("chain_id", None)
+                traffic_share = inner.pop("rank_traffic_share", None)
+                if traffic_share is None:
+                    traffic_share = inner.pop("traffic_share", None)
                 predicted_y = inner.pop("predicted_y", None)
                 predicted_v = inner.pop("predicted_v", None)
                 prediction_lineage = inner.pop("prediction_lineage", None)
@@ -290,6 +294,7 @@ class RankSpec:
                     rank_id=rank_id,
                     mechanism_id=mech,
                     chain_id=chain_id,
+                    rank_traffic_share=traffic_share,
                     predicted_y=predicted_y,
                     predicted_v=predicted_v,
                     prediction_lineage=prediction_lineage,
@@ -309,6 +314,7 @@ class RankSpec:
             rank_id=raw.get("rank_id"),
             mechanism_id=raw.get("mechanism_id"),
             chain_id=raw.get("chain_id"),
+            rank_traffic_share=raw.get("rank_traffic_share", raw.get("traffic_share")),
             predicted_y=raw.get("predicted_y"),
             predicted_v=raw.get("predicted_v"),
             prediction_lineage=raw.get("prediction_lineage"),
@@ -323,6 +329,7 @@ class RankSpec:
             "rank_id": self.rank_id,
             "mechanism_id": self.mechanism_id,
             "chain_id": self.chain_id,
+            "rank_traffic_share": self.rank_traffic_share,
             "predicted_y": self.predicted_y,
             "predicted_v": self.predicted_v,
             "prediction_lineage": self.prediction_lineage,
@@ -422,8 +429,10 @@ class PlanAction:
         if not ladder:
             return
         seen: set[str] = set()
-        for i, rank in enumerate(ladder):
-            rank.rank_id = rank.rank_id or f"rank_{i}"
+        from tandemn_system_data.ids import new_rank_id  # type: ignore[import-untyped]
+
+        for rank in ladder:
+            rank.rank_id = rank.rank_id or new_rank_id()
             if rank.rank_id in seen:
                 raise ValueError(f"job {job_id}: duplicate rank_id {rank.rank_id!r}")
             seen.add(rank.rank_id)
@@ -498,6 +507,10 @@ class Plan:
                 actions.append(PlanAction.from_dict(entry, job_id=job_id))
         else:
             raise ValueError("plan must be a Plan, an actions list, or a job_id->action dict")
+
+        rank_ids = [rank.rank_id for action in actions for rank in action.ladder or []]
+        if len(rank_ids) != len(set(rank_ids)):
+            raise ValueError("plan contains duplicate rank_id values")
 
         return cls(
             tick=int(meta.get("tick", tick)),
