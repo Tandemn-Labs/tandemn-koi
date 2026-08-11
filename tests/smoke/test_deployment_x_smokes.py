@@ -234,6 +234,24 @@ def _catalog_x_assertions():
 
 
 class DeploymentXSmokeTests(unittest.TestCase):
+    def test_composite_ranks_split_workload_by_traffic_share(self):
+        snapshot = _snapshot()
+        first = snapshot.active_jobs[0]["active_chains"][0]
+        second = snapshot.active_jobs[0]["active_chains"][1]
+        first["shape_json"]["rank_traffic_share"] = 0.4
+        second["shape_json"]["rank_id"] = "rank_b"
+        second["shape_json"]["rank_traffic_share"] = 0.6
+
+        index = build_deployment_x_index(
+            snapshot,
+            hardware_catalog=_hardware_catalog(),
+            model_catalogs=_model_catalogs(),
+            x_fields=_x_fields(),
+        )
+
+        self.assertEqual(index.resolve("job_1", "rank_a").x["request_arrival_rate"], 40.0)
+        self.assertEqual(index.resolve("job_1", "rank_b").x["request_arrival_rate"], 60.0)
+
     def test_idle_index_needs_no_catalogs(self):
         snapshot = ClusterResourceSnapshot(
             tick=1,

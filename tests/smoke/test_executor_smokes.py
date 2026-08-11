@@ -24,7 +24,7 @@ class StorePlanExecutorSmokeTests(unittest.TestCase):
         self.assertEqual(ack, [{"plan_id": store.plan.plan_id, "status": "created"}])
         self.assertEqual(store.plan.user_id, "user_1")
         self.assertEqual(store.plan.tick_rationale, "place one rank")
-        self.assertEqual(store.plan.actions[0].ladder[0]["rank_id"], "rank_0")
+        self.assertTrue(store.plan.actions[0].ladder[0]["rank_id"].startswith("rank_"))
         self.assertEqual(store.plan.actions[0].ladder[0]["predicted_y"], {"p99_ttft_ms": 120.0})
         self.assertEqual(store.plan.actions[0].ladder[0]["predicted_v"], {"kv_cache_util": 0.4})
 
@@ -34,7 +34,7 @@ class StorePlanExecutorSmokeTests(unittest.TestCase):
         StorePlanExecutor("user_1", plan_store=store).send_to_executor(_raw_place_plan())
 
         self.assertEqual(store.plan.actions[0].job_id, "job_1")
-        self.assertEqual(store.plan.actions[0].ladder[0]["rank_id"], "rank_0")
+        self.assertTrue(store.plan.actions[0].ladder[0]["rank_id"].startswith("rank_"))
 
 
 def _raw_place_plan():
