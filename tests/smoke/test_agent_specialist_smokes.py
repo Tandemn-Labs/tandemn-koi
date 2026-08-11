@@ -4,7 +4,7 @@ import unittest
 from src.agent.agent import KoiAgentHarness, PlanMaterializationError, SpecialistRunner
 from src.agent.tools import agent_tools
 from src.core.mechanism_registry import MechanismRegistry
-from src.core.models import Mechanism, PlanAction, RankSpec
+from src.core.models import Mechanism, Plan, PlanAction, RankSpec
 
 ENV = "reserved|aws|us-east-1|us-east-1b|L40S"
 
@@ -102,6 +102,42 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
 
         self.assertEqual(explicit.config, {"tp": 1})
         self.assertEqual(shorthand.config, {"tp": 1})
+
+    def test_catalog_launch_config_is_added_after_parsing(self):
+        class ResourceMap:
+            def model_catalog(self, model_id):
+                return {
+                    "model_id": model_id,
+                    "max_num_seq": [{"gpu_type": "L40S", "value": 128}],
+                    "max_num_batched_tokens": [{"gpu_type": "L40S", "value": 4096}],
+                    "block_size": [{"gpu_type": "L40S", "value": 16}],
+                    "gpu_mem_util": 0.9,
+                }
+
+        plan = Plan.from_raw({"actions": [_valid_place()]}, tick=1)
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        harness.resource_map = ResourceMap()
+        harness._materialize_launch_configs(
+            plan,
+            type(
+                "Snapshot",
+                (),
+                {
+                    "pending_jobs_summary": lambda self: [
+                        {
+                            "job_id": "job_1",
+                            "job_features": {"model_id": "Qwen/Qwen2.5-7B-Instruct"},
+                        }
+                    ]
+                },
+            )(),
+        )
+
+        config = plan.actions[0].ladder[0].config
+        self.assertEqual(config["max_num_seq"], 128)
+        self.assertEqual(config["max_num_batched_tokens"], 4096)
+        self.assertEqual(config["block_size"], 16)
+        self.assertEqual(config["gpu_mem_util"], 0.9)
 
     def test_ladder_rejects_false_scope_but_accepts_partial(self):
         registry = MechanismRegistry()

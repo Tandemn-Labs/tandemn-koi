@@ -57,6 +57,7 @@ from src.core.models import (
     Plan,
     PlanAction,
 )
+from src.infra.deployment_x import materialize_launch_config
 
 log = logging.getLogger("koi.agent")
 
@@ -1002,6 +1003,7 @@ class KoiAgentHarness:
             plan = Plan.from_raw(raw_plan, tick=self._current_tick)
         except ValueError as exc:
             raise PlanMaterializationError(str(exc)) from exc
+        self._materialize_launch_configs(plan, cluster_snapshot)
         states = self._job_states(cluster_snapshot)
         book = agent_tools._CTX.validated_budget_book
 
@@ -1045,6 +1047,21 @@ class KoiAgentHarness:
             raise PlanMaterializationError("plan has no actions and no job inventory to cover")
 
         return plan
+
+    def _materialize_launch_configs(self, plan: Plan, cluster_snapshot) -> None:
+        """Copy catalog-owned engine settings into every deployable rank."""
+        for action in plan.actions:
+            if action.type not in LADDER_ACTIONS or not action.ladder:
+                continue
+            job_features = agent_tools._job_features_for(cluster_snapshot, action.job_id)
+            model_id = job_features.get("model_id")
+            if not model_id:
+                raise PlanMaterializationError(f"job {action.job_id}: model_id is required")
+            catalog = self.resource_map.model_catalog(str(model_id))
+            for rank in action.ladder:
+                if rank.env is None or len(rank.env) != 5:
+                    continue
+                rank.config.update(materialize_launch_config(catalog, rank.env[4]))
 
     def _validate_ladder(self, action: PlanAction, book, cluster_snapshot=None) -> None:
         """Validate a ladder-bearing action; raise on hard violations."""

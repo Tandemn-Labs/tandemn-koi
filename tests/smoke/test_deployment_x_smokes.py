@@ -7,7 +7,7 @@ from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node
 from src.cost.dro import DRO
-from src.infra.deployment_x import build_deployment_x_index
+from src.infra.deployment_x import build_deployment_x_index, materialize_launch_config
 from src.infra.resource_map import ClusterResourceSnapshot
 from src.orchestrator.fsm_states import TickContext, TickRunner
 from src.validation.cusum import Cusum
@@ -340,6 +340,24 @@ class DeploymentXSmokeTests(unittest.TestCase):
             index.resolve("job_1")
         with self.assertRaises(KeyError):
             index.resolve("job_1", "missing_rank")
+
+    def test_materializes_catalog_launch_config_for_gpu(self):
+        config = materialize_launch_config(_model_catalogs()["Qwen/Qwen2.5-72B-Instruct"], "H100")
+
+        self.assertEqual(
+            config,
+            {
+                "engine_name": "vllm",
+                "gpu_mem_util": 0.85,
+                "prefix_cache_enabled": True,
+                "max_model_len": 8192,
+                "chunked_prefill_enable": True,
+                "max_num_seq": 256,
+                "max_num_batched_tokens": 8192,
+                "block_size": 16,
+                "kvcache_dtype": "auto",
+            },
+        )
 
     def test_missing_rank_id_is_contract_error(self):
         snapshot = _snapshot()

@@ -28,6 +28,27 @@ _X_SKIP = {
 _LOAD_FIELDS = ("request_arrival_rate", "total_token_budget")
 _MODEL_IDENTITY_FIELDS = {"model_id", "updated_at"}
 _PER_GPU_MODEL_FIELDS = {"max_num_seq", "max_num_batched_tokens", "block_size", "kvcache_dtype"}
+_LAUNCH_CONFIG_FIELDS = frozenset(
+    {
+        "engine_name",
+        "engine_version",
+        "max_num_seq",
+        "max_num_batched_tokens",
+        "gpu_mem_util",
+        "max_model_len",
+        "block_size",
+        "kvcache_dtype",
+        "weight_dtype",
+        "activation_dtype",
+        "weight_quantization_method",
+        "weight_quantization_bits",
+        "prefix_cache_enabled",
+        "chunked_prefill_enable",
+        "scheduling_policy",
+        "preemption_policy",
+        "router_policy",
+    }
+)
 _GPU_FIELDS = (
     "gpu_bandwidth_gbps",
     "gpu_tflops_fp16",
@@ -295,6 +316,16 @@ def _model_catalog_x(catalog: dict[str, Any], gpu_type: str) -> dict[str, Any]:
         key: _per_gpu_model_value(value, gpu_type, key) if key in _PER_GPU_MODEL_FIELDS else value
         for key, value in catalog.items()
         if key not in _MODEL_IDENTITY_FIELDS
+    }
+
+
+def materialize_launch_config(catalog: dict[str, Any], gpu_type: str) -> dict[str, Any]:
+    """Return catalog-owned launch settings resolved for one GPU type."""
+    resolved = _model_catalog_x(catalog, gpu_type)
+    return {
+        key: value
+        for key, value in resolved.items()
+        if key in _LAUNCH_CONFIG_FIELDS and value is not None
     }
 
 
