@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 from typing import Any
 
@@ -46,7 +47,7 @@ class PeerPredictorClient:
         if predict_fn is None:
             # Maintained separately in LLM_placement_solver; install it into Koi's environment.
             try:
-                from predictor_compare import predict as default_predict
+                default_predict = importlib.import_module("predictor_compare").predict
             except ImportError as exc:
                 raise RuntimeError(
                     "peer prediction requires the optional tandemn-predictors package "
@@ -75,7 +76,7 @@ class PeerPredictorClient:
         if input_length is None or output_length is None:
             return None
         try:
-            from predictor_compare import Query
+            Query = importlib.import_module("predictor_compare").Query
         except ImportError as exc:
             raise RuntimeError(
                 "peer prediction requires the optional tandemn-predictors package "
