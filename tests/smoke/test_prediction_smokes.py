@@ -155,6 +155,12 @@ class MockCandidateGraph:
 
 
 class PredictionSmokeTests(unittest.TestCase):
+    def test_a100_labels_use_a100_sxm(self):
+        predictor = SurrogatePrediction()
+
+        for gpu_type in ("A100", "A100_80GB", "A100-40GB", "A100_PCIE"):
+            self.assertEqual(predictor.map_gpu_to_aic_system(gpu_type), "a100_sxm")
+
     def test_tchebycheff_and_dro_scores_are_finite(self):
         y_hat = {"throughput_token_per_sec": 1000, "slo_margin": 100}
         w_t = {"throughput_token_per_sec": 0.5, "slo_margin": 0.5}
