@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from src.core.candidate_graph import CandidateGraph
@@ -7,8 +8,8 @@ from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node
 from src.cost.dro import DRO
-from src.infra.deployment_x import build_deployment_x_index, materialize_launch_config
-from src.infra.resource_map import ClusterResourceSnapshot
+from src.infra.deployment_x import _gpu, build_deployment_x_index, materialize_launch_config
+from src.infra.resource_map import ClusterResourceSnapshot, ResourceMapManager
 from src.orchestrator.fsm_states import TickContext, TickRunner
 from src.validation.cusum import Cusum
 from src.validation.icp import ICP, ICPResult
@@ -170,6 +171,21 @@ def _hardware_catalog():
     }
 
 
+def _azure_hardware_catalog():
+    return {
+        "cloud": "azure",
+        "regions": ["eastus"],
+        "instance_types": [
+            {
+                "instance_type": "Standard_ND96amsr_A100_v4",
+                "accelerators": [],
+                "network": {"network_cards": [{"peak_bandwidth_gbps": 1600}]},
+                "offerings": [{"region": "eastus"}],
+            }
+        ],
+    }
+
+
 def _model_catalogs():
     return {
         "Qwen/Qwen2.5-72B-Instruct": {
@@ -235,6 +251,41 @@ def _catalog_x_assertions():
 
 
 class DeploymentXSmokeTests(unittest.TestCase):
+    def test_gpu_catalog_match_normalizes_store_labels(self):
+        """Match Store's underscore labels with catalog hyphen labels."""
+        hardware = {
+            "accelerators": [
+                {
+                    "kind": "gpu",
+                    "name": "A100-80GB",
+                    "canonical_gpu_name": "A100-40GB",
+                }
+            ]
+        }
+
+        gpu = _gpu(hardware, "A100_80GB")
+
+        self.assertEqual(gpu["name"], "A100-80GB")
+
+    def test_hardware_catalog_merges_aws_and_azure_store_rows(self):
+        """Expose Azure instances alongside the default AWS catalog."""
+        catalogs = [
+            SimpleNamespace(catalog=_hardware_catalog()),
+            SimpleNamespace(catalog=_azure_hardware_catalog()),
+        ]
+        store = SimpleNamespace(all=lambda: catalogs)
+
+        with patch("tandemn_system_data.clients.HardwareCatalogStore", return_value=store):
+            catalog = ResourceMapManager(postgres_client=object()).hardware_catalog()
+
+        by_instance = {
+            (region["cloud"], region["region"], instance["instance_type"])
+            for region in catalog["regions"]
+            for instance in region["instance_types"]
+        }
+        self.assertIn(("aws", "us-east-2", "p5.48xlarge"), by_instance)
+        self.assertIn(("azure", "eastus", "Standard_ND96amsr_A100_v4"), by_instance)
+
     def test_composite_ranks_split_workload_by_traffic_share(self):
         snapshot = _snapshot()
         first = snapshot.active_jobs[0]["active_chains"][0]

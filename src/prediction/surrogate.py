@@ -222,7 +222,7 @@ class SurrogatePrediction:
             "H100_PCIE": "h100_pcie",
             "A100": "a100_sxm",
             "A100_SXM": "a100_sxm",
-            "A100_PCIE": "a100_pcie",
+            "A100_PCIE": "a100_sxm",
             "A30": "a30",
             "L40S": "l40s",
             "L40": "l40",
@@ -239,6 +239,9 @@ class SurrogatePrediction:
         normalized_gpu_type = str(gpu_type).strip()
         normalized_key = normalized_gpu_type.upper().replace("-", "_").replace(" ", "_")
         normalized_value = normalized_gpu_type.lower()
+
+        if normalized_key.startswith("A100"):
+            return "a100_sxm"
 
         if normalized_value in supported_aic_systems:
             return normalized_value
