@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,40 @@ WAITING_JOB_STATUSES = ("waiting",)
 
 def chain_id_for_rank(rank_id: str, chain_index: int) -> str:
     return f"{rank_id}_chain_{chain_index}"
+
+
+def merge_hardware_catalogs(catalogs: Sequence[object]) -> dict[str, Any]:
+    """Normalize Store provider catalogs into deployment X's region schema."""
+    regions = []
+    for hardware in catalogs:
+        catalog = getattr(hardware, "catalog", None)
+        if not isinstance(catalog, dict):
+            continue
+        source_regions = catalog.get("regions", [])
+        if source_regions and isinstance(source_regions[0], dict):
+            regions.extend(source_regions)
+            continue
+        cloud = catalog.get("cloud")
+        if not isinstance(cloud, str):
+            continue
+        for region in source_regions:
+            if not isinstance(region, str):
+                continue
+            regions.append(
+                {
+                    "cloud": cloud,
+                    "region": region,
+                    "instance_types": [
+                        instance
+                        for instance in catalog.get("instance_types", [])
+                        if any(
+                            offering.get("region") == region
+                            for offering in instance.get("offerings", [])
+                        )
+                    ],
+                }
+            )
+    return {"regions": regions}
 
 
 @dataclass
@@ -81,13 +116,14 @@ class ResourceMapManager:
         return ResourceMapStore(self._client(), user_id=self._effective_user_id(user_id))
 
     def hardware_catalog(self) -> dict[str, Any]:
-        """Return the latest Store hardware catalog, raising when absent."""
+        """Return all Store provider catalogs in deployment X's region schema."""
         from tandemn_system_data.clients import HardwareCatalogStore
 
-        catalog = HardwareCatalogStore(self._client()).get()
-        if catalog is None or not catalog.catalog:
+        catalogs = HardwareCatalogStore(self._client()).all()
+        catalog = merge_hardware_catalogs(catalogs)
+        if not catalog["regions"]:
             raise ValueError("hardware catalog is required for deployment X")
-        return dict(catalog.catalog)
+        return catalog
 
     def model_catalog(self, model_id: str) -> dict[str, Any]:
         """Return one Store model catalog row, raising when absent."""

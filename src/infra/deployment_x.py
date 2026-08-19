@@ -396,11 +396,20 @@ def _hardware_x(hardware: dict[str, Any], gpu_type: str) -> dict[str, object]:
 
 def _gpu(hardware: dict[str, Any], gpu_type: str) -> dict[str, Any]:
     """Return the catalog GPU accelerator matching deployment GPU type."""
+    expected = _gpu_name(gpu_type)
     for accelerator in hardware["accelerators"]:
-        names = {accelerator.get("name"), accelerator.get("canonical_gpu_name")}
-        if accelerator.get("kind") == "gpu" and gpu_type in names:
+        names = {
+            _gpu_name(accelerator.get("name")),
+            _gpu_name(accelerator.get("canonical_gpu_name")),
+        }
+        if accelerator.get("kind") == "gpu" and expected in names:
             return dict(accelerator)
     raise ValueError(f"hardware catalog missing GPU accelerator {gpu_type!r}")
+
+
+def _gpu_name(value: object) -> str:
+    """Normalize Store and catalog GPU labels before matching them."""
+    return str(value or "").upper().replace("_", "-")
 
 
 def _network_bandwidth(hardware: dict[str, Any]) -> float:
