@@ -10,6 +10,7 @@ for _logger_name in ("aiconfigurator", "aiconfigurator_core"):
 
 ONLINE_REPLAY_WINDOW_S = 1
 ONLINE_MIN_REQUESTS = 20
+_AIC_FALLBACK_MODES = ("HYBRID", "EMPIRICAL", "SOL")
 
 AIC_MEMORY_X_FIELDS = frozenset(
     {
@@ -97,10 +98,12 @@ class SurrogateExecutionError(Exception):
 class SurrogatePrediction:
     def __init__(self, objective="batch"):
         self.objective = objective
+        self.last_metadata = {}
 
     def compose_prediction(
         self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",), scenario="mean"
     ):
+        self.last_metadata = {}
         env_vector = self.get_env_row(job_features)
         price_vector = self.fetch_cloud_prices(job_config, job_features, env_vector)
         # 1. Resolve what this surrogate is allowed to use/produce in the prediction
@@ -143,6 +146,8 @@ class SurrogatePrediction:
             simulator_controls,
             method,
         )
+        surrogate_input["objective"] = objective
+        surrogate_input["scenario"] = scenario
         # direct_x_values + simulator_controls -> AIC_dynosim args
 
         # 5. Run DynoSim/AIC and get direct outputs
@@ -208,8 +213,8 @@ class SurrogatePrediction:
         # TODO - general helper, can be moved out of this file/class
         # Convert common GPU names into Dynamo/AIC system names.
         gpu_to_aic_system = {
-            "GB200": "gb200_sxm",
-            "GB200_SXM": "gb200_sxm",
+            "GB200": "gb200",
+            "GB200_SXM": "gb200",
             "GB10": "gb10",
             "B200": "b200_sxm",
             "B200_SXM": "b200_sxm",
@@ -224,6 +229,8 @@ class SurrogatePrediction:
             "A100_SXM": "a100_sxm",
             "A100_PCIE": "a100_sxm",
             "A30": "a30",
+            "A10": "a30",
+            "A10G": "a30",
             "L40S": "l40s",
             "L40": "l40",
             "L4": "l4",
@@ -238,7 +245,24 @@ class SurrogatePrediction:
         supported_aic_systems = set(gpu_to_aic_system.values())
         normalized_gpu_type = str(gpu_type).strip()
         normalized_key = normalized_gpu_type.upper().replace("-", "_").replace(" ", "_")
+        if normalized_key.startswith("NVIDIA_"):
+            normalized_key = normalized_key.removeprefix("NVIDIA_")
         normalized_value = normalized_gpu_type.lower()
+
+        approximate_systems = {
+            "A10": "a30",
+            "A10G": "a30",
+            "RTXPRO6000": "l40s",
+            "RTX_PRO_6000": "l40s",
+        }
+        if normalized_key in approximate_systems:
+            resolved = approximate_systems[normalized_key]
+            self.last_metadata["hardware_approximation"] = {
+                "requested_gpu_type": normalized_gpu_type,
+                "resolved_aic_system": resolved,
+                "reason": "nearest_supported_aic_system",
+            }
+            return resolved
 
         if normalized_key.startswith("A100"):
             return "a100_sxm"
@@ -669,7 +693,9 @@ class SurrogatePrediction:
             )
         except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig, SurrogateExecutionError):
             raise
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
             raise self._memory_preflight_error(exc) from exc
         if int(blocks) <= 0:
             raise SurrogateMemoryNoFit(f"AIC memory preflight no-fit: num_gpu_blocks={blocks}")
@@ -732,6 +758,37 @@ class SurrogatePrediction:
             return self.run_aic_dynosim(surrogate_input)
 
     def run_aic_only(self, surrogate_input):
+        return self._run_aic_modes(surrogate_input, ("SILICON", *_AIC_FALLBACK_MODES))
+
+    def _run_aic_modes(self, surrogate_input, modes, fallback_reason=None):
+        failures = []
+        mapped_failures = []
+        for database_mode in modes:
+            try:
+                result = self._run_aic_mode(surrogate_input, database_mode)
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                    raise
+                mapped = self._aic_only_error(exc)
+                if isinstance(mapped, SurrogateMemoryNoFit):
+                    raise mapped from exc
+                mapped_failures.append(mapped)
+                failures.append(f"{database_mode}: {type(exc).__name__}: {exc}")
+                continue
+            self.last_metadata["aic_database_mode"] = database_mode
+            if database_mode != "SILICON":
+                self.last_metadata["aic_fallback"] = {
+                    "reason": fallback_reason or "silicon_estimate_unavailable",
+                    "attempts": failures,
+                    "selected_database_mode": database_mode,
+                }
+            return result
+        message = "AIC has no usable silicon, empirical, or SOL estimate: " + "; ".join(failures)
+        if any(isinstance(failure, SurrogateExecutionError) for failure in mapped_failures):
+            raise SurrogateExecutionError(message)
+        raise SurrogateUnsupportedConfig(message)
+
+    def _run_aic_mode(self, surrogate_input, database_mode):
         engine_args = surrogate_input["engine_args"]
         replay_args = surrogate_input["replay_args"]
         aic_args = surrogate_input.get("aic_args") or {}
@@ -745,26 +802,24 @@ class SurrogatePrediction:
         )
         num_workers = int(replay_args.get("num_workers") or 1)
 
-        try:
-            estimate = self._aic_estimate(
-                model_path=engine_args["aic_model_path"],
-                system_name=engine_args["aic_system"],
-                mode="agg",
-                backend_name=engine_args["aic_backend"],
-                backend_version=engine_args.get("aic_backend_version"),
-                isl=input_tokens,
-                osl=output_tokens,
-                batch_size=self._aic_batch_size(engine_args, replay_args),
-                ctx_tokens=int(engine_args.get("max_num_batched_tokens") or input_tokens),
-                tp_size=int(engine_args.get("aic_tp_size") or 1),
-                pp_size=int(aic_args.get("pp_size") or 1),
-                moe_ep_size=engine_args.get("aic_moe_ep_size"),
-            )
-        except Exception as exc:
-            raise self._aic_only_error(exc) from exc
-
+        estimate = self._aic_estimate(
+            model_path=engine_args["aic_model_path"],
+            system_name=engine_args["aic_system"],
+            mode="agg",
+            backend_name=engine_args["aic_backend"],
+            backend_version=engine_args.get("aic_backend_version"),
+            database_mode=database_mode,
+            isl=input_tokens,
+            osl=output_tokens,
+            batch_size=self._aic_batch_size(engine_args, replay_args),
+            ctx_tokens=int(engine_args.get("max_num_batched_tokens") or input_tokens),
+            tp_size=int(engine_args.get("aic_tp_size") or 1),
+            pp_size=int(aic_args.get("pp_size") or 1),
+            moe_ep_size=engine_args.get("aic_moe_ep_size"),
+        )
         raw = estimate.raw or {}
-        throughput = float(raw.get("tokens/s") or 0.0) * num_workers
+        throughput = float(raw.get("tokens/s") or getattr(estimate, "tokens_per_second", 0.0))
+        throughput *= num_workers
         raw_report = {
             "completed_requests": expected_requests,
             "total_input_tokens": input_tokens * expected_requests,
@@ -774,7 +829,12 @@ class SurrogatePrediction:
             "output_throughput_tok_s": throughput,
             "prefix_cache_reused_ratio": None,
         }
-        return self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
+        y_hat, v_hat = self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
+        if surrogate_input.get("objective") == "online":
+            y_hat.pop("p99_ttft_ms", None)
+            y_hat.pop("p99_tpot_ms", None)
+            self.last_metadata["aic_fallback_omitted_nodes"] = ["p99_tpot_ms", "p99_ttft_ms"]
+        return y_hat, v_hat
 
     @staticmethod
     def _aic_batch_size(engine_args, replay_args):
@@ -799,7 +859,14 @@ class SurrogatePrediction:
         text = str(exc).lower()
         if "oom" in text or "kv cache" in text or "kv-cache" in text or "does not fit" in text:
             return SurrogateMemoryNoFit(f"AIC-only PP no-fit: {exc}")
-        if "unsupported" in text or "not supported" in text or "no database" in text:
+        if (
+            "unsupported" in text
+            or "not supported" in text
+            or "no database" in text
+            or "perfdatanotavailableerror" in text
+            or "empiricalnotimplementederror" in text
+            or ("performance data" in text and "not available" in text)
+        ):
             return SurrogateUnsupportedConfig(f"AIC-only PP unsupported config: {exc}")
         return SurrogateExecutionError(f"AIC-only PP execution failed: {exc}")
 
@@ -807,8 +874,15 @@ class SurrogatePrediction:
         # Run the AIC DynoSim model.
         # Inputs: SurrogateInput
         # Outputs: y_hat, v_hat
-        from dynamo.llm import MockEngineArgs
-        from dynamo.replay.api import run_synthetic_trace_replay
+        try:
+            from dynamo.llm import MockEngineArgs
+            from dynamo.replay.api import run_synthetic_trace_replay
+        except Exception as exc:
+            return self._run_aic_modes(
+                surrogate_input,
+                _AIC_FALLBACK_MODES,
+                fallback_reason=f"DynoSim unavailable: {type(exc).__name__}: {exc}",
+            )
 
         engine_args = surrogate_input["engine_args"]
         replay_args = surrogate_input["replay_args"]
@@ -845,30 +919,41 @@ class SurrogatePrediction:
         elif replay_args.get("arrival_interval_ms") is not None:
             common_replay_args["arrival_interval_ms"] = replay_args["arrival_interval_ms"]
 
-        if pd_enabled:
-            prefill_engine_args = dict(engine_args)
-            decode_engine_args = dict(engine_args)
-            prefill_engine_args["worker_type"] = "prefill"
-            decode_engine_args["worker_type"] = "decode"
+        try:
+            if pd_enabled:
+                prefill_engine_args = dict(engine_args)
+                decode_engine_args = dict(engine_args)
+                prefill_engine_args["worker_type"] = "prefill"
+                decode_engine_args["worker_type"] = "decode"
 
-            raw_report = run_synthetic_trace_replay(
-                input_tokens,
-                output_tokens,
-                request_count,
-                prefill_engine_args=MockEngineArgs(**prefill_engine_args),
-                decode_engine_args=MockEngineArgs(**decode_engine_args),
-                num_prefill_workers=int(replay_args.get("prefill_worker_count", 1)),
-                num_decode_workers=int(replay_args.get("decode_worker_count", 1)),
-                **common_replay_args,
-            )
-        else:
-            raw_report = run_synthetic_trace_replay(
-                input_tokens,
-                output_tokens,
-                request_count,
-                extra_engine_args=MockEngineArgs(**engine_args),
-                num_workers=int(replay_args.get("num_workers", 1)),
-                **common_replay_args,
+                raw_report = run_synthetic_trace_replay(
+                    input_tokens,
+                    output_tokens,
+                    request_count,
+                    prefill_engine_args=MockEngineArgs(**prefill_engine_args),
+                    decode_engine_args=MockEngineArgs(**decode_engine_args),
+                    num_prefill_workers=int(replay_args.get("prefill_worker_count", 1)),
+                    num_decode_workers=int(replay_args.get("decode_worker_count", 1)),
+                    **common_replay_args,
+                )
+            else:
+                raw_report = run_synthetic_trace_replay(
+                    input_tokens,
+                    output_tokens,
+                    request_count,
+                    extra_engine_args=MockEngineArgs(**engine_args),
+                    num_workers=int(replay_args.get("num_workers", 1)),
+                    **common_replay_args,
+                )
+        # PyO3 PanicException inherits BaseException directly, not Exception.
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            details = f"{type(exc).__name__}: {exc}"
+            return self._run_aic_modes(
+                surrogate_input,
+                _AIC_FALLBACK_MODES,
+                fallback_reason=details,
             )
 
         return self.canonicalize_aic_dynosim_output(raw_report, expected_requests)

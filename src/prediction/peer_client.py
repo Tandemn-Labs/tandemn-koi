@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import math
+from copy import copy
 from typing import Any
 
 _MODEL_KEYS = {
@@ -20,9 +21,19 @@ _MODEL_KEYS = {
 _DEVICE_KEYS = {
     "A100": "A100",
     "A100-80GB": "A100",
+    "A10": "A10G",
+    "A10G": "A10G",
     "H100": "H100",
     "H100-80GB": "H100",
+    "L4": "L4",
     "L40S": "L40S",
+    "RTXPRO6000": "L40S",
+    "RTX-PRO-6000": "L40S",
+}
+_SOLVER_FAMILIES = {
+    "A10G": "g5.48xlarge",
+    "L4": "g6.48xlarge",
+    "L40S": "g6e.48xlarge",
 }
 
 
@@ -56,20 +67,116 @@ class PeerPredictorClient:
 
             predict_fn = default_predict
 
-        return {
+        results = {
             name: result.to_dict()
             for name, result in predict_fn(query, predictors=self.names).items()
         }
+        solver = results.get("solver")
+        if solver is not None and solver.get("status") in {"unsupported", "failed"}:
+            fallback = self._retry_roofline(predict_fn, query)
+            if fallback is not None:
+                results["solver"] = fallback
+        input_approximations = {
+            name: query.context[name]
+            for name in ("model_approximation", "hardware_approximation")
+            if query.context.get(name)
+        }
+        if input_approximations:
+            for result in results.values():
+                hardware = input_approximations.get("hardware_approximation") or {}
+                scale = float(hardware.get("throughput_scale") or 1.0)
+                if result.get("status") == "success" and scale != 1.0:
+                    for node in ("total_tps", "input_tps", "output_tps"):
+                        if result.get(node) is not None:
+                            result[node] = float(result[node]) * scale
+                    for node in (
+                        "ttft_ms_p50",
+                        "ttft_ms_p99",
+                        "tpot_ms_p50",
+                        "tpot_ms_p99",
+                        "e2e_ms_p50",
+                        "e2e_ms_p99",
+                    ):
+                        if result.get(node) is not None:
+                            result[node] = float(result[node]) / scale
+                    if result.get("dollar_per_mtok") is not None:
+                        result["dollar_per_mtok"] = float(result["dollar_per_mtok"]) / scale
+                approximation = dict(result.get("approximation") or {})
+                approximation["inputs"] = input_approximations
+                result["approximation"] = approximation
+        return results
+
+    @staticmethod
+    def _retry_roofline(predict_fn, query) -> dict[str, Any] | None:
+        requested = {
+            "task": query.task,
+            "precision": query.precision,
+            "num_replicas": query.num_replicas,
+            "tp": query.tp,
+            "pp": query.pp,
+        }
+        variants = (
+            (query.tp, query.pp),
+            (query.tp, 1),
+            (1, 1),
+        )
+        seen = set()
+        for tp, pp in variants:
+            resolved = ("capacity", "bf16", 1, tp, pp)
+            if resolved in seen or resolved == tuple(requested.values()):
+                continue
+            seen.add(resolved)
+            candidate = copy(query)
+            candidate.task = "capacity"
+            candidate.precision = "bf16"
+            candidate.num_replicas = 1
+            candidate.tp = tp
+            candidate.pp = pp
+            try:
+                retry = predict_fn(candidate, predictors=("solver",)).get("solver")
+            except Exception:
+                continue
+            if retry is None:
+                continue
+            result = retry.to_dict()
+            if result.get("status") != "success":
+                continue
+            replicas = max(1, int(requested["num_replicas"]))
+            for node in ("total_tps", "input_tps", "output_tps", "cost_per_hour"):
+                if result.get(node) is not None:
+                    result[node] = float(result[node]) * replicas
+            result["approximation"] = {
+                "reason": "nearest_supported_roofline_config",
+                "requested": requested,
+                "resolved": {
+                    "task": candidate.task,
+                    "precision": candidate.precision,
+                    "num_replicas": candidate.num_replicas,
+                    "tp": candidate.tp,
+                    "pp": candidate.pp,
+                },
+            }
+            return result
+        return None
 
     @staticmethod
     def _query(job_config: dict[str, Any], job_features: dict[str, Any], *, scenario: str):
         values = {**job_features, **job_config}
         model_id = str(values.get("model_id") or "").strip()
-        model = _MODEL_KEYS.get(model_id.lower())
-        gpu = str(values.get("gpu_type") or "").replace("NVIDIA ", "").strip()
-        device = _DEVICE_KEYS.get(gpu.upper(), _DEVICE_KEYS.get(gpu))
-        if model is None or device is None:
+        model, model_approximation = _resolve_model(values, model_id)
+        gpu = _normalize_gpu(values.get("gpu_type"))
+        device = _DEVICE_KEYS.get(gpu)
+        if model is None or not gpu:
             return None
+        hardware_approximation = None
+        if device is None:
+            device = "L40S"
+            hardware_approximation = {
+                "requested_gpu_type": values.get("gpu_type"),
+                "resolved_peer_device": device,
+                "reason": "generic_supported_roofline_device",
+                "throughput_scale": _generic_roofline_scale(values),
+            }
 
         input_length = _positive_int(values.get("isl_token_avg"))
         output_length = _positive_int(values.get("osl_token_avg"))
@@ -124,6 +231,20 @@ class PeerPredictorClient:
         }
         context = {key: value for key, value in values.items() if key not in represented}
         context["scenario"] = scenario
+        if model_approximation:
+            context["model_approximation"] = model_approximation
+        if hardware_approximation is not None:
+            context["hardware_approximation"] = hardware_approximation
+        elif gpu in {"RTXPRO6000", "RTX-PRO-6000"}:
+            context["hardware_approximation"] = {
+                "requested_gpu_type": values.get("gpu_type"),
+                "resolved_peer_device": device,
+                "reason": "nearest_supported_roofline_device",
+                "throughput_scale": _generic_roofline_scale(values),
+            }
+        solver_family = values.get("instance_type") or _SOLVER_FAMILIES.get(device)
+        if gpu in {"RTXPRO6000", "RTX-PRO-6000"}:
+            solver_family = _SOLVER_FAMILIES[device]
         return Query(
             model=model,
             device=device,
@@ -156,7 +277,7 @@ class PeerPredictorClient:
             dynosim_model=model_id,
             blis_model=values.get("blis_model"),
             solver_config_dir=values.get("solver_config_dir"),
-            solver_instance_family=values.get("instance_type"),
+            solver_instance_family=solver_family,
         )
 
 
@@ -166,3 +287,57 @@ def _positive_int(value) -> int | None:
     except (TypeError, ValueError):
         return None
     return result if result > 0 else None
+
+
+def _normalize_gpu(value) -> str:
+    normalized = str(value or "").strip().upper().replace("_", "-").replace(" ", "-")
+    if normalized.startswith("NVIDIA-"):
+        normalized = normalized.removeprefix("NVIDIA-")
+    return normalized
+
+
+def _resolve_model(values: dict[str, Any], model_id: str) -> tuple[str | None, dict | None]:
+    exact = _MODEL_KEYS.get(model_id.lower())
+    if exact is not None:
+        return exact, None
+    if values.get("solver_config_dir"):
+        return model_id or "custom", None
+    raw_params = values.get("model_params_b")
+    if raw_params is None:
+        return None, None
+    try:
+        params_b = float(raw_params)
+    except (TypeError, ValueError):
+        return None, None
+    if not math.isfinite(params_b) or params_b <= 0 or values.get("is_moe"):
+        return None, None
+    is_qwen = "qwen" in model_id.lower()
+    candidates = ("qwen3-8b", "qwen3-32b", "qwen-72b") if is_qwen else ("llama3-8b", "llama3-70b")
+    sizes = {
+        "qwen3-8b": 8.0,
+        "qwen3-32b": 32.0,
+        "qwen-72b": 72.0,
+        "llama3-8b": 8.0,
+        "llama3-70b": 70.0,
+    }
+    resolved = min(candidates, key=lambda name: abs(params_b - sizes[name]))
+    return resolved, {
+        "requested_model_id": model_id,
+        "resolved_peer_model": resolved,
+        "reason": "nearest_parameter_count_roofline_model",
+    }
+
+
+def _generic_roofline_scale(values: dict[str, Any]) -> float:
+    ratios = []
+    for name, reference in (("gpu_tflops_fp16", 362.0), ("gpu_bandwidth_gbps", 864.0)):
+        raw = values.get(name)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            ratios.append(value / reference)
+    return max(0.1, min(1.0, min(ratios))) if ratios else 0.5
