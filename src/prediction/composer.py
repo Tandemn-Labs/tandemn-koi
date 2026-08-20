@@ -64,7 +64,7 @@ class SurrogateComposer:
         self.lower_quantile = lower_quantile
         self._peer_warnings: set[tuple[str, str]] = set()
         self.last_trace: dict[str, Any] = {}
-        self.version = "koi-surrogate-v3"
+        self.version = "koi-surrogate-v4"
         self._lock = RLock()
 
     def bind_evidence_store(self, evidence_store) -> None:
@@ -197,6 +197,47 @@ class SurrogateComposer:
             }
             backends.update(peer_entries)
 
+            fallback_sources = []
+            fallback_coverage = {}
+            if primary.status != "success":
+                if self.perfdb_mode != "off" and perfdb_estimate.status == "success":
+                    missing_y = {node for node in perfdb_estimate.y_hat if y_hat.get(node) is None}
+                    missing_v = {node for node in perfdb_estimate.v_hat if v_hat.get(node) is None}
+                    y_hat = _fill_available(y_hat, perfdb_estimate.y_hat, perfdb_estimate.coverage)
+                    v_hat = _fill_available(v_hat, perfdb_estimate.v_hat, perfdb_estimate.coverage)
+                    for node in missing_y | missing_v:
+                        if node in y_hat or node in v_hat:
+                            fallback_coverage[node] = float(perfdb_estimate.coverage.get(node, 0.0))
+                    fallback_sources.append("perfdb")
+                for name, entry in peer_entries.items():
+                    if entry.get("status") != "success":
+                        continue
+                    before = set(y_hat)
+                    y_hat = _fill_available(y_hat, entry.get("y_hat") or {})
+                    added = set(y_hat) - before
+                    if added:
+                        fallback_sources.append(name)
+                        confidence = (
+                            0.5 if (entry.get("metadata") or {}).get("approximation") else 1.0
+                        )
+                        fallback_coverage.update(dict.fromkeys(added, confidence))
+                core_y = {"throughput_token_per_sec", "p99_ttft_ms", "p99_tpot_ms"}
+                components["fallback"] = {
+                    "status": "success" if core_y <= set(y_hat) else "partial",
+                    "version": "best-effort-v1",
+                    "coverage": fallback_coverage,
+                    "spread": {},
+                    "metadata": {
+                        "reason": primary.metadata.get("error"),
+                        "sources": fallback_sources,
+                        "missing_core_y": sorted(core_y - set(y_hat)),
+                        "emergency_shadow_override": True,
+                    },
+                    "y_hat": dict(y_hat),
+                    "v_hat": dict(v_hat),
+                    "timing_ms": 0.0,
+                }
+
             stage = "fusion"
             fusion_started = time.perf_counter()
             evidence_rows = load_evidence_snapshot(
@@ -320,6 +361,8 @@ class SurrogateComposer:
                     "perfdb_mode": self.perfdb_mode,
                     "peer_mode": self.peer_mode,
                     "lower_quantile": self.lower_quantile,
+                    "primary_status": primary.status,
+                    "fallback_sources": fallback_sources,
                 },
             }
             self.last_trace = trace
@@ -426,9 +469,24 @@ class SurrogateComposer:
             }
         entries = {}
         for name, result in results.items():
+            try:
+                y_hat = _peer_y(result)
+            except (TypeError, ValueError, OverflowError) as exc:
+                result = {
+                    **result,
+                    "status": "failed",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+                y_hat = {}
+            version = result.get("backend_version")
+            approximation = result.get("approximation")
+            if version and approximation:
+                digest = hashlib.sha256(repr(approximation).encode()).hexdigest()[:8]
+                version = f"{version}:approx-{digest}"
             entries[name] = {
                 "status": result.get("status", "failed"),
-                "version": result.get("backend_version"),
+                "version": version,
                 "coverage": {},
                 "spread": {},
                 "metadata": {
@@ -437,9 +495,10 @@ class SurrogateComposer:
                     "ignored_fields": list(result.get("ignored_fields") or []),
                     "error": result.get("error"),
                     "error_type": result.get("error_type"),
+                    "approximation": deepcopy(approximation),
                     "mode": self.peer_mode,
                 },
-                "y_hat": _peer_y(result),
+                "y_hat": y_hat,
                 "v_hat": {},
             }
         return entries, _elapsed_ms(started)
@@ -447,14 +506,15 @@ class SurrogateComposer:
     def _composite_version(self, backends: dict[str, dict[str, Any]]) -> str:
         versions = sorted((name, entry.get("version")) for name, entry in backends.items())
         identity = (
-            "koi-surrogate-v3",
+            "koi-surrogate-v4",
             self.perfdb_mode,
             self.peer_mode,
             self.lower_quantile,
             versions,
         )
         digest = hashlib.sha256(repr(identity).encode()).hexdigest()[:12]
-        return f"koi-surrogate-v3:{digest}"
+        return f"koi-surrogate-v4:{digest}"
+
 
 def _estimate_trace(estimate: SurrogateEstimate, timing_ms: float) -> dict[str, Any]:
     return {
@@ -497,6 +557,17 @@ def _coverage_blend(base: dict, measured: dict, coverage: dict) -> dict[str, flo
                 output[node] = float(value)
         elif weight > 0:
             output[node] = (1.0 - weight) * float(output[node]) + weight * float(value)
+    return output
+
+
+def _fill_available(base: dict, candidate: dict, coverage: dict | None = None) -> dict[str, float]:
+    output = dict(base)
+    for node, value in candidate.items():
+        if output.get(node) is not None or value is None:
+            continue
+        if coverage is not None and float(coverage.get(node, 0.0)) <= 0:
+            continue
+        output[node] = float(value)
     return output
 
 
@@ -570,6 +641,28 @@ def _rederive_cost_and_slo(raw_y, final_y, config, features, candidate_graph):
         )
 
     requested_y = set(getattr(candidate_graph, "y", ()) or ())
+    if output.get("cost_per_token") is None and "cost_per_token" in requested_y and throughput:
+        values = {**features, **config}
+        price_per_hour = next(
+            (
+                float(values[name])
+                for name in (
+                    "price_per_hour",
+                    "price_per_unit_hour",
+                    "price_per_instance_hour",
+                    "hourly_price",
+                    "usd_per_hour",
+                    "cost_per_hour",
+                )
+                if values.get(name) is not None
+            ),
+            None,
+        )
+        if price_per_hour is not None and float(throughput) > 0:
+            output["cost_per_token"] = (
+                price_per_hour * max(1, int(values.get("dp") or 1)) / (float(throughput) * 3600.0)
+            )
+
     wants_slo = "slo_margin" in raw_y or "slo_margin" in requested_y
     latency_changed = any(
         output.get(node) != raw_y.get(node) for node in ("p99_ttft_ms", "p99_tpot_ms")

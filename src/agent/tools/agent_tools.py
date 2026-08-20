@@ -1705,6 +1705,14 @@ def size_ladder(
             return True
         if not y:
             return False
+        if ttft_target is not None and not any(
+            y.get(key) is not None for key in ("p99_ttft_ms", "p99_TTFT_ms")
+        ):
+            return False
+        if tpot_target is not None and not any(
+            y.get(key) is not None for key in ("p99_tpot_ms", "p99_TPOT_ms")
+        ):
+            return False
         ttft = _y_value(y, "p99_ttft_ms", "p99_TTFT_ms")
         tpot = _y_value(y, "p99_tpot_ms", "p99_TPOT_ms")
         if ttft_target is not None and ttft > ttft_target:

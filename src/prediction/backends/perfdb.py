@@ -25,6 +25,7 @@ PERFDB_K = 8
 PERFDB_K_MIN = 5
 PERFDB_TAU = 1.0
 PERFDB_TAU_GPU = 1.0
+PERFDB_MAX_DP_EXTRAPOLATION = 8
 PERFDB_FEATURE_WEIGHTS = {
     "tp": 1.0,
     "pp": 1.0,
@@ -95,7 +96,7 @@ class PerfDBBackend:
         path = Path(csv_path).resolve()
         data_hash = hashlib.sha256(path.read_bytes()).hexdigest()
         self.csv_path = str(path)
-        self.version = f"perfdb:v1:{data_hash[:16]}"
+        self.version = f"perfdb:v2:{data_hash[:16]}"
         self.enforce_readiness = enforce_readiness
         self.rows = _load_rows(self.csv_path, data_hash)
 
@@ -116,13 +117,13 @@ class PerfDBBackend:
             dp = int(values.get("dp") or 1)
         except (TypeError, ValueError, OverflowError):
             return self._empty("unsupported", "invalid_dp")
-        if dp != 1:
-            reason = "dp_gt_1" if dp > 1 else "invalid_dp"
-            return self._empty("unsupported", reason)
+        if dp < 1:
+            return self._empty("unsupported", "invalid_dp")
         query = _candidate_query(values)
         if query is None:
             return self._empty("unsupported", "missing_hard_scope_or_distance_features")
         architecture, gpu_type, precision, workload_type, features, gpu_count = query
+        effective_dp = min(dp, PERFDB_MAX_DP_EXTRAPOLATION)
         scope = [
             row
             for row in self.rows
@@ -157,7 +158,7 @@ class PerfDBBackend:
                 value = source.get(node)
                 if value is None:
                     continue
-                gpu_ratio = gpu_count / row.gpu_count
+                gpu_ratio = gpu_count * effective_dp / row.gpu_count
                 if node == "throughput_token_per_sec":
                     value *= gpu_ratio
                 values_for_node.append((distance, row, float(value), gpu_ratio))
@@ -192,7 +193,15 @@ class PerfDBBackend:
             coverage=coverage,
             spread=spread,
             source=self.name,
-            metadata={"neighbor_count": len(neighbors), "scope_size": len(scope)},
+            metadata={
+                "neighbor_count": len(neighbors),
+                "scope_size": len(scope),
+                "source_dp": 1,
+                "requested_dp": dp,
+                "effective_dp": effective_dp,
+                "dp_approximation": dp != 1,
+                "dp_extrapolation_capped": dp != effective_dp,
+            },
         )
 
     def _empty(
