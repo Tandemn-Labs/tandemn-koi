@@ -27,6 +27,7 @@ log = logging.getLogger("koi.surrogate.composer")
 
 _MODES = frozenset({"off", "shadow", "enabled"})
 _MEASURED_ONLY_MIN_COVERAGE = 0.8
+_FALLBACK_MIN_COVERAGE = 0.2
 
 
 class SurrogateComposer:
@@ -329,6 +330,15 @@ class SurrogateComposer:
             y_hat = _rederive_cost_and_slo(raw_y, y_hat, config, features, candidate_graph)
             timings[stage] = _elapsed_ms(derived_started)
             timings["total"] = _elapsed_ms(started)
+            compatibility = {}
+            if primary.metadata.get("compatibility"):
+                compatibility["primary"] = deepcopy(primary.metadata["compatibility"])
+            if perfdb_estimate.metadata.get("compatibility"):
+                compatibility["perfdb"] = deepcopy(perfdb_estimate.metadata["compatibility"])
+            for name, entry in peer_entries.items():
+                peer_compatibility = (entry.get("metadata") or {}).get("compatibility")
+                if peer_compatibility:
+                    compatibility[name] = deepcopy(peer_compatibility)
 
             trace = {
                 "schema_version": 3,
@@ -343,6 +353,8 @@ class SurrogateComposer:
                 "method": list(method) if isinstance(method, list | tuple) else method,
                 "components": components,
                 "backends": backends,
+                "compatibility": compatibility,
+                "profile_match": deepcopy(primary.metadata.get("aic_profile_match")),
                 "raw": {"y_hat": raw_y, "v_hat": raw_v},
                 "pre_calibration": {
                     "y_hat": pre_calibration_y,
@@ -495,6 +507,7 @@ class SurrogateComposer:
                     "ignored_fields": list(result.get("ignored_fields") or []),
                     "error": result.get("error"),
                     "error_type": result.get("error_type"),
+                    "compatibility": deepcopy(result.get("compatibility") or {}),
                     "approximation": deepcopy(approximation),
                     "mode": self.peer_mode,
                 },
@@ -565,7 +578,7 @@ def _fill_available(base: dict, candidate: dict, coverage: dict | None = None) -
     for node, value in candidate.items():
         if output.get(node) is not None or value is None:
             continue
-        if coverage is not None and float(coverage.get(node, 0.0)) <= 0:
+        if coverage is not None and float(coverage.get(node, 0.0)) < _FALLBACK_MIN_COVERAGE:
             continue
         output[node] = float(value)
     return output
@@ -607,6 +620,8 @@ def compact_prediction_lineage(trace: dict[str, Any] | None) -> dict[str, Any]:
         "context": deepcopy(trace.get("context")),
         "scenario": trace.get("scenario"),
         "method": deepcopy(trace.get("method")),
+        "compatibility": deepcopy(trace.get("compatibility") or {}),
+        "profile_match": deepcopy(trace.get("profile_match")),
         "backends": {
             name: {
                 "status": backend.get("status"),

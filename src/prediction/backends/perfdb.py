@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from src.prediction.backends.base import Candidate, SurrogateEstimate
+from src.prediction.compatibility import canonicalize_gpu, resolve_dtype, resolve_gpu
 from src.prediction.normalization import (
     architecture_signature,
     candidate_gpu_count,
@@ -25,7 +26,7 @@ PERFDB_K = 8
 PERFDB_K_MIN = 5
 PERFDB_TAU = 1.0
 PERFDB_TAU_GPU = 1.0
-PERFDB_MAX_DP_EXTRAPOLATION = 8
+PERFDB_MAX_DP_EXTRAPOLATION = 4
 PERFDB_FEATURE_WEIGHTS = {
     "tp": 1.0,
     "pp": 1.0,
@@ -124,14 +125,42 @@ class PerfDBBackend:
             return self._empty("unsupported", "missing_hard_scope_or_distance_features")
         architecture, gpu_type, precision, workload_type, features, gpu_count = query
         effective_dp = min(dp, PERFDB_MAX_DP_EXTRAPOLATION)
-        scope = [
+        compatible_scope = [
             row
             for row in self.rows
-            if row.architecture == architecture
-            and row.gpu_type == gpu_type
-            and row.precision == precision
-            and row.workload_type == workload_type
+            if row.architecture == architecture and row.workload_type == workload_type
         ]
+        gpu_resolution = resolve_gpu(
+            gpu_type,
+            backend="perfdb",
+            available={row.gpu_type for row in compatible_scope},
+            requested_profile=values,
+        )
+        if not gpu_resolution.supported:
+            return self._empty(
+                "no_coverage",
+                "no_compatible_gpu_scope",
+                {"compatibility": {"gpu": gpu_resolution.to_dict()}},
+            )
+        gpu_scope = [row for row in compatible_scope if row.gpu_type == gpu_resolution.resolved]
+        dtype_resolution = resolve_dtype(
+            precision,
+            backend="perfdb",
+            component="performance",
+            available={row.precision for row in gpu_scope},
+        )
+        if not dtype_resolution.supported:
+            return self._empty(
+                "no_coverage",
+                "no_compatible_dtype_scope",
+                {
+                    "compatibility": {
+                        "gpu": gpu_resolution.to_dict(),
+                        "performance_dtype": dtype_resolution.to_dict(),
+                    }
+                },
+            )
+        scope = [row for row in gpu_scope if row.precision == dtype_resolution.resolved]
         distinct = {tuple(row.features.items()) for row in scope}
         if not scope:
             return self._empty("no_coverage", "hard_scope_empty")
@@ -152,6 +181,8 @@ class PerfDBBackend:
         coverage: dict[str, float] = {}
         spread: dict[str, float] = {}
         for node in self.provides():
+            if node in _V_NODES and (gpu_resolution.approximate or dtype_resolution.approximate):
+                continue
             values_for_node = []
             for distance, row in neighbors:
                 source = row.y if node in _Y_NODES else row.v
@@ -160,7 +191,13 @@ class PerfDBBackend:
                     continue
                 gpu_ratio = gpu_count * effective_dp / row.gpu_count
                 if node == "throughput_token_per_sec":
-                    value *= gpu_ratio
+                    value *= (
+                        gpu_ratio
+                        * gpu_resolution.throughput_scale
+                        * dtype_resolution.throughput_scale
+                    )
+                elif node in {"p99_ttft_ms", "p99_tpot_ms"}:
+                    value *= gpu_resolution.latency_scale * dtype_resolution.latency_scale
                 values_for_node.append((distance, row, float(value), gpu_ratio))
             if not values_for_node:
                 continue
@@ -180,16 +217,26 @@ class PerfDBBackend:
                 node_coverage = min(1.0, len(values_for_node) / PERFDB_K_MIN)
                 node_coverage *= math.exp(-((nearest[0] / PERFDB_TAU) ** 2))
                 node_coverage *= math.exp(-abs(math.log(nearest[3])) / PERFDB_TAU_GPU)
+            node_coverage *= gpu_resolution.confidence * dtype_resolution.confidence
             target = y_hat if node in _Y_NODES else v_hat
             target[node] = measured
             coverage[node] = node_coverage
             spread[node] = node_spread
 
+        compatibility = {
+            "gpu": gpu_resolution.to_dict(),
+            "performance_dtype": dtype_resolution.to_dict(),
+        }
+        approximate = gpu_resolution.approximate or dtype_resolution.approximate
+        version = self.version
+        if approximate:
+            identity = f"{gpu_resolution.fingerprint()}:{dtype_resolution.fingerprint()}"
+            version = f"{version}:compat-{hashlib.sha256(identity.encode()).hexdigest()[:8]}"
         return SurrogateEstimate(
             y_hat=y_hat,
             v_hat=v_hat,
             status="success" if coverage else "no_coverage",
-            version=self.version,
+            version=version,
             coverage=coverage,
             spread=spread,
             source=self.name,
@@ -201,6 +248,7 @@ class PerfDBBackend:
                 "effective_dp": effective_dp,
                 "dp_approximation": dp != 1,
                 "dp_extrapolation_capped": dp != effective_dp,
+                "compatibility": compatibility,
             },
         )
 
@@ -255,7 +303,7 @@ def _parse_row(raw: dict[str, str]) -> _PerfDBRow | None:
     }
     _, values = normalize_candidate_inputs({}, values)
     architecture = architecture_signature(values)
-    gpu_type = _text(raw.get("gpu_model"))
+    gpu_type = canonicalize_gpu(raw.get("gpu_model"))
     precision = normalize_precision(raw.get("precision"))
     workload_type = normalize_workload_type(raw.get("task_type"))
     raw_dp = raw.get("dp")
@@ -315,7 +363,7 @@ def _parse_row(raw: dict[str, str]) -> _PerfDBRow | None:
 
 def _candidate_query(values: dict) -> tuple | None:
     architecture = architecture_signature(values)
-    gpu_type = _text(values.get("gpu_type"))
+    gpu_type = canonicalize_gpu(values.get("gpu_type"))
     precision = normalize_precision(values.get("precision") or values.get("weight_dtype"))
     workload_type = normalize_workload_type(
         values.get("workload_type") or values.get("type") or values.get("task_type")

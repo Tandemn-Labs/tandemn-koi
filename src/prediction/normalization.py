@@ -4,6 +4,8 @@ import json
 import math
 from typing import Any
 
+from src.prediction.compatibility import canonicalize_dtype
+
 _ALIASES = {
     "gpu_mem_gb": ("gpu_memory_gb", "gpu_vram_gb", "vram_gb_per_gpu"),
     "isl_token_avg": ("input_len_tokens_avg", "input_length_avg"),
@@ -47,10 +49,7 @@ def merged_candidate(candidate: Any) -> dict[str, Any]:
 
 
 def normalize_precision(value: Any) -> str | None:
-    if value is None:
-        return None
-    normalized = str(value).strip().lower()
-    return {"bfloat16": "bf16", "float16": "fp16"}.get(normalized, normalized)
+    return canonicalize_dtype(value)
 
 
 def normalize_workload_type(value: Any) -> str | None:

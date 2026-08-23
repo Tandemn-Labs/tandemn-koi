@@ -188,6 +188,7 @@ def _surrogate_summary(trace: dict[str, Any]) -> dict[str, Any]:
     backends = trace.get("backends") or {}
     fusion = trace.get("fusion") or {}
     calibration = trace.get("calibration") or {}
+    compatibility = trace.get("compatibility") or {}
     failure = trace.get("failure") or None
     return {
         "schema_version": trace.get("schema_version"),
@@ -223,6 +224,22 @@ def _surrogate_summary(trace: dict[str, Any]) -> dict[str, Any]:
             "offset_y_nodes": sorted((calibration.get("offsets_y") or {}).keys()),
             "offset_v_nodes": sorted((calibration.get("offsets_v") or {}).keys()),
         },
+        "compatibility": {
+            backend: {
+                dimension: {
+                    key: resolution.get(key)
+                    for key in ("requested", "resolved", "kind", "confidence")
+                }
+                for dimension, resolution in resolutions.items()
+            }
+            for backend, resolutions in compatibility.items()
+        },
+        "profile_match": {
+            key: (trace.get("profile_match") or {}).get(key)
+            for key in ("profile_id", "distance", "confidence")
+        }
+        if trace.get("profile_match")
+        else None,
         "failure": (
             {
                 "stage": failure.get("stage"),

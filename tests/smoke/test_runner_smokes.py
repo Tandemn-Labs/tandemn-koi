@@ -216,6 +216,16 @@ class RunnerSmokeTests(unittest.TestCase):
             "normalized_candidate": {"job_config": {"model_id": "secret-model"}},
             "components": {"primary": {"status": "success", "version": "aic-v1"}},
             "backends": {"primary": {"status": "success", "version": "aic-v1"}},
+            "compatibility": {
+                "primary": {
+                    "gpu": {
+                        "requested": "A10G",
+                        "resolved": "A30",
+                        "kind": "nearest",
+                        "confidence": 0.5,
+                    }
+                }
+            },
             "fusion": {"status": "insufficient_evidence", "lower_quantile": 0.05},
             "calibration": {"status": "insufficient_evidence", "offsets_y": {}},
             "timings_ms": {"total": 1.0},
@@ -233,6 +243,10 @@ class RunnerSmokeTests(unittest.TestCase):
         self.assertEqual(compact_event["kind"], "surrogate_prediction")
         self.assertEqual(compact_event["tick"], 4)
         self.assertNotIn("normalized_candidate", compact_event["payload"])
+        self.assertEqual(
+            compact_event["payload"]["compatibility"]["primary"]["gpu"]["resolved"],
+            "A30",
+        )
         self.assertEqual(
             full_event["payload"]["normalized_candidate"]["job_config"]["model_id"],
             "secret-model",

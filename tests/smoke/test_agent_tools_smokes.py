@@ -731,6 +731,54 @@ class AgentToolsSmokeTests(unittest.TestCase):
             for name, value in saved_context.items():
                 setattr(agent_tools._CTX, name, value)
 
+    def test_size_ladder_does_not_treat_missing_fallback_latency_as_zero(self):
+        saved_context = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("resource_map", "surrogate", "candidate_graph", "dro")
+        }
+        saved_payload = agent_tools._rank_prediction_payload
+        saved_predict = agent_tools._predict_outcome_core
+        try:
+            agent_tools.bind_tools(
+                resource_map=_ResourceMap(),
+                surrogate=object(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            agent_tools._rank_prediction_payload = lambda rank, features: {
+                "job_config": {},
+                "job_features": {},
+            }
+            agent_tools._predict_outcome_core = lambda config, features, **_kwargs: {
+                "y_hat": {"throughput_token_per_sec": 1000.0}
+            }
+
+            result = agent_tools.size_ladder(
+                [
+                    {
+                        "rank_id": "rank-fallback",
+                        "role": "aggregate",
+                        "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                        "config": {"instance_type": "p5.48xlarge", "gpu_count": 1},
+                    }
+                ],
+                {
+                    "type": "online",
+                    "target_p99_ttft_ms": 100.0,
+                    "target_p99_tpot_ms": 10.0,
+                },
+                target_tps=100.0,
+            )
+        finally:
+            agent_tools._rank_prediction_payload = saved_payload
+            agent_tools._predict_outcome_core = saved_predict
+            for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertFalse(result["meets_target"])
+        self.assertFalse(result["per_rank"][0]["slo_ok"])
+        self.assertEqual(result["per_rank"][0]["reason"], "under-SLO at max DP")
+
     def test_budget_book_tracks_and_enforces_instance_pools(self):
         env = "reserved|aws|us-east-1|us-east-1b|L40S"
         resources = {
