@@ -7,6 +7,7 @@ from src.prediction.profile_search import (
     TopologyProfile,
     WorkloadProfile,
     build_operation_signature,
+    model_profile_from_values,
     rank_profiles,
 )
 
@@ -89,6 +90,24 @@ def test_operation_signature_increases_with_model_and_workload_size():
     )
     assert tp8.prefill_flops < small.prefill_flops / 7
     assert tp8.decode_flops_per_token < small.decode_flops_per_token / 7
+
+
+def test_missing_architecture_uses_structural_model_profile_instead_of_failing():
+    profile = model_profile_from_values(
+        "acme/unknown-8b",
+        {
+            "model_params_b": 8,
+            "num_hidden_layers": 32,
+            "hidden_size": 4096,
+            "num_attn_heads": 32,
+            "weight_dtype": "bf16",
+        },
+    )
+
+    assert profile is not None
+    assert profile.architecture == "generic_dense"
+    assert profile.intermediate_size == 16384
+    assert profile.kv_heads == 32
 
 
 def test_moe_signature_uses_active_experts_for_compute_and_total_experts_for_memory():
