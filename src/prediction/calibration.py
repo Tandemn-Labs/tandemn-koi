@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from src.prediction.compatibility import canonicalize_dtype, canonicalize_gpu
 from src.prediction.normalization import (
     effective_batch_size,
     normalize_candidate_inputs,
@@ -87,7 +88,7 @@ def build_prediction_context(
         dp = int(values.get("dp") or 1)
         hard = {
             "model_id": _text(values.get("model_id")),
-            "gpu_type": _text(values.get("gpu_type")),
+            "gpu_type": canonicalize_gpu(values.get("gpu_type")),
             "precision": normalize_precision(values.get("precision") or values.get("weight_dtype")),
             "workload_type": normalize_workload_type(
                 values.get("workload_type") or values.get("type")
@@ -97,6 +98,14 @@ def build_prediction_context(
             "scenario": _text(scenario),
             "dp": dp,
         }
+        optional_dtypes = {
+            "activation_dtype": canonicalize_dtype(values.get("activation_dtype")),
+            "fmha_dtype": canonicalize_dtype(values.get("fmha_quant_mode")),
+            "kv_cache_dtype": canonicalize_dtype(
+                values.get("kvcache_quant_mode") or values.get("kvcache_dtype")
+            ),
+        }
+        hard.update({name: value for name, value in optional_dtypes.items() if value is not None})
     except (TypeError, ValueError, OverflowError):
         return None
     if any(value is None for value in hard.values()) or dp < 1:

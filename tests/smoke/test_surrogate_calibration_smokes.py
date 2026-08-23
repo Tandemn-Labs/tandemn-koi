@@ -35,6 +35,23 @@ class _Store:
         return list(self.rows)
 
 
+def test_prediction_context_canonicalizes_gpu_and_isolates_component_dtypes():
+    bf16 = build_prediction_context(
+        {**CONFIG, "activation_dtype": "bfloat16", "kvcache_dtype": "bf16"},
+        {**FEATURES, "gpu_type": "NVIDIA_H100"},
+        scenario="peak",
+    )
+    fp8 = build_prediction_context(
+        {**CONFIG, "activation_dtype": "fp8", "kvcache_dtype": "fp8"},
+        {**FEATURES, "gpu_type": "H100"},
+        scenario="peak",
+    )
+
+    assert bf16["hard"]["gpu_type"] == "H100"
+    assert bf16["hard"]["activation_dtype"] == "bf16"
+    assert bf16["hard"] != fp8["hard"]
+
+
 def _calibration_row(
     index,
     *,

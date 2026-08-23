@@ -104,10 +104,32 @@ def test_perfdb_strict_scope_coverage_spread_dp_and_hash_version(tmp_path):
     assert estimate.y_hat["throughput_token_per_sec"] == 600.0
     assert estimate.coverage["throughput_token_per_sec"] == 1.0
     assert estimate.spread["throughput_token_per_sec"] == 0.0
-    assert backend.estimate(_candidate(dp=2)).status == "unsupported"
+    dp_estimate = backend.estimate(_candidate(dp=2))
+    assert dp_estimate.status == "success"
+    assert dp_estimate.y_hat["throughput_token_per_sec"] == 1200.0
+    assert dp_estimate.metadata["dp_approximation"] is True
+    assert 0 < dp_estimate.coverage["throughput_token_per_sec"] < 1
+    capped = backend.estimate(_candidate(dp=100))
+    assert capped.y_hat["throughput_token_per_sec"] == 2400.0
+    assert capped.metadata["effective_dp"] == 4
+    assert capped.metadata["dp_extrapolation_capped"] is True
+    nearest_gpu_candidate = _candidate()
+    nearest_gpu_candidate.job_features["gpu_type"] = "A100"
+    nearest_gpu = backend.estimate(nearest_gpu_candidate)
+    assert nearest_gpu.status == "success"
+    assert nearest_gpu.metadata["compatibility"]["gpu"]["kind"] == "nearest"
+    assert nearest_gpu.y_hat["throughput_token_per_sec"] < 600.0
+    assert nearest_gpu.y_hat["p99_ttft_ms"] > 100.0
+    assert nearest_gpu.v_hat == {}
+    assert nearest_gpu.coverage["throughput_token_per_sec"] < 1.0
+
+    dtype_candidate = _candidate()
+    dtype_candidate.job_features["weight_dtype"] = "fp16"
+    nearest_dtype = backend.estimate(dtype_candidate)
+    assert nearest_dtype.status == "success"
+    assert nearest_dtype.metadata["compatibility"]["performance_dtype"]["resolved"] == "bf16"
+
     for field, value in (
-        ("gpu_type", "A100"),
-        ("weight_dtype", "fp16"),
         ("type", "online"),
         ("model_architecture", "OtherArchitecture"),
     ):

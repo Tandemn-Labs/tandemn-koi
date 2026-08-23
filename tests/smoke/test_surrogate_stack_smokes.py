@@ -1,3 +1,5 @@
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 from src.core.models import RankSpec
@@ -5,6 +7,7 @@ from src.prediction.backends.aic import AICBackend
 from src.prediction.backends.base import SurrogateEstimate
 from src.prediction.calibration import EVIDENCE_SCAN_LIMIT, build_prediction_context
 from src.prediction.composer import SurrogateComposer, compact_prediction_lineage
+from src.prediction.surrogate import SurrogateUnsupportedConfig
 
 
 class _NoFitError(Exception):
@@ -26,6 +29,21 @@ class _Primary:
                 "slo_margin": 9.0,
             },
             {"kv_cache_util": 0.0, "gpu_mem_used_fraction": 0.0},
+        )
+
+
+class _UnsupportedBackend:
+    name = "primary"
+
+    def provides(self):
+        return set()
+
+    def estimate(self, *_args, **_kwargs):
+        return SurrogateEstimate(
+            status="unsupported",
+            version="aic-v1",
+            source="primary",
+            metadata={"error": "missing AIC performance slice"},
         )
 
 
@@ -168,6 +186,55 @@ def test_aic_backend_passes_dictionaries_method_scenario_and_failure_unchanged()
     else:
         raise AssertionError("structured primary failure was swallowed")
 
+    class _Unsupported(_Primary):
+        def compose_prediction(self, *args, **kwargs):
+            self.last_metadata = {
+                "compatibility": {"gpu": {"requested": "MI300", "kind": "unsupported"}}
+            }
+            raise SurrogateUnsupportedConfig("no AIC estimate")
+
+    unsupported = AICBackend(_Unsupported()).estimate(
+        SimpleNamespace(job_config={}, job_features={}), candidate_graph=graph
+    )
+    assert unsupported.status == "unsupported"
+    assert unsupported.metadata["error"] == "no AIC estimate"
+    assert unsupported.metadata["compatibility"]["gpu"]["requested"] == "MI300"
+
+
+def test_aic_backend_serializes_stateful_compatibility_metadata():
+    class StatefulPrimary:
+        def __init__(self):
+            self.last_metadata = {}
+
+        def compose_prediction(self, job_config, **_kwargs):
+            marker = job_config["gpu_type"]
+            self.last_metadata = {
+                "compatibility": {
+                    "gpu": {
+                        "requested": marker,
+                        "resolved": marker,
+                        "kind": "exact",
+                        "confidence": 1.0,
+                    }
+                }
+            }
+            time.sleep(0.01)
+            return {"throughput_token_per_sec": 1.0}, {}
+
+    backend = AICBackend(StatefulPrimary())
+
+    def estimate(marker):
+        result = backend.estimate(
+            SimpleNamespace(job_config={"gpu_type": marker}, job_features={}),
+            candidate_graph=object(),
+        )
+        return result.metadata["compatibility"]["gpu"]["requested"]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(estimate, ("A10G", "L4", "H100", "L40S")))
+
+    assert results == ["A10G", "L4", "H100", "L40S"]
+
 
 def test_primary_passthrough_analytic_overlay_singular_dp_scenario_and_no_pp_derating():
     primary = _Primary()
@@ -245,6 +312,88 @@ def test_primary_failure_short_circuits_and_records_compact_failure():
         "error_type": "_NoFitError",
         "message": "does not fit",
     }
+
+
+def test_unsupported_primary_uses_roofline_peer_best_effort_in_shadow_mode():
+    for gpu_type in (
+        "nvidia-a10g",
+        "nvidia-RTXPRO6000",
+        "nvidia-L4",
+        "H100",
+        "unexpected-future-gpu",
+    ):
+        peers = _Peers()
+        composer = SurrogateComposer(
+            _UnsupportedBackend(),
+            peer_client=peers,
+            peer_mode="shadow",
+            perfdb_mode="off",
+        )
+
+        y_hat, _, trace = composer.compose_prediction_with_trace(
+            {**CONFIG, "gpu_type": gpu_type}, FEATURES, _Graph()
+        )
+
+        assert y_hat["throughput_token_per_sec"] == 200.0
+        assert y_hat["p99_ttft_ms"] == 12.0
+        assert y_hat["p99_tpot_ms"] == 1.5
+        assert trace["components"]["fallback"]["status"] == "success"
+        assert trace["metadata"]["fallback_sources"] == ["solver", "blis"]
+
+
+def test_unsupported_primary_uses_perfdb_best_effort_in_shadow_mode():
+    composer = SurrogateComposer(
+        _UnsupportedBackend(),
+        perfdb_backend=_PerfDB(),
+        perfdb_mode="shadow",
+        peer_mode="off",
+    )
+
+    y_hat, v_hat, trace = composer.compose_prediction_with_trace(CONFIG, FEATURES, _Graph())
+
+    assert y_hat["throughput_token_per_sec"] == 300.0
+    assert y_hat["p99_ttft_ms"] == 15.0
+    assert v_hat["sm_utilization"] == 0.7
+    assert trace["metadata"]["fallback_sources"] == ["perfdb"]
+
+
+def test_unsupported_primary_ignores_very_low_coverage_perfdb_values():
+    class LowCoveragePerfDB(_PerfDB):
+        def estimate(self, candidate, **kwargs):
+            estimate = super().estimate(candidate, **kwargs)
+            estimate.coverage = dict.fromkeys(estimate.coverage, 0.05)
+            return estimate
+
+    composer = SurrogateComposer(
+        _UnsupportedBackend(),
+        perfdb_backend=LowCoveragePerfDB(),
+        perfdb_mode="shadow",
+        peer_mode="off",
+    )
+
+    y_hat, _, trace = composer.compose_prediction_with_trace(CONFIG, FEATURES, _Graph())
+
+    assert y_hat == {}
+    assert trace["components"]["fallback"]["status"] == "partial"
+
+
+def test_unsupported_primary_returns_partial_analytic_result_when_others_are_off():
+    composer = SurrogateComposer(
+        _UnsupportedBackend(),
+        perfdb_mode="off",
+        peer_mode="off",
+    )
+
+    y_hat, v_hat, trace = composer.compose_prediction_with_trace(CONFIG, FEATURES, _Graph())
+
+    assert y_hat == {}
+    assert v_hat["gpu_mem_used_fraction"] > 0
+    assert trace["components"]["fallback"]["status"] == "partial"
+    assert trace["components"]["fallback"]["metadata"]["missing_core_y"] == [
+        "p99_tpot_ms",
+        "p99_ttft_ms",
+        "throughput_token_per_sec",
+    ]
 
 
 def test_learned_fusion_trace_skips_residual_throughput_calibration():
@@ -369,6 +518,15 @@ def test_compact_prediction_lineage_excludes_debug_payloads():
         "schema_version": 3,
         "context": {"hard": {"model_id": "model"}},
         "scenario": "peak",
+        "compatibility": {
+            "primary": {
+                "gpu": {
+                    "requested": "A10G",
+                    "resolved": "A30",
+                    "kind": "nearest",
+                }
+            }
+        },
         "backends": {
             "primary": {
                 "status": "success",
@@ -387,6 +545,7 @@ def test_compact_prediction_lineage_excludes_debug_payloads():
     lineage = compact_prediction_lineage(trace)
 
     assert lineage["backends"]["primary"]["version"] == "aic-v1"
+    assert lineage["compatibility"]["primary"]["gpu"]["resolved"] == "A30"
     assert "metadata" not in lineage["backends"]["primary"]
     assert "timings_ms" not in lineage
     assert "components" not in lineage

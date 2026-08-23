@@ -2,8 +2,10 @@ import builtins
 import contextlib
 import io
 import math
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from src.prediction import surrogate as surrogate_module
@@ -158,8 +160,66 @@ class PredictionSmokeTests(unittest.TestCase):
     def test_a100_labels_use_a100_sxm(self):
         predictor = SurrogatePrediction()
 
-        for gpu_type in ("A100", "A100_80GB", "A100-40GB", "A100_PCIE"):
+        for gpu_type in ("A100", "A100_80GB", "A100-40GB"):
             self.assertEqual(predictor.map_gpu_to_aic_system(gpu_type), "a100_sxm")
+        self.assertEqual(predictor.map_gpu_to_aic_system("A100_PCIE"), "a100_pcie")
+        predictor.map_gpu_to_aic_system("A100-40GB")
+        self.assertLess(
+            predictor.last_metadata["compatibility"]["gpu"]["throughput_scale"],
+            1.0,
+        )
+
+    def test_a100_40gb_proxy_preserves_requested_memory_capacity(self):
+        captured = {}
+        predictor = SurrogatePrediction()
+
+        def estimate(**kwargs):
+            captured.update(kwargs)
+            return 100
+
+        predictor._estimate_num_gpu_blocks = estimate
+        predictor.build_surrogate_inputs(
+            {
+                "model_id": "model",
+                "gpu_type": "A100-40GB",
+                "max_num_seq": 4,
+                "max_num_batched_tokens": 2048,
+                "weight_dtype": "fp16",
+                "kvcache_dtype": "fp8",
+            },
+            {"request_count": 4, "replay_mode": "offline"},
+            ("AIC_DynoSim",),
+        )
+
+        self.assertEqual(captured["gpu_memory_capacity_bytes_override"], 40 * (1 << 30))
+        self.assertEqual(captured["gemm_quant_mode"], "bfloat16")
+        self.assertEqual(captured["kvcache_quant_mode"], "fp8")
+
+    def test_unexpected_gpu_labels_resolve_to_best_effort_aic_systems(self):
+        predictor = SurrogatePrediction()
+
+        self.assertEqual(predictor.map_gpu_to_aic_system("nvidia-a10g"), "a30")
+        self.assertEqual(
+            predictor.last_metadata["compatibility"]["gpu"]["kind"],
+            "nearest",
+        )
+        self.assertEqual(predictor.map_gpu_to_aic_system("nvidia-L4"), "l4")
+        self.assertEqual(
+            predictor.map_gpu_to_aic_system("nvidia-RTXPRO6000"),
+            "rtx_pro_6000_server",
+        )
+        self.assertEqual(predictor.map_gpu_to_aic_system("GB200"), "gb200")
+
+    def test_legacy_gpu_labels_use_explicit_aic_proxies_or_fail_safely(self):
+        predictor = SurrogatePrediction()
+
+        self.assertEqual(predictor.map_gpu_to_aic_system("T4"), "l4")
+        self.assertEqual(predictor.map_gpu_to_aic_system("V100"), "a30")
+        self.assertEqual(predictor.map_gpu_to_aic_system("V100_PCIE"), "a30")
+        self.assertEqual(predictor.map_gpu_to_aic_system("L40"), "l40s")
+        for gpu_type in ("GB10", "MI300"):
+            with self.assertRaisesRegex(SurrogateUnsupportedConfig, "No compatible AIC system"):
+                predictor.map_gpu_to_aic_system(gpu_type)
 
     def test_tchebycheff_and_dro_scores_are_finite(self):
         y_hat = {"throughput_token_per_sec": 1000, "slo_margin": 100}
@@ -458,6 +518,22 @@ class PredictionSmokeTests(unittest.TestCase):
                 method=("AIC_DynoSim",),
             )
 
+    def test_aic_memory_preflight_native_panic_is_structured(self):
+        class PanicException(BaseException):
+            pass
+
+        def estimate(**_kwargs):
+            raise PanicException("native memory estimator panic")
+
+        predictor = SurrogatePrediction()
+        predictor._estimate_num_gpu_blocks = estimate
+        with self.assertRaisesRegex(SurrogateExecutionError, "native memory estimator panic"):
+            predictor.build_surrogate_inputs(
+                direct_x_values={"model_id": "m", "gpu_type": "H100"},
+                simulator_controls={"request_count": 1, "replay_mode": "offline"},
+                method=("AIC_DynoSim",),
+            )
+
     def test_compose_prediction_keeps_consumed_non_direct_x_values(self):
         captured_memory = {}
         captured_surrogate = {}
@@ -497,8 +573,8 @@ class PredictionSmokeTests(unittest.TestCase):
 
         self.assertEqual(captured_memory["gpu_memory_capacity_bytes_override"], 80 * (1 << 30))
         self.assertEqual(captured_memory["pp_size"], 1)
-        self.assertNotIn("gemm_quant_mode", captured_memory)
-        self.assertNotIn("kvcache_quant_mode", captured_memory)
+        self.assertIsNone(captured_memory["gemm_quant_mode"])
+        self.assertIsNone(captured_memory["kvcache_quant_mode"])
         self.assertEqual(captured_surrogate["engine_args"]["router_queue_policy"], "wspt")
 
     def test_compose_prediction_routes_pp_to_aic_only(self):
@@ -713,6 +789,429 @@ class PredictionSmokeTests(unittest.TestCase):
                 {key: value for key, value in raw_report.items() if key != "completed_requests"},
                 expected_requests=2,
             )
+
+    def test_dynosim_native_missing_perf_data_falls_back_to_aic_sol(self):
+        class PanicException(BaseException):
+            pass
+
+        dynamo = ModuleType("dynamo")
+        llm = ModuleType("dynamo.llm")
+        replay = ModuleType("dynamo.replay")
+        replay_api = ModuleType("dynamo.replay.api")
+        llm.MockEngineArgs = lambda **kwargs: kwargs
+
+        def panic(*_args, **_kwargs):
+            raise PanicException(
+                "PerfDataNotAvailableError: FMHA bf16 batch=3 sequence=682 "
+                "heads=8 kv_heads=2 head_size=64"
+            )
+
+        replay_api.run_synthetic_trace_replay = panic
+        modules = {
+            "dynamo": dynamo,
+            "dynamo.llm": llm,
+            "dynamo.replay": replay,
+            "dynamo.replay.api": replay_api,
+        }
+        surrogate_input = {
+            "engine_args": {
+                "aic_model_path": "model",
+                "aic_system": "h100_sxm",
+                "aic_backend": "vllm",
+            },
+            "replay_args": {
+                "input_tokens": 682,
+                "output_tokens": 1,
+                "request_count": 3,
+                "expected_completed_requests": 3,
+                "replay_mode": "offline",
+                "router_mode": "round_robin",
+            },
+        }
+
+        attempted_modes = []
+
+        def estimate(**kwargs):
+            attempted_modes.append(kwargs["database_mode"])
+            if kwargs["database_mode"] != "SOL":
+                raise ValueError("PerfDataNotAvailableError: no empirical slice")
+            return SimpleNamespace(
+                raw={"tokens/s": 42.0},
+                ttft=12.0,
+                tpot=3.0,
+            )
+
+        predictor = SurrogatePrediction()
+        predictor._aic_estimate = estimate
+        with patch.dict(sys.modules, modules):
+            y_hat, _ = predictor.run_aic_dynosim(surrogate_input)
+
+        self.assertEqual(attempted_modes, ["HYBRID", "EMPIRICAL", "SOL"])
+        self.assertEqual(y_hat["throughput_token_per_sec"], 42.0)
+        self.assertEqual(predictor.last_metadata["aic_database_mode"], "SOL")
+        self.assertIn("batch=3 sequence=682", predictor.last_metadata["aic_fallback"]["reason"])
+
+    def test_online_aic_capacity_fallback_omits_queueing_latency(self):
+        predictor = SurrogatePrediction()
+        predictor._aic_estimate = lambda **_kwargs: SimpleNamespace(
+            raw={"tokens/s": 42.0},
+            ttft=12.0,
+            tpot=3.0,
+        )
+        surrogate_input = {
+            "objective": "online",
+            "engine_args": {
+                "aic_model_path": "model",
+                "aic_system": "h100_sxm",
+                "aic_backend": "vllm",
+            },
+            "replay_args": {
+                "input_tokens": 512,
+                "output_tokens": 170,
+                "request_count": 3,
+                "expected_completed_requests": 3,
+            },
+        }
+
+        y_hat, _ = predictor._run_aic_mode(surrogate_input, "SOL")
+
+        self.assertEqual(y_hat, {"throughput_token_per_sec": 42.0})
+        self.assertEqual(
+            predictor.last_metadata["aic_fallback_omitted_nodes"],
+            ["p99_tpot_ms", "p99_ttft_ms"],
+        )
+
+    def test_aic_proxy_gpu_scales_direct_estimate_conservatively(self):
+        predictor = SurrogatePrediction()
+        predictor.map_gpu_to_aic_system("nvidia-a10g")
+        predictor._aic_estimate = lambda **_kwargs: SimpleNamespace(
+            raw={"tokens/s": 100.0},
+            ttft=10.0,
+            tpot=2.0,
+        )
+        surrogate_input = {
+            "engine_args": {
+                "aic_model_path": "model",
+                "aic_system": "a30",
+                "aic_backend": "vllm",
+            },
+            "replay_args": {
+                "input_tokens": 512,
+                "output_tokens": 170,
+                "request_count": 3,
+                "expected_completed_requests": 3,
+            },
+        }
+
+        y_hat, _ = predictor._run_aic_mode(surrogate_input, "SOL")
+
+        scale = predictor.last_metadata["compatibility"]["gpu"]["throughput_scale"]
+        self.assertEqual(y_hat["throughput_token_per_sec"], 100.0 * scale)
+        self.assertAlmostEqual(y_hat["p99_ttft_ms"], 10.0 / scale)
+        self.assertAlmostEqual(y_hat["p99_tpot_ms"], 2.0 / scale)
+
+    def test_direct_aic_throughput_combines_prefill_and_decode_scaling(self):
+        predictor = SurrogatePrediction()
+        predictor.last_metadata = {
+            "aic_profile_match": {
+                "prefill_speed_ratio": 0.25,
+                "decode_speed_ratio": 1.0,
+            }
+        }
+        predictor._aic_estimate = lambda **_kwargs: SimpleNamespace(
+            raw={"tokens/s": 100.0},
+            ttft=10.0,
+            tpot=2.0,
+        )
+        surrogate_input = {
+            "engine_args": {
+                "aic_model_path": "proxy",
+                "aic_system": "h100_sxm",
+                "aic_backend": "vllm",
+            },
+            "replay_args": {
+                "input_tokens": 512,
+                "output_tokens": 128,
+                "request_count": 3,
+                "expected_completed_requests": 3,
+            },
+        }
+
+        y_hat, _ = predictor._run_aic_mode(surrogate_input, "SOL")
+
+        expected_scale = (10 + 2 * 128) / (10 / 0.25 + 2 * 128)
+        self.assertEqual(y_hat["throughput_token_per_sec"], 100.0 * expected_scale)
+
+    def test_joint_aic_profile_search_returns_ranked_bounded_matches(self):
+        predictor = SurrogatePrediction()
+        values = {
+            "model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "model_architecture": "Qwen2ForCausalLM",
+            "model_params_b": 7.6,
+            "num_hidden_layers": 28,
+            "hidden_size": 3584,
+            "intermediate_size": 18944,
+            "num_attn_heads": 28,
+            "num_kv_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 152064,
+            "max_pos_embeddings": 32768,
+            "gpu_type": "NVIDIA RTX 8000",
+            "gpu_vendor": "nvidia",
+            "gpu_generation": "turing",
+            "gpu_mem_gb": 48,
+            "gpu_bandwidth_gbps": 672,
+            "gpu_tflops_fp16": 130.5,
+            "pcie_bandwidth_gbps": 32,
+            "weight_dtype": "fp16",
+            "type": "online",
+            "isl_token_avg": 512,
+            "osl_token_avg": 170,
+            "request_arrival_rate": 2.0,
+            "max_num_seq": 8,
+            "tp": 1,
+            "pp": 1,
+            "dp": 1,
+            "engine_name": "vllm",
+            "engine_version": "0.22.0",
+        }
+
+        matches = predictor._rank_aic_profiles(values)
+
+        self.assertEqual(len(matches), 5)
+        self.assertEqual(
+            [match.distance for match in matches],
+            sorted(match.distance for match in matches),
+        )
+        self.assertTrue(all(match.prefill_speed_ratio > 0 for match in matches))
+        self.assertTrue(all(match.decode_speed_ratio > 0 for match in matches))
+
+    def test_dynosim_retries_next_ranked_aic_profile(self):
+        class PanicException(BaseException):
+            pass
+
+        attempts = []
+        dynamo = ModuleType("dynamo")
+        llm = ModuleType("dynamo.llm")
+        replay = ModuleType("dynamo.replay")
+        replay_api = ModuleType("dynamo.replay.api")
+        llm.MockEngineArgs = lambda **kwargs: kwargs
+
+        def replay_call(*_args, **kwargs):
+            engine = kwargs["extra_engine_args"]
+            attempts.append(engine)
+            if engine["aic_system"] == "first_system":
+                raise PanicException("PerfDataNotAvailableError: missing slice")
+            return {
+                "completed_requests": 3,
+                "total_input_tokens": 1536,
+                "total_output_tokens": 510,
+                "p99_ttft_ms": 20.0,
+                "p99_tpot_ms": 4.0,
+                "output_throughput_tok_s": 50.0,
+            }
+
+        replay_api.run_synthetic_trace_replay = replay_call
+        modules = {
+            "dynamo": dynamo,
+            "dynamo.llm": llm,
+            "dynamo.replay": replay,
+            "dynamo.replay.api": replay_api,
+        }
+        matches = (
+            {
+                "profile_id": "first",
+                "aic_system": "first_system",
+                "model_id": "first-model",
+                "prefill_speed_ratio": 0.5,
+                "decode_speed_ratio": 0.25,
+            },
+            {
+                "profile_id": "second",
+                "aic_system": "second_system",
+                "model_id": "second-model",
+                "prefill_speed_ratio": 0.8,
+                "decode_speed_ratio": 0.4,
+            },
+        )
+        surrogate_input = {
+            "engine_args": {
+                "aic_model_path": "target-model",
+                "aic_system": "target-system",
+                "aic_backend": "vllm",
+            },
+            "replay_args": {
+                "input_tokens": 512,
+                "output_tokens": 170,
+                "request_count": 3,
+                "expected_completed_requests": 3,
+                "replay_mode": "offline",
+                "router_mode": "round_robin",
+            },
+            "aic_profile_matches": matches,
+        }
+
+        predictor = SurrogatePrediction()
+        with patch.dict(sys.modules, modules):
+            y_hat, _ = predictor.run_aic_dynosim(surrogate_input)
+
+        self.assertEqual(
+            [attempt["aic_system"] for attempt in attempts], ["first_system", "second_system"]
+        )
+        self.assertEqual(attempts[1]["aic_model_path"], "second-model")
+        self.assertEqual(attempts[1]["speedup_ratio"], 0.8)
+        self.assertEqual(attempts[1]["decode_speedup_ratio"], 0.5)
+        self.assertEqual(y_hat["throughput_token_per_sec"], 50.0)
+        self.assertEqual(predictor.last_metadata["aic_profile_match"]["profile_id"], "second")
+
+        with patch.dict(sys.modules, modules):
+            predictor.run_aic_dynosim(surrogate_input)
+        self.assertEqual(
+            [attempt["aic_system"] for attempt in attempts],
+            ["first_system", "second_system", "second_system"],
+        )
+
+        changed_workload = {
+            **surrogate_input,
+            "replay_args": {**surrogate_input["replay_args"], "arrival_interval_ms": 10.0},
+        }
+        with patch.dict(sys.modules, modules):
+            predictor.run_aic_dynosim(changed_workload)
+        self.assertEqual(
+            [attempt["aic_system"] for attempt in attempts[-2:]],
+            ["first_system", "second_system"],
+        )
+
+    def test_joint_profile_search_runs_real_online_dynosim(self):
+        predictor = SurrogatePrediction()
+        config = {
+            "model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "model_architecture": "Qwen2ForCausalLM",
+            "model_params_b": 7.6,
+            "num_hidden_layers": 28,
+            "hidden_size": 3584,
+            "intermediate_size": 18944,
+            "num_attn_heads": 28,
+            "num_kv_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 152064,
+            "max_pos_embeddings": 32768,
+            "gpu_type": "NVIDIA RTX 8000",
+            "gpu_vendor": "nvidia",
+            "gpu_generation": "turing",
+            "gpu_mem_gb": 48,
+            "gpu_bandwidth_gbps": 672,
+            "gpu_tflops_fp16": 130.5,
+            "pcie_bandwidth_gbps": 32,
+            "weight_dtype": "fp16",
+            "activation_dtype": "fp16",
+            "kvcache_dtype": "fp16",
+            "tp": 1,
+            "pp": 1,
+            "dp": 1,
+            "max_num_seq": 8,
+            "max_num_batched_tokens": 2048,
+            "engine_name": "vllm",
+            "engine_version": "0.22.0",
+        }
+        features = {
+            "type": "online",
+            "_traffic_mode": "request_rate",
+            "isl_token_avg": 512,
+            "osl_token_avg": 170,
+            "request_arrival_rate": 2.0,
+            "target_p99_ttft_ms": 1000,
+            "target_p99_tpot_ms": 100,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            y_hat, _ = predictor.compose_prediction(config, features, MockCandidateGraph())
+
+        assert y_hat["throughput_token_per_sec"] > 0
+        assert y_hat["p99_ttft_ms"] >= 0
+        assert y_hat["p99_tpot_ms"] >= 0
+        assert predictor.last_metadata["aic_profile_match"]["profile_id"]
+
+    def test_aic_fallback_preserves_infrastructure_failure_classification(self):
+        def unavailable(**_kwargs):
+            raise ImportError("AIC runtime unavailable")
+
+        predictor = SurrogatePrediction()
+        predictor._aic_estimate = unavailable
+        surrogate_input = {
+            "engine_args": {
+                "aic_model_path": "model",
+                "aic_system": "h100_sxm",
+                "aic_backend": "vllm",
+            },
+            "replay_args": {
+                "input_tokens": 512,
+                "output_tokens": 170,
+                "request_count": 3,
+            },
+        }
+
+        with self.assertRaisesRegex(SurrogateExecutionError, "AIC runtime unavailable"):
+            predictor._run_aic_modes(surrogate_input, ("HYBRID", "EMPIRICAL", "SOL"))
+
+    def test_aic_unsupported_dtype_does_not_run_default_precision(self):
+        predictor = SurrogatePrediction()
+        predictor.last_metadata = {
+            "compatibility": {
+                "weights_dtype": {
+                    "kind": "unsupported",
+                    "resolved": None,
+                }
+            }
+        }
+        predictor.run_aic_dynosim = lambda *_args, **_kwargs: self.fail(
+            "unsupported dtype reached DynoSim"
+        )
+
+        with self.assertRaisesRegex(SurrogateUnsupportedConfig, "compatible dtype"):
+            predictor.run_surrogate({}, ("AIC_DynoSim",))
+
+    def test_aic_nondefault_dtype_uses_direct_mode(self):
+        predictor = SurrogatePrediction()
+        predictor.last_metadata = {
+            "compatibility": {
+                "weights_dtype": {
+                    "kind": "exact",
+                    "resolved": "fp8",
+                }
+            }
+        }
+        predictor.run_aic_only = lambda *_args, **_kwargs: ({"source": "direct"}, {})
+        predictor.run_aic_dynosim = lambda *_args, **_kwargs: self.fail(
+            "nondefault dtype reached DynoSim"
+        )
+
+        y_hat, _ = predictor.run_surrogate({}, ("AIC_DynoSim",))
+
+        self.assertEqual(y_hat["source"], "direct")
+
+    def test_profile_match_routes_dtype_proxy_through_dynosim(self):
+        predictor = SurrogatePrediction()
+        predictor.last_metadata = {
+            "compatibility": {
+                "kv_cache_dtype": {
+                    "kind": "nearest",
+                    "canonical": "fp8",
+                    "resolved": "bf16",
+                }
+            }
+        }
+        predictor.run_aic_dynosim = lambda *_args, **_kwargs: ({"source": "dynosim"}, {})
+        predictor.run_aic_only = lambda *_args, **_kwargs: self.fail(
+            "profile-backed dtype proxy bypassed DynoSim"
+        )
+
+        y_hat, _ = predictor.run_surrogate(
+            {"aic_profile_matches": ({"profile_id": "proxy"},)},
+            ("AIC_DynoSim",),
+        )
+
+        self.assertEqual(y_hat["source"], "dynosim")
 
     def test_aic_replay_required_outputs_must_be_valid(self):
         predictor = SurrogatePrediction()
