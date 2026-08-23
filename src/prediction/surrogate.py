@@ -127,6 +127,7 @@ PROFILE_X_FIELDS = frozenset(
         "model_metadata",
         "model_params_b",
         "max_pos_embeddings",
+        "moe_intermediate_size",
         "num_active_experts",
         "num_attention_heads",
         "num_attn_heads",
@@ -138,6 +139,7 @@ PROFILE_X_FIELDS = frozenset(
         "num_routed_experts",
         "nvlink_bandwidth_gbps",
         "pcie_bandwidth_gbps",
+        "supported_dtypes",
         "context",
         "type",
         "vocab_size",
@@ -723,6 +725,7 @@ class SurrogatePrediction:
 
             _, normalized_values = normalize_candidate_inputs({}, values)
             normalized_values = {**values, **normalized_values}
+            normalized_values = self._enrich_requested_model_values(normalized_values)
             requested_gpu = gpu_profile_from_values(
                 str(normalized_values.get("gpu_type") or ""), normalized_values
             )
@@ -743,6 +746,28 @@ class SurrogatePrediction:
                 "error": str(exc),
             }
             return ()
+
+    def _enrich_requested_model_values(self, values):
+        model_id = values.get("model_id")
+        if not model_id:
+            return values
+        try:
+            from aiconfigurator.sdk.utils import (  # type: ignore[import-untyped]
+                get_model_config_from_model_path,
+            )
+
+            config = get_model_config_from_model_path(str(model_id))
+        except Exception as exc:
+            self.last_metadata["model_profile_enrichment"] = {
+                "status": "unavailable",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            return values
+        if not isinstance(config, dict):
+            return values
+        self.last_metadata["model_profile_enrichment"] = {"status": "success"}
+        return {**config, **values}
 
     def _resolve_aic_dtypes(self, values):
         requested = {

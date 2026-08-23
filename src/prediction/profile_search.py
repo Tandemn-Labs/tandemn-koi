@@ -9,6 +9,21 @@ from typing import Any
 from src.prediction.compatibility import GPUProfile, canonicalize_dtype, gpu_profile_distance
 
 PROFILE_SEARCH_VERSION = "joint-knn-v1"
+_MODEL_DISTANCE_FIELDS = frozenset(
+    {
+        "architecture",
+        "layers",
+        "hidden_size",
+        "intermediate_size",
+        "attention_heads",
+        "kv_heads",
+        "head_dim",
+        "parameter_count",
+        "routed_experts",
+        "active_experts",
+        "moe_intermediate_size",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +47,7 @@ class ModelProfile:
     moe_intermediate_size: int = 0
     fmha_dtype: str = "bf16"
     kv_cache_dtype: str = "bf16"
+    known_fields: frozenset[str] = _MODEL_DISTANCE_FIELDS
 
 
 @dataclass(frozen=True)
@@ -142,11 +158,26 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
         or raw.get("num_key_value_heads")
         or heads
     )
-    if None in (architecture, layers, hidden, intermediate, heads, kv_heads):
-        return None
-    assert layers is not None and hidden is not None and intermediate is not None
-    assert heads is not None and kv_heads is not None and architecture is not None
-    head_dim = _integer(values.get("d") or values.get("head_dim")) or hidden // heads
+    known_fields = set()
+    for name, value in (
+        ("architecture", architecture),
+        ("layers", layers),
+        ("hidden_size", hidden),
+        ("intermediate_size", intermediate),
+        ("attention_heads", heads),
+        ("kv_heads", kv_heads),
+    ):
+        if value is not None:
+            known_fields.add(name)
+    layers = layers or 1
+    hidden = hidden or 1
+    heads = heads or 1
+    intermediate = intermediate or hidden * 4
+    kv_heads = kv_heads or heads
+    explicit_head_dim = _integer(values.get("d") or values.get("head_dim"))
+    if explicit_head_dim is not None:
+        known_fields.add("head_dim")
+    head_dim = explicit_head_dim or max(1, hidden // heads)
     vocab = _integer(values.get("vocab") or values.get("vocab_size") or raw.get("vocab_size")) or 0
     experts = (
         _integer(
@@ -161,6 +192,7 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
         or 0
     )
     is_moe = bool(values.get("is_moe") or experts > 0)
+    architecture = architecture or ("generic_moe" if is_moe else "generic_dense")
     moe_intermediate = (
         _integer(
             values.get("moe_inter_size")
@@ -170,6 +202,14 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
         or 0
     )
     params = _number(values.get("model_params_b") or values.get("params_billion"))
+    if params is not None:
+        known_fields.add("parameter_count")
+    if experts:
+        known_fields.add("routed_experts")
+    if active:
+        known_fields.add("active_experts")
+    if moe_intermediate:
+        known_fields.add("moe_intermediate_size")
     parameter_count = (
         params * 1e9
         if params is not None
@@ -239,6 +279,7 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
         moe_intermediate_size=moe_intermediate,
         fmha_dtype=fmha_dtype,
         kv_cache_dtype=kv_cache_dtype,
+        known_fields=frozenset(known_fields),
     )
 
 
@@ -353,9 +394,6 @@ def rank_profiles(
     limit: int = 5,
 ) -> tuple[ProfileMatch, ...]:
     """Rank backend support points by joint GPU/model/workload similarity."""
-    requested_signature = build_operation_signature(
-        requested.model, requested.workload, requested.topology
-    )
     matches = []
     for supported in available:
         if supported.engine_name != requested.engine_name:
@@ -364,6 +402,10 @@ def rank_profiles(
             continue
         if supported.model.layers < requested.topology.pp:
             continue
+        completed_model = _complete_model(requested.model, supported.model)
+        requested_signature = build_operation_signature(
+            completed_model, requested.workload, requested.topology
+        )
         if requested.gpu.memory_gb is not None and requested_signature.weight_bytes_per_gpu > (
             requested.gpu.memory_gb * (1 << 30)
         ):
@@ -375,7 +417,7 @@ def rank_profiles(
             requested.gpu, supported.gpu, allow_cross_vendor=True
         )
         model_distance, model_reasons = _model_distance(
-            requested.model,
+            completed_model,
             supported.model,
             requested_signature,
             proxy_signature,
@@ -384,13 +426,13 @@ def rank_profiles(
             requested.workload, supported.model
         )
         weight_distance, weight_reasons = _dtype_distance(
-            requested.model.weight_dtype, supported.model.weight_dtype
+            completed_model.weight_dtype, supported.model.weight_dtype
         )
         fmha_distance, fmha_reasons = _dtype_distance(
-            requested.model.fmha_dtype, supported.model.fmha_dtype
+            completed_model.fmha_dtype, supported.model.fmha_dtype
         )
         kv_distance, kv_reasons = _dtype_distance(
-            requested.model.kv_cache_dtype, supported.model.kv_cache_dtype
+            completed_model.kv_cache_dtype, supported.model.kv_cache_dtype
         )
         dtype_distance = math.sqrt(weight_distance**2 + fmha_distance**2 + kv_distance**2)
         dtype_reasons = (*weight_reasons, *fmha_reasons, *kv_reasons)
@@ -427,11 +469,15 @@ def rank_profiles(
         )
         prefill_ratio = _bounded_ratio(proxy_prefill, target_prefill)
         decode_ratio = _bounded_ratio(proxy_decode, target_decode)
+        completeness = len(requested.model.known_fields) / len(_MODEL_DISTANCE_FIELDS)
         matches.append(
             ProfileMatch(
                 supported=supported,
                 distance=distance,
-                confidence=max(0.05, min(1.0, math.exp(-0.5 * distance))),
+                confidence=max(
+                    0.05,
+                    min(1.0, math.exp(-0.5 * distance) * max(0.25, completeness)),
+                ),
                 prefill_speed_ratio=prefill_ratio,
                 decode_speed_ratio=decode_ratio,
                 reasons=(*gpu_reasons, *model_reasons, *workload_reasons, *dtype_reasons),
@@ -439,6 +485,41 @@ def rank_profiles(
         )
     matches.sort(key=lambda match: (match.distance, match.supported.profile_id))
     return tuple(matches[: max(1, int(limit))])
+
+
+def _complete_model(requested: ModelProfile, supported: ModelProfile) -> ModelProfile:
+    values = requested.__dict__.copy()
+    for field in ("layers", "hidden_size", "attention_heads"):
+        if field not in requested.known_fields:
+            values[field] = getattr(supported, field)
+    if "intermediate_size" not in requested.known_fields:
+        values["intermediate_size"] = values["hidden_size"] * 4
+    if "kv_heads" not in requested.known_fields:
+        values["kv_heads"] = values["attention_heads"]
+    if "head_dim" not in requested.known_fields:
+        values["head_dim"] = max(1, values["hidden_size"] // values["attention_heads"])
+    if requested.is_moe:
+        for field in ("routed_experts", "active_experts", "moe_intermediate_size"):
+            if field not in requested.known_fields:
+                values[field] = getattr(supported, field)
+    if "parameter_count" not in requested.known_fields:
+        values["parameter_count"] = _estimate_parameter_count(
+            values["layers"],
+            values["hidden_size"],
+            values["intermediate_size"],
+            values["attention_heads"],
+            values["kv_heads"],
+            values["head_dim"],
+            values["vocab_size"],
+            values["routed_experts"],
+            values["moe_intermediate_size"],
+        )
+    values["model_id"] = requested.model_id
+    values["weight_dtype"] = requested.weight_dtype
+    values["fmha_dtype"] = requested.fmha_dtype
+    values["kv_cache_dtype"] = requested.kv_cache_dtype
+    values["known_fields"] = requested.known_fields
+    return ModelProfile(**values)
 
 
 def resolve_model_reference(
@@ -507,7 +588,10 @@ def _model_distance(
     if _model_family(requested) != _model_family(supported):
         terms.append(1.0)
         reasons.append("model_family_penalty")
-    if requested.architecture != supported.architecture:
+    if (
+        "architecture" in requested.known_fields
+        and requested.architecture != supported.architecture
+    ):
         terms.append(0.25)
         reasons.append("architecture_penalty")
     return math.sqrt(sum(terms)), tuple(reasons)

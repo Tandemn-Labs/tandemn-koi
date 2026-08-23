@@ -986,6 +986,35 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertTrue(all(match.prefill_speed_ratio > 0 for match in matches))
         self.assertTrue(all(match.decode_speed_ratio > 0 for match in matches))
 
+    def test_joint_profile_search_uses_partial_model_metadata(self):
+        predictor = SurrogatePrediction()
+        predictor._enrich_requested_model_values = lambda values: values
+        values = {
+            "model_id": "acme/private-8b",
+            "model_params_b": 8,
+            "num_hidden_layers": 32,
+            "hidden_size": 4096,
+            "num_attn_heads": 32,
+            "gpu_type": "H100",
+            "gpu_mem_gb": 80,
+            "gpu_bandwidth_gbps": 3350,
+            "gpu_tflops_fp16": 989,
+            "weight_dtype": "bf16",
+            "type": "online",
+            "isl_token_avg": 512,
+            "osl_token_avg": 128,
+            "max_num_seq": 8,
+            "tp": 1,
+            "pp": 1,
+            "dp": 1,
+            "engine_name": "vllm",
+        }
+
+        matches = predictor._rank_aic_profiles(values)
+
+        self.assertEqual(len(matches), 5)
+        self.assertTrue(all(match.confidence < 1.0 for match in matches))
+
     def test_dynosim_retries_next_ranked_aic_profile(self):
         class PanicException(BaseException):
             pass
