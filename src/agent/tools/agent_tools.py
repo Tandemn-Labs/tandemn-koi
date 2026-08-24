@@ -437,7 +437,7 @@ def assert_planning_ready() -> None:
 # as an infeasible/skipped frame - so hitting it late just means "commit the best
 # scored so far", never a crash or forced defer. Raise it for deeper search; it
 # is generous by design (a normal tick uses far fewer).
-SURROGATE_CALL_BUDGET = 10_000
+SURROGATE_CALL_BUDGET = 30
 _surrogate_calls = 0
 # Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
 # scenario). DynoSim is deterministic, so re-probing a config the LLM already
@@ -672,9 +672,20 @@ def _slo_thresholds_for(snapshot, job_id: str) -> dict:
     """
     if snapshot is None:
         return {}
-    if hasattr(snapshot, "slo_thresholds"):
-        return dict(snapshot.slo_thresholds(job_id) or {})
-    return {}
+    thresholds = (
+        dict(snapshot.slo_thresholds(job_id) or {})
+        if hasattr(snapshot, "slo_thresholds")
+        else {}
+    )
+    features = _job_features_for(snapshot, job_id)
+    for outcome, names in {
+        "p99_ttft_ms": ("target_p99_ttft_ms", "target_p99_TTFT_ms"),
+        "p99_tpot_ms": ("target_p99_tpot_ms", "target_p99_TPOT_ms"),
+    }.items():
+        value = next((features[name] for name in names if features.get(name) is not None), None)
+        if value is not None and float(value) > 0:
+            thresholds.setdefault(outcome, float(value))
+    return thresholds
 
 
 # Job-outcome composition across a (possibly heterogeneous) multi-rank ladder.
@@ -2342,7 +2353,7 @@ def _predict_outcome_core(
                                 job_config=job_config,
                                 job_features=job_features,
                                 candidate_graph=_CTX.candidate_graph,
-                                method=("AIC_DynoSim",),
+                                method=("AIC_Direct",),
                                 scenario=scenario,
                                 as_of_timestamp_utc=time.time() if calibrate else None,
                             )
@@ -2356,7 +2367,7 @@ def _predict_outcome_core(
                         job_config=job_config,
                         job_features=job_features,
                         candidate_graph=_CTX.candidate_graph,
-                        method=("AIC_DynoSim",),
+                        method=("AIC_Direct",),
                         scenario=scenario,
                     )
                     prediction_lineage = None

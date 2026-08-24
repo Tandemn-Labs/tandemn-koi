@@ -76,7 +76,7 @@ class SurrogateComposer:
         job_config,
         job_features,
         candidate_graph,
-        method=("AIC_DynoSim",),
+        method=("AIC_Direct",),
         scenario="mean",
         as_of_timestamp_utc: float | None = None,
     ):
@@ -96,7 +96,7 @@ class SurrogateComposer:
         job_config,
         job_features,
         candidate_graph,
-        method=("AIC_DynoSim",),
+        method=("AIC_Direct",),
         scenario="mean",
         as_of_timestamp_utc: float | None = None,
     ):
@@ -679,18 +679,22 @@ def _rederive_cost_and_slo(raw_y, final_y, config, features, candidate_graph):
             )
 
     wants_slo = "slo_margin" in raw_y or "slo_margin" in requested_y
-    latency_changed = any(
-        output.get(node) != raw_y.get(node) for node in ("p99_ttft_ms", "p99_tpot_ms")
-    )
-    if wants_slo and latency_changed:
+    if wants_slo:
         values = {**features, **config}
         margins = []
-        if values.get("target_p99_ttft_ms") is not None and output.get("p99_ttft_ms") is not None:
-            margins.append(float(values["target_p99_ttft_ms"]) - float(output["p99_ttft_ms"]))
-        if values.get("target_p99_tpot_ms") is not None and output.get("p99_tpot_ms") is not None:
-            margins.append(float(values["target_p99_tpot_ms"]) - float(output["p99_tpot_ms"]))
+        for target_name, outcome_name in (
+            ("target_p99_ttft_ms", "p99_ttft_ms"),
+            ("target_p99_tpot_ms", "p99_tpot_ms"),
+        ):
+            target = values.get(target_name)
+            outcome = output.get(outcome_name)
+            if target is None or outcome is None or float(target) <= 0:
+                continue
+            margins.append((float(target) - float(outcome)) / float(target))
         if margins:
             output["slo_margin"] = min(margins)
+        else:
+            output.pop("slo_margin", None)
     return output
 
 
