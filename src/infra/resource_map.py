@@ -4,6 +4,7 @@ import argparse
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.core.models import LADDER_ACTIONS, Plan, env_gpu_type
@@ -15,6 +16,8 @@ from tandemn_system_data.clients import (  # type: ignore[import-untyped]
 
 ACTIVE_CHAIN_STATUSES = ("launching", "running")
 WAITING_JOB_STATUSES = ("waiting",)
+RANK_FAILURE_HISTORY_TICKS = 3
+DEFAULT_TICK_INTERVAL_SECONDS = 300
 
 
 def chain_id_for_rank(rank_id: str, chain_index: int) -> str:
@@ -93,9 +96,16 @@ class AllocationUnit:
 class ResourceMapManager:
     """Read Koi resource/job state from Tandemn Store public clients."""
 
-    def __init__(self, user_id: str | None = None, postgres_client=None):
+    def __init__(
+        self,
+        user_id: str | None = None,
+        postgres_client=None,
+        rank_failure_history_seconds: int = RANK_FAILURE_HISTORY_TICKS
+        * DEFAULT_TICK_INTERVAL_SECONDS,
+    ):
         self.user_id = user_id
         self._postgres_client = postgres_client
+        self._rank_failure_history_seconds = int(rank_failure_history_seconds)
 
     # ------------------------------------------------------------------
     # Tandemn Store access
@@ -137,6 +147,9 @@ class ResourceMapManager:
     def _job_store(self):
         return JobStore(self._client())
 
+    def _failure_since(self) -> datetime:
+        return datetime.now(UTC) - timedelta(seconds=self._rank_failure_history_seconds)
+
     # ------------------------------------------------------------------
     # Jobs and chains
     # ------------------------------------------------------------------
@@ -145,19 +158,31 @@ class ResourceMapManager:
         """Return waiting jobs for compatibility with the old submitted name."""
         return self.get_waiting_jobs(user_id=user_id)
 
-    def get_running_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return running jobs plus active chain allocations."""
+    def get_running_jobs(
+        self, user_id: str | None = None, *, failure_since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Return running jobs with active chains and recent rank failures."""
         effective_user_id = self._effective_user_id(user_id)
+        jobs = self._job_store()
+        failure_since = failure_since or self._failure_since()
         return [
-            self._running_job_to_summary(running_job)
-            for running_job in self._job_store().running_jobs(effective_user_id)
+            self._running_job_to_summary(
+                running_job,
+                jobs.failed_ranks_since(running_job.job.job_id, failure_since),
+            )
+            for running_job in jobs.running_jobs(effective_user_id)
         ]
 
-    def get_waiting_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return jobs waiting for placement."""
+    def get_waiting_jobs(
+        self, user_id: str | None = None, *, failure_since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Return waiting jobs with failures from prior placement attempts."""
         effective_user_id = self._effective_user_id(user_id)
+        jobs = self._job_store()
+        failure_since = failure_since or self._failure_since()
         return [
-            self._job_to_summary(job) for job in self._job_store().waiting_jobs(effective_user_id)
+            self._job_to_summary(job, jobs.failed_ranks_since(job.job_id, failure_since))
+            for job in jobs.waiting_jobs(effective_user_id)
         ]
 
     def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
@@ -183,7 +208,7 @@ class ResourceMapManager:
         return dict(model)
 
     @classmethod
-    def _job_to_summary(cls, job) -> dict[str, Any]:
+    def _job_to_summary(cls, job, recent_rank_failures=()) -> dict[str, Any]:
         raw = cls._model_dump(job)
         spec = dict(raw.get("spec_json") or {})
         job_features = dict(spec.get("job_features") or spec.get("features") or spec)
@@ -199,6 +224,22 @@ class ResourceMapManager:
             "spec_json": spec,
             "input_source": raw.get("input_source") or {},
             "output_target": raw.get("output_target") or {},
+            "recent_rank_failures": [
+                cls._rank_failure_summary(rank) for rank in recent_rank_failures
+            ],
+        }
+
+    @classmethod
+    def _rank_failure_summary(cls, rank) -> dict[str, Any]:
+        """Return rank failure feedback for the next planning tick."""
+        raw = cls._model_dump(rank)
+        return {
+            "rank_id": raw["rank_id"],
+            "plan_id": raw.get("plan_id"),
+            "role": raw.get("role"),
+            "shape_json": dict(raw.get("shape_json") or {}),
+            "reason_code": raw.get("reason_code"),
+            "failed_at": raw.get("updated_at"),
         }
 
     @classmethod
@@ -221,8 +262,8 @@ class ResourceMapManager:
         ]
 
     @classmethod
-    def _running_job_to_summary(cls, running_job) -> dict[str, Any]:
-        job = cls._job_to_summary(running_job.job)
+    def _running_job_to_summary(cls, running_job, recent_rank_failures=()) -> dict[str, Any]:
+        job = cls._job_to_summary(running_job.job, recent_rank_failures)
         chains = [chain for rank in running_job.ranks for chain in cls._rank_to_chains(rank)]
         job["active_chains"] = chains
         job["current_ladder"] = chains
@@ -236,11 +277,12 @@ class ResourceMapManager:
         return self.snapshot_cluster_state(tick=None)
 
     def snapshot_cluster_state(self, tick) -> ClusterResourceSnapshot:
+        failure_since = self._failure_since()
         return ClusterResourceSnapshot(
             tick=tick,
             resources=self.resources_summary(),
-            active_jobs=self.get_running_jobs(),
-            pending_jobs=self.get_waiting_jobs(),
+            active_jobs=self.get_running_jobs(failure_since=failure_since),
+            pending_jobs=self.get_waiting_jobs(failure_since=failure_since),
         )
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
@@ -740,10 +782,14 @@ class _SmokeResourceMapManager(ResourceMapManager):
     def get_resource_map(self, user_id: str | None = None):
         return _smoke_resource_map()
 
-    def get_running_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+    def get_running_jobs(
+        self, user_id: str | None = None, *, failure_since: datetime | None = None
+    ) -> list[dict[str, Any]]:
         return []
 
-    def get_waiting_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+    def get_waiting_jobs(
+        self, user_id: str | None = None, *, failure_since: datetime | None = None
+    ) -> list[dict[str, Any]]:
         return []
 
     def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
