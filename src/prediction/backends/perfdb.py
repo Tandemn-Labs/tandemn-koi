@@ -109,7 +109,7 @@ class PerfDBBackend:
         candidate: Candidate,
         *,
         candidate_graph=None,
-        method=("AIC_DynoSim",),
+        method=("AIC_Direct",),
         scenario: str = "mean",
     ) -> SurrogateEstimate:
         del candidate_graph, method, scenario

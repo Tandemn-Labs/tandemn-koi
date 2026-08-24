@@ -174,7 +174,7 @@ class SurrogatePrediction:
         self._failed_profile_slices = set()
 
     def compose_prediction(
-        self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",), scenario="mean"
+        self, job_config, job_features, candidate_graph, method=("AIC_Direct",), scenario="mean"
     ):
         self.last_metadata = {}
         env_vector = self.get_env_row(job_features)
@@ -194,7 +194,7 @@ class SurrogatePrediction:
         )
         model_id = job_config.get("model_id") or job_features.get("model_id")
         if model_id is None:
-            raise SurrogateUnsupportedConfig("AIC_DynoSim needs model_id")
+            raise SurrogateUnsupportedConfig("AIC prediction needs model_id")
         direct_x_values["model_id"] = model_id
         # field names -> actual values from job_config/env_vector
 
@@ -380,6 +380,7 @@ class SurrogatePrediction:
                 "derive_y": {"cost_per_token", "slo_margin"},
             }
         }
+        method_scope["AIC_Direct"] = method_scope["AIC_DynoSim"]
         if method_name not in method_scope:
             raise SurrogateUnsupportedConfig(f"Unsupported surrogate method: {method_name}")
 
@@ -580,21 +581,21 @@ class SurrogatePrediction:
             method[0] if isinstance(method, (list, tuple)) and len(method) == 1 else method
         )
 
-        if method_name != "AIC_DynoSim":
+        if method_name not in {"AIC_Direct", "AIC_DynoSim"}:
             raise SurrogateUnsupportedConfig(
                 f"Unsupported method or multi method is not supported yet: {method}"
             )
 
         model_id = direct_x_values.get("model_id")
         if model_id is None:
-            raise SurrogateUnsupportedConfig("AIC_DynoSim needs model_id")
+            raise SurrogateUnsupportedConfig("AIC prediction needs model_id")
 
         gpu_type = direct_x_values.get("gpu_type")
         if gpu_type is None:
-            raise SurrogateUnsupportedConfig("AIC_DynoSim needs gpu_type")
+            raise SurrogateUnsupportedConfig("AIC prediction needs gpu_type")
 
         pp = int(direct_x_values.get("pp") or 1)
-        aic_only = pp != 1
+        aic_only = method_name == "AIC_Direct" or pp != 1
         if aic_only and direct_x_values.get("pd_enabled", False):
             raise SurrogateUnsupportedConfig(
                 "AIC-only PP prediction supports aggregate serving only"
@@ -894,7 +895,7 @@ class SurrogatePrediction:
         # Run the surrogate model.
         # Inputs: SurrogateInput, Method=List[DynoSim, LLMSimulator, etc], accumulate_logic: average,llm decides
         # Outputs: y_hat, v_hat
-        if len(method) == 1 and method[0] == "AIC_DynoSim":
+        if len(method) == 1 and method[0] in {"AIC_Direct", "AIC_DynoSim"}:
             dtype_resolutions = [
                 resolution
                 for name, resolution in (self.last_metadata.get("compatibility") or {}).items()
@@ -907,8 +908,7 @@ class SurrogatePrediction:
                 or resolution.get("resolved") not in {None, "bf16"}
                 for resolution in dtype_resolutions
             )
-            # dont accumulate, just run the surrogate model
-            if surrogate_input.get("aic_only"):
+            if method[0] == "AIC_Direct" or surrogate_input.get("aic_only"):
                 return self.run_aic_only(surrogate_input)
             if surrogate_input.get("aic_profile_matches"):
                 return self.run_aic_dynosim(surrogate_input)

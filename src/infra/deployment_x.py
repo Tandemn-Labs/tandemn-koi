@@ -58,6 +58,10 @@ _GPU_FIELDS = (
     "pcie_bandwidth_gbps",
     "gpu_watts",
 )
+_GPU_NAME_ALIASES = {
+    "MI300": "MI300X",
+    "MI300-X": "MI300X",
+}
 _ALIASES = {
     "deadline_hrs": ("deadline_hrs", "deadline_hours"),
     "isl_token_avg": ("isl_token_avg", "input_len_tokens_avg"),
@@ -387,10 +391,16 @@ def _catalog_by_instance(catalog: dict[str, Any]) -> dict[tuple[str, str, str], 
 def _hardware_x(hardware: dict[str, Any], gpu_type: str) -> dict[str, object]:
     """Return required hardware X from one catalog instance entry."""
     gpu = _gpu(hardware, gpu_type)
-    out = {key: gpu[key] for key in _GPU_FIELDS}
+    out = {
+        key: gpu[key]
+        for key in _GPU_FIELDS
+        if key in gpu and not _is_missing_x_value(gpu[key])
+    }
     out["gpu_mem_gb"] = float(gpu["memory_mib_each"]) / 1024.0
     out["gpu_per_node"] = gpu["count"]
-    out["internode_bandwidth_gbps"] = _network_bandwidth(hardware)
+    network_bandwidth = _network_bandwidth(hardware)
+    if network_bandwidth is not None:
+        out["internode_bandwidth_gbps"] = network_bandwidth
     return out
 
 
@@ -409,12 +419,16 @@ def _gpu(hardware: dict[str, Any], gpu_type: str) -> dict[str, Any]:
 
 def _gpu_name(value: object) -> str:
     """Normalize Store and catalog GPU labels before matching them."""
-    return str(value or "").upper().replace("_", "-")
+    normalized = str(value or "").upper().replace("_", "-")
+    return _GPU_NAME_ALIASES.get(normalized, normalized)
 
 
-def _network_bandwidth(hardware: dict[str, Any]) -> float:
-    """Return required peak network bandwidth for inter-node X."""
-    return max(float(card["peak_bandwidth_gbps"]) for card in hardware["network"]["network_cards"])
+def _network_bandwidth(hardware: dict[str, Any]) -> float | None:
+    """Return peak network bandwidth when the catalog provides network cards."""
+    cards = hardware.get("network", {}).get("network_cards", [])
+    if not cards:
+        return None
+    return max(float(card["peak_bandwidth_gbps"]) for card in cards)
 
 
 def _derive_x(x: dict[str, Any]) -> None:
