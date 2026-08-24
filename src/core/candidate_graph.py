@@ -8,7 +8,7 @@ without a late KeyError during S3.
 
 from collections.abc import Sequence
 
-from src.core.models import Edge, EdgeMetadata, Node
+from src.core.models import Edge, EdgeMetadata, Mechanism, Node
 
 
 class CandidateGraph:
@@ -86,6 +86,18 @@ class CandidateGraph:
         """Return incoming edges to one node id."""
         edge_ids = self.edges_by_dst.get(node_id, set())
         return [self.edge_table[edge_id] for edge_id in edge_ids]
+
+    def required_x_for_mechanism(self, mechanism: Mechanism) -> list[str]:
+        """Return all X values needed to evaluate one mechanism."""
+        required = set(mechanism.scope.get("x", ()))
+        for condition in mechanism.scope.get("conditions", ()):
+            if isinstance(condition, dict) and condition.get("feature"):
+                required.add(str(condition["feature"]))
+        for edge_id in mechanism.edge_ids:
+            edge = self.edge_table[edge_id]
+            if edge.src_type == "X":
+                required.add(edge.src)
+        return sorted(required)
 
     @property
     def x(self) -> list[str]:

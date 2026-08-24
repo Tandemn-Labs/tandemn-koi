@@ -12,6 +12,14 @@ from typing import Any
 from src.core.models import Mechanism, MechanismMetadata
 
 
+def _has_context_value(context: dict, key: object) -> bool:
+    """Return whether context contains a known value for one X field."""
+    if key not in context:
+        return False
+    value = context[key]
+    return value is not None and value != "NA"
+
+
 class MechanismRegistry:
     """In-memory mechanism catalog plus secondary indexes."""
 
@@ -137,8 +145,9 @@ class MechanismRegistry:
         require_x_overlap: bool = True,
     ) -> dict[str, Any]:
         """Match a mechanism against workload, model, and candidate values."""
-        matched_x = sorted(set(mechanism.scope.get("x", ())) & context.keys())
-        missing_x = sorted(set(mechanism.scope.get("x", ())) - context.keys())
+        scope_x = set(mechanism.scope.get("x", ()))
+        matched_x = sorted(key for key in scope_x if _has_context_value(context, key))
+        missing_x = sorted(key for key in scope_x if not _has_context_value(context, key))
         result: dict[str, Any] = {
             "quality": "exact",
             "matched_x": matched_x,
@@ -196,7 +205,7 @@ class MechanismRegistry:
             if op not in operators:
                 check["result"] = False
                 return reject(f"unknown condition operator {op!r}")
-            if feature not in context:
+            if not _has_context_value(context, feature):
                 check["result"] = None
                 result["quality"] = "partial"
                 result["reasons"].append(f"condition feature {feature!r} is missing")

@@ -391,8 +391,18 @@ class TickRunner:
             y_observed_mean = {name: float(np.mean(arr)) for name, arr in y_obs.items() if len(arr)}
 
             committed = self._committed_mechanism_id(rank_telem)
-            mechanism_context = {**job_features.get(job_id, {}), **x}
-            applicable = self._applicable_mechanisms(mechanism_context, committed)
+            mechanism_context = {
+                key: value
+                for key, value in {**job_features.get(job_id, {}), **x}.items()
+                if value is not None and value != "NA"
+            }
+            applicable = self._applicable_mechanisms(
+                mechanism_context,
+                committed,
+                diagnostics=ctx.mechanism_diagnostics,
+                job_id=job_id,
+                rank_id=rank_id,
+            )
 
             v_params = self._resolve_cusum_params(residuals_per_v, cached_v_params)
             y_params = self._resolve_cusum_params(residuals_per_y, cached_y_params)
@@ -876,24 +886,49 @@ class TickRunner:
         self,
         context: dict[str, Any],
         committed_id: str | None,
+        *,
+        diagnostics: list[dict[str, Any]] | None = None,
+        job_id: str | None = None,
+        rank_id: str | None = None,
     ) -> list[Any]:
         """Resolve the mechanisms this rank's evidence speaks to.
 
         Active structured matches on deployed X and workload values, plus the
-        committed mechanism regardless of status - the agent's bet always
-        receives its verdict, even if the mechanism was archived
-        mid-flight.
+        committed mechanism regardless of status. Every returned mechanism has
+        all X values required by its edges, scope, and conditions.
         """
-        applicable = {
+        if self.candidate_graph is None:
+            raise ValueError("candidate graph is required for mechanism X validation")
+        candidates = {
             mechanism.mechanism_id: mechanism
             for mechanism, _ in self.mechanism_registry.find_applicable(context)
         }
-        if committed_id is not None and committed_id not in applicable:
+        if committed_id is not None and committed_id not in candidates:
             try:
-                applicable[committed_id] = self.mechanism_registry.get_mechanism(committed_id)
+                candidates[committed_id] = self.mechanism_registry.get_mechanism(committed_id)
             except KeyError:
                 log.warning("committed mechanism %s not in registry", committed_id)
-        return list(applicable.values())
+
+        applicable = []
+        for mechanism in candidates.values():
+            required_x = self.candidate_graph.required_x_for_mechanism(mechanism)
+            missing_x = [name for name in required_x if name not in context]
+            if missing_x:
+                if diagnostics is not None:
+                    diagnostics.append(
+                        {
+                            "job_id": job_id,
+                            "rank_id": rank_id,
+                            "mechanism_id": mechanism.mechanism_id,
+                            "status": "skipped",
+                            "reason": "missing_x",
+                            "missing_x": missing_x,
+                            "icp": [],
+                        }
+                    )
+                continue
+            applicable.append(mechanism)
+        return applicable
 
     def _bundle(self, mechanism) -> _MechanismBundle:
         """Cached V/Y bundle view for one mechanism."""

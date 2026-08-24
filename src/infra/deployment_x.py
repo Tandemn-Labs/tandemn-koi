@@ -258,9 +258,9 @@ def _rank_x(
 ) -> dict[str, Any]:
     catalog_x = _model_catalog_x(model_catalog, env[4])
     x: dict[str, Any] = {
-        **catalog_x,
-        **job_values,
-        **{key: value for key, value in shape.items() if key not in _X_SKIP},
+        **_available_x(catalog_x),
+        **_available_x(job_values),
+        **_available_x({key: value for key, value in shape.items() if key not in _X_SKIP}),
     }
     x["market"] = env[0]
     x["cloud"] = env[1]
@@ -325,7 +325,7 @@ def materialize_launch_config(catalog: dict[str, Any], gpu_type: str) -> dict[st
     return {
         key: value
         for key, value in resolved.items()
-        if key in _LAUNCH_CONFIG_FIELDS and value is not None
+        if key in _LAUNCH_CONFIG_FIELDS and not _is_missing_x_value(value)
     }
 
 
@@ -428,11 +428,15 @@ def _derive_x(x: dict[str, Any]) -> None:
 
 def _set_ratio(x: dict[str, Any], out: str, numerator: str, denominator: str) -> None:
     """Set a derived ratio only when both source fields are present."""
-    if numerator in x and denominator in x:
-        bottom = float(x[denominator])
-        if bottom == 0.0:
-            raise ValueError(f"cannot derive {out}: {denominator} is zero")
-        x[out] = float(x[numerator]) / bottom
+    top = x.get(numerator)
+    bottom = x.get(denominator)
+    if _is_missing_x_value(top) or _is_missing_x_value(bottom):
+        return
+    assert top is not None and bottom is not None
+    bottom = float(bottom)
+    if bottom == 0.0:
+        raise ValueError(f"cannot derive {out}: {denominator} is zero")
+    x[out] = float(top) / bottom
 
 
 def _allocate_load_x(
@@ -453,8 +457,10 @@ def _allocate_load_x(
     """
     share = _rank_traffic_share(shape, replica_count, total_replicas)
     for field in _LOAD_FIELDS:
-        if field in job_values:
-            x[field] = float(job_values[field]) * share
+        value = job_values.get(field)
+        if not _is_missing_x_value(value):
+            assert value is not None
+            x[field] = float(value) * share
 
 
 def _rank_traffic_share(shape: dict[str, Any], replica_count: int, total_replicas: int) -> float:
@@ -468,8 +474,19 @@ def _rank_traffic_share(shape: dict[str, Any], replica_count: int, total_replica
 
 
 def _project_x(x: dict[str, Any], x_fields: list[str] | tuple[str, ...]) -> dict[str, object]:
-    """Keep only candidate-graph X fields with non-missing source values."""
-    missing = [key for key in x_fields if key not in x or x[key] in (None, "NA")]
-    if missing:
-        raise ValueError(f"missing deployment X fields: {missing}")
-    return {key: x[key] for key in x_fields}
+    """Keep available values from the candidate graph's X vocabulary."""
+    return {
+        key: x[key]
+        for key in x_fields
+        if key in x and not _is_missing_x_value(x[key])
+    }
+
+
+def _available_x(values: dict[str, Any]) -> dict[str, Any]:
+    """Return source values that are known rather than absent sentinels."""
+    return {key: value for key, value in values.items() if not _is_missing_x_value(value)}
+
+
+def _is_missing_x_value(value: object) -> bool:
+    """Return whether a source value represents unknown deployment X."""
+    return value is None or value == "NA"

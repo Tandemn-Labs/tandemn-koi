@@ -437,7 +437,7 @@ def assert_planning_ready() -> None:
 # as an infeasible/skipped frame - so hitting it late just means "commit the best
 # scored so far", never a crash or forced defer. Raise it for deeper search; it
 # is generous by design (a normal tick uses far fewer).
-SURROGATE_CALL_BUDGET = 100
+SURROGATE_CALL_BUDGET = 10_000
 _surrogate_calls = 0
 # Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
 # scenario). DynoSim is deterministic, so re-probing a config the LLM already
