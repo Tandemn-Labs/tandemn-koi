@@ -225,13 +225,36 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
             ],
         )
 
-        job = ResourceMapManager._running_job_to_summary(running_job)
+        failed_rank = Model(
+            rank_id="rank_failed",
+            plan_id="plan_0",
+            role="decode",
+            status="failed",
+            shape_json={"count": 8, "gpu_type": "H100"},
+            n_replicas=1,
+            reason_code="OOM",
+            updated_at="2026-08-23T12:00:00+00:00",
+        )
+        job = ResourceMapManager._running_job_to_summary(running_job, [failed_rank])
         self.assertEqual(
             [chain["chain_id"] for chain in job["active_chains"]],
             ["rank_0_chain_0", "rank_0_chain_1"],
         )
         self.assertTrue(
             all(chain["shape_json"]["rank_id"] == "rank_0" for chain in job["active_chains"])
+        )
+        self.assertEqual(
+            job["recent_rank_failures"],
+            [
+                {
+                    "rank_id": "rank_failed",
+                    "plan_id": "plan_0",
+                    "role": "decode",
+                    "shape_json": {"count": 8, "gpu_type": "H100"},
+                    "reason_code": "OOM",
+                    "failed_at": "2026-08-23T12:00:00+00:00",
+                }
+            ],
         )
 
         telemetry = StoreTelemetry(
@@ -248,6 +271,49 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
         snapshot = ClusterResourceSnapshot(1, {}, [job], [])
         rank = next(telemetry.iter_per_rank(telemetry.collect_telemetry(0, 1, snapshot)))
         self.assertEqual(rank.y_observed["throughput_token_per_sec"].tolist(), [30.0])
+
+    def test_running_jobs_requests_failures_since_snapshot_cutoff(self):
+        cutoff = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+        calls = []
+
+        class JobStore:
+            def running_jobs(self, user_id):
+                job = SimpleNamespace(
+                    job_id="job_1",
+                    model_dump=lambda mode="json": {
+                        "job_id": "job_1",
+                        "user_id": user_id,
+                        "spec_json": {},
+                    },
+                )
+                return [
+                    SimpleNamespace(
+                        job=job,
+                        ranks=[],
+                    )
+                ]
+
+            def failed_ranks_since(self, job_id, since):
+                calls.append((job_id, since))
+                return [
+                    {
+                        "rank_id": "rank_failed",
+                        "plan_id": "plan_1",
+                        "role": "decode",
+                        "status": "failed",
+                        "shape_json": {"count": 8},
+                        "reason_code": "OOM",
+                        "updated_at": "2026-08-23T12:00:00+00:00",
+                    }
+                ]
+
+        manager = ResourceMapManager(user_id="user_1")
+        manager._job_store = lambda: JobStore()
+
+        jobs = manager.get_running_jobs(failure_since=cutoff)
+
+        self.assertEqual(calls, [("job_1", cutoff)])
+        self.assertEqual(jobs[0]["recent_rank_failures"][0]["reason_code"], "OOM")
 
 
 if __name__ == "__main__":

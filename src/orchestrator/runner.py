@@ -16,7 +16,7 @@ from src.cost import switch_cost as switchcost_module
 from src.cost.dro import DRO
 from src.executor.executor import StorePlanExecutor
 from src.exploration import eig as eig_module
-from src.infra.resource_map import ResourceMapManager
+from src.infra.resource_map import RANK_FAILURE_HISTORY_TICKS, ResourceMapManager
 from src.infra.telemetry import StoreTelemetry
 from src.learning.regret import RegretCalculator
 from src.learning.slow_loop import SlowLoop
@@ -136,7 +136,11 @@ def build_runner(args: argparse.Namespace):
         cusum=cusum,
         tracked_v_variables=candidate_graph.v,
     )
-    resource_map = ResourceMapManager(user_id=args.user_id, postgres_client=client)
+    resource_map = ResourceMapManager(
+        user_id=args.user_id,
+        postgres_client=client,
+        rank_failure_history_seconds=RANK_FAILURE_HISTORY_TICKS * args.tick_interval_sec,
+    )
     telemetry = StoreTelemetry(
         user_id=args.user_id,
         gpu_metric_store=GpuMetricStore(client),
