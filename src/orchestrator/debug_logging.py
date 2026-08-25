@@ -10,6 +10,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from src.agent.tools import agent_tools
+
 RAW_STATE_FIELDS = {
     "S0_ENTER_TICK": ("cluster_snapshot",),
     "S1_OBSERVE": ("telemetry", "deployment_x", "telemetry_diagnostics"),
@@ -126,6 +128,7 @@ class DebugLogger:
             "deploy_acks": getattr(ctx, "deploy_acks", []) or [],
             "error": repr(getattr(ctx, "error", None)) if getattr(ctx, "error", None) else None,
             "state_durations_ms": getattr(ctx, "state_durations_ms", {}) or {},
+            "surrogate_budget": _compact(agent_tools.get_surrogate_budget_status(), "no-llm"),
         }
         if self.trace == "all":
             summary["candidate_plan"] = _compact(getattr(ctx, "candidate_plan", None), self.trace)
@@ -193,6 +196,7 @@ def _surrogate_summary(trace: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": trace.get("schema_version"),
         "scenario": trace.get("scenario"),
+        "method": trace.get("method"),
         "composite_version": trace.get("composite_version"),
         "components": {
             name: {

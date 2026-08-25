@@ -597,6 +597,16 @@ class DeploymentXSmokeTests(unittest.TestCase):
                     icp_result_per_edge=dict.fromkeys(mechanism.edge_ids, ICPResult.UNDECIDED),
                     y_observed_mean={"p99_ttft_ms": 100.0},
                     y_predicted={"p99_ttft_ms": 100.0},
+                    prediction_lineage={
+                        "decision_dro_band": {
+                            "p99_ttft_ms": {
+                                "point": 100.0,
+                                "lower": 99.85,
+                                "upper": 100.15,
+                            }
+                        },
+                        "decision_required_objectives": ["p99_ttft_ms"],
+                    },
                 )
             ],
         )
