@@ -458,7 +458,8 @@ _surrogate_budget_rejections = 0
 _surrogate_finalization_calls = 0
 _surrogate_stress_calls = 0
 # Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
-# scenario, method). DynoSim is deterministic, so re-probing a config the LLM already
+# scenario, calibration, method, accounting mode). DynoSim is deterministic, so
+# re-probing a config the LLM already
 # evaluated THIS tick returns the identical numbers - we serve them from here
 # instead of re-running the surrogate. Access happens under
 # _SURROGATE_EXECUTION_LOCK (see _predict_outcome_core).
@@ -537,6 +538,7 @@ _NON_TOOL_NAMES = frozenset(
         "bind_tools",
         "all_callables",
         "assert_planning_ready",
+        "compute_sigma_for_commit",
         "configure_surrogate_call_budget",
         "reset_tick_caches",
         "stamp_plan_predictions",
@@ -774,6 +776,7 @@ def _compose_job_y_hat(
     job_features: dict[str, Any] | None = None,
     *,
     method: tuple[str, ...] = _AIC_DIRECT_METHOD,
+    finalization: bool = False,
 ) -> dict[str, Any]:
     """Compose a job-level y_hat from a ladder's per-rank predictions.
 
@@ -804,7 +807,10 @@ def _compose_job_y_hat(
         try:
             payload = _rank_prediction_payload(rank, feats)
             y = _predict_outcome_core(
-                payload["job_config"], payload["job_features"], method=method
+                payload["job_config"],
+                payload["job_features"],
+                method=method,
+                _finalization=finalization,
             ).get("y_hat", {})
         except SurrogateBudgetExceeded:
             raise
@@ -1032,17 +1038,57 @@ def get_priority() -> list[dict[str, Any]]:
         List of {"job_id", "user_id", "priority_score", "signals"}
         sorted by descending score.
     """
+
+    def field(job: dict[str, Any], features: dict[str, Any], *names: str, default=None):
+        for source in (job, features):
+            for name in names:
+                value = source.get(name)
+                if value is not None:
+                    return value
+        return default
+
+    def number(value: Any, default: float) -> float:
+        if isinstance(value, bool):
+            return default
+        try:
+            converted = float(value)
+        except (TypeError, ValueError):
+            return default
+        return converted if math.isfinite(converted) else default
+
+    priority_classes = {
+        "LOW": 0.0,
+        "STANDARD": 1.0,
+        "HIGH": 2.0,
+        "CRITICAL": 3.0,
+    }
     jobs = list(get_pending_jobs()) + list(get_active_jobs())
     scored: list[dict[str, Any]] = []
     for j in jobs:
+        job_features = j.get("job_features")
+        if not isinstance(job_features, dict):
+            job_features = {}
+
+        raw_priority_class = field(j, job_features, "priority_class", default=0.0)
+        if isinstance(raw_priority_class, str):
+            class_name = raw_priority_class.strip().upper()
+            priority_class = priority_classes.get(class_name, number(raw_priority_class, 0.0))
+        else:
+            priority_class = number(raw_priority_class, 0.0)
+
+        workload_type = field(j, job_features, "workload_type", "type")
+        if workload_type is None:
+            workload_type = j.get("kind")
+        if workload_type is None:
+            workload_type = job_features.get("kind", "online")
         signals = {
-            "user_priority": float(j.get("user_priority", 1.0)),
-            "priority_class": float(j.get("priority_class", 0)),
-            "is_online": 1.0 if j.get("type", "online") == "online" else 0.0,
-            "deadline_pressure": float(j.get("deadline_pressure", 0.0)),
-            "slo_margin_deficit": max(0.0, -float(j.get("slo_margin", 0.0))),
-            "queue_age_ticks": float(j.get("queue_age_ticks", 0)),
-            "recent_failures": float(j.get("recent_failures", 0)),
+            "user_priority": number(field(j, job_features, "user_priority"), 1.0),
+            "priority_class": priority_class,
+            "is_online": 1.0 if str(workload_type).strip().lower() == "online" else 0.0,
+            "deadline_pressure": number(field(j, job_features, "deadline_pressure"), 0.0),
+            "slo_margin_deficit": max(0.0, -number(field(j, job_features, "slo_margin"), 0.0)),
+            "queue_age_ticks": number(field(j, job_features, "queue_age_ticks"), 0.0),
+            "recent_failures": number(field(j, job_features, "recent_failures"), 0.0),
         }
         score = (
             signals["user_priority"] * 10.0
@@ -1061,7 +1107,7 @@ def get_priority() -> list[dict[str, Any]]:
                 "signals": signals,
             }
         )
-    scored.sort(key=lambda x: float(x["priority_score"]), reverse=True)
+    scored.sort(key=lambda x: (-float(x["priority_score"]), str(x["job_id"] or "")))
     return scored
 
 
@@ -2455,15 +2501,16 @@ def _prediction_cache_key(
     scenario: str,
     calibrate: bool,
     method: tuple[str, ...],
+    finalization: bool,
 ) -> str | None:
     """Canonical, order-stable key for the composed-prediction memo.
 
-    Calibration mode is part of the key because deployment stamping requests an
-    uncalibrated prediction while candidate scoring uses evidence calibration.
+    Calibration and accounting modes are part of the key so finalization cannot
+    silently reuse a search-budgeted prediction without finalization accounting.
     """
     try:
         return json.dumps(
-            [job_config, job_features, scenario, bool(calibrate), method],
+            [job_config, job_features, scenario, bool(calibrate), method, bool(finalization)],
             sort_keys=True,
             default=str,
         )
@@ -2490,7 +2537,14 @@ def _predict_outcome_core(
     global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
     global _surrogate_finalization_calls, _surrogate_stress_calls
     selected_method = (method,) if isinstance(method, str) else tuple(method)
-    key = _prediction_cache_key(job_config, job_features, scenario, calibrate, selected_method)
+    key = _prediction_cache_key(
+        job_config,
+        job_features,
+        scenario,
+        calibrate,
+        selected_method,
+        _finalization,
+    )
 
     with _SURROGATE_EXECUTION_LOCK:
         cached = _prediction_cache.get(key) if key is not None else None
@@ -3039,6 +3093,16 @@ def compute_sigma(plan) -> dict[str, Any]:
     Returns:
         {"per_job": dict, "aggregate_sigma": float, "swap_count": int}.
     """
+    return _compute_sigma(plan, finalization=False)
+
+
+def compute_sigma_for_commit(plan) -> dict[str, Any]:
+    """Score a materialized plan without consuming the search-call budget."""
+    return _compute_sigma(plan, finalization=True)
+
+
+def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
+    """Shared plan scorer with an explicit surrogate-accounting mode."""
     _require(
         "slow_loop",
         "tchebycheff_module",
@@ -3086,7 +3150,12 @@ def compute_sigma(plan) -> dict[str, Any]:
         w_t = _CTX.slow_loop.get_sss_wt(job_type=job_mode)
         w_cost = float((w_t or {}).get("cost_per_token", 0.0) or 0.0)
         prediction_method = _AIC_DYNOSIM_METHOD if job_mode == "online" else _AIC_DIRECT_METHOD
-        y_hat = _compose_job_y_hat(action, job_features, method=prediction_method)
+        y_hat = _compose_job_y_hat(
+            action,
+            job_features,
+            method=prediction_method,
+            finalization=finalization,
+        )
         if not y_hat:
             continue
         # Score against the job's OWN SLO/throughput TARGET, not the absolute z*

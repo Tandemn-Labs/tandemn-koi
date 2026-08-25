@@ -17,6 +17,20 @@ from src.orchestrator.debug_logging import DebugLogger
 class LLMWorkflowControlsSmokeTests(unittest.TestCase):
     """Exercise workflow controls without external services."""
 
+    @staticmethod
+    def _trajectory_harness(response):
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        harness.llm = types.SimpleNamespace(complete=lambda _history: response)
+        harness.resource_map = None
+        harness.user_registry = None
+        harness.stdout_limit = 2000
+        harness.k_max = 1
+        harness.wall_clock_sec = 30.0
+        harness.consecutive_error_limit = 5
+        harness.max_history_messages = 0
+        harness.trace = AgentTrace()
+        return harness
+
     def test_specialist_empty_response_consumes_one_of_two_total_attempts(self):
         class ScriptedLLM:
             def __init__(self):
@@ -98,7 +112,7 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         harness._current_tick = 0
         harness.one_trajectory = lambda **_kwargs: next(plans)
 
-        def compute_sigma(plan):
+        def compute_sigma_for_commit(plan):
             if plan is unscorable:
                 raise RuntimeError("cannot score")
             return {"aggregate_sigma": -4.5}
@@ -106,7 +120,11 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         with (
             patch.object(agent_tools, "bind_tools"),
             patch.object(agent_tools, "assert_planning_ready"),
-            patch.object(agent_tools, "compute_sigma", side_effect=compute_sigma),
+            patch.object(
+                agent_tools,
+                "compute_sigma_for_commit",
+                side_effect=compute_sigma_for_commit,
+            ),
             patch.object(
                 agent_tools,
                 "stamp_plan_predictions",
@@ -128,6 +146,19 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertEqual([event["k_idx"] for event in unscorable_events], [0])
         self.assertNotIn("Infinity", json.dumps(harness.trace.events))
 
+    def test_score_plan_calls_commit_scoring_helper(self):
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        plan = Plan(tick=7)
+        with patch.object(
+            agent_tools,
+            "compute_sigma_for_commit",
+            return_value={"aggregate_sigma": 2.5, "per_job": {}},
+        ) as compute:
+            score = harness._score_plan(plan)
+
+        self.assertEqual(score, 2.5)
+        compute.assert_called_once_with(plan)
+
     def test_plan_with_unscored_ladder_action_is_unscorable(self):
         harness = KoiAgentHarness.__new__(KoiAgentHarness)
         plan = Plan(
@@ -148,10 +179,200 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         )
         with patch.object(
             agent_tools,
-            "compute_sigma",
+            "compute_sigma_for_commit",
             return_value={"aggregate_sigma": 0.0, "per_job": {}},
         ):
             self.assertIsNone(harness._score_plan(plan))
+
+    def test_explicit_final_plan_beats_joint_salvage(self):
+        recommendation = {"chosen": [{"job_id": "joint_job", "type": "defer"}]}
+        explicit = {
+            "tick_rationale": "The root explicitly deferred this job.",
+            "actions": [
+                {
+                    "job_id": "root_job",
+                    "type": "defer",
+                    "rationale": "Intentional root decision.",
+                }
+            ],
+        }
+        response = (
+            "```repl\n"
+            "joint = jointly_select_placements([])\n"
+            f"plan = {explicit!r}\n"
+            "FINAL_VAR(plan)\n"
+            "```"
+        )
+        harness = self._trajectory_harness(response)
+        materialized = object()
+
+        with (
+            patch.object(
+                agent_tools,
+                "all_callables",
+                return_value={
+                    "jointly_select_placements": lambda _candidates: recommendation,
+                },
+            ),
+            patch.object(harness, "_try_materialize", return_value=materialized) as attempt,
+        ):
+            result = harness.one_trajectory(None, None, None, None, tick=7)
+
+        self.assertIs(result, materialized)
+        self.assertEqual(attempt.call_args.args[0], explicit)
+        self.assertFalse(
+            any(event["kind"] == "joint_recommendation_salvaged" for event in harness.trace.events)
+        )
+
+    def test_leftover_plan_beats_joint_salvage(self):
+        recommendation = {"chosen": [{"job_id": "joint_job", "type": "defer"}]}
+        leftover = {
+            "tick_rationale": "The root left an explicit plan in the REPL.",
+            "actions": [{"job_id": "root_job", "type": "defer"}],
+        }
+        response = f"```repl\njoint = jointly_select_placements([])\nplan = {leftover!r}\n```"
+        harness = self._trajectory_harness(response)
+        materialized = object()
+
+        with (
+            patch.object(
+                agent_tools,
+                "all_callables",
+                return_value={
+                    "jointly_select_placements": lambda _candidates: recommendation,
+                },
+            ),
+            patch.object(harness, "_try_materialize", return_value=materialized) as attempt,
+        ):
+            result = harness.one_trajectory(None, None, None, None, tick=7)
+
+        self.assertIs(result, materialized)
+        self.assertEqual(attempt.call_args.args[0], leftover)
+        self.assertFalse(
+            any(event["kind"] == "joint_recommendation_salvaged" for event in harness.trace.events)
+        )
+
+    def test_last_joint_is_salvaged_materialized_and_traced(self):
+        chosen = [{"job_id": "job_1", "type": "defer"}]
+        recommendation = {"chosen": chosen}
+        harness = self._trajectory_harness("```repl\njoint = jointly_select_placements([])\n```")
+        materialized = object()
+
+        with (
+            patch.object(
+                agent_tools,
+                "all_callables",
+                return_value={
+                    "jointly_select_placements": lambda _candidates: recommendation,
+                },
+            ),
+            patch.object(harness, "_try_materialize", return_value=materialized) as attempt,
+        ):
+            result = harness.one_trajectory(None, None, None, None, tick=7, k_idx=2)
+
+        raw_plan, snapshot, last_joint = attempt.call_args.args
+        self.assertIs(result, materialized)
+        self.assertIsNone(snapshot)
+        self.assertIs(last_joint, recommendation)
+        self.assertEqual(raw_plan["actions"], chosen)
+        self.assertIsNot(raw_plan["actions"], chosen)
+        self.assertIsNot(raw_plan["actions"][0], chosen[0])
+        self.assertIn("turn limit ended", raw_plan["tick_rationale"])
+        self.assertIn("recommendation was salvaged", raw_plan["tick_rationale"])
+        salvage_events = [
+            event
+            for event in harness.trace.events
+            if event["kind"] == "joint_recommendation_salvaged"
+        ]
+        self.assertEqual(len(salvage_events), 1)
+        self.assertEqual(salvage_events[0]["action_count"], 1)
+        self.assertEqual(salvage_events[0]["k_idx"], 2)
+
+    def test_empty_last_joint_returns_none_without_salvage(self):
+        harness = self._trajectory_harness("```repl\njoint = jointly_select_placements([])\n```")
+
+        with (
+            patch.object(
+                agent_tools,
+                "all_callables",
+                return_value={"jointly_select_placements": lambda _candidates: {"chosen": []}},
+            ),
+            patch.object(harness, "_try_materialize") as attempt,
+        ):
+            result = harness.one_trajectory(None, None, None, None, tick=7)
+
+        self.assertIsNone(result)
+        attempt.assert_not_called()
+        self.assertFalse(
+            any(event["kind"] == "joint_recommendation_salvaged" for event in harness.trace.events)
+        )
+
+    def test_specialist_backfills_omitted_maps_and_sole_mechanism_id(self):
+        proposal = {
+            "job_id": "job_1",
+            "user_id": "user_1",
+            "type": "place",
+            "ladder": [
+                {
+                    "role": "aggregate",
+                    "env": ["reserved", "aws", "r1", "z1", "H100"],
+                    "config": {
+                        "instance_type": "p5",
+                        "gpu_count": 1,
+                        "tp": 1,
+                        "pp": 1,
+                    },
+                    "n_replicas": 1,
+                }
+            ],
+            "fitness": "happy",
+            "mechanism_ids": ["M_only"],
+            "new_mechanism_proposals": [],
+            "reasoning": "One valid placement.",
+        }
+
+        class ScriptedLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, _messages):
+                self.calls += 1
+                return json.dumps(proposal)
+
+        llm = ScriptedLLM()
+        trace = AgentTrace()
+        specialist = SpecialistRunner(llm, trace=trace)
+        slice_ = {
+            "user_id": "user_1",
+            "env_budget": {"reserved|aws|r1|z1|H100": 1},
+        }
+        with (
+            patch.object(
+                agent_tools,
+                "get_job_brief",
+                return_value={
+                    "job_id": "job_1",
+                    "job_features": {"model_id": "model_1"},
+                    "current_ladder": None,
+                },
+            ),
+            patch.object(agent_tools, "_budget_violations", return_value=[]),
+            patch.object(agent_tools, "instance_catalog", return_value={}),
+        ):
+            result = specialist.run_one("job_1", slice_)
+            violations = SpecialistRunner._validate(result, "job_1", slice_)
+
+        self.assertEqual(llm.calls, 1)
+        for field in (
+            "used_capacity",
+            "unused_capacity",
+            "marginal_value_of_more",
+            "budget_utilization",
+        ):
+            self.assertEqual(result[field], {})
+        self.assertEqual(result["ladder"][0]["mechanism_id"], "M_only")
+        self.assertEqual(violations, [])
+        self.assertEqual(trace.events[-1]["violations"], [])
 
     def test_placement_floor_materializes_recommended_launch_config(self):
         harness = KoiAgentHarness.__new__(KoiAgentHarness)
@@ -200,7 +421,7 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             defaults = runner.parse_args([])
 
-        self.assertEqual(defaults.temperature, 0.2)
+        self.assertEqual(defaults.temperature, 1)
         self.assertEqual(defaults.wall_clock_sec, 240.0)
         self.assertEqual(defaults.k_p, 1)
         self.assertEqual(defaults.k_max, 4)
@@ -257,6 +478,8 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertIn("recommendation for you to inspect", prompt)
         self.assertIn("do not call any primary workflow stage before or after it", prompt)
         self.assertIn("Inspect `priority`", prompt)
+        self.assertIn("in that same REPL turn", prompt)
+        self.assertIn("not a mandatory extra turn", prompt)
         self.assertIn("scored['diagnostics']", prompt)
         self.assertIn("scored['budget_limited']", prompt)
         self.assertIn("Online candidates are SLO-complete, full-service", prompt)
@@ -265,6 +488,13 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertIn("include an explicit DEFER action", prompt)
         self.assertNotIn("solver owns the pick", prompt)
         self.assertNotIn("FINAL_VAR(plan_tick())", prompt)
+        self.assertNotIn("fairness, churn", prompt)
+        self.assertIn("must always be JSON objects", specialist_prompt)
+        self.assertIn("Use {} when a map is not applicable", specialist_prompt)
+        self.assertIn(
+            "Every ladder rank's mechanism_id must also appear",
+            specialist_prompt,
+        )
         self.assertNotIn("predicted_y", specialist_prompt)
         self.assertNotIn("predicted_sigma", specialist_prompt)
 
