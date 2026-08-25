@@ -1873,16 +1873,12 @@ def size_ladder(
 
         target        = required throughput (batch: budget/deadline*headroom;
                         online: arrival_rate * output_len * headroom)
-        per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap. Direct cheaply
-                        screens capacity. For online jobs with latency SLOs, DynoSim
-                        verifies only a DP that can carry the share, plus max DP for
-                        a possible SLO-safe partial contribution. Take the first DP
-                        whose queue-aware TTFT/TPOT clear the SLO and keeps up; the
-                        rest of the demand spills to the next rank.
+        per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap with direct AIC.
+                        Take the first DP whose TTFT/TPOT clear the SLO and keeps up;
+                        the rest of the demand spills to the next rank.
         achieved_tps  = demand actually served within SLO (SUM across ranks).
 
-    Online latency GATES the replica count (queueing latency FALLS with more
-    replicas), it does not veto the rank. In advisory mode only, a rank that cannot
+    Online latency GATES the replica count. In advisory mode only, a rank that cannot
     provide full service may contribute a separately tested SLO-safe partial load;
     otherwise the legacy fallback remains diagnostic-only for online candidates.
     meets_target requires the whole demand covered AND every serving rank in SLO.
@@ -1913,8 +1909,8 @@ def size_ladder(
     regime = str(job_features.get("type", "online")).lower()
     is_online = regime != "batch"
     # utilization_target is accepted for backward compatibility but no longer used.
-    # Direct screens each DP's capacity, and queue-aware verification supplies the
-    # online p99 latency; no linear per-chain utilization estimate is needed.
+    # Direct AIC supplies capacity and online latency for normal sizing. Explicit
+    # advisory partial-admission probes may opt into queue-aware DynoSim.
     _ = utilization_target
     target = (
         float(target_tps)
@@ -2036,7 +2032,19 @@ def size_ladder(
                 y_hat["_throughput_token_per_sec_lower"] = lower
             return y_hat
         except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
-            log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
+            log.warning(
+                "size_ladder rejected candidate: model=%s gpu=%s instance=%s "
+                "tp=%s pp=%s dp=%d error=%s",
+                payload["job_config"].get("model_id")
+                or payload["job_features"].get("model_id"),
+                payload["job_features"].get("gpu_type")
+                or payload["job_config"].get("gpu_type"),
+                r.config.get("instance_type"),
+                r.config.get("tp"),
+                r.config.get("pp"),
+                d,
+                exc,
+            )
             physical_rejections.append(str(exc))
             return None
         except SurrogateExecutionError as exc:
@@ -2050,26 +2058,18 @@ def size_ladder(
         rank: RankSpec,
         d: int,
         share_tps: float,
-        max_dp: int,
         direct_predictions: dict[int, dict | None],
     ) -> dict | None:
         # Predict this rank at DP=d workers carrying `share_tps` tokens/s of demand.
-        # Direct screens capacity first. DynoSim runs only when an online DP can
-        # carry the share, or at max DP to characterize a possible partial rank.
+        # Direct AIC is the default sizing backend. Queue-aware DynoSim is reserved
+        # for explicit advisory partial-admission probes.
         # Returns:
         #   dict y_hat -> the DP-aggregate prediction,
         #   {}         -> overloaded/incomplete at this DP (try more replicas),
         #   None       -> physical/memory no-fit (no replica count fixes it).
         direct_y = _run_at_load(rank, d, share_tps, _AIC_DIRECT_METHOD)
         direct_predictions[d] = direct_y
-        if direct_y is None or not verify_online_latency:
-            return direct_y
-        direct_can_carry = bool(direct_y) and _covers_offered_load(
-            _capacity_tps(direct_y), share_tps
-        )
-        if not direct_can_carry and d != max_dp:
-            return {}
-        return _run_at_load(rank, d, share_tps, _AIC_DYNOSIM_METHOD)
+        return direct_y
 
     sized: list[dict[str, Any]] = []
     per_rank: list[dict[str, Any]] = []
@@ -2150,7 +2150,7 @@ def size_ladder(
             fallback_y: dict[str, Any] = {}
             for d in _dp_candidates(max_by_cap, preferred_replicas):
                 dp_tried = max(dp_tried, d)
-                y = _predict_at(rank, d, share, max_by_cap, direct_predictions)
+                y = _predict_at(rank, d, share, direct_predictions)
                 if y is None:
                     reason = "does not fit (memory/physical)"
                     break
@@ -2960,7 +2960,7 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
         if action.type not in LADDER_ACTIONS or not action.ladder:
             continue
         job_features = _job_features_for(snapshot, action.job_id)
-        method = _AIC_DYNOSIM_METHOD if _job_mode(job_features) == "online" else _AIC_DIRECT_METHOD
+        method = _AIC_DIRECT_METHOD
         required_objectives = _decision_required_objectives(snapshot, action, job_features)
         partial_admission = None
         if action.admission_mode == "advisory" and action.served_fraction is not None:
@@ -3432,7 +3432,7 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
         job_mode = _job_mode(job_features)
         w_t = _CTX.slow_loop.get_sss_wt(job_type=job_mode)
         w_cost = float((w_t or {}).get("cost_per_token", 0.0) or 0.0)
-        prediction_method = _AIC_DYNOSIM_METHOD if job_mode == "online" else _AIC_DIRECT_METHOD
+        prediction_method = _AIC_DIRECT_METHOD
         prediction_scenario = "peak" if job_mode == "online" else "mean"
         y_hat = _compose_job_y_hat(
             action,

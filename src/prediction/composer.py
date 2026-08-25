@@ -22,6 +22,7 @@ from src.prediction.calibration import (
 )
 from src.prediction.normalization import normalize_candidate_inputs
 from src.prediction.peer_client import PeerPredictorClient
+from src.prediction.surrogate import SurrogateMemoryNoFit, SurrogateUnsupportedConfig
 
 log = logging.getLogger("koi.surrogate.composer")
 
@@ -430,11 +431,18 @@ class SurrogateComposer:
                 "failure": failure,
                 "timings_ms": timings,
             }
-            log.error(
-                "surrogate prediction failed: stage=%s error=%s",
-                stage,
-                failure["message"],
-            )
+            if isinstance(exc, (SurrogateMemoryNoFit, SurrogateUnsupportedConfig)):
+                log.debug(
+                    "surrogate candidate rejected: stage=%s error=%s",
+                    stage,
+                    failure["message"],
+                )
+            else:
+                log.error(
+                    "surrogate prediction failed: stage=%s error=%s",
+                    stage,
+                    failure["message"],
+                )
             raise
 
     def _run_perfdb(self, candidate, candidate_graph, method, scenario):

@@ -243,8 +243,16 @@ def _rank_deployment(
         rank_id=rank_id,
         env_label=env,
         x=_project_x(x, x_fields),
-        v_predicted=dict(shape.get("predicted_v") or {}),
-        y_predicted=dict(shape.get("predicted_y") or {}),
+        v_predicted={
+            name: value
+            for name, value in dict(shape.get("predicted_v") or {}).items()
+            if value is not None
+        },
+        y_predicted={
+            name: value
+            for name, value in dict(shape.get("predicted_y") or {}).items()
+            if value is not None
+        },
         prediction_lineage=dict(shape.get("prediction_lineage") or {}) or None,
     )
 
