@@ -13,13 +13,14 @@ One tick is a closed learning loop:
     S1 OBSERVE        Pull per-rank telemetry bundles for [t-1, t].
     S2 VALIDATE       Per rank: residuals -> applicable mechanisms ->
                       per-mechanism (V-CUSUM, Y-CUSUM) -> per-mechanism Q ->
-                      ICP per edge -> one EvidenceRow appended; DRO fed.
-    S3 SLOW_UPDATE    1) Beta(alpha, beta) fan-out: every decided
+                      ICP per edge -> one EvidenceRow appended.
+    S3 SLOW_UPDATE    1) Decision-band coverage, then DRO residual ingestion.
+                      2) Beta(alpha, beta) fan-out: every decided
                          (row, mechanism) pair updates that mechanism and
                          its edges via ConfidenceService.
-                      2) SlowLoop.slow_update_all: w_t, z_star_t,
+                      3) SlowLoop.slow_update_all: w_t, z_star_t,
                          lambda_swit, beta_t, B_t, epsilon_dro.
-                      3) Meta cadence: CUSUM (delta, h) recalibration every
+                      4) Meta cadence: CUSUM (delta, h) recalibration every
                          `recalibrate_every` ticks.
     S4 AGENTIC_PLAN   One KoiAgentHarness.run_agent_loop call -> plan.
                       The harness owns K_P sampling, budget-first specialist
@@ -65,6 +66,7 @@ lives in agent.py; the tools live in agent_tools.py.
 
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -348,8 +350,8 @@ class TickRunner:
         (committed + scope matches, restricted to bundles fully observable
         in this rank's telemetry); run V-CUSUM and Y-CUSUM per mechanism;
         classify a Q per mechanism; run ICP once per edge in the union of
-        applicable bundles; append one EvidenceRow; feed DRO's residual
-        ring.
+        applicable bundles; append one EvidenceRow. S3 evaluates the
+        immutable decision-time DRO band before feeding this row's residual.
 
         No Beta updates here - S2 writes evidence, S3 reads it. The
         separation keeps S2 idempotent for replay.
@@ -509,14 +511,15 @@ class TickRunner:
             self.evidence_store.append_row(row)
             ctx.evidence_rows.append(row)
 
-            self.dro.append_residual_history(pred_y=y_pred, obs_y=y_observed_mean)
-
         return FSMState.S3_SLOW_UPDATE
 
     def S3(self, ctx: TickContext) -> FSMState:
         """Apply the learning updates, then refresh the slow-loop knobs.
 
-        Part 1 - Beta fan-out: every decided (row, mechanism) pair updates
+        Part 1 - Evaluate decision-time DRO coverage, then append every
+        current residual to DRO history.
+
+        Part 2 - Beta fan-out: every decided (row, mechanism) pair updates
         that mechanism's Beta and the Betas of ITS edges, with the edge
         delta modulated by that edge's ICP result. An edge shared by
         several applicable mechanisms receives one update per mechanism
@@ -524,17 +527,23 @@ class TickRunner:
         ConfidenceService also records env coverage and recency (single
         writer for all confidence state).
 
-        Part 2 - SlowLoop.slow_update_all with the observed swap rate
-        (recorded by last tick's S6), the observed DRO coverage (this
-        tick's rows vs their predicted bands), the R2 gradient (v0 stub),
+        Part 3 - SlowLoop.slow_update_all receives coverage, the observed
+        swap rate (recorded by last tick's S6), the R2 gradient (v0 stub),
         and annealed targets.
 
-        Part 3 - meta cadence: CUSUM (delta, h) recalibration from
+        Part 4 - meta cadence: CUSUM (delta, h) recalibration from
         accumulated residual history every recalibrate_every ticks.
         """
-        did_confidence_update = False
         ctx.confidence_diagnostics = []
         slow_before = self._slow_state_snapshot()
+        coverage = self._observed_coverage_details(ctx)
+        for row in ctx.evidence_rows:
+            self.dro.append_residual_history(
+                pred_y=row.y_predicted,
+                obs_y=row.y_observed_mean,
+            )
+
+        did_confidence_update = False
         for row in ctx.evidence_rows:
             for mid, q in row.q_label_per_mechanism.items():
                 if q is None:
@@ -587,7 +596,6 @@ class TickRunner:
             flush_confidence()
 
         observed_swap_rate = self._observed_swap_rate(ctx)
-        coverage = self._observed_coverage_details(ctx)
         r2_gradient = self._r2_gradient(ctx)
         target_overrides = self.slow_loop.anneal_targets(ctx.tick)
         dro_before = self._dro_parameters()
@@ -1116,53 +1124,88 @@ class TickRunner:
         return 0.0
 
     def _observed_coverage_details(self, ctx: TickContext) -> dict[str, Any]:
-        """Return this tick's DRO coverage and the bands used to compute it.
+        """Evaluate outcomes against immutable DRO bands persisted at decision time.
 
-        Bands are recomputed from each row's stored y_predicted with the
-        current epsilon - one tick of epsilon drift versus the band that
-        existed at deploy time, accepted as the honest v0 approximation.
-        Returns the DRO target (no-signal) when the tick produced no rows.
+        The target coverage is the existing float API's neutral no-signal
+        value. A persisted but unusable band is measured as uncovered; only
+        a missing band or missing required observation is non-evaluable.
         """
+        target = float(getattr(self.dro, "target", 0.90))
         rows = [r for r in ctx.evidence_rows if r.y_observed_mean]
         if not rows:
             return {
-                "value": float(getattr(self.dro, "target", 0.90)),
+                "value": target,
                 "inside_rows": 0,
                 "row_count": 0,
+                "evaluable_row_count": 0,
+                "has_signal": False,
                 "reason": "no_evidence",
                 "rows": [],
             }
         inside = 0
+        evaluable = 0
         row_details = []
         for row in rows:
-            band = self.dro.compute_dro_band(row.y_predicted)
-            row_inside = self.dro._all_objectives_inside(row.y_observed_mean, band)
+            lineage = getattr(row, "prediction_lineage", None)
+            has_band = isinstance(lineage, Mapping) and "decision_dro_band" in lineage
+            band = lineage.get("decision_dro_band") if has_band else None
+            required = lineage.get("decision_required_objectives") if has_band else None
+            status = self.dro._coverage_status(row.y_observed_mean, band, required)
+            row_inside = status is True
+            if status is not None:
+                evaluable += 1
             if row_inside:
                 inside += 1
+            if required is None:
+                required_names = list(band) if isinstance(band, Mapping) else []
+            elif isinstance(required, (list, tuple, set, frozenset)):
+                required_names = [name for name in required if isinstance(name, str)]
+            else:
+                required_names = []
             objectives = {}
-            for name, observed in row.y_observed_mean.items():
-                objective_band = band.get(name)
-                if objective_band is None:
-                    objectives[name] = {"observed": float(observed), "band": None}
+            for name in required_names:
+                observed = row.y_observed_mean.get(name)
+                objective_band = band.get(name) if isinstance(band, Mapping) else None
+                if not isinstance(objective_band, Mapping):
+                    objectives[name] = {
+                        "observed": self._float_or_none(observed),
+                        "band": None,
+                        "inside": False,
+                    }
                     continue
                 objectives[name] = {
-                    "observed": float(observed),
-                    "point": objective_band["point"],
-                    "lower": objective_band["lower"],
-                    "upper": objective_band["upper"],
-                    "inside": objective_band["lower"] <= observed <= objective_band["upper"],
+                    "observed": self._float_or_none(observed),
+                    "point": objective_band.get("point"),
+                    "lower": objective_band.get("lower"),
+                    "upper": objective_band.get("upper"),
+                    "inside": self.dro._all_objectives_inside(
+                        {name: observed}, {name: objective_band}, [name]
+                    ),
                 }
             row_details.append(
                 {
                     "row_id": row.row_id,
                     "inside": row_inside,
+                    "evaluable": status is not None,
                     "objectives": objectives,
                 }
             )
+        if not evaluable:
+            return {
+                "value": target,
+                "inside_rows": 0,
+                "row_count": len(rows),
+                "evaluable_row_count": 0,
+                "has_signal": False,
+                "reason": "no_evaluable_decision_bands",
+                "rows": row_details,
+            }
         return {
-            "value": inside / len(rows),
+            "value": inside / evaluable,
             "inside_rows": inside,
             "row_count": len(rows),
+            "evaluable_row_count": evaluable,
+            "has_signal": True,
             "reason": "measured",
             "rows": row_details,
         }

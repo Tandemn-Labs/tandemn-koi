@@ -64,6 +64,7 @@ Tool catalog:
 
     prediction / scoring:
         predict_outcome             calibrated surrogate prediction + DRO band
+        get_surrogate_budget_status current tick search-budget accounting
         get_z_star                  current ideal-point reference (z_star_t)
         compute_tchebycheff         augmented Tchebycheff J
         optimize_config             LLM-steered coordinate descent over candidates
@@ -86,7 +87,6 @@ import json
 import logging
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from threading import Lock
 from typing import Any
@@ -367,6 +367,13 @@ def bind_tools(**components) -> None:
     surrogate_changed = components.get("surrogate") is not None and components.get(
         "surrogate"
     ) is not getattr(_CTX, "surrogate", None)
+    specialist_changed = components.get("specialist_runner") is not None and components.get(
+        "specialist_runner"
+    ) is not getattr(_CTX, "specialist_runner", None)
+    context_changed = any(
+        value is not None and value is not getattr(_CTX, name, None)
+        for name, value in components.items()
+    )
     for name, value in components.items():
         if not hasattr(_ToolContext, name):
             raise ValueError(f"bind_tools: unknown component {name!r}")
@@ -375,10 +382,16 @@ def bind_tools(**components) -> None:
     if surrogate_changed:
         with _SURROGATE_EXECUTION_LOCK:
             _prediction_cache.clear()
+    if specialist_changed:
+        _specialist_results_cache.clear()
+    if context_changed:
+        _scored_candidates_cache.clear()
     surrogate = getattr(_CTX, "surrogate", None)
     evidence_store = getattr(_CTX, "evidence_store", None)
-    if surrogate is not None and evidence_store is not None and hasattr(
-        surrogate, "bind_evidence_store"
+    if (
+        surrogate is not None
+        and evidence_store is not None
+        and hasattr(surrogate, "bind_evidence_store")
     ):
         surrogate.bind_evidence_store(evidence_store)
 
@@ -430,43 +443,92 @@ def assert_planning_ready() -> None:
         )
 
 
-# Per-tick surrogate-call budget: a runaway BACKSTOP, not a quality limiter.
+# Per-tick surrogate SEARCH-call budget: a runaway BACKSTOP, not a quality limiter.
 # The planner may explore freely (grid / coordinate search) up to this many
 # surrogate simulations per tick; beyond it a sim raises SurrogateBudgetExceeded,
-# which size_ladder / optimize_config / the specialist eval loops catch and treat
-# as an infeasible/skipped frame - so hitting it late just means "commit the best
-# scored so far", never a crash or forced defer. Raise it for deeper search; it
-# is generous by design (a normal tick uses far fewer).
-SURROGATE_CALL_BUDGET = 30
+# which candidate evaluation reports separately from physical failures, so hitting
+# it late means "commit the best scored so far", never a crash or forced defer.
+# Raise it for deeper search; it is generous by design (a normal tick uses far fewer).
+SURROGATE_CALL_BUDGET = 100
+_AIC_DIRECT_METHOD = ("AIC_Direct",)
+_AIC_DYNOSIM_METHOD = ("AIC_DynoSim",)
 _surrogate_calls = 0
+_surrogate_cache_hits = 0
+_surrogate_budget_rejections = 0
+_surrogate_finalization_calls = 0
+_surrogate_stress_calls = 0
 # Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
-# scenario). DynoSim is deterministic, so re-probing a config the LLM already
+# scenario, method). DynoSim is deterministic, so re-probing a config the LLM already
 # evaluated THIS tick returns the identical numbers - we serve them from here
-# instead of re-running the surrogate. Reads are lock-free (atomic dict.get under
-# the GIL); writes happen under _SURROGATE_EXECUTION_LOCK (see _predict_outcome_core).
+# instead of re-running the surrogate. Access happens under
+# _SURROGATE_EXECUTION_LOCK (see _predict_outcome_core).
 # Cleared every tick by reset_tick_caches so calibration / z* / evidence updates are
 # never stale, and so a cache hit never leaks across capacity/telemetry boundaries.
 _prediction_cache: dict[str, dict[str, Any]] = {}
+_specialist_results_cache: dict[str, dict[str, dict[str, Any]]] = {}
+_scored_candidates_cache: dict[str, dict[str, Any]] = {}
 
 
 class SurrogateBudgetExceeded(RuntimeError):
-    """Raised when a tick exceeds SURROGATE_CALL_BUDGET distinct surrogate sims."""
+    """Raised when a search call would exceed the tick's surrogate budget."""
+
+
+def configure_surrogate_call_budget(limit: int) -> None:
+    """Set the per-tick search-call limit without resetting current metrics."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError("surrogate call budget must be an integer")
+    if limit < 0:
+        raise ValueError("surrogate call budget must be >= 0")
+    global SURROGATE_CALL_BUDGET
+    with _SURROGATE_EXECUTION_LOCK:
+        SURROGATE_CALL_BUDGET = limit
+    # A result truncated under the old limit is not reusable after reconfiguration.
+    _scored_candidates_cache.clear()
+
+
+def get_surrogate_budget_status() -> dict[str, int]:
+    """Return current tick search usage and non-search surrogate accounting."""
+    with _SURROGATE_EXECUTION_LOCK:
+        return {
+            "limit": SURROGATE_CALL_BUDGET,
+            "calls_executed": _surrogate_calls,
+            "cache_hits": _surrogate_cache_hits,
+            "budget_rejections": _surrogate_budget_rejections,
+            "finalization_calls": _surrogate_finalization_calls,
+            "stress_calls": _surrogate_stress_calls,
+            "remaining": max(0, SURROGATE_CALL_BUDGET - _surrogate_calls),
+        }
+
+
+def _tick_cache_key(*values: Any) -> str | None:
+    """Build a stable key for plain per-tick tool inputs."""
+    try:
+        return json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        return None
 
 
 def reset_tick_caches() -> None:
-    """Clear per-tick caches: user envelopes and the validated BudgetBook.
+    """Clear per-tick tool caches and surrogate accounting.
 
     Must run at every tick boundary (S0 wires it via the TickRunner's
     on_tick_start hook). Without this, run_job_specialists' default-book
     path could reuse a book validated against LAST tick's capacity -
     a stale-budget hole in the anti-split-brain ordering.
     """
-    global _surrogate_calls
+    global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
+    global _surrogate_finalization_calls, _surrogate_stress_calls
     _CTX.user_envelopes = None
     _CTX.validated_budget_book = None
     with _SURROGATE_EXECUTION_LOCK:
         _surrogate_calls = 0
+        _surrogate_cache_hits = 0
+        _surrogate_budget_rejections = 0
+        _surrogate_finalization_calls = 0
+        _surrogate_stress_calls = 0
         _prediction_cache.clear()
+    _specialist_results_cache.clear()
+    _scored_candidates_cache.clear()
 
 
 # Public module functions that are NOT LLM tools (infrastructure/boot).
@@ -475,7 +537,9 @@ _NON_TOOL_NAMES = frozenset(
         "bind_tools",
         "all_callables",
         "assert_planning_ready",
+        "configure_surrogate_call_budget",
         "reset_tick_caches",
+        "stamp_plan_predictions",
     }
 )
 
@@ -599,6 +663,9 @@ def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
 def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None = None) -> dict:
     """Build the surrogate payload for one rank without mutating the rank."""
     features = _sanitize_agent_features(dict(job_features or {}))
+    arrival_share = rank.config.get("_arrival_share_rps")
+    if arrival_share is not None:
+        features["request_arrival_rate"] = float(arrival_share)
     env = None
     if rank.env is not None:
         env = list(rank.env) if isinstance(rank.env, (list, tuple)) else str(rank.env).split("|")
@@ -673,9 +740,7 @@ def _slo_thresholds_for(snapshot, job_id: str) -> dict:
     if snapshot is None:
         return {}
     thresholds = (
-        dict(snapshot.slo_thresholds(job_id) or {})
-        if hasattr(snapshot, "slo_thresholds")
-        else {}
+        dict(snapshot.slo_thresholds(job_id) or {}) if hasattr(snapshot, "slo_thresholds") else {}
     )
     features = _job_features_for(snapshot, job_id)
     for outcome, names in {
@@ -704,7 +769,12 @@ _COST_OBJS = frozenset({"cost_per_token"})
 _MARGIN_OBJS = frozenset({"slo_margin"})
 
 
-def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> dict[str, Any]:
+def _compose_job_y_hat(
+    action,
+    job_features: dict[str, Any] | None = None,
+    *,
+    method: tuple[str, ...] = _AIC_DIRECT_METHOD,
+) -> dict[str, Any]:
     """Compose a job-level y_hat from a ladder's per-rank predictions.
 
     y_hat is predicted per rank (per config); this rolls the ranks up to the
@@ -733,9 +803,11 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
         )
         try:
             payload = _rank_prediction_payload(rank, feats)
-            y = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
-                "y_hat", {}
-            )
+            y = _predict_outcome_core(
+                payload["job_config"], payload["job_features"], method=method
+            ).get("y_hat", {})
+        except SurrogateBudgetExceeded:
+            raise
         except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
             log.warning("rank y_hat rejected for job %s (%s)", action.job_id, exc)
             y = {}
@@ -744,8 +816,9 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
         except Exception:
             log.exception("rank y_hat failed for job %s", action.job_id)
             y = {}
-        if y:
-            samples.append((max(1, int(rank.n_replicas or 1)), y))
+        if not y:
+            return {}
+        samples.append((max(1, int(rank.n_replicas or 1)), y))
     if not samples:
         return {}
     # Always roll up (even a single rank) so DP is applied: a lone rank with
@@ -1431,6 +1504,7 @@ def _budget_violations(
 
 def run_job_specialists(
     max_workers: int = 8,
+    include_active: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Run bounded per-job specialists under a validated BudgetBook.
 
@@ -1442,12 +1516,14 @@ def run_job_specialists(
 
     Args:
         max_workers: Parallel specialist calls.
+        include_active: Include running jobs in addition to waiting jobs. Defaults
+            to False because the candidate builder currently consumes waiting jobs.
 
     Returns:
         Dict job_id -> JobSpecialistResult ({"job_id", "type", "ladder",
-        "predicted_y", "predicted_sigma", "budget_utilization",
-        "fitness", "marginal_value_of_more", "unused_capacity",
-        "mechanism_ids", "new_mechanism_proposals", "reasoning"}).
+        "budget_utilization", "used_capacity", "fitness",
+        "marginal_value_of_more", "unused_capacity", "mechanism_ids",
+        "new_mechanism_proposals", "reasoning"}).
 
     Raises:
         RuntimeError: If no validated book exists or no specialist
@@ -1460,11 +1536,34 @@ def run_job_specialists(
             "run_job_specialists requires the BudgetBook most recently "
             "validated by validate_budget_book. Validate first."
         )
-    job_ids = list((book.get("job_budgets") or {}).keys())
-    results = _CTX.specialist_runner.run_many(
-        jobs=job_ids, budget_book=book, max_workers=int(max_workers)
+    cache_key = _tick_cache_key(book, int(max_workers), bool(include_active))
+    if cache_key is not None and cache_key in _specialist_results_cache:
+        return copy.deepcopy(_specialist_results_cache[cache_key])
+    pending_ids = {
+        job.get("job_id", job.get("id"))
+        for job in get_pending_jobs()
+        if job.get("job_id", job.get("id"))
+    }
+    eligible_ids = set(pending_ids)
+    if include_active:
+        eligible_ids.update(
+            job.get("job_id", job.get("id"))
+            for job in get_active_jobs()
+            if job.get("job_id", job.get("id"))
+        )
+    job_ids = [job_id for job_id in (book.get("job_budgets") or {}) if job_id in eligible_ids]
+    results = (
+        _CTX.specialist_runner.run_many(
+            jobs=job_ids, budget_book=book, max_workers=int(max_workers)
+        )
+        if job_ids
+        else []
     )
-    return {str(result.get("job_id")): result for result in results}
+    by_job = {str(result.get("job_id")): result for result in results}
+    if cache_key is not None:
+        _specialist_results_cache[cache_key] = copy.deepcopy(by_job)
+        return copy.deepcopy(_specialist_results_cache[cache_key])
+    return copy.deepcopy(by_job)
 
 
 # ----------------------------------------------------------------------
@@ -1658,13 +1757,12 @@ def size_ladder(
 
         target        = required throughput (batch: budget/deadline*headroom;
                         online: arrival_rate * output_len * headroom)
-        per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap. At each d the
-                        surrogate simulates the rank at num_workers=d serving its
-                        share of the arrival rate and returns the DP-aggregate
-                        throughput + real p99 latency (queue included). Take the
-                        min d whose p99 TTFT/TPOT clear the SLO AND that keeps up
-                        with the share; the rest of the demand spills to the next
-                        rank. NO per-chain*util derate, NO linear scaling.
+        per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap. Direct cheaply
+                        screens capacity. For online jobs with latency SLOs, DynoSim
+                        verifies only a DP that can carry the share, plus max DP for
+                        a possible SLO-safe partial contribution. Take the first DP
+                        whose queue-aware TTFT/TPOT clear the SLO and keeps up; the
+                        rest of the demand spills to the next rank.
         achieved_tps  = demand actually served within SLO (SUM across ranks).
 
     Online latency GATES the replica count (queueing latency FALLS with more
@@ -1695,10 +1793,9 @@ def size_ladder(
     job_features = _sanitize_agent_features(dict(job_features or {}))
     regime = str(job_features.get("type", "online")).lower()
     is_online = regime != "batch"
-    # utilization_target is accepted for backward compatibility but no longer used:
-    # the surrogate now simulates the DP queue directly (num_workers=dp), so we do
-    # NOT derate a per-chain estimate - we SEARCH the replica count against the
-    # surrogate's own p99 latency.
+    # utilization_target is accepted for backward compatibility but no longer used.
+    # Direct screens each DP's capacity, and queue-aware verification supplies the
+    # online p99 latency; no linear per-chain utilization estimate is needed.
     _ = utilization_target
     target = (
         float(target_tps)
@@ -1708,6 +1805,7 @@ def size_ladder(
     osl = _feature_value(job_features, "osl_token_avg", "output_len_tokens_avg") or 0.0
     ttft_target = _feature_value(job_features, "target_p99_ttft_ms", "target_p99_TTFT_ms")
     tpot_target = _feature_value(job_features, "target_p99_tpot_ms", "target_p99_TPOT_ms")
+    verify_online_latency = is_online and (ttft_target is not None or tpot_target is not None)
 
     def _slo_ok(y: dict) -> bool:
         # Online latency gate. Batch has no per-request latency SLO -> always passes
@@ -1730,27 +1828,46 @@ def size_ladder(
             return False
         return not (tpot_target is not None and tpot > tpot_target)
 
+    def _slo_prediction_complete(y: dict) -> bool:
+        if not is_online:
+            return True
+        return (
+            bool(y)
+            and (
+                ttft_target is None
+                or any(y.get(key) is not None for key in ("p99_ttft_ms", "p99_TTFT_ms"))
+            )
+            and (
+                tpot_target is None
+                or any(y.get(key) is not None for key in ("p99_tpot_ms", "p99_TPOT_ms"))
+            )
+        )
+
     def _capacity_tps(y: dict) -> float:
         point = _y_value(y, "throughput_token_per_sec")
         lower = y.get("_throughput_token_per_sec_lower")
         return min(point, float(lower)) if lower is not None and float(lower) > 0 else point
 
-    def _dp_candidates(cap: int) -> list[int]:
+    def _dp_candidates(cap: int, preferred: int | None = None) -> list[int]:
         ds, d = [], 1
         while d <= cap:
             ds.append(d)
             d *= 2
         if cap >= 1 and (not ds or ds[-1] != cap):
             ds.append(cap)
+        if preferred is not None and 1 <= preferred <= cap:
+            larger = [candidate for candidate in ds if candidate > preferred]
+            smaller = [candidate for candidate in ds if candidate < preferred]
+            ds = [preferred, *larger, *smaller]
         return ds
 
     physical_rejections: list[str] = []
 
-    def _predict_at(rank: RankSpec, d: int, share_tps: float) -> dict | None:
+    def _predict_at(rank: RankSpec, d: int, share_tps: float, max_dp: int) -> dict | None:
         # Predict this rank at DP=d workers carrying `share_tps` tokens/s of demand.
-        # For online we hand that demand in as an arrival rate (share_tps/osl); the
-        # surrogate splits it across the d workers (num_workers=dp), so more workers
-        # -> less per-worker queue -> lower p99. Returns:
+        # Direct screens capacity first. DynoSim runs only when an online DP can
+        # carry the share, or at max DP to characterize a possible partial rank.
+        # Returns:
         #   dict y_hat -> the DP-aggregate prediction,
         #   {}         -> overloaded/incomplete at this DP (try more replicas),
         #   None       -> physical/memory no-fit (no replica count fixes it).
@@ -1762,25 +1879,38 @@ def size_ladder(
         payload = _rank_prediction_payload(r, feats)
         if not config_runnable(dict(r.config), payload["job_features"])[0]:
             return None
-        try:
-            prediction = _predict_outcome_core(
-                payload["job_config"], payload["job_features"], scenario="peak"
-            )
-            y_hat = dict(prediction.get("y_hat", {}))
-            lower = prediction.get("throughput_token_per_sec_lower")
-            if lower is not None:
-                y_hat["_throughput_token_per_sec_lower"] = lower
-            return y_hat
-        except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
-            log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
-            physical_rejections.append(str(exc))
-            return None
-        except SurrogateExecutionError as exc:
-            message = str(exc)
-            if message.startswith("completed ") and message.endswith(" requests"):
-                log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
-                return {}
-            raise
+
+        def _run(method: tuple[str, ...]) -> dict | None:
+            try:
+                prediction = _predict_outcome_core(
+                    payload["job_config"],
+                    payload["job_features"],
+                    scenario="peak",
+                    method=method,
+                )
+                y_hat = dict(prediction.get("y_hat", {}))
+                lower = prediction.get("throughput_token_per_sec_lower")
+                if lower is not None:
+                    y_hat["_throughput_token_per_sec_lower"] = lower
+                return y_hat
+            except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
+                log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
+                physical_rejections.append(str(exc))
+                return None
+            except SurrogateExecutionError as exc:
+                message = str(exc)
+                if message.startswith("completed ") and message.endswith(" requests"):
+                    log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
+                    return {}
+                raise
+
+        direct_y = _run(_AIC_DIRECT_METHOD)
+        if direct_y is None or not verify_online_latency:
+            return direct_y
+        direct_can_carry = bool(direct_y) and _capacity_tps(direct_y) >= 0.99 * share_tps
+        if not direct_can_carry and d != max_dp:
+            return {}
+        return _run(_AIC_DYNOSIM_METHOD)
 
     sized: list[dict[str, Any]] = []
     per_rank: list[dict[str, Any]] = []
@@ -1804,6 +1934,7 @@ def size_ladder(
     for raw in ranks:
         physical_rejection_start = len(physical_rejections)
         rank = RankSpec.from_dict(raw)
+        preferred_replicas = max(1, int(rank.n_replicas or 1))
         gpus_per_chain = rank.gpus_per_chain()
         gpu_type = env_gpu_type(rank.env)
         env_key = _env_key(rank.env)
@@ -1850,9 +1981,11 @@ def size_ladder(
             reason = "demand already covered by earlier ranks"
         else:
             met = False
-            for d in _dp_candidates(max_by_cap):
-                dp_tried = d
-                y = _predict_at(rank, d, share)
+            fallback_d = 0
+            fallback_y: dict[str, Any] = {}
+            for d in _dp_candidates(max_by_cap, preferred_replicas):
+                dp_tried = max(dp_tried, d)
+                y = _predict_at(rank, d, share, max_by_cap)
                 if y is None:
                     reason = "does not fit (memory/physical)"
                     break
@@ -1862,19 +1995,22 @@ def size_ladder(
                     reason = "overloaded at max DP" if d == max_by_cap else reason
                     continue
                 y_hat = y
+                if d >= fallback_d:
+                    fallback_d, fallback_y = d, y
                 tp = _capacity_tps(y)
                 keeps_up = tp >= 0.99 * share if share > 0 else tp > 0
                 if _slo_ok(y) and keeps_up:
                     n_replicas, served, slo_ok, reason, met = d, share, True, "ok", True
                     break
-            if not met and y_hat:
+            if not met and fallback_y:
                 # No DP up to capacity cleared SLO+keep-up at the full share. Take max
                 # capacity and serve the throughput it can push; the rest spills to
                 # the next rank. slo_ok=False here keeps meets_target honest.
+                y_hat = fallback_y
                 tp = _capacity_tps(y_hat)
                 partial = min(share, tp)
                 if partial > 0:
-                    n_replicas = _dp_candidates(max_by_cap)[-1]
+                    n_replicas = fallback_d
                     served = partial
                     slo_ok = _slo_ok(y_hat)
                     reason = "capacity-bound (partial share)" if slo_ok else "under-SLO at max DP"
@@ -1913,6 +2049,8 @@ def size_ladder(
                 "share_tps": share,
                 "served_tps": served,
                 "slo_ok": slo_ok,
+                "prediction_received": bool(y_hat),
+                "prediction_complete": _slo_prediction_complete(y_hat),
                 "reason": reason,
                 "physical_violations": physical_rejections[physical_rejection_start:],
             }
@@ -2268,6 +2406,7 @@ def predict_outcome(
     env: list[str] | tuple[str, ...] | None = None,  # TODO - Added direct env to this tool for v0
     calibrate: bool = True,
     scenario: str = "mean",
+    queue_aware: bool = False,
 ) -> dict[str, Any]:
     """Run the composed surrogate and attach its prediction lineage and DRO band.
 
@@ -2277,6 +2416,8 @@ def predict_outcome(
         mechanism: Optional mechanism context, informational only.
         env: Optional canonical [market, cloud, region, zone, gpu_type].
         calibrate: Apply the residual correction (default True).
+        queue_aware: Use DynoSim queue verification instead of the default
+            inexpensive Direct prediction.
 
     Returns:
         {"y_hat": calibrated dict, "y_hat_raw": surrogate dict,
@@ -2293,7 +2434,19 @@ def predict_outcome(
     job_config = _sanitize_agent_config(dict(config.get("job_config", config)))
     if env and len(env) == 5 and not job_config.get("gpu_type"):
         job_config["gpu_type"] = env[4]
-    return _predict_outcome_core(job_config, job_features, calibrate=calibrate, scenario=scenario)
+    is_online = _job_mode(job_features) == "online"
+    method = (
+        _AIC_DYNOSIM_METHOD
+        if is_online and (queue_aware or scenario == "peak_all_multiturn_stress")
+        else _AIC_DIRECT_METHOD
+    )
+    return _predict_outcome_core(
+        job_config,
+        job_features,
+        calibrate=calibrate,
+        scenario=scenario,
+        method=method,
+    )
 
 
 def _prediction_cache_key(
@@ -2301,6 +2454,7 @@ def _prediction_cache_key(
     job_features: dict[str, Any],
     scenario: str,
     calibrate: bool,
+    method: tuple[str, ...],
 ) -> str | None:
     """Canonical, order-stable key for the composed-prediction memo.
 
@@ -2309,7 +2463,7 @@ def _prediction_cache_key(
     """
     try:
         return json.dumps(
-            [job_config, job_features, scenario, bool(calibrate)],
+            [job_config, job_features, scenario, bool(calibrate), method],
             sort_keys=True,
             default=str,
         )
@@ -2322,76 +2476,86 @@ def _predict_outcome_core(
     job_features: dict[str, Any],
     calibrate: bool = True,
     scenario: str = "mean",
+    *,
+    method: str | tuple[str, ...] = _AIC_DIRECT_METHOD,
+    _finalization: bool = False,
 ) -> dict[str, Any]:
     """Run or reuse one composed prediction with trusted, sanitized inputs.
 
-    Cache misses remain serialized because the direct surrogate is not thread-safe.
+    Cache misses remain serialized because the composed surrogate is not thread-safe.
     The composer owns calibration; callers receive final values plus the raw and
     calibration details carried in its prediction lineage.
     """
     _require("candidate_graph", "dro", "surrogate")
-    global _surrogate_calls
-    key = _prediction_cache_key(job_config, job_features, scenario, calibrate)
+    global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
+    global _surrogate_finalization_calls, _surrogate_stress_calls
+    selected_method = (method,) if isinstance(method, str) else tuple(method)
+    key = _prediction_cache_key(job_config, job_features, scenario, calibrate, selected_method)
 
-    cached = _prediction_cache.get(key) if key is not None else None
-    if cached is None:
-        with _SURROGATE_EXECUTION_LOCK:
-            cached = _prediction_cache.get(key) if key is not None else None
-            if cached is None:
-                if scenario != "peak_all_multiturn_stress":
-                    _surrogate_calls += 1
-                    if _surrogate_calls > SURROGATE_CALL_BUDGET:
-                        raise SurrogateBudgetExceeded(
-                            f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
-                            "narrow to your best few candidate configs and reuse scored results."
-                        )
-                if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
-                    # Point-in-time cutoff prevents later evidence leaking into replayed predictions.
-                    try:
-                        y_hat, v_hat, prediction_lineage = (
-                            _CTX.surrogate.compose_prediction_with_trace(
-                                job_config=job_config,
-                                job_features=job_features,
-                                candidate_graph=_CTX.candidate_graph,
-                                method=("AIC_Direct",),
-                                scenario=scenario,
-                                as_of_timestamp_utc=time.time() if calibrate else None,
-                            )
-                        )
-                    except Exception:
-                        _persist_surrogate_trace(getattr(_CTX.surrogate, "last_trace", None))
-                        raise
-                    _persist_surrogate_trace(prediction_lineage)
-                else:
-                    result = _CTX.surrogate.compose_prediction(
+    with _SURROGATE_EXECUTION_LOCK:
+        cached = _prediction_cache.get(key) if key is not None else None
+        if cached is not None:
+            _surrogate_cache_hits += 1
+        else:
+            is_stress = scenario == "peak_all_multiturn_stress"
+            if _finalization:
+                _surrogate_finalization_calls += 1
+            elif is_stress:
+                _surrogate_stress_calls += 1
+            else:
+                if _surrogate_calls >= SURROGATE_CALL_BUDGET:
+                    _surrogate_budget_rejections += 1
+                    raise SurrogateBudgetExceeded(
+                        f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
+                        "narrow to your best few candidate configs and reuse scored results."
+                    )
+                _surrogate_calls += 1
+            if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
+                # Point-in-time cutoff prevents later evidence leaking into replayed predictions.
+                try:
+                    y_hat, v_hat, prediction_lineage = _CTX.surrogate.compose_prediction_with_trace(
                         job_config=job_config,
                         job_features=job_features,
                         candidate_graph=_CTX.candidate_graph,
-                        method=("AIC_Direct",),
+                        method=selected_method,
                         scenario=scenario,
+                        as_of_timestamp_utc=time.time() if calibrate else None,
                     )
-                    prediction_lineage = None
-                    if isinstance(result, tuple) and len(result) == 2:
-                        y_hat, v_hat = result
-                    else:
-                        y_hat = getattr(result, "y_hat", {}) or {}
-                        v_hat = getattr(result, "v_hat", {}) or {}
-                cached = {
+                except Exception:
+                    _persist_surrogate_trace(getattr(_CTX.surrogate, "last_trace", None))
+                    raise
+                _persist_surrogate_trace(prediction_lineage)
+            else:
+                result = _CTX.surrogate.compose_prediction(
+                    job_config=job_config,
+                    job_features=job_features,
+                    candidate_graph=_CTX.candidate_graph,
+                    method=selected_method,
+                    scenario=scenario,
+                )
+                prediction_lineage = None
+                if isinstance(result, tuple) and len(result) == 2:
+                    y_hat, v_hat = result
+                else:
+                    y_hat = getattr(result, "y_hat", {}) or {}
+                    v_hat = getattr(result, "v_hat", {}) or {}
+            cached = copy.deepcopy(
+                {
                     "y_hat": dict(y_hat or {}),
                     "v_hat": dict(v_hat or {}),
                     "prediction_lineage": copy.deepcopy(prediction_lineage),
                 }
-                if key is not None:
-                    _prediction_cache[key] = cached
+            )
+            if key is not None:
+                _prediction_cache[key] = copy.deepcopy(cached)
 
+    cached = copy.deepcopy(cached)
     y_hat = dict(cached["y_hat"])
     v_hat = dict(cached["v_hat"])
-    prediction_lineage = copy.deepcopy(cached.get("prediction_lineage"))
+    prediction_lineage = cached.get("prediction_lineage")
     y_hat_raw = ((prediction_lineage or {}).get("raw") or {}).get("y_hat") or dict(y_hat)
     offsets = ((prediction_lineage or {}).get("calibration") or {}).get("offsets_y") or {}
-    lower_throughput = ((prediction_lineage or {}).get("fusion") or {}).get(
-        "lower_throughput"
-    )
+    lower_throughput = ((prediction_lineage or {}).get("fusion") or {}).get("lower_throughput")
 
     dro_band = _CTX.dro.compute_dro_band(y_hat or {})
     return {
@@ -2443,6 +2607,11 @@ def _attach_peak_multiturn_stress(action: dict[str, Any], job_features: dict[str
                 payload["job_features"],
                 calibrate=False,
                 scenario="peak_all_multiturn_stress",
+                method=(
+                    _AIC_DYNOSIM_METHOD
+                    if _job_mode(job_features) == "online"
+                    else _AIC_DIRECT_METHOD
+                ),
             )
             y = dict(pred.get("y_hat_raw") or pred.get("y_hat") or {})
             v = dict(pred.get("v_hat") or {})
@@ -2463,6 +2632,22 @@ def _attach_peak_multiturn_stress(action: dict[str, Any], job_features: dict[str
     action.setdefault("selection_diagnostics", {})["peak_all_multiturn_stress"] = diagnostic
 
 
+def _decision_required_objectives(snapshot, action, job_features: dict[str, Any]) -> list[str]:
+    """Hard objectives whose decision-time bands must be evaluated later."""
+    required = {
+        str(objective)
+        for objective, threshold in _slo_thresholds_for(snapshot, action.job_id).items()
+        if threshold is not None
+    }
+    try:
+        target_tps = action.target_tps or required_throughput_enumerator(job_features)
+        if float(target_tps or 0.0) > 0:
+            required.add(_THROUGHPUT_OBJ)
+    except (TypeError, ValueError):
+        pass
+    return sorted(required)
+
+
 def stamp_plan_predictions(plan, cluster_snapshot=None):
     """Attach raw per-rank predictions to the plan that will be deployed."""
     typed = _as_plan(plan)
@@ -2471,20 +2656,28 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
         if action.type not in LADDER_ACTIONS or not action.ladder:
             continue
         job_features = _job_features_for(snapshot, action.job_id)
+        method = _AIC_DYNOSIM_METHOD if _job_mode(job_features) == "online" else _AIC_DIRECT_METHOD
+        required_objectives = _decision_required_objectives(snapshot, action, job_features)
         for rank in action.ladder:
             payload = _rank_prediction_payload(rank, job_features)
             pred = _predict_outcome_core(
-                payload["job_config"], payload["job_features"], calibrate=False, scenario="peak"
+                payload["job_config"],
+                payload["job_features"],
+                calibrate=False,
+                scenario="peak",
+                method=method,
+                _finalization=True,
             )
             rank.predicted_y = dict(pred.get("y_hat") or pred.get("y_hat_raw") or {})
             rank.predicted_v = dict(pred.get("v_hat") or {})
             lineage = compact_prediction_lineage(pred.get("prediction_lineage"))
-            if lineage:
-                lineage["deployment_id"] = (
-                    f"deploy:{typed.tick}:{action.job_id}:{rank.rank_id or 'rank'}"
-                )
-                lineage["evidence_baseline"] = "pre_calibration"
-            rank.prediction_lineage = lineage or None
+            lineage["decision_dro_band"] = copy.deepcopy(pred.get("dro_band") or {})
+            lineage["decision_required_objectives"] = list(required_objectives)
+            lineage["deployment_id"] = (
+                f"deploy:{typed.tick}:{action.job_id}:{rank.rank_id or 'rank'}"
+            )
+            lineage["evidence_baseline"] = "pre_calibration"
+            rank.prediction_lineage = lineage
     return typed
 
 
@@ -2892,7 +3085,8 @@ def compute_sigma(plan) -> dict[str, Any]:
         job_mode = _job_mode(job_features)
         w_t = _CTX.slow_loop.get_sss_wt(job_type=job_mode)
         w_cost = float((w_t or {}).get("cost_per_token", 0.0) or 0.0)
-        y_hat = _compose_job_y_hat(action, job_features)
+        prediction_method = _AIC_DYNOSIM_METHOD if job_mode == "online" else _AIC_DIRECT_METHOD
+        y_hat = _compose_job_y_hat(action, job_features, method=prediction_method)
         if not y_hat:
             continue
         # Score against the job's OWN SLO/throughput TARGET, not the absolute z*
@@ -3136,6 +3330,30 @@ def _online_slo_targets(features: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _online_sizing_rejection(
+    sized: dict[str, Any], features: dict[str, Any]
+) -> tuple[str, str] | None:
+    """Reject online partial service when a latency SLO was declared."""
+    targets = _online_slo_targets(features)
+    if _job_mode(features) != "online" or not any(value is not None for value in targets.values()):
+        return None
+    per_rank = sized.get("per_rank") or []
+    if any(
+        rank.get("prediction_received") and rank.get("prediction_complete") is False
+        for rank in per_rank
+    ):
+        return "prediction_incomplete", "surrogate prediction omitted a declared TTFT/TPOT SLO"
+    if any(
+        rank.get("slo_ok") is False
+        and (rank.get("prediction_received") or "under-SLO" in str(rank.get("reason") or ""))
+        for rank in per_rank
+    ):
+        return "under_slo", "predicted TTFT/TPOT does not meet the declared online SLO"
+    if sized.get("ranks") and not sized.get("meets_target"):
+        return "under_target", "online frame does not provide full-service throughput"
+    return None
+
+
 def _normalize_candidate_rank(raw: Any) -> dict[str, Any] | None:
     """Clean any proposed rank to the canonical shape, or None if unusable."""
     if not isinstance(raw, dict):
@@ -3184,6 +3402,7 @@ def _rank_shape_key(rank: dict[str, Any]) -> tuple:
         cfg.get("pp"),
         cfg.get("gpu_count"),
         cfg.get("num_nodes_per_chain"),
+        rank.get("n_replicas", 1),
     )
 
 
@@ -3218,6 +3437,9 @@ def _score_one_frame(
     scored_rank["mechanism_id"] = mid
     try:
         sized = size_ladder([scored_rank], features)
+    except SurrogateBudgetExceeded as exc:
+        diag.update(status="budget_exhausted", reason=str(exc))
+        return {"candidate": None, "meets_target": False, "diag": diag}
     except Exception as exc:
         diag.update(status="size_error", reason=f"size_ladder failed: {exc}")
         return {"candidate": None, "meets_target": False, "diag": diag}
@@ -3234,6 +3456,16 @@ def _score_one_frame(
         unmet_tps=unmet_tps,
         served_fraction=served_fraction,
     )
+    online_rejection = _online_sizing_rejection(sized, features)
+    if online_rejection is not None:
+        status, reason = online_rejection
+        diag.update(status=status, reason=reason)
+        return {
+            "candidate": None,
+            "composite_eligible": status == "under_target",
+            "meets_target": False,
+            "diag": diag,
+        }
     if not ranks:
         diag.update(
             status="no_fit",
@@ -3265,10 +3497,12 @@ def _score_one_frame(
             return {"candidate": None, "meets_target": meets, "diag": diag}
         score = compute_sigma(one)["per_job"][jid]
         act["sigma"] = score["sigma"]
+    except SurrogateBudgetExceeded as exc:
+        diag.update(status="budget_exhausted", reason=str(exc))
+        return {"candidate": None, "meets_target": meets, "diag": diag}
     except Exception as exc:
         diag.update(status="score_error", reason=f"scoring failed: {exc}")
         return {"candidate": None, "meets_target": meets, "diag": diag}
-    _attach_peak_multiturn_stress(act, features)
     diag.update(status="ok", **score)
     return {"candidate": act, "meets_target": meets, "diag": diag}
 
@@ -3315,6 +3549,9 @@ def _score_composite(
         return {"candidate": None, "meets_target": False, "diag": diag}
     try:
         sized = size_ladder(scored_ranks, features)
+    except SurrogateBudgetExceeded as exc:
+        diag.update(status="budget_exhausted", reason=str(exc))
+        return {"candidate": None, "meets_target": False, "diag": diag}
     except Exception as exc:
         diag.update(status="size_error", reason=f"size_ladder failed: {exc}")
         return {"candidate": None, "meets_target": False, "diag": diag}
@@ -3333,6 +3570,11 @@ def _score_composite(
         unmet_tps=unmet_tps,
         served_fraction=served_fraction,
     )
+    online_rejection = _online_sizing_rejection(sized, features)
+    if online_rejection is not None:
+        status, reason = online_rejection
+        diag.update(status=status, reason=reason)
+        return {"candidate": None, "meets_target": False, "diag": diag}
     if len(sized_ranks) < 2:
         # size_ladder covered the target (or ran out) on ONE rank - no composite;
         # the single-frame candidate already represents it.
@@ -3365,12 +3607,35 @@ def _score_composite(
             return {"candidate": None, "meets_target": meets, "diag": diag}
         score = compute_sigma(one)["per_job"][jid]
         act["sigma"] = score["sigma"]
+    except SurrogateBudgetExceeded as exc:
+        diag.update(status="budget_exhausted", reason=str(exc))
+        return {"candidate": None, "meets_target": meets, "diag": diag}
     except Exception as exc:
         diag.update(status="score_error", reason=f"scoring failed: {exc}")
         return {"candidate": None, "meets_target": meets, "diag": diag}
-    _attach_peak_multiturn_stress(act, features)
     diag.update(status="ok", **score)
     return {"candidate": act, "meets_target": meets, "diag": diag}
+
+
+def _budget_skipped_frame(rank: dict[str, Any]) -> dict[str, Any]:
+    """Diagnostic placeholder for a frame not attempted after cap exhaustion."""
+    env = rank.get("env")
+    cfg = rank.get("config") or {}
+    return {
+        "candidate": None,
+        "meets_target": False,
+        "diag": {
+            "env": env_gpu_type(env) if env else None,
+            "instance_type": cfg.get("instance_type"),
+            "tp": cfg.get("tp"),
+            "status": "budget_skipped",
+            "reason": "not attempted after surrogate search budget exhaustion",
+            "meets_target": False,
+            "achieved_tps": None,
+            "target_tps": None,
+            "sigma": None,
+        },
+    }
 
 
 def build_scored_candidates(
@@ -3395,27 +3660,32 @@ def build_scored_candidates(
     part of a job to A100 so another job keeps the H100) when that is the best
     cluster outcome.
 
-    EVERY physically-runnable, feasible frame is returned as a candidate - INCLUDING
-    under-target ones - because placing a job beats deferring it; the joint solver
-    decides serve-vs-defer from the scored sigma, not a hard meets_target gate here.
-    A job appears in `exhausted` only when it has NO runnable, feasible frame at all.
+    EVERY physically-runnable, feasible batch frame is returned as a candidate.
+    Online jobs that declare latency SLOs require a complete, full-service SLO-meeting
+    prediction for standalone placement; SLO-safe partials remain internal inputs to
+    composite construction. A job appears in `exhausted` only when it has NO runnable,
+    feasible frame; budget-truncated jobs are reported separately.
 
     Returns {"candidates": [...for jointly_select_placements],
              "exhausted": {job_id: reason},
+             "budget_limited": {job_id: reason},
              "diagnostics": {job_id: [per-frame diag incl. meets_target/achieved_tps]}}.
     """
     _require("resource_map", "surrogate")
+    cache_key = _tick_cache_key(budget_book, specialist_results)
+    if cache_key is not None and cache_key in _scored_candidates_cache:
+        return copy.deepcopy(_scored_candidates_cache[cache_key])
     snapshot = _snapshot()
     specs = instance_catalog()
-    gpu_type_env: dict[str, list[str]] = {}
-    for env_key, info in get_resource_map().items():
+    free_envs: list[tuple[str, list[str]]] = []
+    for raw_env_key, info in sorted(get_resource_map().items(), key=lambda item: _env_key(item[0])):
         try:
             if int(info.get("free", 0) or 0) <= 0:
                 continue
         except (TypeError, ValueError):
             continue
-        gpu_type = info.get("gpu_type") or str(env_key).split("|")[-1]
-        gpu_type_env.setdefault(str(gpu_type), str(env_key).split("|"))
+        env_key = _env_key(raw_env_key)
+        free_envs.append((env_key, env_key.split("|")))
 
     spec_by_job: dict[str, dict[str, Any]] = {}
     if isinstance(specialist_results, dict):
@@ -3438,7 +3708,10 @@ def build_scored_candidates(
     # (tp2*DP4 .. tp8*DP1) for big ones; the solver picks the best-sigma survivor.
     frames_by_job: dict[str, list[dict[str, Any]]] = {}
     ctx_by_job: dict[str, tuple[Any, Any, dict[str, Any]]] = {}
-    for job in get_pending_jobs():
+    pending_jobs = sorted(
+        get_pending_jobs(), key=lambda job: str(job.get("job_id", job.get("id", "")))
+    )
+    for job in pending_jobs:
         jid = job.get("job_id", job.get("id"))
         if not jid:
             continue
@@ -3461,8 +3734,8 @@ def build_scored_candidates(
         # the box - fill it; size_ladder scales n_replicas across instances for
         # throughput, and Phase 2.5 spans pools when one is not enough. Specialist
         # ladders above stay as hints (deduped by shape).
-        for _gpu_type, env in gpu_type_env.items():
-            for instance_type, spec in (specs.get(_env_key(env)) or {}).items():
+        for env_key, env in free_envs:
+            for instance_type, spec in sorted((specs.get(env_key) or {}).items()):
                 gpi = int(spec.get("gpus_per_instance", 0) or 0)
                 if gpi <= 0 or int(spec.get("free_instances", 0) or 0) <= 0:
                     continue
@@ -3486,26 +3759,31 @@ def build_scored_candidates(
         frames_by_job[jid] = frames
         ctx_by_job[jid] = (user_id, slice_id, features)
 
-    # Phase 2 (surrogate-heavy): score EVERY frame across all jobs CONCURRENTLY.
-    # Each _score_one_frame runs size_ladder + check_feasibility + compute_sigma -
-    # tens of seconds of surrogate each - so scoring them serially blew the tick
-    # (~7 min). Fan the leaf scorings out on a thread pool: the surrogate runs its
-    # own worker pool and concurrent tool calls are already used safely in the REPL.
-    tasks = [
-        (jid, ctx_by_job[jid][0], ctx_by_job[jid][1], rank, ctx_by_job[jid][2])
-        for jid, frames in frames_by_job.items()
-        for rank in frames
-    ]
+    # Phase 2 (surrogate-heavy): deterministic round-robin over jobs. The surrogate
+    # is globally serialized, so threads add no throughput and obscure which jobs
+    # received the final calls. Specialist frame 0 leads for every job before any
+    # job receives frame 1.
     scored_by_job: dict[str, list[dict[str, Any]]] = {jid: [] for jid in frames_by_job}
-    if tasks:
+    budget_exhausted = False
+    max_frames = max((len(frames) for frames in frames_by_job.values()), default=0)
+    for frame_index in range(max_frames):
+        for jid, frames in frames_by_job.items():
+            if frame_index >= len(frames):
+                continue
+            user_id, slice_id, features = ctx_by_job[jid]
+            scored = _score_one_frame(jid, user_id, slice_id, frames[frame_index], features)
+            scored_by_job[jid].append(scored)
+            if scored.get("diag", {}).get("status") == "budget_exhausted":
+                budget_exhausted = True
+                break
+        if budget_exhausted:
+            break
 
-        def _run(task: tuple) -> tuple:
-            jid, user_id, slice_id, rank, features = task
-            return jid, _score_one_frame(jid, user_id, slice_id, rank, features)
-
-        with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
-            for jid, scored in pool.map(_run, tasks):
-                scored_by_job[jid].append(scored)
+    if budget_exhausted:
+        for jid, frames in frames_by_job.items():
+            results = scored_by_job[jid]
+            for rank in frames[len(results) :]:
+                results.append(_budget_skipped_frame(rank))
 
     # Phase 2.5 (heterogeneous composites). Two motivations:
     #  - CAPACITY: if NO single pool meets the target, span pools (fill the
@@ -3519,66 +3797,131 @@ def build_scored_candidates(
     # candidate by sigma (which includes the bounded cost term), so if no mix is both
     # cheaper AND SLO-meeting, the single pool still wins. A cheapest-first ordering
     # whose cheapest pool already meets alone collapses to <2 ranks -> no composite.
-    # scored_by_job[jid] aligns with frames_by_job[jid] (thread pool preserves order).
+    # scored_by_job[jid] aligns with frames_by_job[jid].
     try:
         w_cost = float((_CTX.slow_loop.get_sss_wt() or {}).get("cost_per_token", 0.0) or 0.0)
     except Exception:
         w_cost = 0.0
-    for jid, frames in frames_by_job.items():
-        results = scored_by_job.get(jid) or []
-        runnable = [
-            (f, r) for f, r in zip(frames, results, strict=False) if r.get("candidate") is not None
-        ]
-        if not runnable:
-            continue
-        user_id, slice_id, features = ctx_by_job[jid]
-        single_meets = any(r.get("meets_target") for _, r in runnable)
-        orders: list[list[dict[str, Any]]] = []
-        if not single_meets:
-            orders.append(
-                [
-                    f
-                    for f, _ in sorted(
-                        runnable,
-                        key=lambda fr: fr[1]["diag"].get("achieved_tps") or 0.0,
-                        reverse=True,
-                    )
-                ]
-            )
-        if w_cost > 0:
-            orders.append(
-                [
-                    f
-                    for f, _ in sorted(
-                        runnable, key=lambda fr: fr[1]["diag"].get("cost_penalty") or 0.0
-                    )
-                ]
-            )
-        for order in orders:
-            composite = _score_composite(jid, user_id, slice_id, order, features)
-            if composite is not None:
+    if not budget_exhausted:
+        for jid, frames in frames_by_job.items():
+            results = scored_by_job.get(jid) or []
+            composable = [
+                (f, r)
+                for f, r in zip(frames, results, strict=False)
+                if r.get("candidate") is not None or r.get("composite_eligible")
+            ]
+            if not composable:
+                continue
+            user_id, slice_id, features = ctx_by_job[jid]
+            single_meets = any(r.get("meets_target") for _, r in composable)
+            orders: list[list[dict[str, Any]]] = []
+            if not single_meets:
+                orders.append(
+                    [
+                        f
+                        for f, _ in sorted(
+                            composable,
+                            key=lambda fr: fr[1]["diag"].get("achieved_tps") or 0.0,
+                            reverse=True,
+                        )
+                    ]
+                )
+            if w_cost > 0:
+                orders.append(
+                    [
+                        f
+                        for f, _ in sorted(
+                            composable, key=lambda fr: fr[1]["diag"].get("cost_penalty") or 0.0
+                        )
+                    ]
+                )
+            for order in orders:
+                composite = _score_composite(jid, user_id, slice_id, order, features)
                 scored_by_job[jid].append(composite)
+                if composite.get("diag", {}).get("status") == "budget_exhausted":
+                    budget_exhausted = True
+                    break
+            if budget_exhausted:
+                break
 
-    # Phase 3 (cheap): group into candidates / exhausted / diagnostics. Every
-    # feasible frame is a candidate - INCLUDING under-target ones (placing beats
-    # deferring; the joint solver decides serve-vs-defer from sigma). `exhausted` =
-    # a job with NO runnable, feasible frame at all, not merely "under target".
+    if budget_exhausted:
+        for _jid, scored_list in scored_by_job.items():
+            composable = [
+                item
+                for item in scored_list
+                if item.get("candidate") is not None or item.get("composite_eligible")
+            ]
+            single_meets = any(item.get("meets_target") for item in composable)
+            composite_was_relevant = len(composable) >= 2 and (not single_meets or w_cost > 0)
+            has_composite_result = any(
+                item.get("diag", {}).get("env") == "composite" for item in scored_list
+            )
+            has_budget_status = any(
+                item.get("diag", {}).get("status") in {"budget_exhausted", "budget_skipped"}
+                for item in scored_list
+            )
+            if composite_was_relevant and not has_composite_result and not has_budget_status:
+                scored_list.append(
+                    {
+                        "candidate": None,
+                        "meets_target": False,
+                        "diag": {
+                            "env": "composite",
+                            "instance_type": None,
+                            "tp": None,
+                            "status": "budget_skipped",
+                            "reason": (
+                                "composite not attempted after surrogate search budget exhaustion"
+                            ),
+                            "meets_target": False,
+                            "achieved_tps": None,
+                            "target_tps": None,
+                            "sigma": None,
+                        },
+                    }
+                )
+
+    # Phase 3 (cheap): group into candidates / exhausted / diagnostics. Batch may
+    # retain under-target frames; online frames with declared latency SLOs passed
+    # the full-service gate above. Budget-truncated jobs never become exhausted.
     candidates: list[dict[str, Any]] = []
     exhausted: dict[str, str] = {}
+    budget_limited: dict[str, str] = {}
     diagnostics: dict[str, list[dict[str, Any]]] = {}
     for jid, scored_list in scored_by_job.items():
         job_diag = [s["diag"] for s in scored_list]
         job_candidates = [s["candidate"] for s in scored_list if s["candidate"] is not None]
         diagnostics[jid] = job_diag
+        limited = [
+            diag
+            for diag in job_diag
+            if diag.get("status") in {"budget_exhausted", "budget_skipped"}
+        ]
+        if limited:
+            reasons = [diag["reason"] for diag in limited if diag.get("reason")]
+            budget_limited[jid] = (
+                "; ".join(dict.fromkeys(reasons))
+                if reasons
+                else "surrogate search budget exhausted"
+            )
         if job_candidates:
             candidates.extend(job_candidates)
-        else:
+        elif not limited:
             reasons = [d["reason"] for d in job_diag if d.get("reason")]
             exhausted[jid] = (
                 "; ".join(dict.fromkeys(reasons)) if reasons else "no runnable, feasible frame"
             )
 
-    return {"candidates": candidates, "exhausted": exhausted, "diagnostics": diagnostics}
+    result = {
+        "candidates": candidates,
+        "exhausted": exhausted,
+        "budget_limited": budget_limited,
+        "diagnostics": diagnostics,
+    }
+    if cache_key is not None:
+        _scored_candidates_cache[cache_key] = copy.deepcopy(result)
+        return copy.deepcopy(_scored_candidates_cache[cache_key])
+    return copy.deepcopy(result)
 
 
 def jointly_select_placements(
@@ -3807,15 +4150,11 @@ def check_feasibility(plan) -> dict[str, Any]:
 
 
 def plan_tick() -> dict[str, Any]:
-    """Run the FULL deterministic tick pipeline and return a ready-to-commit plan.
+    """Run the full deterministic pipeline as a one-call planning recommendation.
 
-    The root's entire job is ``FINAL_VAR(plan_tick())``. This closes the weak-root
-    failure mode observed in the wild: the LLM re-runs the pipeline itself, sees the
-    (perfectly normal) negative sigmas, panics, and commits an all-defer plan even
-    though ``jointly_select_placements`` already PLACED every job feasibly. plan_tick
-    makes the serve-vs-defer call non-negotiable - the returned plan IS the joint
-    solver's decision, built straight from ``chosen``. Negative sigma is expected and
-    is NOT a defer reason; do not rebuild this plan, add defers, or re-judge sigma.
+    The root may commit this result directly or make a reasoned, feasible adjustment.
+    This shortcut must not be combined with a second execution of the same pipeline in
+    one tick. Negative sigma is expected and is not, by itself, a reason to defer.
 
     Sequence is byte-for-byte the documented MANDATORY ORDER:
       build_user_envelopes -> get_priority -> allocate_budget_book ->
@@ -3843,12 +4182,14 @@ def plan_tick() -> dict[str, Any]:
     chosen = list(joint.get("chosen", []) or [])
     deferred = list(joint.get("deferred", []) or [])
     exhausted = scored.get("exhausted", {}) or {}
+    budget_limited = scored.get("budget_limited", {}) or {}
     plan: dict[str, Any] = {
         "tick_rationale": (
             f"plan_tick: joint solver placed {len(chosen)} job(s) "
             f"(objective={joint.get('objective')}); deferred={deferred}; "
-            f"exhausted={list(exhausted.keys())}. Committed AS-IS from "
-            "jointly_select_placements - negative sigma is normal, NOT a defer reason."
+            f"candidate_exhausted={list(exhausted.keys())}; "
+            f"budget_limited={list(budget_limited.keys())}. Recommended by "
+            "jointly_select_placements; negative sigma is normal, NOT a defer reason."
         ),
         "actions": chosen,
     }
