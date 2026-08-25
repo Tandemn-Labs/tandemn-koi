@@ -293,6 +293,11 @@ class DeploymentXSmokeTests(unittest.TestCase):
         first["shape_json"]["rank_traffic_share"] = 0.4
         second["shape_json"]["rank_id"] = "rank_b"
         second["shape_json"]["rank_traffic_share"] = 0.6
+        for chain in (first, second):
+            chain["shape_json"]["prediction_lineage"]["partial_admission"] = {
+                "mode": "advisory",
+                "enforced": False,
+            }
 
         index = build_deployment_x_index(
             snapshot,
@@ -303,6 +308,57 @@ class DeploymentXSmokeTests(unittest.TestCase):
 
         self.assertEqual(index.resolve("job_1", "rank_a").x["request_arrival_rate"], 40.0)
         self.assertEqual(index.resolve("job_1", "rank_b").x["request_arrival_rate"], 60.0)
+
+    def test_single_rank_honors_explicit_traffic_share(self):
+        snapshot = _snapshot()
+        for chain in snapshot.active_jobs[0]["active_chains"]:
+            chain["shape_json"]["rank_traffic_share"] = 0.4
+
+        index = build_deployment_x_index(
+            snapshot,
+            hardware_catalog=_hardware_catalog(),
+            model_catalogs=_model_catalogs(),
+            x_fields=_x_fields(),
+        )
+
+        self.assertEqual(index.resolve("job_1", "rank_a").x["request_arrival_rate"], 40.0)
+
+    def test_single_rank_advisory_unenforced_share_uses_full_observed_load(self):
+        snapshot = _snapshot()
+        evidence = {
+            "mode": "advisory",
+            "requested_tps": 100.0,
+            "admitted_tps": 40.0,
+            "served_fraction": 0.4,
+            "enforced": False,
+        }
+        for chain in snapshot.active_jobs[0]["active_chains"]:
+            chain["shape_json"]["rank_traffic_share"] = 0.4
+            chain["shape_json"]["prediction_lineage"]["partial_admission"] = evidence
+
+        index = build_deployment_x_index(
+            snapshot,
+            hardware_catalog=_hardware_catalog(),
+            model_catalogs=_model_catalogs(),
+            x_fields=_x_fields(),
+        )
+
+        self.assertEqual(index.resolve("job_1", "rank_a").x["request_arrival_rate"], 100.0)
+
+    def test_explicit_traffic_share_must_be_finite_and_bounded(self):
+        for share in (0.0, -0.1, 1.1, float("inf"), float("nan")):
+            with self.subTest(share=share):
+                snapshot = _snapshot()
+                for chain in snapshot.active_jobs[0]["active_chains"]:
+                    chain["shape_json"]["rank_traffic_share"] = share
+
+                with self.assertRaisesRegex(ValueError, "finite and in"):
+                    build_deployment_x_index(
+                        snapshot,
+                        hardware_catalog=_hardware_catalog(),
+                        model_catalogs=_model_catalogs(),
+                        x_fields=_x_fields(),
+                    )
 
     def test_idle_index_needs_no_catalogs(self):
         snapshot = ClusterResourceSnapshot(

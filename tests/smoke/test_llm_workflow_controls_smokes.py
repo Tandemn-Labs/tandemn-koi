@@ -427,21 +427,35 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertEqual(defaults.k_max, 4)
         self.assertEqual(defaults.surrogate_call_budget, 100)
         self.assertEqual(defaults.surrogate_lower_quantile, 0.05)
+        self.assertEqual(defaults.partial_online_admission, "off")
 
         with patch.dict(
             os.environ,
             {
                 "KOI_SURROGATE_CALL_BUDGET": "37",
                 "KOI_SURROGATE_LOWER_QUANTILE": "0.2",
+                "KOI_PARTIAL_ONLINE_ADMISSION": "advisory",
             },
             clear=True,
         ):
             environment = runner.parse_args([])
         self.assertEqual(environment.surrogate_call_budget, 37)
         self.assertEqual(environment.surrogate_lower_quantile, 0.2)
+        self.assertEqual(environment.partial_online_admission, "advisory")
 
         with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
             runner.parse_args(["--surrogate-call-budget", "0"])
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
+            runner.parse_args(["--partial-online-admission", "enabled"])
+        with (
+            patch.dict(
+                os.environ,
+                {"KOI_PARTIAL_ONLINE_ADMISSION": "enabled"},
+                clear=True,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            runner.parse_args([])
 
         with patch.dict(os.environ, {}, clear=True):
             args = runner.parse_args(
@@ -452,22 +466,36 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
                     "test-key",
                     "--surrogate-call-budget",
                     "17",
+                    "--partial-online-admission",
+                    "advisory",
                 ]
             )
         with (
-            patch.object(agent_tools, "configure_surrogate_call_budget") as configure,
+            patch.object(agent_tools, "configure_surrogate_call_budget") as configure_budget,
+            patch.object(
+                agent_tools,
+                "configure_partial_online_admission",
+                create=True,
+            ) as configure_admission,
             patch.object(runner, "PostgresClient", side_effect=RuntimeError("stop after wiring")),
             self.assertRaisesRegex(RuntimeError, "stop after wiring"),
         ):
             runner.build_runner(args)
-        configure.assert_called_once_with(17)
+        configure_budget.assert_called_once_with(17)
+        configure_admission.assert_called_once_with("advisory")
 
-    def test_root_prompt_prescribes_one_pipeline_or_one_shortcut(self):
+    def test_root_prompt_prescribes_workflow_and_full_service_when_admission_is_off(self):
         harness = KoiAgentHarness.__new__(KoiAgentHarness)
         harness.k_max = 4
         harness.wall_clock_sec = 240.0
 
-        prompt = harness.build_root_prompt(tick=9)
+        with patch.object(
+            agent_tools,
+            "get_partial_online_admission_status",
+            return_value={"mode": "off"},
+            create=True,
+        ):
+            prompt = harness.build_root_prompt(tick=9)
         specialist_prompt = SpecialistRunner._default_prompt("job_1", {}, {})
 
         self.assertEqual(prompt.count("run_job_specialists()"), 1)
@@ -482,9 +510,13 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertIn("not a mandatory extra turn", prompt)
         self.assertIn("scored['diagnostics']", prompt)
         self.assertIn("scored['budget_limited']", prompt)
+        self.assertIn("PARTIAL ONLINE ADMISSION MODE: off", prompt)
+        self.assertIn("Online throughput remains full-service admission", prompt)
         self.assertIn("Online candidates are SLO-complete, full-service", prompt)
+        self.assertNotIn("positive partial throughput candidates can be selected", prompt)
         self.assertIn("Any allowed batch partial candidate", prompt)
         self.assertIn("meets_target and served_fraction", prompt)
+        self.assertIn("Optional partial-admission metadata", prompt)
         self.assertIn("include an explicit DEFER action", prompt)
         self.assertNotIn("solver owns the pick", prompt)
         self.assertNotIn("FINAL_VAR(plan_tick())", prompt)
@@ -497,6 +529,61 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         )
         self.assertNotIn("predicted_y", specialist_prompt)
         self.assertNotIn("predicted_sigma", specialist_prompt)
+        for field in (
+            "admitted_tps",
+            "achieved_tps",
+            "unmet_tps",
+            "meets_target",
+            "served_fraction",
+            "admission_mode",
+            "rank_traffic_share",
+        ):
+            self.assertIn(field, prompt)
+
+    def test_root_prompt_describes_advisory_partial_online_contract(self):
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        harness.k_max = 4
+        harness.wall_clock_sec = 240.0
+
+        with patch.object(
+            agent_tools,
+            "get_partial_online_admission_status",
+            return_value={"mode": "advisory"},
+            create=True,
+        ):
+            prompt = harness.build_root_prompt(tick=9)
+
+        self.assertIn("PARTIAL ONLINE ADMISSION MODE: advisory", prompt)
+        self.assertIn("benchmark/experimental", prompt)
+        self.assertIn("Latency SLOs remain hard at the tested admitted load", prompt)
+        self.assertIn("positive partial throughput candidates can be selected", prompt)
+        self.assertIn(
+            "must preserve admitted_tps, achieved_tps, unmet_tps, meets_target, "
+            "served_fraction, and admission_mode",
+            prompt,
+        )
+        self.assertIn("every selected rank must preserve rank_traffic_share", prompt)
+        self.assertIn(
+            "WARNING: Store receives an advisory admitted target, but the current "
+            "Orca/router may still route full traffic; this mode does not imply enforcement. "
+            "It is benchmark-only and unsafe for production SLO guarantees.",
+            prompt,
+        )
+        self.assertIn("Never claim full traffic is throttled", prompt)
+        self.assertNotIn("Online candidates are SLO-complete, full-service", prompt)
+        self.assertIn("in that same REPL turn", prompt)
+        self.assertIn("You are the final decision-maker", prompt)
+        self.assertIn("Optional partial-admission metadata", prompt)
+        for field in (
+            "admitted_tps",
+            "achieved_tps",
+            "unmet_tps",
+            "meets_target",
+            "served_fraction",
+            "admission_mode",
+            "rank_traffic_share",
+        ):
+            self.assertIn(field, prompt)
 
     def test_tick_summary_and_surrogate_trace_keep_compact_provenance(self):
         ctx = types.SimpleNamespace(
@@ -548,6 +635,11 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             args = runner.parse_args(["--api-key", "do-not-log"])
         budget_status = {"limit": 100, "calls_executed": 0, "remaining": 100}
+        admission_status = {
+            "mode": "off",
+            "advisory_enabled": False,
+            "router_enforcement_guaranteed": False,
+        }
         with tempfile.TemporaryDirectory() as log_dir:
             logger = DebugLogger(log_dir, trace="no-llm", run_id="manifest-controls")
             with (
@@ -555,6 +647,12 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
                     runner.agent_tools,
                     "get_surrogate_budget_status",
                     return_value=budget_status,
+                ),
+                patch.object(
+                    runner.agent_tools,
+                    "get_partial_online_admission_status",
+                    return_value=admission_status,
+                    create=True,
                 ),
                 patch.object(runner, "_source_revision", return_value="466d69f"),
                 patch.object(runner, "_source_dirty", return_value=True),
@@ -568,6 +666,8 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertEqual(event["payload"]["surrogate_budget"], budget_status)
         self.assertEqual(event["payload"]["config"]["surrogate_call_budget"], 100)
         self.assertEqual(event["payload"]["config"]["surrogate_lower_quantile"], 0.05)
+        self.assertEqual(event["payload"]["config"]["partial_online_admission"], "off")
+        self.assertEqual(event["payload"]["partial_online_admission"], admission_status)
         self.assertNotIn("do-not-log", json.dumps(event))
         self.assertNotIn("api_key", json.dumps(event))
 

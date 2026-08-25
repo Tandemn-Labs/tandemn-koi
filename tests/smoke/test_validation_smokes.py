@@ -319,6 +319,183 @@ class ValidationSmokeTests(unittest.TestCase):
                 self.assertFalse(result.feasible)
                 self.assertTrue(any(expected in violation for violation in result.violations))
 
+    def test_validator_accepts_consistent_partial_admission_without_predictions(self):
+        result = Validator().val_plan(_raw_partial_plan())
+
+        self.assertTrue(result.feasible, result.violations)
+
+    def test_validator_accepts_full_service_accounting_without_admission_fields(self):
+        plan = _raw_partial_plan()
+        action = plan["actions"][0]
+        action.update(
+            {
+                "achieved_tps": 100.0,
+                "unmet_tps": 0.0,
+                "meets_target": True,
+                "served_fraction": 1.0,
+            }
+        )
+        action.pop("admitted_tps")
+        action.pop("admission_mode")
+        action["ladder"][0].pop("rank_traffic_share")
+
+        result = Validator().val_plan(plan)
+
+        self.assertTrue(result.feasible, result.violations)
+
+    def test_validator_accepts_legacy_batch_partial_without_online_admission_fields(self):
+        plan = _raw_partial_plan()
+        plan["actions"][0].pop("admitted_tps")
+        plan["actions"][0].pop("admission_mode")
+
+        result = Validator().val_plan(plan)
+
+        self.assertTrue(result.feasible, result.violations)
+
+    def test_validator_guards_online_partial_admission_by_mode(self):
+        plan = _raw_partial_plan()
+        action = plan["actions"][0]
+        action["target_p99_ttft_ms"] = 100.0
+
+        disabled = Validator().val_plan(plan)
+        enabled = Validator(partial_online_admission_mode="advisory").val_plan(plan)
+
+        self.assertFalse(disabled.feasible)
+        self.assertTrue(any("disabled" in violation for violation in disabled.violations))
+        self.assertTrue(enabled.feasible, enabled.violations)
+
+        for field_name in ("admitted_tps", "admission_mode"):
+            with self.subTest(field_name=field_name):
+                missing = _raw_partial_plan()
+                missing["actions"][0]["target_p99_tpot_ms"] = 10.0
+                missing["actions"][0].pop(field_name)
+                result = Validator(partial_online_admission_mode="advisory").val_plan(missing)
+                self.assertFalse(result.feasible)
+                self.assertTrue(
+                    any(field_name in violation for violation in result.violations),
+                    result.violations,
+                )
+
+        enforced = _raw_partial_plan()
+        enforced["actions"][0]["target_p99_ttft_ms"] = 100.0
+        enforced["actions"][0]["admission_mode"] = "enforced"
+        result = Validator(partial_online_admission_mode="advisory").val_plan(enforced)
+        self.assertFalse(result.feasible)
+        self.assertTrue(any("unsupported" in violation for violation in result.violations))
+
+        with self.assertRaisesRegex(ValueError, "off.*advisory"):
+            Validator(partial_online_admission_mode="enforced")
+
+    def test_validator_rejects_inconsistent_partial_admission_metadata(self):
+        cases = (
+            ("target_nonfinite", "target_tps", float("inf"), "target_tps must be"),
+            ("target_zero", "target_tps", 0.0, "target_tps must be"),
+            ("admitted_nonfinite", "admitted_tps", float("nan"), "admitted_tps must be"),
+            ("admitted_zero", "admitted_tps", 0.0, "admitted_tps must be"),
+            ("achieved_nonfinite", "achieved_tps", float("inf"), "achieved_tps must be"),
+            ("achieved_zero", "achieved_tps", 0.0, "achieved_tps must be"),
+            ("admitted_mismatch", "admitted_tps", 55.0, "approximately equal achieved_tps"),
+            ("admitted_over_target", "admitted_tps", 110.0, "admitted_tps must be <="),
+            ("achieved_over_target", "achieved_tps", 110.0, "achieved_tps must be <="),
+            ("unmet_nonfinite", "unmet_tps", float("nan"), "unmet_tps must be"),
+            ("unmet_negative", "unmet_tps", -1.0, "unmet_tps must be"),
+            ("unmet_mismatch", "unmet_tps", 30.0, "target_tps - achieved_tps"),
+            ("fraction_nonfinite", "served_fraction", float("inf"), "served_fraction must be"),
+            ("fraction_zero", "served_fraction", 0.0, "served_fraction must be"),
+            ("fraction_over_one", "served_fraction", 1.1, "served_fraction must be"),
+            ("fraction_mismatch", "served_fraction", 0.7, "achieved_tps / target_tps"),
+            ("meets_target_type", "meets_target", "false", "meets_target must be a boolean"),
+            ("meets_target_partial", "meets_target", True, "must match whether achieved_tps"),
+            ("admission_mode", "admission_mode", "automatic", "admission_mode must be"),
+            ("admission_mode_type", "admission_mode", [], "admission_mode must be"),
+            ("enforced_mode", "admission_mode", "enforced", "unsupported"),
+        )
+        for name, field_name, value, expected in cases:
+            with self.subTest(name=name):
+                plan = _raw_partial_plan()
+                plan["actions"][0][field_name] = value
+
+                result = Validator().val_plan(plan)
+
+                self.assertFalse(result.feasible)
+                self.assertTrue(
+                    any(expected in violation for violation in result.violations),
+                    result.violations,
+                )
+
+    def test_validator_requires_complete_partial_admission_metadata(self):
+        for field_name in (
+            "achieved_tps",
+            "unmet_tps",
+            "meets_target",
+            "served_fraction",
+        ):
+            with self.subTest(field_name=field_name):
+                plan = _raw_partial_plan()
+                plan["actions"][0].pop(field_name)
+
+                result = Validator().val_plan(plan)
+
+                self.assertFalse(result.feasible)
+                self.assertTrue(
+                    any(field_name in violation for violation in result.violations),
+                    result.violations,
+                )
+
+    def test_validator_rejects_partial_rank_share_errors(self):
+        for share in (None, 0.0, 1.1, float("inf"), float("nan")):
+            with self.subTest(share=share):
+                plan = _raw_partial_plan()
+                plan["actions"][0]["ladder"][0]["rank_traffic_share"] = share
+
+                result = Validator().val_plan(plan)
+
+                self.assertFalse(result.feasible)
+                self.assertTrue(
+                    any("rank_traffic_share must be finite" in v for v in result.violations),
+                    result.violations,
+                )
+
+        plan = _raw_partial_plan()
+        plan["actions"][0]["ladder"][0]["rank_traffic_share"] = 0.5
+        result = Validator().val_plan(plan)
+        self.assertFalse(result.feasible)
+        self.assertTrue(
+            any("rank_traffic_share sum" in violation for violation in result.violations),
+            result.violations,
+        )
+
+    def test_validator_requires_complete_shares_for_multi_rank_and_explicit_share(self):
+        plan = _raw_place_plan({"instance_type": "p5.48xlarge", "gpu_count": 1, "tp": 1, "pp": 1})
+        plan["actions"][0]["ladder"].append(
+            {
+                "role": "aggregate",
+                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                "config": {
+                    "instance_type": "p5.48xlarge",
+                    "gpu_count": 1,
+                    "tp": 1,
+                    "pp": 1,
+                },
+                "n_replicas": 1,
+            }
+        )
+
+        missing = Validator().val_plan(plan)
+        self.assertFalse(missing.feasible)
+        self.assertTrue(any("rank_traffic_share" in item for item in missing.violations))
+
+        plan["actions"][0]["ladder"][0]["rank_traffic_share"] = 0.4
+        plan["actions"][0]["ladder"][1]["rank_traffic_share"] = 0.6
+        complete = Validator().val_plan(plan)
+        self.assertTrue(complete.feasible, complete.violations)
+
+        single = _raw_place_plan({"instance_type": "p5.48xlarge", "gpu_count": 1, "tp": 1, "pp": 1})
+        single["actions"][0]["ladder"][0]["rank_traffic_share"] = 0.5
+        explicit = Validator().val_plan(single)
+        self.assertFalse(explicit.feasible)
+        self.assertTrue(any("sum" in item for item in explicit.violations))
+
     def test_c5_rejects_cross_job_instance_pool_overallocation(self):
         env = "reserved|aws|us-east-1|us-east-1b|L40S"
         resources = {
@@ -393,6 +570,24 @@ def _raw_place_plan(config):
             }
         ]
     }
+
+
+def _raw_partial_plan():
+    plan = _raw_place_plan({"instance_type": "p5.48xlarge", "gpu_count": 1, "tp": 1, "pp": 1})
+    action = plan["actions"][0]
+    action.update(
+        {
+            "target_tps": 100.0,
+            "admitted_tps": 60.0,
+            "achieved_tps": 60.0,
+            "unmet_tps": 40.0,
+            "meets_target": False,
+            "served_fraction": 0.6,
+            "admission_mode": "advisory",
+        }
+    )
+    action["ladder"][0]["rank_traffic_share"] = 0.6
+    return plan
 
 
 if __name__ == "__main__":

@@ -31,6 +31,50 @@ class StorePlanExecutorSmokeTests(unittest.TestCase):
             store.plan.actions[0].ladder[0]["prediction_lineage"]["deployment_id"],
             "deploy-0",
         )
+        self.assertEqual(store.plan.actions[0].target_tps, 10.0)
+
+    def test_partial_plan_sends_admitted_target_and_rank_share(self):
+        store = _PlanStore()
+        raw = _raw_place_plan()
+        action = raw["actions"][0]
+        action.update(
+            {
+                "target_tps": 100.0,
+                "admitted_tps": 60.0,
+                "achieved_tps": 60.0,
+                "unmet_tps": 40.0,
+                "meets_target": False,
+                "served_fraction": 0.6,
+                "admission_mode": "advisory",
+            }
+        )
+        action["ladder"][0]["rank_traffic_share"] = 0.6
+
+        plan = Plan.from_raw(raw, tick=7)
+        StorePlanExecutor("user_1", plan_store=store).send_to_executor(plan)
+
+        stored_action = store.plan.actions[0]
+        self.assertEqual(plan.actions[0].target_tps, 100.0)
+        self.assertEqual(stored_action.target_tps, 60.0)
+        self.assertEqual(stored_action.ladder[0]["rank_traffic_share"], 0.6)
+
+    def test_full_admission_metadata_keeps_required_target(self):
+        store = _PlanStore()
+        raw = _raw_place_plan()
+        raw["actions"][0].update(
+            {
+                "admitted_tps": 10.0,
+                "achieved_tps": 10.0,
+                "unmet_tps": 0.0,
+                "meets_target": True,
+                "served_fraction": 1.0,
+                "admission_mode": "enforced",
+            }
+        )
+
+        StorePlanExecutor("user_1", plan_store=store).send_to_executor(Plan.from_raw(raw, tick=7))
+
+        self.assertEqual(store.plan.actions[0].target_tps, 10.0)
 
     def test_accepts_raw_plan_input(self):
         store = _PlanStore()

@@ -371,6 +371,12 @@ class PlanAction:
     budget_ref: str | None = None  # BudgetSlice reference for resource-consuming actions
     rationale: str | None = None
     predicted_y: dict | None = None  # advisory: LLM's predict_outcome result; scoring re-derives
+    admitted_tps: float | None = None
+    achieved_tps: float | None = None
+    unmet_tps: float | None = None
+    meets_target: bool | None = None
+    served_fraction: float | None = None
+    admission_mode: str | None = None
 
     @classmethod
     def from_dict(cls, raw, job_id: str | None = None) -> "PlanAction":
@@ -414,6 +420,12 @@ class PlanAction:
             user_id=raw.get("user_id"),
             ladder=ladder,
             target_tps=raw.get("target_tps"),
+            admitted_tps=raw.get("admitted_tps"),
+            achieved_tps=raw.get("achieved_tps"),
+            unmet_tps=raw.get("unmet_tps"),
+            meets_target=raw.get("meets_target"),
+            served_fraction=raw.get("served_fraction"),
+            admission_mode=raw.get("admission_mode"),
             target_p99_ttft_ms=raw.get("target_p99_ttft_ms"),
             target_p99_tpot_ms=raw.get("target_p99_tpot_ms"),
             mechanism_id=raw.get("mechanism_id"),
@@ -438,7 +450,7 @@ class PlanAction:
             seen.add(rank.rank_id)
 
     def to_dict(self) -> dict:
-        return {
+        raw = {
             "job_id": self.job_id,
             "type": self.type.value,
             "user_id": self.user_id,
@@ -451,6 +463,18 @@ class PlanAction:
             "budget_ref": self.budget_ref,
             "rationale": self.rationale,
         }
+        for field_name in (
+            "admitted_tps",
+            "achieved_tps",
+            "unmet_tps",
+            "meets_target",
+            "served_fraction",
+            "admission_mode",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                raw[field_name] = value
+        return raw
 
 
 @dataclass

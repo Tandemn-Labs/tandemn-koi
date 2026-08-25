@@ -4,6 +4,7 @@ import json
 import tempfile
 import types
 import unittest
+from unittest.mock import DEFAULT, patch
 
 from src.orchestrator import runner
 from src.orchestrator.debug_logging import DebugLogger
@@ -15,11 +16,73 @@ class RunnerSmokeTests(unittest.TestCase):
 
     def test_parse_args_accepts_surrogate_configuration(self):
         args = runner.parse_args(
-            ["--surrogate-lower-quantile", "0.1", "--surrogate-peer-mode", "enabled"]
+            [
+                "--surrogate-lower-quantile",
+                "0.1",
+                "--surrogate-peer-mode",
+                "enabled",
+                "--partial-online-admission",
+                "advisory",
+            ]
         )
 
         self.assertEqual(args.surrogate_lower_quantile, 0.1)
         self.assertEqual(args.surrogate_peer_mode, "enabled")
+        self.assertEqual(args.partial_online_admission, "advisory")
+
+    def test_build_runner_wires_partial_online_admission_into_validator(self):
+        with patch.dict(runner.os.environ, {}, clear=True):
+            args = runner.parse_args(
+                [
+                    "--user-id",
+                    "user_1",
+                    "--api-key",
+                    "test-key",
+                    "--partial-online-admission",
+                    "advisory",
+                ]
+            )
+        candidate_graph = types.SimpleNamespace(y=[], v=[])
+        mechanism_registry = object()
+        confidence_service = object()
+        resource_map = object()
+
+        with (
+            patch.object(runner.agent_tools, "configure_surrogate_call_budget"),
+            patch.object(runner.agent_tools, "configure_partial_online_admission"),
+            patch.multiple(
+                runner,
+                PostgresClient=DEFAULT,
+                init_causal_graph=DEFAULT,
+                EvidenceService=DEFAULT,
+                DRO=DEFAULT,
+                RegretCalculator=DEFAULT,
+                Cusum=DEFAULT,
+                ICP=DEFAULT,
+                QuadrantValidator=DEFAULT,
+                SlowLoop=DEFAULT,
+                ResourceMapManager=DEFAULT,
+                GpuMetricStore=DEFAULT,
+                StoreTelemetry=DEFAULT,
+                Validator=DEFAULT,
+            ) as dependencies,
+            self.assertRaisesRegex(RuntimeError, "validator wired"),
+        ):
+            dependencies["init_causal_graph"].return_value = (
+                candidate_graph,
+                mechanism_registry,
+                confidence_service,
+            )
+            dependencies["ResourceMapManager"].return_value = resource_map
+            dependencies["Validator"].side_effect = RuntimeError("validator wired")
+            runner.build_runner(args)
+
+        dependencies["Validator"].assert_called_once_with(
+            candidate_graph=candidate_graph,
+            mechanism_registry=mechanism_registry,
+            resource_map=resource_map,
+            partial_online_admission_mode="advisory",
+        )
 
     def test_main_runs_next_persisted_tick(self):
         """Without --tick, the runner starts at evidence current_tick + 1."""

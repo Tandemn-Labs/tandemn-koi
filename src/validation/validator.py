@@ -20,12 +20,13 @@ Constraint hierarchy (tenant policy ahead of resource feasibility):
     C3 tenant/budget  per-tenant policy (skipped when no tenant_registry)
     C4 swap budget    active-job churn does not exceed B_t
     C5 capacity       allocation-unit footprint fits snapshot free capacity
-    C6 chain physics  each rank is launchable (5-tuple env, >=1 replica, fits)
+    C6 chain physics  each rank is launchable; partial-admission accounting is coherent
 
 MVP note: SLO/DRO risk is score-only via compute_sigma, not validation-gated.
 TODO(v1): revisit a hard SLO gate once the cutoff policy is well understood.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,6 +49,17 @@ _KNOWN_WORKLOAD_TYPES = frozenset({"any", "online", "batch"})
 _KNOWN_MODEL_TYPES = frozenset({"any", "moe", "dense_small", "dense_large"})
 _CONDITION_OPERATORS = frozenset({">", "<", ">=", "<=", "=="})
 _ALLOWED_SCOPE_KEYS = frozenset({"x", "v", "workload_type", "model_type", "conditions"})
+_SERVICE_ACCOUNTING_FIELDS = (
+    "achieved_tps",
+    "unmet_tps",
+    "meets_target",
+    "served_fraction",
+    "admitted_tps",
+    "admission_mode",
+)
+_PARTIAL_ONLINE_ADMISSION_MODES = frozenset({"off", "advisory"})
+_ADMISSION_REL_TOL = 1e-3
+_ADMISSION_ABS_TOL = 1e-6
 
 
 @dataclass
@@ -89,13 +101,17 @@ class Validator:
         slo_predictor=None,
         slo_breach_threshold: float = 0.5,
         resource_map=None,
+        partial_online_admission_mode: str = "off",
     ):
+        if partial_online_admission_mode not in _PARTIAL_ONLINE_ADMISSION_MODES:
+            raise ValueError("partial_online_admission_mode must be exactly 'off' or 'advisory'")
         self.candidate_graph = candidate_graph
         self.mechanism_registry = mechanism_registry
         self.tenant_registry = tenant_registry
         self.resource_map = resource_map
         self.slo_predictor = slo_predictor
         self.slo_breach_threshold = float(slo_breach_threshold)
+        self.partial_online_admission_mode = partial_online_admission_mode
 
     # ------------------------------------------------------------------
     # Plan validation
@@ -298,7 +314,7 @@ class Validator:
     # ----- C6 chain physics -----
 
     def _check_chain_physics(self, typed: Plan, snapshot) -> list[str]:
-        """Each deployed rank must be physically launchable.
+        """Each deployed rank and its optional admission metadata must be valid.
 
         env must be a 5-tuple (market, cloud, region, zone, gpu_type); replicas >= 1;
         a single chain's GPU footprint must not exceed the env's total GPUs (a
@@ -310,6 +326,7 @@ class Validator:
         for action in typed.actions:
             if action.type not in LADDER_ACTIONS:
                 continue
+            violations.extend(self._check_partial_admission(action))
             if not action.ladder:
                 violations.append(
                     f"C6 physics: job {action.job_id} {action.type.value} has no ladder"
@@ -376,6 +393,154 @@ class Validator:
                                 f"GPUs/replica but env total is {total}"
                             )
         return violations
+
+    def _check_partial_admission(self, action) -> list[str]:
+        """Validate service accounting, rank shares, and guarded online admission."""
+        prefix = f"C6 admission: job {action.job_id}"
+        violations: list[str] = []
+        accounting_present = any(
+            getattr(action, name) is not None for name in _SERVICE_ACCOUNTING_FIELDS
+        )
+        fraction = self._finite_number(action.served_fraction)
+        if not accounting_present:
+            return self._check_rank_traffic_shares(action, fraction, prefix)
+
+        positive: dict[str, float] = {}
+        for name in ("target_tps", "achieved_tps"):
+            number = self._finite_number(getattr(action, name))
+            if number is None or number <= 0.0:
+                violations.append(f"{prefix} {name} must be a finite positive number")
+            else:
+                positive[name] = number
+
+        admitted = None
+        if action.admitted_tps is not None:
+            admitted = self._finite_number(action.admitted_tps)
+            if admitted is None or admitted <= 0.0:
+                violations.append(f"{prefix} admitted_tps must be a finite positive number")
+                admitted = None
+
+        unmet = self._finite_number(action.unmet_tps)
+        if unmet is None or unmet < 0.0:
+            violations.append(f"{prefix} unmet_tps must be a finite non-negative number")
+
+        if fraction is None or fraction <= 0.0 or fraction > 1.0:
+            violations.append(f"{prefix} served_fraction must be finite and in (0, 1]")
+
+        if not isinstance(action.meets_target, bool):
+            violations.append(f"{prefix} meets_target must be a boolean")
+        if action.admission_mode == "enforced":
+            violations.append(
+                f"{prefix} admission_mode='enforced' is unsupported by the downstream router"
+            )
+        elif action.admission_mode is not None and action.admission_mode != "advisory":
+            violations.append(f"{prefix} admission_mode must be 'advisory' when present")
+
+        target = positive.get("target_tps")
+        achieved = positive.get("achieved_tps")
+        if (
+            admitted is not None
+            and achieved is not None
+            and not self._admission_close(admitted, achieved)
+        ):
+            violations.append(f"{prefix} admitted_tps must approximately equal achieved_tps")
+        if target is not None:
+            for name, value in (("admitted_tps", admitted), ("achieved_tps", achieved)):
+                if (
+                    value is not None
+                    and value > target
+                    and not self._admission_close(value, target)
+                ):
+                    violations.append(f"{prefix} {name} must be <= target_tps")
+        if (
+            target is not None
+            and achieved is not None
+            and unmet is not None
+            and not self._admission_close(unmet, max(0.0, target - achieved))
+        ):
+            violations.append(
+                f"{prefix} unmet_tps must approximately equal target_tps - achieved_tps"
+            )
+        if (
+            target is not None
+            and achieved is not None
+            and fraction is not None
+            and not self._admission_close(fraction, min(1.0, achieved / target))
+        ):
+            violations.append(
+                f"{prefix} served_fraction must approximately equal achieved_tps / target_tps"
+            )
+        if target is not None and achieved is not None and isinstance(action.meets_target, bool):
+            expected_meets_target = achieved >= target or self._admission_close(achieved, target)
+            if action.meets_target != expected_meets_target:
+                violations.append(
+                    f"{prefix} meets_target must match whether achieved_tps meets target_tps"
+                )
+
+        has_latency_target = any(
+            target_value is not None
+            for target_value in (action.target_p99_ttft_ms, action.target_p99_tpot_ms)
+        )
+        if has_latency_target and fraction is not None and fraction < 1.0:
+            if admitted is None:
+                violations.append(f"{prefix} online partial service requires admitted_tps")
+            if action.admission_mode != "advisory":
+                violations.append(
+                    f"{prefix} online partial service requires admission_mode='advisory'"
+                )
+            if self.partial_online_admission_mode != "advisory":
+                violations.append(
+                    f"{prefix} advisory online partial service is disabled by the validator"
+                )
+
+        violations.extend(self._check_rank_traffic_shares(action, fraction, prefix))
+        return violations
+
+    @classmethod
+    def _check_rank_traffic_shares(cls, action, fraction, prefix: str) -> list[str]:
+        """Validate explicit shares and require them for partial or multi-rank service."""
+        ranks = list(action.ladder or [])
+        if not ranks:
+            return []
+        explicit_share = any(rank.rank_traffic_share is not None for rank in ranks)
+        partial_service = fraction is not None and fraction < 1.0
+        if len(ranks) == 1 and not explicit_share and not partial_service:
+            return []
+
+        violations: list[str] = []
+        shares: list[float] = []
+        for index, rank in enumerate(ranks):
+            share = cls._finite_number(rank.rank_traffic_share)
+            if share is None or share <= 0.0 or share > 1.0:
+                violations.append(
+                    f"{prefix} rank {index} rank_traffic_share must be finite and in (0, 1]"
+                )
+            else:
+                shares.append(share)
+
+        expected = fraction if fraction is not None else 1.0
+        if len(shares) == len(ranks) and not cls._admission_close(sum(shares), expected):
+            expected_name = "served_fraction" if action.served_fraction is not None else "1"
+            violations.append(
+                f"{prefix} rank_traffic_share sum must approximately equal {expected_name}"
+            )
+        return violations
+
+    @staticmethod
+    def _finite_number(value) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _admission_close(left: float, right: float) -> bool:
+        return math.isclose(
+            left,
+            right,
+            rel_tol=_ADMISSION_REL_TOL,
+            abs_tol=_ADMISSION_ABS_TOL,
+        )
 
     # ----- Future C7 SLO chance (disabled in MVP) -----
 
