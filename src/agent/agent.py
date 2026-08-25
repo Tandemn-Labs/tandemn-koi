@@ -229,10 +229,16 @@ class SpecialistRunner:
             "Constraints:\n"
             "- type is place, keep, swap, or defer. If no safe ladder fits, use keep "
             "for a running job or defer for a waiting job.\n"
-            "- Never exceed the slice. Report budget_utilization as a flat canonical "
-            "env map and report fitness as starved, happy, overprovisioned, or blocked.\n"
+            "- Never exceed the slice. Report fitness as starved, happy, "
+            "overprovisioned, or blocked.\n"
+            "- used_capacity, unused_capacity, marginal_value_of_more, and "
+            "budget_utilization must always be JSON objects. Use {} when a map is not "
+            "applicable. Every nonempty key must be a canonical "
+            "market|cloud|region|zone|gpu_type env.\n"
             "- Mechanism IDs are opaque: use exact mechanism_candidates first, then "
             "partial matches. If none applies, propose one without inventing an ID.\n"
+            "- Every ladder rank's mechanism_id must also appear in the top-level "
+            "mechanism_ids list.\n"
             "- Every env is [market,cloud,region,zone,gpu_type]. Every ladder rank is "
             "{'role':'aggregate','env':[...],'config':{'instance_type':str,"
             "'gpu_count':int,'tp':int,'pp':int,'sp':int,'ep':int,'cp':int},"
@@ -358,13 +364,31 @@ class SpecialistRunner:
 
     @staticmethod
     def _backfill_derived_fields(result: dict[str, Any], brief: dict[str, Any]) -> None:
-        """Fill rank-config fields Koi derives, so the specialist need not emit them.
+        """Fill deterministic fields the specialist may safely omit.
 
         gpu_type comes from env[4]; model_id from the job brief. Downstream
         (deployment_x, the surrogate) derives these regardless; backfilling
         keeps the committed rank config self-describing and lets validation
         pass without asking a weak model for redundant, error-prone fields.
+        Missing diagnostic maps default to empty objects. A sole valid top-level
+        mechanism id is unambiguous, so ranks may inherit it.
         """
+        for field in (
+            "used_capacity",
+            "unused_capacity",
+            "marginal_value_of_more",
+            "budget_utilization",
+        ):
+            if field not in result:
+                result[field] = {}
+
+        mechanism_ids = result.get("mechanism_ids")
+        sole_mechanism_id = None
+        if isinstance(mechanism_ids, list) and len(mechanism_ids) == 1:
+            candidate = mechanism_ids[0]
+            if isinstance(candidate, str) and candidate.strip():
+                sole_mechanism_id = candidate
+
         model_id = ((brief or {}).get("job_features") or {}).get("model_id")
         ladder = result.get("ladder")
         if not isinstance(ladder, list):
@@ -372,6 +396,8 @@ class SpecialistRunner:
         for rank in ladder:
             if not isinstance(rank, dict):
                 continue
+            if sole_mechanism_id is not None and "mechanism_id" not in rank:
+                rank["mechanism_id"] = sole_mechanism_id
             config = rank.get("config")
             if not isinstance(config, dict):
                 continue
@@ -422,12 +448,13 @@ class SpecialistRunner:
             "marginal_value_of_more",
             "budget_utilization",
         ):
-            value = result.get(field) or {}
+            value = result.get(field)
             if not isinstance(value, dict):
                 violations.append(f"{field} must be a dict keyed by canonical env")
                 continue
             for env in value:
-                if len(agent_tools._env_key(env).split("|")) != 5:
+                parts = env.split("|") if isinstance(env, str) else []
+                if len(parts) != 5 or any(not part.strip() for part in parts):
                     violations.append(
                         f"{field} env {env!r} must be market|cloud|region|zone|gpu_type"
                     )
@@ -437,6 +464,11 @@ class SpecialistRunner:
         if action_name in (ActionType.PLACE.value, ActionType.SWAP.value):
             if not isinstance(mechanism_ids, list) or not mechanism_ids:
                 violations.append(f"{action_name} requires non-empty mechanism_ids")
+            elif any(
+                not isinstance(mechanism_id, str) or not mechanism_id.strip()
+                for mechanism_id in mechanism_ids
+            ):
+                violations.append("mechanism_ids must contain non-empty strings")
             if not isinstance(ladder, list) or not ladder:
                 violations.append(f"{action_name} requires non-empty canonical ladder")
             else:
@@ -537,7 +569,9 @@ class SpecialistRunner:
         mechanism_id = rank.get("mechanism_id")
         if not mechanism_id:
             violations.append(f"{prefix}.mechanism_id is required")
-        elif mechanism_ids and mechanism_id not in mechanism_ids:
+        elif not isinstance(mechanism_id, str):
+            violations.append(f"{prefix}.mechanism_id must be a non-empty string")
+        elif not isinstance(mechanism_ids, list) or mechanism_id not in mechanism_ids:
             violations.append(f"{prefix}.mechanism_id must be present in mechanism_ids")
         return violations
 
@@ -648,7 +682,7 @@ class KoiAgentHarness:
 
         Runs K_P independent trajectories, pre-screens each plan with the
         bound validator when available, scores survivors with
-        agent_tools.compute_sigma, and returns the best plan. Returns the
+        agent_tools.compute_sigma_for_commit, and returns the best plan. Returns the
         keep-all/defer-pending fallback when no trajectory produces a
         usable plan.
 
@@ -875,9 +909,31 @@ class KoiAgentHarness:
             )
             history = self._compact_history(history)
 
+        final = runtime.final_value
+        if final is not None:
+            return self._try_materialize(final, cluster_snapshot, runtime.last_joint)
+
         leftover = runtime.namespace.get("plan")
         if leftover is not None:
             return self._try_materialize(leftover, cluster_snapshot, runtime.last_joint)
+
+        last_joint = runtime.last_joint
+        chosen = last_joint.get("chosen") if isinstance(last_joint, dict) else None
+        if isinstance(chosen, list) and chosen:
+            raw_plan = {
+                "tick_rationale": (
+                    "Root turn limit ended before the root finalized a plan; its last "
+                    "joint recommendation was salvaged."
+                ),
+                "actions": copy.deepcopy(chosen),
+            }
+            self.trace.add(
+                "joint_recommendation_salvaged",
+                tick=tick,
+                k_idx=k_idx,
+                action_count=len(chosen),
+            )
+            return self._try_materialize(raw_plan, cluster_snapshot, last_joint)
         return None
 
     def _compact_history(self, history: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1192,7 +1248,7 @@ class KoiAgentHarness:
     def _score_plan(self, plan: Plan) -> float | None:
         """Score a plan by aggregate sigma, or return None when unscorable."""
         try:
-            result = agent_tools.compute_sigma(plan)
+            result = agent_tools.compute_sigma_for_commit(plan)
             per_job = result.get("per_job") or {}
             scored_jobs = set(per_job)
             required_jobs = {
@@ -1202,14 +1258,17 @@ class KoiAgentHarness:
             }
             if not required_jobs <= scored_jobs:
                 missing = sorted(required_jobs - scored_jobs)
-                log.error("compute_sigma omitted ladder jobs: %s", missing)
+                log.error("compute_sigma_for_commit omitted ladder jobs: %s", missing)
                 return None
             score = float(result["aggregate_sigma"])
         except Exception:
-            log.exception("compute_sigma failed during K_P scoring")
+            log.exception("compute_sigma_for_commit failed during K_P scoring")
             return None
         if not math.isfinite(score):
-            log.error("compute_sigma returned a non-finite aggregate score: %r", score)
+            log.error(
+                "compute_sigma_for_commit returned a non-finite aggregate score: %r",
+                score,
+            )
             return None
         return score
 
@@ -1350,15 +1409,20 @@ class KoiAgentHarness:
             "Specialists and candidate construction each run ONCE. Do not rerun any "
             "earlier stage after seeing `joint`. If budget validation fails, do not run "
             "specialists; build a conservative keep/defer plan and record the violations.\n\n"
-            "Inspect `priority`, joint['chosen'], joint['deferred'], scored['exhausted'], "
-            "scored['budget_limited'], scored['diagnostics'], fairness, churn, and current "
-            "cluster evidence. Then either accept the recommendation or make a reasoned "
-            "adjustment using the already-scored feasible candidates. You own that choice. "
+            "Write the pipeline and its commit path in one REPL block. Immediately after "
+            "`joint` returns a nonempty `joint['chosen']`, build `plan` from those chosen "
+            "actions (or a reasoned adjustment using already-scored feasible candidates), "
+            "add your rationale, call `feas = check_feasibility(plan)`, and, when feasible, "
+            "call `FINAL_VAR(plan)` in that same REPL turn. Do not postpone finalization to "
+            "a follow-up turn. Inspect `priority` and current cluster evidence as needed for "
+            "your root-owned judgment. `joint['deferred']`, `scored['exhausted']`, "
+            "`scored['budget_limited']`, and `scored['diagnostics']` are troubleshooting aids "
+            "for an empty or suspicious recommendation, not a mandatory extra turn. "
+            "You still own whether to accept or reasonedly adjust the recommendation. "
             "To override a job in joint['chosen'], include an explicit DEFER action with a "
             "non-empty rationale; omission is not an override. The deterministic placement "
-            "floor restores an omitted or unexplained defer from the recommendation. Build one plan, "
-            "call `feas = check_feasibility(plan)`, resolve any reported violations without "
-            "rerunning the pipeline, and call FINAL_VAR(plan) only when feasible.\n\n"
+            "floor restores an omitted or unexplained defer from the recommendation. Resolve "
+            "any feasibility violations without rerunning the pipeline.\n\n"
             "SHORTCUT/FALLBACK. As an alternative to the primary workflow, you may call "
             "plan_tick() exactly once and inspect its returned plan before accepting it or "
             "making a reasoned feasible adjustment. If you use this shortcut, do not call "

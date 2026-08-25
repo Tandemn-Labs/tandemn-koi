@@ -1,3 +1,4 @@
+import math
 import unittest
 from contextlib import ExitStack
 from unittest.mock import patch
@@ -17,18 +18,27 @@ class _DRO:
             for objective, value in y_hat.items()
         }
 
+    @staticmethod
+    def dro_chance_constraint(**_kwargs):
+        return {"_any_violated": 0.0}
+
 
 class _RecordingSurrogate:
-    def __init__(self):
+    def __init__(self, y_hats=None):
         self.calls = []
+        self.y_hats = y_hats
 
     def compose_prediction_with_trace(self, **kwargs):
         self.calls.append(kwargs)
-        y_hat = {
-            "p99_ttft_ms": 20.0,
-            "p99_tpot_ms": 2.0,
-            "throughput_token_per_sec": 200.0,
-        }
+        y_hat = dict(
+            self.y_hats[len(self.calls) - 1]
+            if self.y_hats is not None
+            else {
+                "p99_ttft_ms": 20.0,
+                "p99_tpot_ms": 2.0,
+                "throughput_token_per_sec": 200.0,
+            }
+        )
         return (
             y_hat,
             {"queue": {"depth": 1.0}},
@@ -45,6 +55,49 @@ class _SlowLoop:
     @staticmethod
     def get_sss_wt(*_args, **_kwargs):
         return {"cost_per_token": 0.0}
+
+
+class _SigmaSlowLoop:
+    def __init__(self):
+        self.typical_ranges = dict(agent_tools.DEFAULT_TYPICAL_RANGES)
+
+    @staticmethod
+    def get_sss_wt(*_args, **_kwargs):
+        return {"throughput_token_per_sec": 1.0, "cost_per_token": 0.0}
+
+    @staticmethod
+    def get_sss_z_star_t(*_args, **_kwargs):
+        return dict(agent_tools.DEFAULT_COLD_START_Z_STAR)
+
+    @staticmethod
+    def get_sss_eig_incentive_t():
+        return 0.0
+
+    @staticmethod
+    def get_sss_lambda_switch():
+        return 0.0
+
+    @staticmethod
+    def get_sss_radius_dro():
+        return 0.0
+
+
+class _Tchebycheff:
+    @staticmethod
+    def compute_tchebycheff(**_kwargs):
+        return -0.25
+
+
+class _EIG:
+    @staticmethod
+    def compute_eig(**_kwargs):
+        return 0.0
+
+
+class _SwitchCost:
+    @staticmethod
+    def compute_switch_cost(**_kwargs):
+        return type("Bundle", (), {"total": 0.0})()
 
 
 def _rank(env, instance_type, *, n_replicas=1):
@@ -94,6 +147,58 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         agent_tools._CTX.resource_map = None
         return surrogate
 
+    def _sigma_plan(self, *instance_types):
+        ranks = []
+        for instance_type in instance_types or ("p5",):
+            rank = _rank("reserved|aws|r1|z1|H100", instance_type)
+            rank["mechanism_id"] = "M_test"
+            ranks.append(agent_tools.RankSpec.from_dict(rank))
+        return agent_tools.Plan(
+            tick=0,
+            actions=[
+                agent_tools.PlanAction(
+                    job_id="job-final",
+                    type=agent_tools.ActionType.PLACE,
+                    ladder=ranks,
+                    target_tps=1.0,
+                )
+            ],
+        )
+
+    def _sigma_patches(self):
+        snapshot = type(
+            "Snapshot",
+            (),
+            {
+                "active_jobs_summary": lambda self: [],
+                "pending_jobs_summary": lambda self: [
+                    {
+                        "job_id": "job-final",
+                        "job_features": {
+                            "type": "batch",
+                            "total_token_budget": 3600.0,
+                            "deadline_hours": 1.0,
+                            "headroom_factor": 1.0,
+                        },
+                    }
+                ],
+            },
+        )()
+        stack = ExitStack()
+        stack.enter_context(patch.object(agent_tools, "_snapshot", return_value=snapshot))
+        stack.enter_context(patch.object(agent_tools, "get_pending_jobs", return_value=[]))
+        stack.enter_context(patch.object(agent_tools, "get_priority", return_value=[]))
+        stack.enter_context(patch.object(agent_tools, "_materialize_ladder", return_value=object()))
+        stack.enter_context(patch.object(agent_tools, "_materialize_chain_list", return_value=[]))
+        stack.enter_context(patch.object(agent_tools._CTX, "slow_loop", _SigmaSlowLoop()))
+        stack.enter_context(patch.object(agent_tools._CTX, "tchebycheff_module", _Tchebycheff()))
+        stack.enter_context(patch.object(agent_tools._CTX, "eig_module", _EIG()))
+        stack.enter_context(patch.object(agent_tools._CTX, "switchcost_module", _SwitchCost()))
+        stack.enter_context(patch.object(agent_tools._CTX, "mechanism_registry", object()))
+        stack.enter_context(patch.object(agent_tools._CTX, "confidence_service", object()))
+        stack.enter_context(patch.object(agent_tools._CTX, "evidence_store", object()))
+        return stack
+
     def test_budget_configuration_cache_hits_and_rejections_are_accounted(self):
         surrogate = self._bind_prediction_fakes()
         agent_tools.configure_surrogate_call_budget(1)
@@ -124,6 +229,69 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
 
     def test_finalization_helper_is_not_exposed_to_the_llm(self):
         self.assertNotIn("stamp_plan_predictions", agent_tools.all_callables())
+        self.assertNotIn("compute_sigma_for_commit", agent_tools.all_callables())
+
+    def test_public_compute_sigma_uses_search_budget(self):
+        surrogate = self._bind_prediction_fakes()
+        agent_tools.configure_surrogate_call_budget(1)
+
+        with self._sigma_patches():
+            result = agent_tools.compute_sigma(self._sigma_plan("p5"))
+            with self.assertRaises(agent_tools.SurrogateBudgetExceeded):
+                agent_tools.compute_sigma(self._sigma_plan("p4"))
+
+        status = agent_tools.get_surrogate_budget_status()
+        self.assertEqual(
+            set(result),
+            {"per_job", "aggregate_sigma", "swap_count", "unserved_penalty"},
+        )
+        self.assertIn("job-final", result["per_job"])
+        self.assertEqual(len(surrogate.calls), 1)
+        self.assertEqual(status["calls_executed"], 1)
+        self.assertEqual(status["finalization_calls"], 0)
+        self.assertEqual(status["budget_rejections"], 1)
+        self.assertEqual(status["remaining"], 0)
+
+    def test_commit_sigma_bypasses_exhausted_search_and_uses_finalization_accounting(self):
+        surrogate = self._bind_prediction_fakes()
+        agent_tools.configure_surrogate_call_budget(1)
+        plan = self._sigma_plan("p5")
+
+        with self._sigma_patches():
+            search_result = agent_tools.compute_sigma(plan)
+            commit_result = agent_tools.compute_sigma_for_commit(plan)
+
+        status = agent_tools.get_surrogate_budget_status()
+        self.assertEqual(set(commit_result), set(search_result))
+        self.assertEqual(set(commit_result["per_job"]), {"job-final"})
+        self.assertEqual(len(surrogate.calls), 2)
+        self.assertEqual(status["calls_executed"], 1)
+        self.assertEqual(status["finalization_calls"], 1)
+        self.assertEqual(status["budget_rejections"], 0)
+        self.assertEqual(status["remaining"], 0)
+
+    def test_commit_sigma_rejects_a_partial_rank_prediction_with_the_same_schema(self):
+        full_prediction = {
+            "p99_ttft_ms": 20.0,
+            "p99_tpot_ms": 2.0,
+            "throughput_token_per_sec": 200.0,
+        }
+        surrogate = self._bind_prediction_fakes(_RecordingSurrogate([full_prediction, {}]))
+        agent_tools.configure_surrogate_call_budget(0)
+
+        with self._sigma_patches():
+            result = agent_tools.compute_sigma_for_commit(self._sigma_plan("p5-a", "p5-b"))
+
+        status = agent_tools.get_surrogate_budget_status()
+        self.assertEqual(
+            set(result),
+            {"per_job", "aggregate_sigma", "swap_count", "unserved_penalty"},
+        )
+        self.assertEqual(result["per_job"], {})
+        self.assertEqual(len(surrogate.calls), 2)
+        self.assertEqual(status["calls_executed"], 0)
+        self.assertEqual(status["finalization_calls"], 2)
+        self.assertEqual(status["remaining"], 0)
 
     def test_finalization_bypasses_search_cap_and_stamps_decision_metadata(self):
         surrogate = self._bind_prediction_fakes()
@@ -204,6 +372,98 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             [call["method"] for call in surrogate.calls],
             [("AIC_Direct",), ("AIC_DynoSim",), ("AIC_Direct",)],
         )
+
+    def test_priority_uses_nested_class_and_workload_signals(self):
+        jobs = [
+            {
+                "job_id": "job-low",
+                "kind": "online",
+                "job_features": {
+                    "user_priority": 1.0,
+                    "priority_class": "LOW",
+                    "type": "batch",
+                    "deadline_pressure": 0.1,
+                    "slo_margin": 0.5,
+                    "queue_age_ticks": 2,
+                    "recent_failures": 0,
+                },
+            },
+            {
+                "job_id": "job-high",
+                "kind": "batch",
+                "job_features": {
+                    "user_priority": 2.0,
+                    "priority_class": "HIGH",
+                    "workload_type": "online",
+                    "deadline_pressure": 0.5,
+                    "slo_margin": -0.25,
+                    "queue_age_ticks": 4,
+                    "recent_failures": 2,
+                },
+            },
+        ]
+        with (
+            patch.object(agent_tools, "get_pending_jobs", return_value=jobs),
+            patch.object(agent_tools, "get_active_jobs", return_value=[]),
+        ):
+            priorities = agent_tools.get_priority()
+
+        by_id = {entry["job_id"]: entry for entry in priorities}
+        self.assertEqual([entry["job_id"] for entry in priorities], ["job-high", "job-low"])
+        self.assertEqual(
+            by_id["job-high"]["signals"],
+            {
+                "user_priority": 2.0,
+                "priority_class": 2.0,
+                "is_online": 1.0,
+                "deadline_pressure": 0.5,
+                "slo_margin_deficit": 0.25,
+                "queue_age_ticks": 4.0,
+                "recent_failures": 2.0,
+            },
+        )
+        self.assertEqual(by_id["job-high"]["priority_score"], 53.5)
+        self.assertEqual(by_id["job-low"]["signals"]["priority_class"], 0.0)
+        self.assertEqual(by_id["job-low"]["signals"]["is_online"], 0.0)
+        self.assertEqual(by_id["job-low"]["priority_score"], 11.5)
+
+    def test_priority_handles_malformed_values_and_ties_stably(self):
+        malformed_features = {
+            "user_priority": "not-a-number",
+            "priority_class": "URGENT",
+            "workload_type": "batch",
+            "deadline_pressure": {},
+            "slo_margin": [],
+            "queue_age_ticks": "NaN",
+            "recent_failures": None,
+        }
+        jobs = [
+            {"job_id": "job-b", "job_features": dict(malformed_features)},
+            {"job_id": "job-a", "job_features": dict(malformed_features)},
+            {
+                "job_id": "job-numeric",
+                "job_features": {
+                    "user_priority": 0,
+                    "priority_class": 2.5,
+                    "workload_type": "batch",
+                },
+            },
+        ]
+        with (
+            patch.object(agent_tools, "get_pending_jobs", return_value=jobs),
+            patch.object(agent_tools, "get_active_jobs", return_value=[]),
+        ):
+            priorities = agent_tools.get_priority()
+
+        self.assertEqual(
+            [entry["job_id"] for entry in priorities],
+            ["job-numeric", "job-a", "job-b"],
+        )
+        by_id = {entry["job_id"]: entry for entry in priorities}
+        self.assertEqual(by_id["job-numeric"]["signals"]["priority_class"], 2.5)
+        self.assertEqual(by_id["job-numeric"]["priority_score"], 25.0)
+        self.assertEqual(by_id["job-a"]["priority_score"], 10.0)
+        self.assertTrue(all(math.isfinite(entry["priority_score"]) for entry in priorities))
 
     def test_plan_tick_rationale_separates_candidate_and_budget_limits(self):
         with (
