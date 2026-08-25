@@ -956,10 +956,18 @@ class TickRunner:
     def _missing_bundle_inputs(bundle, v_obs, v_pred, y_obs, y_pred) -> dict[str, list[str]]:
         """Return missing CUSUM inputs grouped by trajectory type."""
         return {
-            "v_observed": [name for name in bundle.bundle_v_variables if name not in v_obs],
-            "v_predicted": [name for name in bundle.bundle_v_variables if name not in v_pred],
-            "y_observed": [name for name in bundle.bundle_y_outcomes if name not in y_obs],
-            "y_predicted": [name for name in bundle.bundle_y_outcomes if name not in y_pred],
+            "v_observed": [
+                name for name in bundle.bundle_v_variables if v_obs.get(name) is None
+            ],
+            "v_predicted": [
+                name for name in bundle.bundle_v_variables if v_pred.get(name) is None
+            ],
+            "y_observed": [
+                name for name in bundle.bundle_y_outcomes if y_obs.get(name) is None
+            ],
+            "y_predicted": [
+                name for name in bundle.bundle_y_outcomes if y_pred.get(name) is None
+            ],
         }
 
     def _cusum_diagnostics(self, bundle, v_obs, v_pred, y_obs, y_pred, v_params, y_params):

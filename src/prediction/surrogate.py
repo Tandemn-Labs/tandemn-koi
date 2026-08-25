@@ -1001,10 +1001,6 @@ class SurrogatePrediction:
             "prefix_cache_reused_ratio": None,
         }
         y_hat, v_hat = self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
-        if surrogate_input.get("objective") == "online":
-            y_hat.pop("p99_ttft_ms", None)
-            y_hat.pop("p99_tpot_ms", None)
-            self.last_metadata["aic_fallback_omitted_nodes"] = ["p99_tpot_ms", "p99_ttft_ms"]
         return y_hat, v_hat
 
     def _phase_compatibility_scales(self):
