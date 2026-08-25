@@ -77,7 +77,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--openai-model", default=os.getenv("OPENAI_MODEL", "gpt-5.5"))
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"))
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=1)
     parser.add_argument("--max-tokens", type=int, default=20000)
     parser.add_argument("--timeout-sec", type=float, default=200.0)
     parser.add_argument("--k-p", type=int, default=1)
