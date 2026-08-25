@@ -391,11 +391,7 @@ def _catalog_by_instance(catalog: dict[str, Any]) -> dict[tuple[str, str, str], 
 def _hardware_x(hardware: dict[str, Any], gpu_type: str) -> dict[str, object]:
     """Return required hardware X from one catalog instance entry."""
     gpu = _gpu(hardware, gpu_type)
-    out = {
-        key: gpu[key]
-        for key in _GPU_FIELDS
-        if key in gpu and not _is_missing_x_value(gpu[key])
-    }
+    out = {key: gpu[key] for key in _GPU_FIELDS if key in gpu and not _is_missing_x_value(gpu[key])}
     out["gpu_mem_gb"] = float(gpu["memory_mib_each"]) / 1024.0
     out["gpu_per_node"] = gpu["count"]
     network_bandwidth = _network_bandwidth(hardware)
@@ -478,22 +474,34 @@ def _allocate_load_x(
 
 
 def _rank_traffic_share(shape: dict[str, Any], replica_count: int, total_replicas: int) -> float:
-    """Return rank traffic share; multi-rank jobs must declare it."""
-    if total_replicas == replica_count:
+    """Return a valid explicit rank share, or the single-rank default."""
+    lineage = shape.get("prediction_lineage")
+    partial_admission = lineage.get("partial_admission") if isinstance(lineage, dict) else None
+    if (
+        total_replicas == replica_count
+        and isinstance(partial_admission, dict)
+        and partial_admission.get("mode") == "advisory"
+        and partial_admission.get("enforced") is False
+    ):
         return 1.0
     for key in ("rank_traffic_share", "traffic_share"):
-        if key in shape:
-            return float(shape[key])
+        value = shape.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be finite and in (0, 1]")
+        share = float(value)
+        if not math.isfinite(share) or share <= 0.0 or share > 1.0:
+            raise ValueError(f"{key} must be finite and in (0, 1]")
+        return share
+    if total_replicas == replica_count:
+        return 1.0
     raise ValueError("multi-rank jobs require rank_traffic_share per rank")
 
 
 def _project_x(x: dict[str, Any], x_fields: list[str] | tuple[str, ...]) -> dict[str, object]:
     """Keep available values from the candidate graph's X vocabulary."""
-    return {
-        key: x[key]
-        for key in x_fields
-        if key in x and not _is_missing_x_value(x[key])
-    }
+    return {key: x[key] for key in x_fields if key in x and not _is_missing_x_value(x[key])}
 
 
 def _available_x(values: dict[str, Any]) -> dict[str, Any]:

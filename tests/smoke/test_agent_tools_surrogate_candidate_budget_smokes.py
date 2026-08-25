@@ -117,6 +117,7 @@ def _rank(env, instance_type, *, n_replicas=1):
 class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
     def setUp(self):
         self.saved_budget = agent_tools.SURROGATE_CALL_BUDGET
+        self.saved_admission_mode = agent_tools.PARTIAL_ONLINE_ADMISSION_MODE
         self.saved_context = {
             name: getattr(agent_tools._CTX, name)
             for name in (
@@ -131,11 +132,13 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             )
         }
         agent_tools.configure_surrogate_call_budget(100)
+        agent_tools.configure_partial_online_admission("off")
         agent_tools.reset_tick_caches()
 
     def tearDown(self):
         agent_tools.reset_tick_caches()
         agent_tools.configure_surrogate_call_budget(self.saved_budget)
+        agent_tools.configure_partial_online_admission(self.saved_admission_mode)
         for name, value in self.saved_context.items():
             setattr(agent_tools._CTX, name, value)
 
@@ -146,6 +149,55 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         agent_tools._CTX.surrogate = surrogate
         agent_tools._CTX.resource_map = None
         return surrogate
+
+    def _size_online(self, predict, *, target_tps=100.0, include_tpot_target=True):
+        env = "reserved|aws|r1|z1|H100"
+
+        class ResourceMap:
+            @staticmethod
+            def resources_summary():
+                return {env: {"free": 1, "gpu_type": "H100"}}
+
+            @staticmethod
+            def rank_allocation_summary(rank, resources=None):
+                return {
+                    "allocation_kind": "gpu",
+                    "instance_type": rank.config["instance_type"],
+                    "gpus_per_unit": 1,
+                    "price_per_unit_hour": None,
+                    "capacity_per_replica": 1,
+                    "free_capacity_gpus": 1,
+                    "engine_gpus": 1,
+                }
+
+        features = {
+            "type": "online",
+            "output_len_tokens_avg": 1.0,
+            "target_p99_ttft_ms": 100.0,
+        }
+        if include_tpot_target:
+            features["target_p99_tpot_ms"] = 10.0
+        agent_tools._CTX.resource_map = ResourceMap()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.candidate_graph = object()
+        agent_tools._CTX.dro = _DRO()
+        with (
+            patch.object(
+                agent_tools,
+                "_rank_prediction_payload",
+                side_effect=lambda rank, rank_features: {
+                    "job_config": {"dp": rank.n_replicas},
+                    "job_features": dict(rank_features),
+                },
+            ),
+            patch.object(agent_tools, "_predict_outcome_core", side_effect=predict),
+        ):
+            result = agent_tools.size_ladder(
+                [_rank(env, "p5")],
+                features,
+                target_tps=target_tps,
+            )
+        return env, features, result
 
     def _sigma_plan(self, *instance_types):
         ranks = []
@@ -225,7 +277,97 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual(reset_status["limit"], 1)
         self.assertEqual(reset_status["calls_executed"], 0)
         self.assertEqual(reset_status["cache_hits"], 0)
+        self.assertEqual(reset_status["raw_cache_hits"], 0)
         self.assertEqual(reset_status["budget_rejections"], 0)
+
+    def test_partial_admission_mode_is_guarded_hidden_and_survives_tick_reset(self):
+        self.assertNotIn("configure_partial_online_admission", agent_tools.all_callables())
+        self.assertIn("get_partial_online_admission_status", agent_tools.all_callables())
+        with self.assertRaises(TypeError):
+            agent_tools.configure_partial_online_admission(True)
+        with self.assertRaises(ValueError):
+            agent_tools.configure_partial_online_admission("ADVISORY")
+
+        agent_tools.configure_partial_online_admission("advisory")
+        agent_tools.reset_tick_caches()
+
+        self.assertEqual(
+            agent_tools.get_partial_online_admission_status(),
+            {
+                "mode": "advisory",
+                "searches": 0,
+                "queue_aware_probes": 0,
+                "safe_probes": 0,
+                "admissions": 0,
+                "truncated_searches": 0,
+            },
+        )
+
+    def test_cross_tick_aic_raw_hits_refund_only_search_calls(self):
+        class RawCacheSurrogate(_RecordingSurrogate):
+            def compose_prediction_with_trace(self, **kwargs):
+                y_hat, v_hat, lineage = super().compose_prediction_with_trace(**kwargs)
+                lineage["components"] = {"primary": {"metadata": {"aic_raw_cache": {"hit": True}}}}
+                return y_hat, v_hat, lineage
+
+        surrogate = self._bind_prediction_fakes(RawCacheSurrogate())
+        agent_tools.configure_surrogate_call_budget(1)
+
+        agent_tools._predict_outcome_core({"model_id": "raw-a"}, {"type": "online"})
+        agent_tools._predict_outcome_core({"model_id": "raw-b"}, {"type": "online"})
+        agent_tools._predict_outcome_core(
+            {"model_id": "final"},
+            {"type": "online"},
+            _finalization=True,
+        )
+        agent_tools._predict_outcome_core(
+            {"model_id": "stress"},
+            {"type": "online"},
+            scenario="peak_all_multiturn_stress",
+        )
+
+        status = agent_tools.get_surrogate_budget_status()
+        self.assertEqual(len(surrogate.calls), 4)
+        self.assertEqual(status["calls_executed"], 0)
+        self.assertEqual(status["raw_cache_hits"], 2)
+        self.assertEqual(status["finalization_calls"], 1)
+        self.assertEqual(status["stress_calls"], 1)
+        self.assertEqual(status["remaining"], 1)
+
+    def test_warmed_primary_cache_bypasses_an_exhausted_search_budget(self):
+        class WarmedCacheSurrogate(_RecordingSurrogate):
+            def __init__(self):
+                super().__init__()
+                self.warmed = False
+
+            def primary_cache_contains(self, **_kwargs):
+                return self.warmed
+
+            def compose_prediction_with_trace(self, **kwargs):
+                was_warmed = self.warmed
+                y_hat, v_hat, lineage = super().compose_prediction_with_trace(**kwargs)
+                self.warmed = True
+                lineage["components"] = {
+                    "primary": {"metadata": {"aic_raw_cache": {"hit": was_warmed}}}
+                }
+                return y_hat, v_hat, lineage
+
+        surrogate = self._bind_prediction_fakes(WarmedCacheSurrogate())
+        agent_tools.configure_surrogate_call_budget(1)
+        candidate = {"model_id": "raw-warmed"}
+        features = {"type": "online"}
+        agent_tools._predict_outcome_core(candidate, features)
+
+        agent_tools.reset_tick_caches()
+        agent_tools.configure_surrogate_call_budget(0)
+        result = agent_tools._predict_outcome_core(candidate, features)
+
+        status = agent_tools.get_surrogate_budget_status()
+        self.assertEqual(result["y_hat"]["throughput_token_per_sec"], 200.0)
+        self.assertEqual(len(surrogate.calls), 2)
+        self.assertEqual(status["calls_executed"], 0)
+        self.assertEqual(status["raw_cache_hits"], 1)
+        self.assertEqual(status["budget_rejections"], 0)
 
     def test_finalization_helper_is_not_exposed_to_the_llm(self):
         self.assertNotIn("stamp_plan_predictions", agent_tools.all_callables())
@@ -293,6 +435,109 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual(status["finalization_calls"], 2)
         self.assertEqual(status["remaining"], 0)
 
+    def test_final_score_charges_only_residual_unserved_fraction(self):
+        self._bind_prediction_fakes()
+        partial = self._sigma_plan("p5")
+        partial.actions[0].served_fraction = 0.4
+        pending = [{"job_id": "job-final"}]
+        priority = [{"job_id": "job-final", "priority_score": 10.0}]
+
+        with (
+            self._sigma_patches(),
+            patch.object(agent_tools, "get_pending_jobs", return_value=pending),
+            patch.object(agent_tools, "get_priority", return_value=priority),
+        ):
+            result = agent_tools.compute_sigma_for_commit(partial)
+            legacy = agent_tools.compute_sigma_for_commit(self._sigma_plan("p5"))
+            malformed = self._sigma_plan("p5")
+            malformed.actions[0].served_fraction = float("nan")
+            with self.assertRaisesRegex(ValueError, "served_fraction"):
+                agent_tools.compute_sigma_for_commit(malformed)
+
+        self.assertEqual(result["unserved_penalty"], 6.0)
+        self.assertAlmostEqual(
+            result["aggregate_sigma"],
+            result["per_job"]["job-final"]["sigma"] - 6.0,
+        )
+        self.assertEqual(legacy["unserved_penalty"], 0.0)
+
+    def test_online_sigma_uses_peak_scenario_for_search_and_finalization(self):
+        self._bind_prediction_fakes()
+        calls = []
+
+        def compose(_action, _features, **kwargs):
+            calls.append(kwargs)
+            return {
+                "p99_ttft_ms": 20.0,
+                "p99_tpot_ms": 2.0,
+                "throughput_token_per_sec": 100.0,
+            }
+
+        online_features = {
+            "type": "online",
+            "request_arrival_rate": 1.0,
+            "output_len_tokens_avg": 1.0,
+            "headroom_factor": 1.0,
+            "target_p99_ttft_ms": 100.0,
+            "target_p99_tpot_ms": 10.0,
+        }
+        with (
+            self._sigma_patches(),
+            patch.object(agent_tools, "_job_features_for", return_value=online_features),
+            patch.object(agent_tools, "_compose_job_y_hat", side_effect=compose),
+        ):
+            agent_tools.compute_sigma(self._sigma_plan("p5"))
+            agent_tools.compute_sigma_for_commit(self._sigma_plan("p5"))
+
+        self.assertEqual(
+            [(call["scenario"], call["finalization"]) for call in calls],
+            [("peak", False), ("peak", True)],
+        )
+        self.assertEqual(
+            [call["method"] for call in calls],
+            [("AIC_DynoSim",), ("AIC_DynoSim",)],
+        )
+
+    def test_composed_online_score_uses_public_target_and_share_before_legacy_fallback(self):
+        rank = _rank("reserved|aws|r1|z1|H100", "p5")
+        rank["config"]["_arrival_share_rps"] = 0.375
+        rank["rank_traffic_share"] = 0.25
+        action = agent_tools.PlanAction(
+            job_id="job",
+            type=agent_tools.ActionType.PLACE,
+            ladder=[agent_tools.RankSpec.from_dict(rank)],
+            target_tps=100.0,
+        )
+        calls = []
+
+        def predict(job_config, job_features, **kwargs):
+            calls.append((job_config, job_features, kwargs))
+            return {
+                "y_hat": {
+                    "p99_ttft_ms": 20.0,
+                    "p99_tpot_ms": 2.0,
+                    "throughput_token_per_sec": 37.5,
+                }
+            }
+
+        agent_tools._CTX.resource_map = None
+        with patch.object(agent_tools, "_predict_outcome_core", side_effect=predict):
+            agent_tools._compose_job_y_hat(
+                action,
+                {
+                    "type": "online",
+                    "request_arrival_rate": 9.0,
+                    "output_len_tokens_avg": 50.0,
+                },
+                method=("AIC_DynoSim",),
+                scenario="peak",
+            )
+
+        config, features, kwargs = calls[0]
+        self.assertNotIn("_arrival_share_rps", config)
+        self.assertEqual(features["request_arrival_rate"], 0.5)
+        self.assertEqual(kwargs["scenario"], "peak")
+
     def test_finalization_bypasses_search_cap_and_stamps_decision_metadata(self):
         surrogate = self._bind_prediction_fakes()
         agent_tools.configure_surrogate_call_budget(1)
@@ -325,6 +570,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         )()
         final_rank = _rank("reserved|aws|r1|z1|H100", "p5")
         final_rank["config"]["_arrival_share_rps"] = 0.75
+        final_rank["rank_traffic_share"] = 0.6
         typed_plan = agent_tools.Plan(
             tick=0,
             actions=[
@@ -333,6 +579,12 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
                     type=agent_tools.ActionType.PLACE,
                     ladder=[agent_tools.RankSpec.from_dict(final_rank)],
                     target_tps=100.0,
+                    admitted_tps=60.0,
+                    achieved_tps=60.0,
+                    unmet_tps=40.0,
+                    meets_target=False,
+                    served_fraction=0.6,
+                    admission_mode="advisory",
                 )
             ],
         )
@@ -356,7 +608,17 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             [call["method"] for call in surrogate.calls],
             [("AIC_Direct",), ("AIC_DynoSim",)],
         )
-        self.assertEqual(surrogate.calls[-1]["job_features"]["request_arrival_rate"], 0.75)
+        self.assertEqual(surrogate.calls[-1]["job_features"]["request_arrival_rate"], 1.2)
+        self.assertEqual(
+            lineage["partial_admission"],
+            {
+                "mode": "advisory",
+                "requested_tps": 100.0,
+                "admitted_tps": 60.0,
+                "served_fraction": 0.6,
+                "enforced": False,
+            },
+        )
 
     def test_public_prediction_defaults_direct_and_queue_verification_is_explicit(self):
         surrogate = self._bind_prediction_fakes()
@@ -590,6 +852,104 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
                     self.assertEqual(
                         result.get("composite_eligible", False), expected == "under_target"
                     )
+
+    def test_advisory_safe_partial_frame_and_composite_are_candidates_with_metadata(self):
+        env = "reserved|aws|r1|z1|H100"
+        ranks = [_rank(env, "p5-a"), _rank(env, "p5-b")]
+        features = {
+            "type": "online",
+            "target_p99_ttft_ms": 100.0,
+            "target_p99_tpot_ms": 10.0,
+        }
+
+        def sized(scored_ranks, _features):
+            per_rank = [
+                {
+                    "n_replicas": rank.get("n_replicas", 1),
+                    "served_tps": 50.0 / len(scored_ranks),
+                    "prediction_received": True,
+                    "prediction_complete": True,
+                    "slo_ok": True,
+                    "partial_admission": True,
+                }
+                for rank in scored_ranks
+            ]
+            return {
+                "ranks": scored_ranks,
+                "meets_target": False,
+                "target_tps": 100.0,
+                "achieved_tps": 50.0,
+                "unmet_tps": 50.0,
+                "partial_online_admission": True,
+                "admission_mode": "advisory",
+                "partial_search_truncated": True,
+                "per_rank": per_rank,
+            }
+
+        agent_tools.configure_partial_online_admission("advisory")
+        with (
+            patch.object(agent_tools, "_applicable_mechanism_id", return_value="M_test"),
+            patch.object(agent_tools, "size_ladder", side_effect=sized),
+            patch.object(agent_tools, "check_feasibility", return_value={"feasible": True}),
+            patch.object(
+                agent_tools,
+                "compute_sigma",
+                return_value={"per_job": {"job": {"sigma": -0.25}}},
+            ),
+        ):
+            frame = agent_tools._score_one_frame("job", "user", "slice", ranks[0], features)
+            composite = agent_tools._score_composite(
+                "job",
+                "user",
+                "slice",
+                ranks,
+                features,
+            )
+
+        for result in (frame, composite):
+            candidate = result["candidate"]
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate["achieved_tps"], 50.0)
+            self.assertEqual(candidate["unmet_tps"], 50.0)
+            self.assertFalse(candidate["meets_target"])
+            self.assertEqual(candidate["served_fraction"], 0.5)
+            self.assertEqual(candidate["admitted_tps"], 50.0)
+            self.assertEqual(candidate["admission_mode"], "advisory")
+            self.assertTrue(result["diag"]["partial_search_truncated"])
+
+    def test_online_without_declared_latency_target_cannot_use_guarded_partial_path(self):
+        rank = _rank("reserved|aws|r1|z1|H100", "p5")
+        sized = {
+            "ranks": [rank],
+            "meets_target": False,
+            "target_tps": 100.0,
+            "achieved_tps": 50.0,
+            "partial_online_admission": True,
+            "per_rank": [
+                {
+                    "n_replicas": 1,
+                    "served_tps": 50.0,
+                    "prediction_received": True,
+                    "prediction_complete": True,
+                    "slo_ok": True,
+                }
+            ],
+        }
+        agent_tools.configure_partial_online_admission("advisory")
+        with (
+            patch.object(agent_tools, "_applicable_mechanism_id", return_value="M_test"),
+            patch.object(agent_tools, "size_ladder", return_value=sized),
+        ):
+            result = agent_tools._score_one_frame(
+                "job",
+                "user",
+                "slice",
+                rank,
+                {"type": "online"},
+            )
+
+        self.assertIsNone(result["candidate"])
+        self.assertEqual(result["diag"]["status"], "under_target")
 
     def test_successful_candidate_does_not_run_automatic_stress_diagnostic(self):
         rank = _rank("reserved|aws|r1|z1|H100", "p5")
@@ -936,6 +1296,114 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual(set(result["budget_limited"]), {"job-1", "job-2"})
         self.assertEqual(len(result["candidates"]), 4)
 
+    def test_selector_derives_proportional_credit_and_rejects_malformed_fractions(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 2, "gpu_type": "H100"}}
+        specs = {
+            env: {
+                "p5": {
+                    "gpus_per_instance": 1,
+                    "free_instances": 2,
+                }
+            }
+        }
+        base = {
+            "type": "place",
+            "ladder": [_rank(env, "p5")],
+            "target_tps": 100.0,
+            "achieved_tps": 25.0,
+            "served_fraction": 0.25,
+        }
+        candidates = [
+            {**base, "job_id": "valid", "sigma": -4.0},
+            {
+                **base,
+                "job_id": "inconsistent",
+                "sigma": 100.0,
+                "served_fraction": 0.9,
+            },
+            {
+                **base,
+                "job_id": "nonfinite",
+                "sigma": 100.0,
+                "served_fraction": float("nan"),
+            },
+            {
+                **base,
+                "job_id": "out-of-range",
+                "sigma": 100.0,
+                "served_fraction": 1.1,
+            },
+            {
+                **{key: value for key, value in base.items() if key != "served_fraction"},
+                "job_id": "incomplete",
+                "sigma": 100.0,
+            },
+            {
+                **base,
+                "job_id": "zero-target",
+                "target_tps": 0.0,
+                "achieved_tps": 0.0,
+                "served_fraction": 1.0,
+                "sigma": 100.0,
+            },
+            {
+                **base,
+                "job_id": "bad-admitted",
+                "admitted_tps": 50.0,
+                "sigma": 100.0,
+            },
+            {
+                "type": "place",
+                "ladder": [_rank(env, "p5")],
+                "job_id": "legacy",
+                "sigma": -4.0,
+            },
+        ]
+        pending = [{"job_id": candidate["job_id"]} for candidate in candidates]
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(agent_tools, "get_pending_jobs", return_value=pending),
+            patch.object(
+                agent_tools,
+                "get_priority",
+                return_value=[
+                    {"job_id": candidate["job_id"], "priority_score": 20.0}
+                    for candidate in candidates
+                ],
+            ),
+        ):
+            selected = agent_tools.jointly_select_placements(candidates)
+
+        self.assertEqual(
+            {candidate["job_id"] for candidate in selected["chosen"]},
+            {"valid", "legacy"},
+        )
+        chosen = next(
+            candidate for candidate in selected["chosen"] if candidate["job_id"] == "valid"
+        )
+        self.assertEqual(chosen["served_fraction"], 0.25)
+        self.assertEqual(chosen["served_credit"], 5.0)
+        self.assertEqual(chosen["solver_gain"], 1.0)
+        legacy = next(
+            candidate for candidate in selected["chosen"] if candidate["job_id"] == "legacy"
+        )
+        self.assertEqual(legacy["served_fraction"], 1.0)
+        self.assertEqual(selected["objective"], 17.0)
+        self.assertEqual(
+            set(selected["deferred"]),
+            {
+                "inconsistent",
+                "nonfinite",
+                "out-of-range",
+                "incomplete",
+                "zero-target",
+                "bad-admitted",
+            },
+        )
+
     def test_job_prediction_requires_every_rank_to_succeed(self):
         action = agent_tools.PlanAction(
             job_id="job",
@@ -964,6 +1432,260 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             ),
         ):
             self.assertEqual(agent_tools._compose_job_y_hat(action, {"type": "batch"}), {})
+
+    def test_advisory_partial_search_keeps_highest_tested_safe_load_with_seven_probes(self):
+        calls = []
+
+        def predict(_config, features, **kwargs):
+            load = float(features["request_arrival_rate"])
+            method = kwargs["method"]
+            calls.append((method, load))
+            if method == ("AIC_Direct",):
+                return {"y_hat": {"throughput_token_per_sec": 100.0}}
+            safe = load <= 60.0
+            return {
+                "y_hat": {
+                    "p99_ttft_ms": 20.0 if safe else 200.0,
+                    "p99_tpot_ms": 2.0 if safe else 20.0,
+                    "throughput_token_per_sec": load,
+                }
+            }
+
+        agent_tools.configure_partial_online_admission("advisory")
+        _env, _features, result = self._size_online(predict)
+
+        partial_loads = [load for method, load in calls if method == ("AIC_DynoSim",)][1:]
+        self.assertEqual(
+            partial_loads,
+            [50.0, 75.0, 62.5, 56.25, 59.375, 60.9375, 60.15625],
+        )
+        self.assertEqual(result["achieved_tps"], 59.375)
+        self.assertFalse(result["meets_target"])
+        self.assertTrue(result["partial_online_admission"])
+        self.assertEqual(result["admission_mode"], "advisory")
+        self.assertNotIn("_arrival_share_rps", result["ranks"][0]["config"])
+        self.assertEqual(result["ranks"][0]["rank_traffic_share"], 0.59375)
+        self.assertEqual(result["per_rank"][0]["admitted_tps"], 59.375)
+        self.assertEqual(result["per_rank"][0]["partial_search_probes"], 7)
+        status = agent_tools.get_partial_online_admission_status()
+        self.assertEqual(status["searches"], 1)
+        self.assertEqual(status["queue_aware_probes"], 7)
+        self.assertEqual(status["safe_probes"], 3)
+        self.assertEqual(status["admissions"], 1)
+
+        agent_tools.reset_tick_caches()
+        reset_status = agent_tools.get_partial_online_admission_status()
+        self.assertEqual(reset_status["mode"], "advisory")
+        self.assertEqual(reset_status["searches"], 0)
+        self.assertEqual(reset_status["queue_aware_probes"], 0)
+
+    def test_partial_probe_requires_only_declared_latency_targets(self):
+        def predict(_config, features, **kwargs):
+            load = float(features["request_arrival_rate"])
+            if kwargs["method"] == ("AIC_Direct",):
+                return {"y_hat": {"throughput_token_per_sec": 100.0}}
+            return {
+                "y_hat": {
+                    "p99_ttft_ms": 20.0 if load <= 60.0 else 200.0,
+                    "throughput_token_per_sec": load,
+                }
+            }
+
+        agent_tools.configure_partial_online_admission("advisory")
+        _env, _features, result = self._size_online(predict, include_tpot_target=False)
+
+        self.assertTrue(result["partial_online_admission"])
+        self.assertGreater(result["achieved_tps"], 0.0)
+        self.assertTrue(result["per_rank"][0]["prediction_complete"])
+
+    def test_partial_probe_rejects_ninety_nine_percent_capacity(self):
+        def predict(_config, features, **kwargs):
+            load = float(features["request_arrival_rate"])
+            if kwargs["method"] == ("AIC_Direct",):
+                return {"y_hat": {"throughput_token_per_sec": 100.0}}
+            return {
+                "y_hat": {
+                    "p99_ttft_ms": 20.0,
+                    "p99_tpot_ms": 2.0,
+                    "throughput_token_per_sec": 0.99 * load,
+                }
+            }
+
+        agent_tools.configure_partial_online_admission("advisory")
+        _env, _features, result = self._size_online(predict)
+
+        self.assertEqual(result["achieved_tps"], 0.0)
+        self.assertEqual(result["ranks"], [])
+        self.assertFalse(result["partial_online_admission"])
+
+    def test_off_mode_does_not_admit_an_unsafe_online_partial(self):
+        def predict(_config, features, **kwargs):
+            load = float(features["request_arrival_rate"])
+            if kwargs["method"] == ("AIC_Direct",):
+                return {"y_hat": {"throughput_token_per_sec": 100.0}}
+            return {
+                "y_hat": {
+                    "p99_ttft_ms": 200.0,
+                    "p99_tpot_ms": 20.0,
+                    "throughput_token_per_sec": load,
+                }
+            }
+
+        _env, features, sized = self._size_online(predict)
+        with (
+            patch.object(agent_tools, "_applicable_mechanism_id", return_value="M_test"),
+            patch.object(agent_tools, "size_ladder", return_value=sized),
+        ):
+            scored = agent_tools._score_one_frame(
+                "job",
+                "user",
+                "slice",
+                _rank("reserved|aws|r1|z1|H100", "p5"),
+                features,
+            )
+
+        self.assertIsNone(scored["candidate"])
+        self.assertEqual(scored["diag"]["status"], "under_slo")
+        self.assertEqual(
+            agent_tools.get_partial_online_admission_status()["queue_aware_probes"],
+            0,
+        )
+
+    def test_advisory_rejects_unsafe_incomplete_and_zero_throughput_partials(self):
+        def response(kind, load):
+            if kind == "unsafe":
+                return {
+                    "p99_ttft_ms": 200.0,
+                    "p99_tpot_ms": 20.0,
+                    "throughput_token_per_sec": load,
+                }
+            if kind == "incomplete":
+                return {"p99_ttft_ms": 20.0, "throughput_token_per_sec": load}
+            return {
+                "p99_ttft_ms": 20.0,
+                "p99_tpot_ms": 2.0,
+                "throughput_token_per_sec": 0.0,
+            }
+
+        agent_tools.configure_partial_online_admission("advisory")
+        for kind, expected_status in (
+            ("unsafe", "under_slo"),
+            ("incomplete", "prediction_incomplete"),
+            ("zero", "no_fit"),
+        ):
+            with self.subTest(kind=kind):
+
+                def predict(_config, features, kind=kind, **kwargs):
+                    load = float(features["request_arrival_rate"])
+                    if kwargs["method"] == ("AIC_Direct",):
+                        return {"y_hat": {"throughput_token_per_sec": 100.0}}
+                    return {"y_hat": response(kind, load)}
+
+                _env, features, sized = self._size_online(predict)
+                with (
+                    patch.object(
+                        agent_tools,
+                        "_applicable_mechanism_id",
+                        return_value="M_test",
+                    ),
+                    patch.object(agent_tools, "size_ladder", return_value=sized),
+                ):
+                    scored = agent_tools._score_one_frame(
+                        "job",
+                        "user",
+                        "slice",
+                        _rank("reserved|aws|r1|z1|H100", "p5"),
+                        features,
+                    )
+
+                self.assertEqual(sized["ranks"], [])
+                self.assertIsNone(scored["candidate"])
+                self.assertEqual(scored["diag"]["status"], expected_status)
+
+    def test_advisory_budget_exhaustion_after_safe_probe_preserves_partial(self):
+        partial_calls = 0
+
+        def predict(_config, features, **kwargs):
+            nonlocal partial_calls
+            load = float(features["request_arrival_rate"])
+            if kwargs["method"] == ("AIC_Direct",):
+                return {"y_hat": {"throughput_token_per_sec": 100.0}}
+            if load == 100.0:
+                return {
+                    "y_hat": {
+                        "p99_ttft_ms": 200.0,
+                        "p99_tpot_ms": 20.0,
+                        "throughput_token_per_sec": 100.0,
+                    }
+                }
+            partial_calls += 1
+            if partial_calls > 1:
+                raise agent_tools.SurrogateBudgetExceeded("test budget exhausted")
+            return {
+                "y_hat": {
+                    "p99_ttft_ms": 20.0,
+                    "p99_tpot_ms": 2.0,
+                    "throughput_token_per_sec": load,
+                }
+            }
+
+        agent_tools.configure_partial_online_admission("advisory")
+        _env, _features, result = self._size_online(predict)
+
+        self.assertEqual(result["achieved_tps"], 50.0)
+        self.assertTrue(result["partial_online_admission"])
+        self.assertTrue(result["partial_search_truncated"])
+        self.assertEqual(result["per_rank"][0]["partial_search_probes"], 2)
+        self.assertIn("truncated", result["per_rank"][0]["reason"])
+        status = agent_tools.get_partial_online_admission_status()
+        self.assertEqual(status["truncated_searches"], 1)
+        self.assertEqual(status["admissions"], 1)
+
+    def test_advisory_budget_exhaustion_before_a_safe_probe_propagates(self):
+        def predict(_config, features, **kwargs):
+            load = float(features["request_arrival_rate"])
+            if kwargs["method"] == ("AIC_Direct",):
+                return {"y_hat": {"throughput_token_per_sec": 100.0}}
+            if load == 100.0:
+                return {
+                    "y_hat": {
+                        "p99_ttft_ms": 200.0,
+                        "p99_tpot_ms": 20.0,
+                        "throughput_token_per_sec": 100.0,
+                    }
+                }
+            raise agent_tools.SurrogateBudgetExceeded("test budget exhausted")
+
+        agent_tools.configure_partial_online_admission("advisory")
+        with self.assertRaisesRegex(agent_tools.SurrogateBudgetExceeded, "test budget"):
+            self._size_online(predict)
+
+    def test_invalid_conservative_lower_bound_never_falls_back_to_point_throughput(self):
+        agent_tools.configure_partial_online_admission("advisory")
+        for lower in (0.0, float("nan")):
+            with self.subTest(lower=lower):
+
+                def predict(_config, features, lower=lower, **kwargs):
+                    load = float(features["request_arrival_rate"])
+                    if kwargs["method"] == ("AIC_Direct",):
+                        return {
+                            "y_hat": {"throughput_token_per_sec": 100.0},
+                            "throughput_token_per_sec_lower": lower,
+                        }
+                    return {
+                        "y_hat": {
+                            "p99_ttft_ms": 20.0,
+                            "p99_tpot_ms": 2.0,
+                            "throughput_token_per_sec": load,
+                        },
+                        "throughput_token_per_sec_lower": lower,
+                    }
+
+                _env, _features, result = self._size_online(predict)
+
+                self.assertEqual(result["achieved_tps"], 0.0)
+                self.assertEqual(result["ranks"], [])
+                self.assertEqual(result["per_rank"][0]["partial_search_probes"], 0)
 
     def test_size_ladder_tries_specialist_replica_count_first(self):
         env = "reserved|aws|r1|z1|H100"

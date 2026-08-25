@@ -87,6 +87,45 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(action.to_dict()["target_p99_ttft_ms"], 500.0)
         self.assertEqual(action.to_dict()["target_p99_tpot_ms"], 50.0)
 
+    def test_plan_action_round_trips_partial_admission_metadata(self):
+        raw_action = {
+            "job_id": "job_partial",
+            "type": "place",
+            "ladder": [],
+            "target_tps": 100.0,
+            "admitted_tps": 60.0,
+            "achieved_tps": 60.0,
+            "unmet_tps": 40.0,
+            "meets_target": False,
+            "served_fraction": 0.6,
+            "admission_mode": "advisory",
+            "sigma": -1.0,
+            "solver_gain": 2.0,
+        }
+
+        action = Plan.from_raw({"actions": [raw_action]}, tick=1).actions[0]
+        serialized = action.to_dict()
+
+        for field_name in (
+            "admitted_tps",
+            "achieved_tps",
+            "unmet_tps",
+            "meets_target",
+            "served_fraction",
+            "admission_mode",
+        ):
+            self.assertEqual(serialized[field_name], raw_action[field_name])
+        self.assertNotIn("sigma", serialized)
+        self.assertNotIn("solver_gain", serialized)
+
+        reparsed = Plan.from_raw({"actions": [serialized]}, tick=1).actions[0]
+        self.assertEqual(reparsed.to_dict(), serialized)
+
+        legacy = Plan.from_raw(
+            {"actions": [{"job_id": "job_legacy", "type": "defer"}]}, tick=1
+        ).actions[0]
+        self.assertNotIn("admitted_tps", legacy.to_dict())
+
     def test_plan_action_autofills_and_preserves_rank_ids(self):
         plan = Plan.from_raw(
             {
@@ -457,9 +496,7 @@ class CoreSmokeTests(unittest.TestCase):
                 row = make_row(f"cal-{index}", index + 1)
                 row.y_predicted = {"throughput_token_per_sec": 100.0}
                 row.y_observed_mean = {"throughput_token_per_sec": 120.0}
-                row.y_observed_trajectory = {
-                    "throughput_token_per_sec": np.array([120.0])
-                }
+                row.y_observed_trajectory = {"throughput_token_per_sec": np.array([120.0])}
                 row.residuals_per_y = {"throughput_token_per_sec": np.array([20.0])}
                 row.deployment_id = f"deploy-cal-{index}"
                 row.evidence_available_timestamp_utc = float(index + 1)

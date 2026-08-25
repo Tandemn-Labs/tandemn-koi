@@ -65,6 +65,7 @@ Tool catalog:
     prediction / scoring:
         predict_outcome             calibrated surrogate prediction + DRO band
         get_surrogate_budget_status current tick search-budget accounting
+        get_partial_online_admission_status  guarded admission mode/counters
         get_z_star                  current ideal-point reference (z_star_t)
         compute_tchebycheff         augmented Tchebycheff J
         optimize_config             LLM-steered coordinate descent over candidates
@@ -140,6 +141,7 @@ AGENT_TUNABLE_X = frozenset(
 # Engine-AUTOTUNED batch knobs: never valid from the agent OR from workload
 # features. Stripped from BOTH config and features.
 _ENGINE_AUTOTUNED_X = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
+_INTERNAL_AGENT_CONFIG_X = frozenset({"_arrival_share_rps"})
 
 # Engine/catalog-owned CONFIG knobs the agent must NOT set (not in the allowed
 # proposal set). The engine/catalog supplies them, and the valid workload value
@@ -165,7 +167,7 @@ _ENGINE_OWNED_X = frozenset(
 
 
 def _sanitize_agent_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Strip engine-owned + engine-autotuned knobs from an agent-proposed CONFIG.
+    """Strip engine-owned, autotuned, and Koi-internal values from CONFIG.
 
     The agent may only propose the placement/topology/parallelism/PD knobs in
     AGENT_TUNABLE_X; everything else is engine/catalog-owned and is removed here
@@ -173,7 +175,7 @@ def _sanitize_agent_config(config: dict[str, Any]) -> dict[str, Any]:
     etc.) can never reach the surrogate. The catalog, workload features, and
     surrogate defaults supply the real values.
     """
-    drop = _ENGINE_AUTOTUNED_X | _ENGINE_OWNED_X
+    drop = _ENGINE_AUTOTUNED_X | _ENGINE_OWNED_X | _INTERNAL_AGENT_CONFIG_X
     return {key: value for key, value in (config or {}).items() if key not in drop}
 
 
@@ -450,13 +452,20 @@ def assert_planning_ready() -> None:
 # it late means "commit the best scored so far", never a crash or forced defer.
 # Raise it for deeper search; it is generous by design (a normal tick uses far fewer).
 SURROGATE_CALL_BUDGET = 100
+PARTIAL_ONLINE_ADMISSION_MODE = "off"
 _AIC_DIRECT_METHOD = ("AIC_Direct",)
 _AIC_DYNOSIM_METHOD = ("AIC_DynoSim",)
 _surrogate_calls = 0
 _surrogate_cache_hits = 0
+_surrogate_raw_cache_hits = 0
 _surrogate_budget_rejections = 0
 _surrogate_finalization_calls = 0
 _surrogate_stress_calls = 0
+_partial_online_searches = 0
+_partial_online_queue_aware_probes = 0
+_partial_online_safe_probes = 0
+_partial_online_admissions = 0
+_partial_online_truncated_searches = 0
 # Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
 # scenario, calibration, method, accounting mode). DynoSim is deterministic, so
 # re-probing a config the LLM already
@@ -487,6 +496,31 @@ def configure_surrogate_call_budget(limit: int) -> None:
     _scored_candidates_cache.clear()
 
 
+def configure_partial_online_admission(mode: str) -> None:
+    """Configure guarded partial admission without resetting tick metrics."""
+    if not isinstance(mode, str):
+        raise TypeError("partial online admission mode must be a string")
+    if mode not in {"off", "advisory"}:
+        raise ValueError("partial online admission mode must be exactly 'off' or 'advisory'")
+    global PARTIAL_ONLINE_ADMISSION_MODE
+    with _SURROGATE_EXECUTION_LOCK:
+        PARTIAL_ONLINE_ADMISSION_MODE = mode
+    _scored_candidates_cache.clear()
+
+
+def get_partial_online_admission_status() -> dict[str, Any]:
+    """Return configured mode and current-tick guarded-search accounting."""
+    with _SURROGATE_EXECUTION_LOCK:
+        return {
+            "mode": PARTIAL_ONLINE_ADMISSION_MODE,
+            "searches": _partial_online_searches,
+            "queue_aware_probes": _partial_online_queue_aware_probes,
+            "safe_probes": _partial_online_safe_probes,
+            "admissions": _partial_online_admissions,
+            "truncated_searches": _partial_online_truncated_searches,
+        }
+
+
 def get_surrogate_budget_status() -> dict[str, int]:
     """Return current tick search usage and non-search surrogate accounting."""
     with _SURROGATE_EXECUTION_LOCK:
@@ -494,6 +528,7 @@ def get_surrogate_budget_status() -> dict[str, int]:
             "limit": SURROGATE_CALL_BUDGET,
             "calls_executed": _surrogate_calls,
             "cache_hits": _surrogate_cache_hits,
+            "raw_cache_hits": _surrogate_raw_cache_hits,
             "budget_rejections": _surrogate_budget_rejections,
             "finalization_calls": _surrogate_finalization_calls,
             "stress_calls": _surrogate_stress_calls,
@@ -518,15 +553,25 @@ def reset_tick_caches() -> None:
     a stale-budget hole in the anti-split-brain ordering.
     """
     global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
+    global _surrogate_raw_cache_hits
     global _surrogate_finalization_calls, _surrogate_stress_calls
+    global _partial_online_admissions, _partial_online_queue_aware_probes
+    global _partial_online_safe_probes, _partial_online_searches
+    global _partial_online_truncated_searches
     _CTX.user_envelopes = None
     _CTX.validated_budget_book = None
     with _SURROGATE_EXECUTION_LOCK:
         _surrogate_calls = 0
         _surrogate_cache_hits = 0
+        _surrogate_raw_cache_hits = 0
         _surrogate_budget_rejections = 0
         _surrogate_finalization_calls = 0
         _surrogate_stress_calls = 0
+        _partial_online_searches = 0
+        _partial_online_queue_aware_probes = 0
+        _partial_online_safe_probes = 0
+        _partial_online_admissions = 0
+        _partial_online_truncated_searches = 0
         _prediction_cache.clear()
     _specialist_results_cache.clear()
     _scored_candidates_cache.clear()
@@ -539,6 +584,7 @@ _NON_TOOL_NAMES = frozenset(
         "all_callables",
         "assert_planning_ready",
         "compute_sigma_for_commit",
+        "configure_partial_online_admission",
         "configure_surrogate_call_budget",
         "reset_tick_caches",
         "stamp_plan_predictions",
@@ -662,10 +708,17 @@ def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
     return {}
 
 
-def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None = None) -> dict:
+def _rank_prediction_payload(
+    rank: RankSpec,
+    job_features: dict[str, Any] | None = None,
+    *,
+    arrival_rate_rps: float | None = None,
+) -> dict:
     """Build the surrogate payload for one rank without mutating the rank."""
     features = _sanitize_agent_features(dict(job_features or {}))
-    arrival_share = rank.config.get("_arrival_share_rps")
+    arrival_share = arrival_rate_rps
+    if arrival_share is None:
+        arrival_share = rank.config.get("_arrival_share_rps")
     if arrival_share is not None:
         features["request_arrival_rate"] = float(arrival_share)
     env = None
@@ -710,7 +763,26 @@ def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None
                 config["price_per_hour"] = float(price)
         except Exception:
             log.exception("rank prediction X assembly failed; using rank config only")
+    config.pop("_arrival_share_rps", None)
     return {"job_config": config, "job_features": features}
+
+
+def _public_rank_arrival_rps(action, rank: RankSpec, job_features: dict[str, Any]) -> float | None:
+    """Derive a rank's request rate from public action accounting when available."""
+    target_tps = getattr(action, "target_tps", None)
+    traffic_share = rank.rank_traffic_share
+    output_length = _feature_value(job_features, "osl_token_avg", "output_len_tokens_avg")
+    try:
+        target = float(target_tps)
+        share = float(traffic_share)
+        output = float(output_length)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(value) for value in (target, share, output)):
+        return None
+    if target <= 0.0 or share <= 0.0 or output <= 0.0:
+        return None
+    return target * share / output
 
 
 def _rank_mechanism_context(rank: RankSpec, job_features: dict[str, Any]) -> dict[str, Any]:
@@ -776,6 +848,7 @@ def _compose_job_y_hat(
     job_features: dict[str, Any] | None = None,
     *,
     method: tuple[str, ...] = _AIC_DIRECT_METHOD,
+    scenario: str = "mean",
     finalization: bool = False,
 ) -> dict[str, Any]:
     """Compose a job-level y_hat from a ladder's per-rank predictions.
@@ -793,22 +866,19 @@ def _compose_job_y_hat(
     #     return dict(action.predicted_y)
     samples: list[tuple[int, dict]] = []
     for rank in action.ladder or []:
-        # Predict each rank at ITS arrival share (recorded by size_ladder), not the
-        # whole job's rate - so a heterogeneous composite is not scored as if every
-        # rank carried the full traffic (that double-counts demand and over-loads
-        # each rank's predicted latency). Single-rank jobs carry the full share, so
-        # they are unaffected.
-        share_rps = (rank.config or {}).get("_arrival_share_rps")
-        feats = (
-            {**(job_features or {}), "request_arrival_rate": float(share_rps)}
-            if share_rps is not None
-            else job_features
-        )
+        # Public action accounting is authoritative. The private config field remains
+        # readable only for plans created before rank_traffic_share was persisted.
+        share_rps = _public_rank_arrival_rps(action, rank, job_features or {})
         try:
-            payload = _rank_prediction_payload(rank, feats)
+            payload = _rank_prediction_payload(
+                rank,
+                job_features,
+                arrival_rate_rps=share_rps,
+            )
             y = _predict_outcome_core(
                 payload["job_config"],
                 payload["job_features"],
+                scenario=scenario,
                 method=method,
                 _finalization=finalization,
             ).get("y_hat", {})
@@ -1812,9 +1882,9 @@ def size_ladder(
         achieved_tps  = demand actually served within SLO (SUM across ranks).
 
     Online latency GATES the replica count (queueing latency FALLS with more
-    replicas), it does not veto the rank. A rank that cannot clear the SLO even at
-    max capacity serves the partial throughput it can push (marked not-slo_ok) and
-    the shortfall spills; unmet_tps reports demand the whole ladder could not cover.
+    replicas), it does not veto the rank. In advisory mode only, a rank that cannot
+    provide full service may contribute a separately tested SLO-safe partial load;
+    otherwise the legacy fallback remains diagnostic-only for online candidates.
     meets_target requires the whole demand covered AND every serving rank in SLO.
 
     Args:
@@ -1835,6 +1905,9 @@ def size_ladder(
          "marginal_value": {env_key: extra_gpus_to_meet_target}}.
     """
     _require("resource_map", "surrogate", "candidate_graph", "dro")
+    global _partial_online_admissions, _partial_online_queue_aware_probes
+    global _partial_online_safe_probes, _partial_online_searches
+    global _partial_online_truncated_searches
 
     job_features = _sanitize_agent_features(dict(job_features or {}))
     regime = str(job_features.get("type", "online")).lower()
@@ -1853,6 +1926,18 @@ def size_ladder(
     tpot_target = _feature_value(job_features, "target_p99_tpot_ms", "target_p99_TPOT_ms")
     verify_online_latency = is_online and (ttft_target is not None or tpot_target is not None)
 
+    def _finite_latency(y: dict, *keys: str) -> float | None:
+        for key in keys:
+            value = y.get(key)
+            if value is None:
+                continue
+            try:
+                latency = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return latency if math.isfinite(latency) and latency >= 0 else None
+        return None
+
     def _slo_ok(y: dict) -> bool:
         # Online latency gate. Batch has no per-request latency SLO -> always passes
         # here and is sized on throughput alone.
@@ -1860,19 +1945,11 @@ def size_ladder(
             return True
         if not y:
             return False
-        if ttft_target is not None and not any(
-            y.get(key) is not None for key in ("p99_ttft_ms", "p99_TTFT_ms")
-        ):
+        ttft = _finite_latency(y, "p99_ttft_ms", "p99_TTFT_ms")
+        tpot = _finite_latency(y, "p99_tpot_ms", "p99_TPOT_ms")
+        if ttft_target is not None and (ttft is None or ttft > ttft_target):
             return False
-        if tpot_target is not None and not any(
-            y.get(key) is not None for key in ("p99_tpot_ms", "p99_TPOT_ms")
-        ):
-            return False
-        ttft = _y_value(y, "p99_ttft_ms", "p99_TTFT_ms")
-        tpot = _y_value(y, "p99_tpot_ms", "p99_TPOT_ms")
-        if ttft_target is not None and ttft > ttft_target:
-            return False
-        return not (tpot_target is not None and tpot > tpot_target)
+        return not (tpot_target is not None and (tpot is None or tpot > tpot_target))
 
     def _slo_prediction_complete(y: dict) -> bool:
         if not is_online:
@@ -1890,9 +1967,30 @@ def size_ladder(
         )
 
     def _capacity_tps(y: dict) -> float:
-        point = _y_value(y, "throughput_token_per_sec")
+        try:
+            point = _y_value(y, "throughput_token_per_sec")
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(point) or point <= 0:
+            return 0.0
         lower = y.get("_throughput_token_per_sec_lower")
-        return min(point, float(lower)) if lower is not None and float(lower) > 0 else point
+        if lower is None:
+            return point
+        try:
+            lower_value = float(lower)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(lower_value) or lower_value <= 0:
+            return 0.0
+        return min(point, lower_value)
+
+    def _covers_offered_load(capacity_tps: float, offered_tps: float) -> bool:
+        return capacity_tps >= offered_tps or math.isclose(
+            capacity_tps,
+            offered_tps,
+            rel_tol=1e-3,
+            abs_tol=1e-6,
+        )
 
     def _dp_candidates(cap: int, preferred: int | None = None) -> list[int]:
         ds, d = [], 1
@@ -1909,7 +2007,52 @@ def size_ladder(
 
     physical_rejections: list[str] = []
 
-    def _predict_at(rank: RankSpec, d: int, share_tps: float, max_dp: int) -> dict | None:
+    def _run_at_load(
+        rank: RankSpec,
+        d: int,
+        share_tps: float,
+        method: tuple[str, ...],
+    ) -> dict | None:
+        feats = dict(job_features)
+        arrival_rate_rps = None
+        if is_online and osl > 0:
+            arrival_rate_rps = float(share_tps) / osl
+            feats["request_arrival_rate"] = arrival_rate_rps
+        r = RankSpec.from_dict(rank.to_dict())
+        r.n_replicas = int(d)
+        payload = _rank_prediction_payload(r, feats, arrival_rate_rps=arrival_rate_rps)
+        if not config_runnable(dict(r.config), payload["job_features"])[0]:
+            return None
+        try:
+            prediction = _predict_outcome_core(
+                payload["job_config"],
+                payload["job_features"],
+                scenario="peak",
+                method=method,
+            )
+            y_hat = dict(prediction.get("y_hat", {}))
+            lower = prediction.get("throughput_token_per_sec_lower")
+            if lower is not None:
+                y_hat["_throughput_token_per_sec_lower"] = lower
+            return y_hat
+        except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
+            log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
+            physical_rejections.append(str(exc))
+            return None
+        except SurrogateExecutionError as exc:
+            message = str(exc)
+            if message.startswith("completed ") and message.endswith(" requests"):
+                log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
+                return {}
+            raise
+
+    def _predict_at(
+        rank: RankSpec,
+        d: int,
+        share_tps: float,
+        max_dp: int,
+        direct_predictions: dict[int, dict | None],
+    ) -> dict | None:
         # Predict this rank at DP=d workers carrying `share_tps` tokens/s of demand.
         # Direct screens capacity first. DynoSim runs only when an online DP can
         # carry the share, or at max DP to characterize a possible partial rank.
@@ -1917,46 +2060,16 @@ def size_ladder(
         #   dict y_hat -> the DP-aggregate prediction,
         #   {}         -> overloaded/incomplete at this DP (try more replicas),
         #   None       -> physical/memory no-fit (no replica count fixes it).
-        feats = dict(job_features)
-        if is_online and osl > 0:
-            feats["request_arrival_rate"] = float(share_tps) / osl
-        r = RankSpec.from_dict(rank.to_dict())
-        r.n_replicas = int(d)
-        payload = _rank_prediction_payload(r, feats)
-        if not config_runnable(dict(r.config), payload["job_features"])[0]:
-            return None
-
-        def _run(method: tuple[str, ...]) -> dict | None:
-            try:
-                prediction = _predict_outcome_core(
-                    payload["job_config"],
-                    payload["job_features"],
-                    scenario="peak",
-                    method=method,
-                )
-                y_hat = dict(prediction.get("y_hat", {}))
-                lower = prediction.get("throughput_token_per_sec_lower")
-                if lower is not None:
-                    y_hat["_throughput_token_per_sec_lower"] = lower
-                return y_hat
-            except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
-                log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
-                physical_rejections.append(str(exc))
-                return None
-            except SurrogateExecutionError as exc:
-                message = str(exc)
-                if message.startswith("completed ") and message.endswith(" requests"):
-                    log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
-                    return {}
-                raise
-
-        direct_y = _run(_AIC_DIRECT_METHOD)
+        direct_y = _run_at_load(rank, d, share_tps, _AIC_DIRECT_METHOD)
+        direct_predictions[d] = direct_y
         if direct_y is None or not verify_online_latency:
             return direct_y
-        direct_can_carry = bool(direct_y) and _capacity_tps(direct_y) >= 0.99 * share_tps
+        direct_can_carry = bool(direct_y) and _covers_offered_load(
+            _capacity_tps(direct_y), share_tps
+        )
         if not direct_can_carry and d != max_dp:
             return {}
-        return _run(_AIC_DYNOSIM_METHOD)
+        return _run_at_load(rank, d, share_tps, _AIC_DYNOSIM_METHOD)
 
     sized: list[dict[str, Any]] = []
     per_rank: list[dict[str, Any]] = []
@@ -2018,6 +2131,12 @@ def size_ladder(
         reason: str | None = None
         y_hat: dict[str, Any] = {}
         dp_tried = 0
+        direct_predictions: dict[int, dict | None] = {}
+        partial_search_attempted = False
+        partial_search_probes = 0
+        partial_search_truncated = False
+        partial_search_upper_tps = 0.0
+        partial_admission = False
 
         if not runnable:
             reason = f"config not runnable: {validity_reason}"
@@ -2031,7 +2150,7 @@ def size_ladder(
             fallback_y: dict[str, Any] = {}
             for d in _dp_candidates(max_by_cap, preferred_replicas):
                 dp_tried = max(dp_tried, d)
-                y = _predict_at(rank, d, share, max_by_cap)
+                y = _predict_at(rank, d, share, max_by_cap, direct_predictions)
                 if y is None:
                     reason = "does not fit (memory/physical)"
                     break
@@ -2044,11 +2163,91 @@ def size_ladder(
                 if d >= fallback_d:
                     fallback_d, fallback_y = d, y
                 tp = _capacity_tps(y)
-                keeps_up = tp >= 0.99 * share if share > 0 else tp > 0
-                if _slo_ok(y) and keeps_up:
+                keeps_up = _covers_offered_load(tp, share) if share > 0 else tp > 0
+                if _slo_ok(y) and keeps_up and tp >= share:
                     n_replicas, served, slo_ok, reason, met = d, share, True, "ok", True
                     break
-            if not met and fallback_y:
+            advisory_search = (
+                not met and PARTIAL_ONLINE_ADMISSION_MODE == "advisory" and verify_online_latency
+            )
+            if advisory_search:
+                partial_search_attempted = True
+                with _SURROGATE_EXECUTION_LOCK:
+                    _partial_online_searches += 1
+                usable_dp = [
+                    d
+                    for d, direct_y in direct_predictions.items()
+                    if direct_y and _capacity_tps(direct_y) > 0
+                ]
+                if usable_dp and osl > 0:
+                    partial_d = max(usable_dp)
+                    partial_search_upper_tps = min(
+                        share,
+                        _capacity_tps(direct_predictions[partial_d] or {}),
+                    )
+                    low = 0.0
+                    high = partial_search_upper_tps
+                    safe_load = 0.0
+                    safe_y: dict[str, Any] = {}
+                    last_probe_y: dict[str, Any] = {}
+                    for _probe_index in range(7):
+                        probe_load = (low + high) / 2.0
+                        if probe_load <= 0 or probe_load <= low:
+                            break
+                        partial_search_probes += 1
+                        with _SURROGATE_EXECUTION_LOCK:
+                            _partial_online_queue_aware_probes += 1
+                        try:
+                            probe_y = _run_at_load(
+                                rank,
+                                partial_d,
+                                probe_load,
+                                _AIC_DYNOSIM_METHOD,
+                            )
+                        except SurrogateBudgetExceeded:
+                            if not safe_y:
+                                raise
+                            partial_search_truncated = True
+                            with _SURROGATE_EXECUTION_LOCK:
+                                _partial_online_truncated_searches += 1
+                            break
+                        last_probe_y = probe_y or {}
+                        probe_safe = (
+                            probe_y is not None
+                            and _slo_prediction_complete(probe_y)
+                            and _slo_ok(probe_y)
+                            and _covers_offered_load(_capacity_tps(probe_y), probe_load)
+                        )
+                        if probe_safe:
+                            low = probe_load
+                            safe_load = min(probe_load, _capacity_tps(probe_y))
+                            safe_y = probe_y
+                            with _SURROGATE_EXECUTION_LOCK:
+                                _partial_online_safe_probes += 1
+                        else:
+                            high = probe_load
+                    if safe_y and safe_load > 0:
+                        n_replicas = partial_d
+                        served = safe_load
+                        y_hat = safe_y
+                        slo_ok = True
+                        partial_admission = True
+                        reason = (
+                            "SLO-safe partial (search truncated by budget)"
+                            if partial_search_truncated
+                            else "SLO-safe partial admission"
+                        )
+                        with _SURROGATE_EXECUTION_LOCK:
+                            _partial_online_admissions += 1
+                    else:
+                        y_hat = last_probe_y or fallback_y
+                        slo_ok = _slo_ok(y_hat)
+                        reason = "no positive SLO-safe partial load at max usable DP"
+                elif osl <= 0:
+                    reason = "cannot test partial load without a positive output length"
+                else:
+                    reason = "no positive conservative direct capacity at max usable DP"
+            elif not met and fallback_y:
                 # No DP up to capacity cleared SLO+keep-up at the full share. Take max
                 # capacity and serve the throughput it can push; the rest spills to
                 # the next rank. slo_ok=False here keeps meets_target honest.
@@ -2066,11 +2265,7 @@ def size_ladder(
         rank.n_replicas = n_replicas
         if n_replicas >= 1:
             rank.rank_traffic_share = served / target if target > 0 else 1.0
-            # Record the arrival rate (req/s) this rank actually serves, so downstream
-            # scoring (compute_sigma) predicts each rank at ITS share, not the whole
-            # job's traffic - otherwise a multi-rank composite double-counts demand.
-            if osl > 0:
-                rank.config["_arrival_share_rps"] = served / osl
+            rank.config.pop("_arrival_share_rps", None)
             sized.append(rank.to_dict())
             remaining = max(0.0, remaining - served)
             remaining_by_pool[pool_key] = max(0, free - n_replicas * capacity_per_replica)
@@ -2097,10 +2292,18 @@ def size_ladder(
                 "slo_ok": slo_ok,
                 "prediction_received": bool(y_hat),
                 "prediction_complete": _slo_prediction_complete(y_hat),
+                "partial_search_attempted": partial_search_attempted,
+                "partial_search_probes": partial_search_probes,
+                "partial_search_truncated": partial_search_truncated,
+                "partial_search_upper_tps": partial_search_upper_tps,
+                "partial_admission": partial_admission,
+                "admitted_tps": served if partial_admission else None,
                 "reason": reason,
                 "physical_violations": physical_rejections[physical_rejection_start:],
             }
         )
+        if partial_search_truncated:
+            break
 
     # achieved = demand actually served; meets_target needs the WHOLE demand covered
     # AND every serving rank inside its latency SLO.
@@ -2108,6 +2311,13 @@ def size_ladder(
     serving = [r for r in per_rank if r["n_replicas"] >= 1]
     served_slo_ok = bool(serving) and all(r["slo_ok"] for r in serving)
     meets_target = remaining <= max(1e-6, 1e-3 * target) and served_slo_ok
+    partial_online_admission = (
+        PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
+        and verify_online_latency
+        and achieved_tps > 0
+        and achieved_tps < target
+        and any(r["partial_admission"] for r in serving)
+    )
     return {
         "ranks": sized,
         "regime": regime,
@@ -2115,6 +2325,10 @@ def size_ladder(
         "achieved_tps": achieved_tps,
         "unmet_tps": max(0.0, remaining),
         "meets_target": meets_target,
+        "partial_online_admission": partial_online_admission,
+        "admission_mode": "advisory" if partial_online_admission else None,
+        "partial_search_probes": sum(r["partial_search_probes"] for r in per_rank),
+        "partial_search_truncated": any(r["partial_search_truncated"] for r in per_rank),
         "per_rank": per_rank,
         "marginal_value": marginal,
     }
@@ -2518,6 +2732,17 @@ def _prediction_cache_key(
         return None
 
 
+def _aic_raw_cache_hit(prediction_lineage: Any) -> bool:
+    """Whether the primary AIC backend reports a successful cross-tick raw hit."""
+    if not isinstance(prediction_lineage, dict):
+        return False
+    components = prediction_lineage.get("components")
+    primary = components.get("primary") if isinstance(components, dict) else None
+    metadata = primary.get("metadata") if isinstance(primary, dict) else None
+    raw_cache = metadata.get("aic_raw_cache") if isinstance(metadata, dict) else None
+    return isinstance(raw_cache, dict) and raw_cache.get("hit") is True
+
+
 def _predict_outcome_core(
     job_config: dict[str, Any],
     job_features: dict[str, Any],
@@ -2535,6 +2760,7 @@ def _predict_outcome_core(
     """
     _require("candidate_graph", "dro", "surrogate")
     global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
+    global _surrogate_raw_cache_hits
     global _surrogate_finalization_calls, _surrogate_stress_calls
     selected_method = (method,) if isinstance(method, str) else tuple(method)
     key = _prediction_cache_key(
@@ -2552,18 +2778,38 @@ def _predict_outcome_core(
             _surrogate_cache_hits += 1
         else:
             is_stress = scenario == "peak_all_multiturn_stress"
+            is_search = not _finalization and not is_stress
+            preflight_raw_hit = False
+            charged_search = False
             if _finalization:
                 _surrogate_finalization_calls += 1
             elif is_stress:
                 _surrogate_stress_calls += 1
             else:
                 if _surrogate_calls >= SURROGATE_CALL_BUDGET:
-                    _surrogate_budget_rejections += 1
-                    raise SurrogateBudgetExceeded(
-                        f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
-                        "narrow to your best few candidate configs and reuse scored results."
-                    )
-                _surrogate_calls += 1
+                    cache_contains = getattr(_CTX.surrogate, "primary_cache_contains", None)
+                    if callable(cache_contains):
+                        try:
+                            preflight_raw_hit = bool(
+                                cache_contains(
+                                    job_config=job_config,
+                                    job_features=job_features,
+                                    candidate_graph=_CTX.candidate_graph,
+                                    method=selected_method,
+                                    scenario=scenario,
+                                )
+                            )
+                        except Exception:
+                            preflight_raw_hit = False
+                    if not preflight_raw_hit:
+                        _surrogate_budget_rejections += 1
+                        raise SurrogateBudgetExceeded(
+                            f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
+                            "narrow to your best few candidate configs and reuse scored results."
+                        )
+                else:
+                    _surrogate_calls += 1
+                    charged_search = True
             if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
                 # Point-in-time cutoff prevents later evidence leaking into replayed predictions.
                 try:
@@ -2593,6 +2839,10 @@ def _predict_outcome_core(
                 else:
                     y_hat = getattr(result, "y_hat", {}) or {}
                     v_hat = getattr(result, "v_hat", {}) or {}
+            if is_search and (preflight_raw_hit or _aic_raw_cache_hit(prediction_lineage)):
+                if charged_search:
+                    _surrogate_calls = max(0, _surrogate_calls - 1)
+                _surrogate_raw_cache_hits += 1
             cached = copy.deepcopy(
                 {
                     "y_hat": dict(y_hat or {}),
@@ -2712,8 +2962,21 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
         job_features = _job_features_for(snapshot, action.job_id)
         method = _AIC_DYNOSIM_METHOD if _job_mode(job_features) == "online" else _AIC_DIRECT_METHOD
         required_objectives = _decision_required_objectives(snapshot, action, job_features)
+        partial_admission = None
+        if action.admission_mode == "advisory" and action.served_fraction is not None:
+            partial_admission = {
+                "mode": "advisory",
+                "requested_tps": action.target_tps,
+                "admitted_tps": action.admitted_tps,
+                "served_fraction": action.served_fraction,
+                "enforced": False,
+            }
         for rank in action.ladder:
-            payload = _rank_prediction_payload(rank, job_features)
+            payload = _rank_prediction_payload(
+                rank,
+                job_features,
+                arrival_rate_rps=_public_rank_arrival_rps(action, rank, job_features),
+            )
             pred = _predict_outcome_core(
                 payload["job_config"],
                 payload["job_features"],
@@ -2731,6 +2994,8 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
                 f"deploy:{typed.tick}:{action.job_id}:{rank.rank_id or 'rank'}"
             )
             lineage["evidence_baseline"] = "pre_calibration"
+            if partial_admission is not None:
+                lineage["partial_admission"] = copy.deepcopy(partial_admission)
             rank.prediction_lineage = lineage
     return typed
 
@@ -3118,6 +3383,24 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
     snapshot = _snapshot()
     per_job: dict[str, dict[str, float]] = {}
     aggregate = 0.0
+    served_fraction_by_job: dict[str, float] = {}
+    for action in typed.actions:
+        if action.type not in LADDER_ACTIONS or not action.ladder:
+            continue
+        raw_fraction = getattr(action, "served_fraction", None)
+        if raw_fraction is None:
+            served_fraction_by_job[action.job_id] = 1.0
+            continue
+        if isinstance(raw_fraction, bool) or not isinstance(raw_fraction, int | float):
+            raise ValueError(
+                f"job {action.job_id}: served_fraction must be a finite number in [0, 1]"
+            )
+        served_fraction = float(raw_fraction)
+        if not math.isfinite(served_fraction) or not 0.0 <= served_fraction <= 1.0:
+            raise ValueError(
+                f"job {action.job_id}: served_fraction must be a finite number in [0, 1]"
+            )
+        served_fraction_by_job[action.job_id] = served_fraction
 
     # w_t (objective weights) is fetched PER JOB in the loop below - it is per-workload-
     # mode (batch favors throughput+cost, online favors latency), so it is NOT global.
@@ -3150,10 +3433,12 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
         w_t = _CTX.slow_loop.get_sss_wt(job_type=job_mode)
         w_cost = float((w_t or {}).get("cost_per_token", 0.0) or 0.0)
         prediction_method = _AIC_DYNOSIM_METHOD if job_mode == "online" else _AIC_DIRECT_METHOD
+        prediction_scenario = "peak" if job_mode == "online" else "mean"
         y_hat = _compose_job_y_hat(
             action,
             job_features,
             method=prediction_method,
+            scenario=prediction_scenario,
             finalization=finalization,
         )
         if not y_hat:
@@ -3291,15 +3576,18 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
     # stuck on L40S, |sigma|~33) correctly stays deferred until a better frame
     # (e.g. H100) is available. Raise UNSERVED_PENALTY above 1.0 to bias harder
     # toward serving.
-    served = {a.job_id for a in typed.actions if a.type in LADDER_ACTIONS and a.ladder}
     priority_by_job = {
         p.get("job_id"): float(p.get("priority_score", 1.0) or 1.0) for p in get_priority()
     }
     unserved_penalty = 0.0
     for job in get_pending_jobs():
         jid = job.get("job_id", job.get("id"))
-        if jid and jid not in served:
-            unserved_penalty += UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0))
+        if not jid:
+            continue
+        served_fraction = served_fraction_by_job.get(jid, 0.0)
+        unserved_penalty += (
+            UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0)) * (1.0 - served_fraction)
+        )
     aggregate -= unserved_penalty
 
     return {
@@ -3402,23 +3690,52 @@ def _online_slo_targets(features: dict[str, Any]) -> dict[str, Any]:
 def _online_sizing_rejection(
     sized: dict[str, Any], features: dict[str, Any]
 ) -> tuple[str, str] | None:
-    """Reject online partial service when a latency SLO was declared."""
-    targets = _online_slo_targets(features)
-    if _job_mode(features) != "online" or not any(value is not None for value in targets.values()):
+    """Reject online service lacking complete, SLO-safe admission evidence."""
+    if _job_mode(features) != "online":
         return None
+    targets = _online_slo_targets(features)
+    has_latency_target = any(value is not None for value in targets.values())
     per_rank = sized.get("per_rank") or []
-    if any(
+    serving = [rank for rank in per_rank if int(rank.get("n_replicas") or 0) >= 1]
+    checked_ranks = serving or per_rank
+    if has_latency_target and any(
         rank.get("prediction_received") and rank.get("prediction_complete") is False
-        for rank in per_rank
+        for rank in checked_ranks
     ):
         return "prediction_incomplete", "surrogate prediction omitted a declared TTFT/TPOT SLO"
-    if any(
+    if has_latency_target and any(
         rank.get("slo_ok") is False
         and (rank.get("prediction_received") or "under-SLO" in str(rank.get("reason") or ""))
-        for rank in per_rank
+        for rank in checked_ranks
     ):
         return "under_slo", "predicted TTFT/TPOT does not meet the declared online SLO"
     if sized.get("ranks") and not sized.get("meets_target"):
+        try:
+            achieved_tps = float(sized.get("achieved_tps") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            achieved_tps = 0.0
+        if not math.isfinite(achieved_tps) or achieved_tps <= 0:
+            return "no_fit", "online frame has no positive SLO-safe admitted throughput"
+        try:
+            safe_partial = bool(checked_ranks) and all(
+                rank.get("prediction_received") is True
+                and rank.get("prediction_complete") is True
+                and rank.get("slo_ok") is True
+                and (
+                    rank.get("served_tps") is None
+                    or (math.isfinite(float(rank["served_tps"])) and float(rank["served_tps"]) > 0)
+                )
+                for rank in checked_ranks
+            )
+        except (TypeError, ValueError, OverflowError):
+            safe_partial = False
+        guarded_partial = (
+            has_latency_target
+            and PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
+            and sized.get("partial_online_admission") is True
+        )
+        if guarded_partial and safe_partial:
+            return None
         return "under_target", "online frame does not provide full-service throughput"
     return None
 
@@ -3524,6 +3841,8 @@ def _score_one_frame(
         meets_target=meets,
         unmet_tps=unmet_tps,
         served_fraction=served_fraction,
+        partial_search_probes=int(sized.get("partial_search_probes") or 0),
+        partial_search_truncated=bool(sized.get("partial_search_truncated")),
     )
     online_rejection = _online_sizing_rejection(sized, features)
     if online_rejection is not None:
@@ -3558,6 +3877,10 @@ def _score_one_frame(
         "rationale": f"Deterministic {gpu_type} candidate "
         f"({'full-service' if meets else 'under-target'}).",
     }
+    partial_online_candidate = sized.get("partial_online_admission") is True
+    if partial_online_candidate:
+        act["admitted_tps"] = achieved_tps
+        act["admission_mode"] = "advisory"
     one = {"tick_rationale": "candidate scoring", "actions": [act]}
     try:
         feas = check_feasibility(one)
@@ -3638,6 +3961,8 @@ def _score_composite(
         target_tps=target_tps,
         unmet_tps=unmet_tps,
         served_fraction=served_fraction,
+        partial_search_probes=int(sized.get("partial_search_probes") or 0),
+        partial_search_truncated=bool(sized.get("partial_search_truncated")),
     )
     online_rejection = _online_sizing_rejection(sized, features)
     if online_rejection is not None:
@@ -3668,6 +3993,10 @@ def _score_composite(
         "rationale": f"Deterministic composite candidate ({label}) "
         f"({'full-service' if meets else 'under-target'}).",
     }
+    partial_online_candidate = sized.get("partial_online_admission") is True
+    if partial_online_candidate:
+        act["admitted_tps"] = achieved_tps
+        act["admission_mode"] = "advisory"
     one = {"tick_rationale": "candidate scoring", "actions": [act]}
     try:
         feas = check_feasibility(one)
@@ -3730,10 +4059,10 @@ def build_scored_candidates(
     cluster outcome.
 
     EVERY physically-runnable, feasible batch frame is returned as a candidate.
-    Online jobs that declare latency SLOs require a complete, full-service SLO-meeting
-    prediction for standalone placement; SLO-safe partials remain internal inputs to
-    composite construction. A job appears in `exhausted` only when it has NO runnable,
-    feasible frame; budget-truncated jobs are reported separately.
+    Online jobs that declare latency SLOs require complete SLO-meeting predictions;
+    under-target online candidates are emitted only in advisory mode after guarded
+    load probing. A job appears in `exhausted` only when it has NO runnable, feasible
+    frame; budget-truncated jobs are reported separately.
 
     Returns {"candidates": [...for jointly_select_placements],
              "exhausted": {job_id: reason},
@@ -3951,8 +4280,8 @@ def build_scored_candidates(
                 )
 
     # Phase 3 (cheap): group into candidates / exhausted / diagnostics. Batch may
-    # retain under-target frames; online frames with declared latency SLOs passed
-    # the full-service gate above. Budget-truncated jobs never become exhausted.
+    # retain under-target frames; online partials pass only through the advisory
+    # safety gate above. Budget-truncated jobs never become exhausted.
     candidates: list[dict[str, Any]] = []
     exhausted: dict[str, str] = {}
     budget_limited: dict[str, str] = {}
@@ -4058,6 +4387,53 @@ def jointly_select_placements(
     def penalty(jid: str) -> float:
         return UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0))
 
+    def candidate_served_fraction(cand: dict[str, Any]) -> float | None:
+        def finite_number(value: Any) -> float | None:
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                return None
+            number = float(value)
+            return number if math.isfinite(number) else None
+
+        accounting_fields = {
+            "target_tps",
+            "admitted_tps",
+            "achieved_tps",
+            "unmet_tps",
+            "meets_target",
+            "served_fraction",
+            "admission_mode",
+        }
+        if not any(field in cand for field in accounting_fields):
+            return 1.0
+        if not all(field in cand for field in ("target_tps", "achieved_tps", "served_fraction")):
+            return None
+
+        target = finite_number(cand["target_tps"])
+        achieved = finite_number(cand["achieved_tps"])
+        fraction = finite_number(cand["served_fraction"])
+        if target is None or target <= 0.0 or achieved is None or achieved <= 0.0:
+            return None
+        if fraction is None or fraction <= 0.0 or fraction > 1.0:
+            return None
+        if achieved > target and not math.isclose(
+            achieved,
+            target,
+            rel_tol=1e-3,
+            abs_tol=1e-6,
+        ):
+            return None
+        derived = min(1.0, achieved / target)
+        if not math.isclose(fraction, derived, rel_tol=1e-3, abs_tol=1e-6):
+            return None
+
+        if "admitted_tps" in cand:
+            admitted = finite_number(cand["admitted_tps"])
+            if admitted is None or admitted <= 0.0:
+                return None
+            if not math.isclose(admitted, achieved, rel_tol=1e-3, abs_tol=1e-6):
+                return None
+        return fraction
+
     # Group scored candidates by job, attaching each frame's per-env GPU cost and
     # its GAIN over deferring that job. Under-target frames only avoid the defer
     # penalty in proportion to delivered throughput; a 50%-served frame is not the
@@ -4070,11 +4446,9 @@ def jointly_select_placements(
         cost = _ladder_capacity_cost(cand.get("ladder") or [], specs)
         if not cost:
             continue  # no real GPU footprint -> not a placeable frame
-        try:
-            served_fraction = float(cand.get("served_fraction", 1.0) or 0.0)
-        except (TypeError, ValueError):
-            served_fraction = 1.0
-        served_fraction = max(0.0, min(1.0, served_fraction))
+        served_fraction = candidate_served_fraction(cand)
+        if served_fraction is None:
+            continue
         served_credit = penalty(jid) * served_fraction
         gain = float(cand.get("sigma", 0.0)) + served_credit
         if gain <= 0:

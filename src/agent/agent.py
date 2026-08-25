@@ -1318,6 +1318,8 @@ class KoiAgentHarness:
                 + "\nFix these specific violations and re-commit.\n\n"
             )
 
+        online_admission_contract = self._partial_online_admission_contract()
+
         return (
             f"{repair_section}"
             # ---------- WHO YOU ARE ----------
@@ -1439,8 +1441,9 @@ class KoiAgentHarness:
             "CANDIDATE CONTRACT. The deterministic candidate builder treats specialist "
             "ladders as hints, generates right-sized frames across available GPU types and "
             "instance pools, adds a heterogeneous frame when useful, sizes them, removes "
-            "unrunnable/infeasible frames, and computes per-job sigma. Online candidates "
-            "are SLO-complete, full-service placements. Any allowed batch partial candidate "
+            "unrunnable/infeasible frames, and computes per-job sigma. "
+            f"{online_admission_contract}"
+            "Any allowed batch partial candidate "
             "carries meets_target and served_fraction so you can reason about its shortfall. "
             "A specialist defer/blocked result is only a local hint. A job in exhausted has "
             "no generated feasible frame; budget_limited identifies work skipped at the "
@@ -1465,6 +1468,40 @@ class KoiAgentHarness:
         )
 
     @staticmethod
+    def _partial_online_admission_contract() -> str:
+        """Describe the effective guarded online-admission mode for the root."""
+        mode = "off"
+        status_fn = getattr(agent_tools, "get_partial_online_admission_status", None)
+        if callable(status_fn):
+            try:
+                status = status_fn()
+            except Exception:
+                log.exception("could not read partial online admission status")
+            else:
+                if isinstance(status, dict):
+                    mode = str(status.get("mode", status.get("effective_mode", "off")))
+                elif isinstance(status, str):
+                    mode = status
+
+        if mode == "advisory":
+            return (
+                "PARTIAL ONLINE ADMISSION MODE: advisory (benchmark/experimental). "
+                "Latency SLOs remain hard at the tested admitted load; positive partial "
+                "throughput candidates can be selected. When one is selected, its action "
+                "must preserve admitted_tps, achieved_tps, unmet_tps, meets_target, "
+                "served_fraction, and admission_mode, and every selected rank must preserve "
+                "rank_traffic_share. "
+                "WARNING: Store receives an advisory admitted target, but the current "
+                "Orca/router may still route full traffic; this mode does not imply "
+                "enforcement. It is benchmark-only and unsafe for production SLO guarantees. "
+                "Never claim full traffic is throttled. "
+            )
+        return (
+            "PARTIAL ONLINE ADMISSION MODE: off. Online throughput remains full-service "
+            "admission. Online candidates are SLO-complete, full-service placements. "
+        )
+
+    @staticmethod
     def _plan_schema_section() -> str:
         """The exact plan schema the LLM must build, with field-by-field shape.
 
@@ -1484,6 +1521,13 @@ class KoiAgentHarness:
             "  {'job_id': str, 'type': <action>, 'user_id': str,\n"
             "   'ladder': [<rank>, ...],            # only for place/swap\n"
             "   'target_tps': float,                # required throughput for place/swap\n"
+            "   # Optional partial-admission metadata: preserve it as a unit from a candidate.\n"
+            "   'admitted_tps': float,              # tested admitted throughput\n"
+            "   'achieved_tps': float,              # predicted throughput at admitted load\n"
+            "   'unmet_tps': float,                 # target throughput shortfall\n"
+            "   'meets_target': bool,               # whether full target throughput is met\n"
+            "   'served_fraction': float,           # fraction of target throughput served\n"
+            "   'admission_mode': str,              # candidate admission classification\n"
             "   'target_p99_ttft_ms': float,        # online SLA, copied from job_features\n"
             "   'target_p99_tpot_ms': float,        # online SLA, copied from job_features\n"
             "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"
@@ -1503,6 +1547,7 @@ class KoiAgentHarness:
             "   # kv_transfer_method, max_num_seq, max_num_batched_tokens, block_size.\n"
             "   # Any such key you set is dropped; the engine/catalog supplies it.\n"
             "   'n_replicas': int,       # rank DP / max endpoint count; do NOT put dp in config\n"
+            "   'rank_traffic_share': float,        # optional partial-admission traffic share\n"
             "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
             "v0 is AGGREGATE-ONLY per rank: every rank is one full "
             "prefill+decode engine (role 'aggregate'); do NOT split prefill/"
