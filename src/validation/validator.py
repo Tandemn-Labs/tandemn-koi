@@ -438,6 +438,10 @@ class Validator:
 
         target = positive.get("target_tps")
         achieved = positive.get("achieved_tps")
+        has_latency_target = any(
+            target_value is not None
+            for target_value in (action.target_p99_ttft_ms, action.target_p99_tpot_ms)
+        )
         if (
             admitted is not None
             and achieved is not None
@@ -471,16 +475,15 @@ class Validator:
                 f"{prefix} served_fraction must approximately equal achieved_tps / target_tps"
             )
         if target is not None and achieved is not None and isinstance(action.meets_target, bool):
-            expected_meets_target = achieved >= target or self._admission_close(achieved, target)
-            if action.meets_target != expected_meets_target:
+            throughput_met = achieved >= target or self._admission_close(achieved, target)
+            invalid_meets_target = action.meets_target and not throughput_met
+            invalid_miss = not action.meets_target and throughput_met and not has_latency_target
+            if invalid_meets_target or invalid_miss:
                 violations.append(
-                    f"{prefix} meets_target must match whether achieved_tps meets target_tps"
+                    f"{prefix} meets_target must match whether achieved_tps meets target_tps "
+                    "and any declared latency SLO"
                 )
 
-        has_latency_target = any(
-            target_value is not None
-            for target_value in (action.target_p99_ttft_ms, action.target_p99_tpot_ms)
-        )
         if has_latency_target and fraction is not None and fraction < 1.0:
             if admitted is None:
                 violations.append(f"{prefix} online partial service requires admitted_tps")

@@ -185,7 +185,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             patch.object(
                 agent_tools,
                 "_rank_prediction_payload",
-                side_effect=lambda rank, rank_features: {
+                side_effect=lambda rank, rank_features, **_kwargs: {
                     "job_config": {"dp": rank.n_replicas},
                     "job_features": dict(rank_features),
                 },
@@ -798,7 +798,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual(frame["diag"]["status"], "budget_exhausted")
         self.assertEqual(composite["diag"]["status"], "budget_exhausted")
 
-    def test_online_under_slo_and_incomplete_predictions_are_not_candidates(self):
+    def test_off_mode_rejects_online_under_slo_under_target_and_incomplete_predictions(self):
         env = "reserved|aws|r1|z1|H100"
         rank = _rank(env, "p5")
         features = {
@@ -839,6 +839,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             ),
         )
 
+        agent_tools.configure_partial_online_admission("off")
         with patch.object(agent_tools, "_applicable_mechanism_id", return_value="M_test"):
             for per_rank, expected in cases:
                 with self.subTest(expected=expected):
@@ -852,6 +853,50 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
                     self.assertEqual(
                         result.get("composite_eligible", False), expected == "under_target"
                     )
+
+    def test_advisory_allows_full_throughput_under_slo_candidate(self):
+        env = "reserved|aws|r1|z1|H100"
+        rank = _rank(env, "p5")
+        features = {
+            "type": "online",
+            "target_p99_ttft_ms": 100.0,
+            "target_p99_tpot_ms": 10.0,
+        }
+        sized = {
+            "ranks": [rank],
+            "meets_target": False,
+            "target_tps": 100.0,
+            "achieved_tps": 100.0,
+            "per_rank": [
+                {
+                    "n_replicas": 1,
+                    "prediction_received": True,
+                    "prediction_complete": True,
+                    "slo_ok": False,
+                }
+            ],
+        }
+
+        agent_tools.configure_partial_online_admission("advisory")
+        with (
+            patch.object(agent_tools, "_applicable_mechanism_id", return_value="M_test"),
+            patch.object(agent_tools, "size_ladder", return_value=sized),
+            patch.object(agent_tools, "check_feasibility", return_value={"feasible": True}),
+            patch.object(
+                agent_tools,
+                "compute_sigma",
+                return_value={"per_job": {"job": {"sigma": -1.0, "pr_slo_dro": 1.0}}},
+            ),
+        ):
+            result = agent_tools._score_one_frame("job", "user", "slice", rank, features)
+
+        candidate = result["candidate"]
+        self.assertIsNotNone(candidate)
+        self.assertFalse(candidate["meets_target"])
+        self.assertTrue(result["diag"]["slo_risk"])
+        self.assertNotIn("admitted_tps", candidate)
+        self.assertNotIn("admission_mode", candidate)
+        self.assertIn("predicted SLO unmet", result["diag"]["reason"])
 
     def test_advisory_safe_partial_frame_and_composite_are_candidates_with_metadata(self):
         env = "reserved|aws|r1|z1|H100"
@@ -917,7 +962,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             self.assertEqual(candidate["admission_mode"], "advisory")
             self.assertTrue(result["diag"]["partial_search_truncated"])
 
-    def test_online_without_declared_latency_target_cannot_use_guarded_partial_path(self):
+    def test_advisory_online_under_target_without_latency_target_is_a_candidate(self):
         rank = _rank("reserved|aws|r1|z1|H100", "p5")
         sized = {
             "ranks": [rank],
@@ -939,6 +984,12 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         with (
             patch.object(agent_tools, "_applicable_mechanism_id", return_value="M_test"),
             patch.object(agent_tools, "size_ladder", return_value=sized),
+            patch.object(agent_tools, "check_feasibility", return_value={"feasible": True}),
+            patch.object(
+                agent_tools,
+                "compute_sigma",
+                return_value={"per_job": {"job": {"sigma": -0.5}}},
+            ),
         ):
             result = agent_tools._score_one_frame(
                 "job",
@@ -948,8 +999,10 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
                 {"type": "online"},
             )
 
-        self.assertIsNone(result["candidate"])
-        self.assertEqual(result["diag"]["status"], "under_target")
+        self.assertIsNotNone(result["candidate"])
+        self.assertEqual(result["candidate"]["admitted_tps"], 50.0)
+        self.assertEqual(result["candidate"]["admission_mode"], "advisory")
+        self.assertEqual(result["diag"]["status"], "ok")
 
     def test_successful_candidate_does_not_run_automatic_stress_diagnostic(self):
         rank = _rank("reserved|aws|r1|z1|H100", "p5")
@@ -972,11 +1025,64 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             patch.object(agent_tools, "_attach_peak_multiturn_stress") as stress,
         ):
             result = agent_tools._score_one_frame(
-                "job", "user", "slice", rank, {"type": "batch", "multi_turn_ratio": 1.0}
+                "job",
+                "user",
+                "slice",
+                rank,
+                {
+                    "type": "batch",
+                    "multi_turn_ratio": 1.0,
+                    "target_p99_ttft_ms": 100.0,
+                    "target_p99_tpot_ms": 10.0,
+                },
             )
 
         self.assertIsNotNone(result["candidate"])
+        self.assertIsNone(result["candidate"]["target_p99_ttft_ms"])
+        self.assertIsNone(result["candidate"]["target_p99_tpot_ms"])
+        self.assertNotIn("admission_mode", result["candidate"])
         stress.assert_not_called()
+
+    def test_batch_partial_with_latency_benchmark_fields_is_not_online_admission(self):
+        rank = _rank("reserved|aws|r1|z1|H100", "p5")
+        sized = {
+            "ranks": [rank],
+            "meets_target": False,
+            "target_tps": 100.0,
+            "achieved_tps": 50.0,
+            "per_rank": [
+                {
+                    "n_replicas": 1,
+                    "prediction_received": True,
+                    "prediction_complete": True,
+                    "slo_ok": True,
+                }
+            ],
+        }
+        features = {
+            "type": "batch",
+            "target_p99_ttft_ms": 100.0,
+            "target_p99_tpot_ms": 10.0,
+        }
+        with (
+            patch.object(agent_tools, "_applicable_mechanism_id", return_value="M_test"),
+            patch.object(agent_tools, "size_ladder", return_value=sized),
+            patch.object(agent_tools, "check_feasibility", return_value={"feasible": True}),
+            patch.object(
+                agent_tools,
+                "compute_sigma",
+                return_value={"per_job": {"job": {"sigma": -0.5}}},
+            ),
+        ):
+            result = agent_tools._score_one_frame("job", "user", "slice", rank, features)
+
+        candidate = result["candidate"]
+        self.assertIsNotNone(candidate)
+        self.assertIsNone(candidate["target_p99_ttft_ms"])
+        self.assertIsNone(candidate["target_p99_tpot_ms"])
+        self.assertNotIn("admitted_tps", candidate)
+        self.assertNotIn("admission_mode", candidate)
+        self.assertFalse(result["diag"]["slo_risk"])
 
     def test_specialist_results_are_cached_and_returned_as_deep_copies(self):
         class Runner:
@@ -1404,6 +1510,57 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             },
         )
 
+    def test_selector_uses_work_conserving_floor_only_for_placeable_advisory_work(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {
+            env: {
+                "p5": {
+                    "gpus_per_instance": 1,
+                    "free_instances": 1,
+                }
+            }
+        }
+        accounting = {
+            "type": "place",
+            "target_tps": 100.0,
+            "admitted_tps": 25.0,
+            "achieved_tps": 25.0,
+            "served_fraction": 0.25,
+            "admission_mode": "advisory",
+            "sigma": -100.0,
+        }
+        candidates = [
+            {
+                **accounting,
+                "job_id": "advisory",
+                "ladder": [_rank(env, "p5")],
+            },
+            {
+                **accounting,
+                "job_id": "no-fit",
+                "ladder": [],
+            },
+        ]
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(
+                agent_tools,
+                "get_pending_jobs",
+                return_value=[{"job_id": "advisory"}, {"job_id": "no-fit"}],
+            ),
+            patch.object(agent_tools, "get_priority", return_value=[]),
+        ):
+            selected = agent_tools.jointly_select_placements(candidates)
+
+        self.assertEqual([candidate["job_id"] for candidate in selected["chosen"]], ["advisory"])
+        chosen = selected["chosen"][0]
+        self.assertTrue(chosen["work_conserving_floor"])
+        self.assertEqual(chosen["solver_gain"], agent_tools._WORK_CONSERVING_GAIN_FLOOR)
+        self.assertEqual(selected["deferred"], ["no-fit"])
+
     def test_job_prediction_requires_every_rank_to_succeed(self):
         action = agent_tools.PlanAction(
             job_id="job",
@@ -1454,7 +1611,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         agent_tools.configure_partial_online_admission("advisory")
         _env, _features, result = self._size_online(predict)
 
-        partial_loads = [load for method, load in calls if method == ("AIC_DynoSim",)][1:]
+        partial_loads = [load for method, load in calls if method == ("AIC_DynoSim",)]
         self.assertEqual(
             partial_loads,
             [50.0, 75.0, 62.5, 56.25, 59.375, 60.9375, 60.15625],
@@ -1498,7 +1655,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertGreater(result["achieved_tps"], 0.0)
         self.assertTrue(result["per_rank"][0]["prediction_complete"])
 
-    def test_partial_probe_rejects_ninety_nine_percent_capacity(self):
+    def test_partial_probe_retains_positive_best_effort_capacity(self):
         def predict(_config, features, **kwargs):
             load = float(features["request_arrival_rate"])
             if kwargs["method"] == ("AIC_Direct",):
@@ -1514,15 +1671,23 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         agent_tools.configure_partial_online_admission("advisory")
         _env, _features, result = self._size_online(predict)
 
-        self.assertEqual(result["achieved_tps"], 0.0)
-        self.assertEqual(result["ranks"], [])
-        self.assertFalse(result["partial_online_admission"])
+        self.assertEqual(result["achieved_tps"], 49.5)
+        self.assertEqual(len(result["ranks"]), 1)
+        self.assertTrue(result["partial_online_admission"])
+        self.assertEqual(result["admission_mode"], "advisory")
+        self.assertIn("best-effort partial", result["per_rank"][0]["reason"])
 
     def test_off_mode_does_not_admit_an_unsafe_online_partial(self):
         def predict(_config, features, **kwargs):
             load = float(features["request_arrival_rate"])
             if kwargs["method"] == ("AIC_Direct",):
-                return {"y_hat": {"throughput_token_per_sec": 100.0}}
+                return {
+                    "y_hat": {
+                        "p99_ttft_ms": 200.0,
+                        "p99_tpot_ms": 20.0,
+                        "throughput_token_per_sec": 100.0,
+                    }
+                }
             return {
                 "y_hat": {
                     "p99_ttft_ms": 200.0,
@@ -1551,7 +1716,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             0,
         )
 
-    def test_advisory_rejects_unsafe_incomplete_and_zero_throughput_partials(self):
+    def test_advisory_allows_unsafe_fallback_but_rejects_incomplete_and_zero_throughput(self):
         def response(kind, load):
             if kind == "unsafe":
                 return {
@@ -1569,7 +1734,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
 
         agent_tools.configure_partial_online_admission("advisory")
         for kind, expected_status in (
-            ("unsafe", "under_slo"),
+            ("unsafe", "ok"),
             ("incomplete", "prediction_incomplete"),
             ("zero", "no_fit"),
         ):
@@ -1589,6 +1754,16 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
                         return_value="M_test",
                     ),
                     patch.object(agent_tools, "size_ladder", return_value=sized),
+                    patch.object(
+                        agent_tools,
+                        "check_feasibility",
+                        return_value={"feasible": True},
+                    ),
+                    patch.object(
+                        agent_tools,
+                        "compute_sigma",
+                        return_value={"per_job": {"job": {"sigma": -1.0}}},
+                    ),
                 ):
                     scored = agent_tools._score_one_frame(
                         "job",
@@ -1598,8 +1773,15 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
                         features,
                     )
 
-                self.assertEqual(sized["ranks"], [])
-                self.assertIsNone(scored["candidate"])
+                if kind == "unsafe":
+                    self.assertEqual(len(sized["ranks"]), 1)
+                    self.assertIsNotNone(scored["candidate"])
+                    self.assertEqual(scored["candidate"]["admission_mode"], "advisory")
+                    self.assertIn("predicted SLO unmet", sized["per_rank"][0]["reason"])
+                else:
+                    self.assertIsNone(scored["candidate"])
+                if kind == "zero":
+                    self.assertEqual(sized["ranks"], [])
                 self.assertEqual(scored["diag"]["status"], expected_status)
 
     def test_advisory_budget_exhaustion_after_safe_probe_preserves_partial(self):

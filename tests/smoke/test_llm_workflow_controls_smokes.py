@@ -7,7 +7,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from src.agent.agent import AgentTrace, KoiAgentHarness, SpecialistRunner
+from src.agent.agent import AgentTrace, KoiAgentHarness, RLMRuntime, SpecialistRunner
 from src.agent.tools import agent_tools
 from src.core.models import ActionType, Plan, PlanAction, RankSpec
 from src.orchestrator import debug_logging, runner
@@ -30,6 +30,16 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         harness.max_history_messages = 0
         harness.trace = AgentTrace()
         return harness
+
+    def test_repl_truncates_transcript_but_preserves_full_trace(self):
+        runtime = RLMRuntime(stdout_limit=4)
+
+        output = runtime.exec_code("print('abcdefgh')\nraise ValueError('boom')")
+
+        self.assertEqual(output, "abcd\n... [truncated at 4 chars]")
+        event = runtime.trace.events[-1]
+        self.assertEqual(event["stdout"], "abcdefgh\n")
+        self.assertIn("ValueError: boom", event["error"])
 
     def test_specialist_empty_response_consumes_one_of_two_total_attempts(self):
         class ScriptedLLM:
@@ -427,7 +437,12 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertEqual(defaults.k_max, 4)
         self.assertEqual(defaults.surrogate_call_budget, 100)
         self.assertEqual(defaults.surrogate_lower_quantile, 0.05)
-        self.assertEqual(defaults.partial_online_admission, "off")
+        self.assertEqual(defaults.partial_online_admission, "advisory")
+        self.assertEqual(agent_tools.PARTIAL_ONLINE_ADMISSION_MODE, "advisory")
+        self.assertEqual(
+            runner.parse_args(["--partial-online-admission", "off"]).partial_online_admission,
+            "off",
+        )
 
         with patch.dict(
             os.environ,
@@ -555,8 +570,11 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
 
         self.assertIn("PARTIAL ONLINE ADMISSION MODE: advisory", prompt)
         self.assertIn("benchmark/experimental", prompt)
-        self.assertIn("Latency SLOs remain hard at the tested admitted load", prompt)
-        self.assertIn("positive partial throughput candidates can be selected", prompt)
+        self.assertIn(
+            "Deterministic prediction, sizing, and SLO/DRO scoring advise and rank", prompt
+        )
+        self.assertIn("incomplete prediction, and zero throughput are hard vetoes", prompt)
+        self.assertIn("predicted SLO or throughput-target miss can still be placed", prompt)
         self.assertIn(
             "must preserve admitted_tps, achieved_tps, unmet_tps, meets_target, "
             "served_fraction, and admission_mode",

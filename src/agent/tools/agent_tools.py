@@ -229,6 +229,7 @@ DEFAULT_COLD_START_Z_STAR = {
 # Opportunity cost charged per WAITING job the plan leaves unserved, so a
 # feasible placement (sigma ~ J<=0 + EIG) beats defer (0). Scaled by priority.
 UNSERVED_PENALTY = 1.0
+_WORK_CONSERVING_GAIN_FLOOR = 1e-9
 # COST is a weighted OPTIMIZE objective (see compute_sigma), governed by the slow
 # loop's weight w_t["cost_per_token"] - the SAME code serves any market, only the
 # weight changes. Reserved sets it ~0 (fleet is sunk -> cost inert, a small job may
@@ -452,7 +453,7 @@ def assert_planning_ready() -> None:
 # it late means "commit the best scored so far", never a crash or forced defer.
 # Raise it for deeper search; it is generous by design (a normal tick uses far fewer).
 SURROGATE_CALL_BUDGET = 100
-PARTIAL_ONLINE_ADMISSION_MODE = "off"
+PARTIAL_ONLINE_ADMISSION_MODE = "advisory"
 _AIC_DIRECT_METHOD = ("AIC_Direct",)
 _AIC_DYNOSIM_METHOD = ("AIC_DynoSim",)
 _surrogate_calls = 0
@@ -1740,7 +1741,7 @@ def required_throughput_enumerator(job_features: dict[str, Any]) -> float:
     Returns:
         Required throughput in tokens/sec.
     """
-    job_type = job_features.get("type", "online")
+    job_type = _job_mode(job_features)
     headroom = float(job_features.get("headroom_factor", 1.5))
     if job_type == "batch":
         budget = float(job_features.get("total_token_budget", 0.0))
@@ -1876,12 +1877,13 @@ def size_ladder(
         per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap with direct AIC.
                         Take the first DP whose TTFT/TPOT clear the SLO and keeps up;
                         the rest of the demand spills to the next rank.
-        achieved_tps  = demand actually served within SLO (SUM across ranks).
+        achieved_tps  = demand assigned to positive-throughput ranks (SUM across ranks).
 
-    Online latency GATES the replica count. In advisory mode only, a rank that cannot
-    provide full service may contribute a separately tested SLO-safe partial load;
-    otherwise the legacy fallback remains diagnostic-only for online candidates.
-    meets_target requires the whole demand covered AND every serving rank in SLO.
+    Online latency GATES the replica count in off mode. In advisory mode, a rank that
+    cannot provide full service first contributes a separately tested SLO-safe partial
+    load. If no safe point exists, a positive max-DP prediction remains available as a
+    best-effort telemetry candidate. meets_target still requires the whole demand
+    covered AND every serving rank in SLO.
 
     Args:
         ranks: rank dicts (RankSpec.from_dict form) with role, env, config.
@@ -1906,8 +1908,8 @@ def size_ladder(
     global _partial_online_truncated_searches
 
     job_features = _sanitize_agent_features(dict(job_features or {}))
-    regime = str(job_features.get("type", "online")).lower()
-    is_online = regime != "batch"
+    regime = _job_mode(job_features)
+    is_online = regime == "online"
     # utilization_target is accepted for backward compatibility but no longer used.
     # Direct AIC supplies capacity and online latency for normal sizing. Explicit
     # advisory partial-admission probes may opt into queue-aware DynoSim.
@@ -2035,10 +2037,8 @@ def size_ladder(
             log.warning(
                 "size_ladder rejected candidate: model=%s gpu=%s instance=%s "
                 "tp=%s pp=%s dp=%d error=%s",
-                payload["job_config"].get("model_id")
-                or payload["job_features"].get("model_id"),
-                payload["job_features"].get("gpu_type")
-                or payload["job_config"].get("gpu_type"),
+                payload["job_config"].get("model_id") or payload["job_features"].get("model_id"),
+                payload["job_features"].get("gpu_type") or payload["job_config"].get("gpu_type"),
                 r.config.get("instance_type"),
                 r.config.get("tp"),
                 r.config.get("pp"),
@@ -2083,13 +2083,12 @@ def size_ladder(
     )
 
     # Cover the demand rank by rank. Each rank tries to serve the REMAINING demand;
-    # size_ladder SEARCHES its replica count (DP) against the surrogate's own p99, so
-    # latency GATES the replica count instead of vetoing the rank up front (queueing
-    # latency DOES fall with more replicas). A rank that clears TTFT+TPOT+keep-up at
-    # some DP takes the whole remaining share; one that cannot even at max capacity
-    # takes the throughput it can push and the shortfall spills to the next rank
-    # (heterogeneous ladder). meets_target needs the whole demand covered AND every
-    # serving rank within SLO.
+    # size_ladder SEARCHES its replica count (DP) against the surrogate's own p99
+    # instead of vetoing a rank before queueing latency can fall with more replicas.
+    # A rank that clears TTFT+TPOT+keep-up takes the remaining share. Advisory mode
+    # may retain positive best-effort throughput when none does; off mode rejects that
+    # result downstream. meets_target still requires full demand and every serving
+    # rank within SLO.
     for raw in ranks:
         physical_rejection_start = len(physical_rejections)
         rank = RankSpec.from_dict(raw)
@@ -2190,6 +2189,8 @@ def size_ladder(
                     safe_load = 0.0
                     safe_y: dict[str, Any] = {}
                     last_probe_y: dict[str, Any] = {}
+                    best_effort_load = 0.0
+                    best_effort_y: dict[str, Any] = {}
                     for _probe_index in range(7):
                         probe_load = (low + high) / 2.0
                         if probe_load <= 0 or probe_load <= low:
@@ -2212,11 +2213,16 @@ def size_ladder(
                                 _partial_online_truncated_searches += 1
                             break
                         last_probe_y = probe_y or {}
+                        probe_capacity = _capacity_tps(last_probe_y)
+                        fallback_load = min(share, probe_capacity)
+                        if fallback_load > best_effort_load:
+                            best_effort_load = fallback_load
+                            best_effort_y = last_probe_y
                         probe_safe = (
                             probe_y is not None
                             and _slo_prediction_complete(probe_y)
                             and _slo_ok(probe_y)
-                            and _covers_offered_load(_capacity_tps(probe_y), probe_load)
+                            and _covers_offered_load(probe_capacity, probe_load)
                         )
                         if probe_safe:
                             low = probe_load
@@ -2240,9 +2246,33 @@ def size_ladder(
                         with _SURROGATE_EXECUTION_LOCK:
                             _partial_online_admissions += 1
                     else:
-                        y_hat = last_probe_y or fallback_y
+                        direct_fallback_y = direct_predictions[partial_d] or {}
+                        direct_fallback_load = min(share, _capacity_tps(direct_fallback_y))
+                        if (
+                            direct_fallback_load > 0
+                            and _slo_prediction_complete(direct_fallback_y)
+                            and not _slo_ok(direct_fallback_y)
+                        ):
+                            y_hat = direct_fallback_y
+                            served = direct_fallback_load
+                        elif best_effort_load > 0:
+                            y_hat = best_effort_y
+                            served = best_effort_load
+                        else:
+                            y_hat = last_probe_y or direct_fallback_y
                         slo_ok = _slo_ok(y_hat)
-                        reason = "no positive SLO-safe partial load at max usable DP"
+                        if served > 0:
+                            n_replicas = partial_d
+                            partial_admission = True
+                            reason = (
+                                "best-effort partial; predicted SLO unmet"
+                                if not slo_ok
+                                else "best-effort partial; predicted throughput below offered load"
+                            )
+                            with _SURROGATE_EXECUTION_LOCK:
+                                _partial_online_admissions += 1
+                        else:
+                            reason = "no positive SLO-safe partial load at max usable DP"
                 elif osl <= 0:
                     reason = "cannot test partial load without a positive output length"
                 else:
@@ -2313,10 +2343,9 @@ def size_ladder(
     meets_target = remaining <= max(1e-6, 1e-3 * target) and served_slo_ok
     partial_online_admission = (
         PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
-        and verify_online_latency
+        and is_online
         and achieved_tps > 0
         and achieved_tps < target
-        and any(r["partial_admission"] for r in serving)
     )
     return {
         "ranks": sized,
@@ -3681,6 +3710,8 @@ def _online_slo_targets(features: dict[str, Any]) -> dict[str, Any]:
     """Online latency SLO targets to carry ON the emitted action (None for batch).
     compute_sigma reads these from job_features, but the deployed action must also
     carry them - Orca/Dynamo route on them - so we copy them onto every place act."""
+    if _job_mode(features) != "online":
+        return {"target_p99_ttft_ms": None, "target_p99_tpot_ms": None}
     return {
         "target_p99_ttft_ms": _feature_value(features, "target_p99_ttft_ms", "target_p99_TTFT_ms"),
         "target_p99_tpot_ms": _feature_value(features, "target_p99_tpot_ms", "target_p99_TPOT_ms"),
@@ -3690,7 +3721,7 @@ def _online_slo_targets(features: dict[str, Any]) -> dict[str, Any]:
 def _online_sizing_rejection(
     sized: dict[str, Any], features: dict[str, Any]
 ) -> tuple[str, str] | None:
-    """Reject online service lacking complete, SLO-safe admission evidence."""
+    """Apply hard online sizing vetoes for the configured admission mode."""
     if _job_mode(features) != "online":
         return None
     targets = _online_slo_targets(features)
@@ -3698,46 +3729,49 @@ def _online_sizing_rejection(
     per_rank = sized.get("per_rank") or []
     serving = [rank for rank in per_rank if int(rank.get("n_replicas") or 0) >= 1]
     checked_ranks = serving or per_rank
-    if has_latency_target and any(
-        rank.get("prediction_received") and rank.get("prediction_complete") is False
-        for rank in checked_ranks
+    if (
+        has_latency_target
+        and sized.get("ranks")
+        and (
+            not checked_ranks
+            or any(
+                rank.get("prediction_received") is not True
+                or rank.get("prediction_complete") is not True
+                for rank in checked_ranks
+            )
+        )
     ):
         return "prediction_incomplete", "surrogate prediction omitted a declared TTFT/TPOT SLO"
-    if has_latency_target and any(
+    try:
+        achieved_tps = float(sized.get("achieved_tps") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        achieved_tps = 0.0
+    if not sized.get("ranks") or not math.isfinite(achieved_tps) or achieved_tps <= 0:
+        return "no_fit", "online frame has no positive admitted throughput"
+
+    under_slo = has_latency_target and any(
         rank.get("slo_ok") is False
         and (rank.get("prediction_received") or "under-SLO" in str(rank.get("reason") or ""))
         for rank in checked_ranks
-    ):
-        return "under_slo", "predicted TTFT/TPOT does not meet the declared online SLO"
-    if sized.get("ranks") and not sized.get("meets_target"):
-        try:
-            achieved_tps = float(sized.get("achieved_tps") or 0.0)
-        except (TypeError, ValueError, OverflowError):
-            achieved_tps = 0.0
-        if not math.isfinite(achieved_tps) or achieved_tps <= 0:
-            return "no_fit", "online frame has no positive SLO-safe admitted throughput"
-        try:
-            safe_partial = bool(checked_ranks) and all(
-                rank.get("prediction_received") is True
-                and rank.get("prediction_complete") is True
-                and rank.get("slo_ok") is True
-                and (
-                    rank.get("served_tps") is None
-                    or (math.isfinite(float(rank["served_tps"])) and float(rank["served_tps"]) > 0)
-                )
-                for rank in checked_ranks
-            )
-        except (TypeError, ValueError, OverflowError):
-            safe_partial = False
-        guarded_partial = (
-            has_latency_target
-            and PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
-            and sized.get("partial_online_admission") is True
-        )
-        if guarded_partial and safe_partial:
-            return None
-        return "under_target", "online frame does not provide full-service throughput"
+    )
+    if PARTIAL_ONLINE_ADMISSION_MODE == "off":
+        if under_slo:
+            return "under_slo", "predicted TTFT/TPOT does not meet the declared online SLO"
+        if not sized.get("meets_target"):
+            return "under_target", "online frame does not provide full-service throughput"
     return None
+
+
+def _sized_online_slo_risk(sized: dict[str, Any], features: dict[str, Any]) -> bool:
+    """Whether a serving online rank has a complete predicted SLO miss."""
+    if _job_mode(features) != "online":
+        return False
+    serving = [
+        rank for rank in (sized.get("per_rank") or []) if int(rank.get("n_replicas") or 0) >= 1
+    ]
+    return any(
+        rank.get("prediction_complete") is True and rank.get("slo_ok") is False for rank in serving
+    )
 
 
 def _normalize_candidate_rank(raw: Any) -> dict[str, Any] | None:
@@ -3810,6 +3844,7 @@ def _score_one_frame(
         "achieved_tps": None,
         "target_tps": None,
         "sigma": None,
+        "slo_risk": False,
     }
     runnable, reason = config_runnable(cfg, features)
     if not runnable:
@@ -3835,12 +3870,14 @@ def _score_one_frame(
     achieved_tps = float(sized.get("achieved_tps") or 0.0)
     unmet_tps = max(0.0, target_tps - achieved_tps) if target_tps > 0 else 0.0
     served_fraction = min(1.0, achieved_tps / target_tps) if target_tps > 0 else 1.0
+    slo_risk = _sized_online_slo_risk(sized, features)
     diag.update(
         achieved_tps=achieved_tps,
         target_tps=target_tps,
         meets_target=meets,
         unmet_tps=unmet_tps,
         served_fraction=served_fraction,
+        slo_risk=slo_risk,
         partial_search_probes=int(sized.get("partial_search_probes") or 0),
         partial_search_truncated=bool(sized.get("partial_search_truncated")),
     )
@@ -3861,6 +3898,12 @@ def _score_one_frame(
             f"{sized.get('target_tps')} tps)",
         )
         return {"candidate": None, "meets_target": False, "diag": diag}
+    if slo_risk:
+        service_label = "predicted SLO unmet; advisory telemetry"
+    elif meets:
+        service_label = "full-service"
+    else:
+        service_label = "under-target"
     act = {
         "job_id": jid,
         "type": "place",
@@ -3874,10 +3917,14 @@ def _score_one_frame(
         "mechanism_id": mid,
         "budget_ref": slice_id,
         **_online_slo_targets(features),
-        "rationale": f"Deterministic {gpu_type} candidate "
-        f"({'full-service' if meets else 'under-target'}).",
+        "rationale": f"Deterministic {gpu_type} candidate ({service_label}).",
     }
-    partial_online_candidate = sized.get("partial_online_admission") is True
+    partial_online_candidate = (
+        _job_mode(features) == "online"
+        and PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
+        and target_tps > 0
+        and 0 < achieved_tps < target_tps
+    )
     if partial_online_candidate:
         act["admitted_tps"] = achieved_tps
         act["admission_mode"] = "advisory"
@@ -3896,6 +3943,8 @@ def _score_one_frame(
         diag.update(status="score_error", reason=f"scoring failed: {exc}")
         return {"candidate": None, "meets_target": meets, "diag": diag}
     diag.update(status="ok", **score)
+    if slo_risk:
+        diag["reason"] = "predicted SLO unmet; advisory mode retains candidate for telemetry"
     return {"candidate": act, "meets_target": meets, "diag": diag}
 
 
@@ -3922,6 +3971,7 @@ def _score_composite(
         "achieved_tps": None,
         "target_tps": None,
         "sigma": None,
+        "slo_risk": False,
     }
     scored_ranks: list[dict[str, Any]] = []
     for rank in ranks:
@@ -3953,6 +4003,7 @@ def _score_composite(
     achieved_tps = float(sized.get("achieved_tps") or 0.0)
     unmet_tps = max(0.0, target_tps - achieved_tps) if target_tps > 0 else 0.0
     served_fraction = min(1.0, achieved_tps / target_tps) if target_tps > 0 else 1.0
+    slo_risk = _sized_online_slo_risk(sized, features)
     label = "+".join(str((r.get("config") or {}).get("instance_type")) for r in sized_ranks) or None
     diag.update(
         instance_type=label,
@@ -3961,6 +4012,7 @@ def _score_composite(
         target_tps=target_tps,
         unmet_tps=unmet_tps,
         served_fraction=served_fraction,
+        slo_risk=slo_risk,
         partial_search_probes=int(sized.get("partial_search_probes") or 0),
         partial_search_truncated=bool(sized.get("partial_search_truncated")),
     )
@@ -3977,6 +4029,12 @@ def _score_composite(
             reason=f"size_ladder used {len(sized_ranks)} rank(s) of {len(scored_ranks)}",
         )
         return {"candidate": None, "meets_target": meets, "diag": diag}
+    if slo_risk:
+        service_state = "predicted SLO unmet; advisory telemetry"
+    elif meets:
+        service_state = "full-service"
+    else:
+        service_state = "under-target"
     act = {
         "job_id": jid,
         "type": "place",
@@ -3990,10 +4048,14 @@ def _score_composite(
         "mechanism_id": sized_ranks[0].get("mechanism_id"),
         "budget_ref": slice_id,
         **_online_slo_targets(features),
-        "rationale": f"Deterministic composite candidate ({label}) "
-        f"({'full-service' if meets else 'under-target'}).",
+        "rationale": f"Deterministic composite candidate ({label}) ({service_state}).",
     }
-    partial_online_candidate = sized.get("partial_online_admission") is True
+    partial_online_candidate = (
+        _job_mode(features) == "online"
+        and PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
+        and target_tps > 0
+        and 0 < achieved_tps < target_tps
+    )
     if partial_online_candidate:
         act["admitted_tps"] = achieved_tps
         act["admission_mode"] = "advisory"
@@ -4012,6 +4074,8 @@ def _score_composite(
         diag.update(status="score_error", reason=f"scoring failed: {exc}")
         return {"candidate": None, "meets_target": meets, "diag": diag}
     diag.update(status="ok", **score)
+    if slo_risk:
+        diag["reason"] = "predicted SLO unmet; advisory mode retains candidate for telemetry"
     return {"candidate": act, "meets_target": meets, "diag": diag}
 
 
@@ -4331,12 +4395,15 @@ def jointly_select_placements(
     Chooses at most one candidate frame per job (or defers it) to MAXIMIZE the
     cluster objective - the sum of placed per-job sigma plus avoided unserved
     demand, credited by served_fraction for under-target frames - subject to
-    per-env free-GPU capacity. This is the joint decision the greedy per-job loop cannot make: it
-    weighs every job's GPU options together, so a scarce type (e.g. H100) goes to
-    whichever job it helps most instead of being pre-split blindly. It ARBITRATES
-    the frames you pass; it does NOT invent them. Proposing the right GPU types
-    (an L40S frame and an H100 frame for a big model) is the planner's
-    domain-knowledge job - this tool just picks the joint optimum among them.
+    per-env free-GPU capacity. Advisory positive-throughput frames receive a tiny
+    positive gain only when their normal gain is non-positive, making otherwise
+    idle capacity work-conserving without displacing normally valuable work. This
+    is the joint decision the greedy per-job loop cannot make: it weighs every
+    job's GPU options together, so a scarce type (e.g. H100) goes to whichever job
+    it helps most instead of being pre-split blindly. It ARBITRATES the frames you
+    pass; it does NOT invent them. Proposing the right GPU types (an L40S frame and
+    an H100 frame for a big model) is the planner's domain-knowledge job - this
+    tool just picks the joint optimum among them.
 
     Capacity is enforced in TWO dimensions - env GPU totals AND per-pool whole-
     INSTANCE limits (validator C5) - so the returned assignment actually fits the
@@ -4387,13 +4454,13 @@ def jointly_select_placements(
     def penalty(jid: str) -> float:
         return UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0))
 
-    def candidate_served_fraction(cand: dict[str, Any]) -> float | None:
-        def finite_number(value: Any) -> float | None:
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                return None
-            number = float(value)
-            return number if math.isfinite(number) else None
+    def finite_number(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
 
+    def candidate_served_fraction(cand: dict[str, Any]) -> float | None:
         accounting_fields = {
             "target_tps",
             "admitted_tps",
@@ -4451,8 +4518,26 @@ def jointly_select_placements(
             continue
         served_credit = penalty(jid) * served_fraction
         gain = float(cand.get("sigma", 0.0)) + served_credit
+        achieved_tps = finite_number(cand.get("achieved_tps"))
+        advisory_positive = (
+            achieved_tps is not None
+            and achieved_tps > 0
+            and (
+                cand.get("admission_mode") == "advisory"
+                or (
+                    PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
+                    and any(
+                        cand.get(field) is not None
+                        for field in ("target_p99_ttft_ms", "target_p99_tpot_ms")
+                    )
+                )
+            )
+        )
         if gain <= 0:
-            continue
+            if not advisory_positive:
+                continue
+            gain = _WORK_CONSERVING_GAIN_FLOOR
+            cand["work_conserving_floor"] = True
         cand["served_fraction"] = served_fraction
         cand["served_credit"] = served_credit
         cand["solver_gain"] = gain
@@ -4499,19 +4584,30 @@ def jointly_select_placements(
         used: dict[str, int] = {}
         chosen: list[dict[str, Any]] = []
         total = 0.0
-        for jid in sorted(jobs, key=lambda j: priority_by_job.get(j, 1.0), reverse=True):
-            for entry in sorted(by_job[jid], key=lambda e: e["gain"], reverse=True):
-                trial = dict(used)
-                over = False
-                for key, need in entry["cost"].items():
-                    trial[key] = trial.get(key, 0) + need
-                    if trial[key] > capacity.get(key, 0):
-                        over = True
+        placed_greedy: set[str] = set()
+        ordered_jobs = sorted(jobs, key=lambda j: priority_by_job.get(j, 1.0), reverse=True)
+        for floor_pass in (False, True):
+            for jid in ordered_jobs:
+                if jid in placed_greedy:
+                    continue
+                entries = [
+                    entry
+                    for entry in by_job[jid]
+                    if bool(entry["cand"].get("work_conserving_floor")) is floor_pass
+                ]
+                for entry in sorted(entries, key=lambda item: item["gain"], reverse=True):
+                    trial = dict(used)
+                    over = False
+                    for key, need in entry["cost"].items():
+                        trial[key] = trial.get(key, 0) + need
+                        if trial[key] > capacity.get(key, 0):
+                            over = True
+                            break
+                    if not over:
+                        used, total = trial, total + entry["gain"]
+                        chosen.append(entry["cand"])
+                        placed_greedy.add(jid)
                         break
-                if not over:
-                    used, total = trial, total + entry["gain"]
-                    chosen.append(entry["cand"])
-                    break
         best = {"objective": total, "chosen": chosen}
 
     chosen = best["chosen"]

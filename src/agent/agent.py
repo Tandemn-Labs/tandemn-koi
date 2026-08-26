@@ -1353,8 +1353,9 @@ class KoiAgentHarness:
             # ---------- YOUR JOB THIS TICK ----------
             "YOUR JOB: produce one cluster-wide plan that maximizes aggregate "
             "sigma, subject to user policy/quota, reserved GPU capacity, "
-            "physical chain feasibility, SLO chance under worst-case demand "
-            "(DRO), the swap budget B_t, and admission control. Only the "
+            "physical chain feasibility, the swap budget B_t, and admission "
+            "control, while using SLO chance under worst-case demand (DRO) to "
+            "rank risk. Only the "
             "reserved market exists this version - never plan spot or "
             "on-demand capacity.\n\n"
             # ---------- THE OBJECTIVE, EXACTLY ----------
@@ -1389,8 +1390,8 @@ class KoiAgentHarness:
             "/ lower latency / cheaper, but can NEVER outrank another job's target "
             "MISS. So Koi satisfices EVERY job's target first (fairness), then spends "
             "leftover capacity optimizing the mode axis. The per-mode objective "
-            "weights set the emphasis; SLO/demand targets stay HARD constraints "
-            "regardless of weights.\n\n"
+            "weights set the emphasis; the admission policy below determines "
+            "whether a predicted target miss is a veto.\n\n"
             # ---------- ONE WORKFLOW, ROOT DECISION ----------
             "DECISION OWNERSHIP. You are the final decision-maker. Deterministic tools "
             "enforce budgets, physical feasibility, and shared capacity; their joint "
@@ -1470,7 +1471,7 @@ class KoiAgentHarness:
     @staticmethod
     def _partial_online_admission_contract() -> str:
         """Describe the effective guarded online-admission mode for the root."""
-        mode = "off"
+        mode = "advisory"
         status_fn = getattr(agent_tools, "get_partial_online_admission_status", None)
         if callable(status_fn):
             try:
@@ -1479,18 +1480,20 @@ class KoiAgentHarness:
                 log.exception("could not read partial online admission status")
             else:
                 if isinstance(status, dict):
-                    mode = str(status.get("mode", status.get("effective_mode", "off")))
+                    mode = str(status.get("mode", status.get("effective_mode", "advisory")))
                 elif isinstance(status, str):
                     mode = status
 
         if mode == "advisory":
             return (
                 "PARTIAL ONLINE ADMISSION MODE: advisory (benchmark/experimental). "
-                "Latency SLOs remain hard at the tested admitted load; positive partial "
-                "throughput candidates can be selected. When one is selected, its action "
-                "must preserve admitted_tps, achieved_tps, unmet_tps, meets_target, "
-                "served_fraction, and admission_mode, and every selected rank must preserve "
-                "rank_traffic_share. "
+                "Deterministic prediction, sizing, and SLO/DRO scoring advise and rank; "
+                "only physical no-fit, invalid configuration, shared-capacity violation, "
+                "incomplete prediction, and zero throughput are hard vetoes. A predicted "
+                "SLO or throughput-target miss can still be placed to collect telemetry. "
+                "An under-target action must preserve admitted_tps, achieved_tps, unmet_tps, "
+                "meets_target, served_fraction, and admission_mode, and every selected rank "
+                "must preserve rank_traffic_share. "
                 "WARNING: Store receives an advisory admitted target, but the current "
                 "Orca/router may still route full traffic; this mode does not imply "
                 "enforcement. It is benchmark-only and unsafe for production SLO guarantees. "
@@ -1525,7 +1528,7 @@ class KoiAgentHarness:
             "   'admitted_tps': float,              # tested admitted throughput\n"
             "   'achieved_tps': float,              # predicted throughput at admitted load\n"
             "   'unmet_tps': float,                 # target throughput shortfall\n"
-            "   'meets_target': bool,               # whether full target throughput is met\n"
+            "   'meets_target': bool,               # throughput and declared SLOs are met\n"
             "   'served_fraction': float,           # fraction of target throughput served\n"
             "   'admission_mode': str,              # candidate admission classification\n"
             "   'target_p99_ttft_ms': float,        # online SLA, copied from job_features\n"
