@@ -455,10 +455,8 @@ def assert_planning_ready() -> None:
 SURROGATE_CALL_BUDGET = 100
 PARTIAL_ONLINE_ADMISSION_MODE = "advisory"
 _AIC_DIRECT_METHOD = ("AIC_Direct",)
-_AIC_DYNOSIM_METHOD = ("AIC_DynoSim",)
 _surrogate_calls = 0
 _surrogate_cache_hits = 0
-_surrogate_raw_cache_hits = 0
 _surrogate_budget_rejections = 0
 _surrogate_finalization_calls = 0
 _surrogate_stress_calls = 0
@@ -468,10 +466,9 @@ _partial_online_safe_probes = 0
 _partial_online_admissions = 0
 _partial_online_truncated_searches = 0
 # Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
-# scenario, calibration, method, accounting mode). DynoSim is deterministic, so
-# re-probing a config the LLM already
-# evaluated THIS tick returns the identical numbers - we serve them from here
-# instead of re-running the surrogate. Access happens under
+# scenario, calibration, method, accounting mode). Direct AIC is deterministic,
+# so re-probing a config the LLM already evaluated THIS tick returns identical
+# numbers. Serve them from here instead of re-running the surrogate. Access happens under
 # _SURROGATE_EXECUTION_LOCK (see _predict_outcome_core).
 # Cleared every tick by reset_tick_caches so calibration / z* / evidence updates are
 # never stale, and so a cache hit never leaks across capacity/telemetry boundaries.
@@ -510,7 +507,10 @@ def configure_partial_online_admission(mode: str) -> None:
 
 
 def get_partial_online_admission_status() -> dict[str, Any]:
-    """Return configured mode and current-tick guarded-search accounting."""
+    """Return guarded-search accounting.
+
+    The legacy queue_aware_probes key now counts Direct AIC advisory probes.
+    """
     with _SURROGATE_EXECUTION_LOCK:
         return {
             "mode": PARTIAL_ONLINE_ADMISSION_MODE,
@@ -529,7 +529,6 @@ def get_surrogate_budget_status() -> dict[str, int]:
             "limit": SURROGATE_CALL_BUDGET,
             "calls_executed": _surrogate_calls,
             "cache_hits": _surrogate_cache_hits,
-            "raw_cache_hits": _surrogate_raw_cache_hits,
             "budget_rejections": _surrogate_budget_rejections,
             "finalization_calls": _surrogate_finalization_calls,
             "stress_calls": _surrogate_stress_calls,
@@ -554,7 +553,6 @@ def reset_tick_caches() -> None:
     a stale-budget hole in the anti-split-brain ordering.
     """
     global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
-    global _surrogate_raw_cache_hits
     global _surrogate_finalization_calls, _surrogate_stress_calls
     global _partial_online_admissions, _partial_online_queue_aware_probes
     global _partial_online_safe_probes, _partial_online_searches
@@ -564,7 +562,6 @@ def reset_tick_caches() -> None:
     with _SURROGATE_EXECUTION_LOCK:
         _surrogate_calls = 0
         _surrogate_cache_hits = 0
-        _surrogate_raw_cache_hits = 0
         _surrogate_budget_rejections = 0
         _surrogate_finalization_calls = 0
         _surrogate_stress_calls = 0
@@ -858,8 +855,10 @@ def _compose_job_y_hat(
     single job-level outcome that J and Pr_DRO are scored on. Honors the
     action's advisory predicted_y when the planner attached one (it already
     composed). A single-rank ladder returns that rank's y_hat unchanged, so
-    homogeneous ladders are unaffected.
+    homogeneous ladders are unaffected. The method input is retained for
+    compatibility; production prediction is always Direct AIC.
     """
+    method = _AIC_DIRECT_METHOD
     # TODO - I can debate this as we don't need the LLM to pass the predicted_y
     # we want it to CALL The SUrrogate ALWAYS
     # so i am, for now, removing this call.
@@ -1874,16 +1873,16 @@ def size_ladder(
 
         target        = required throughput (batch: budget/deadline*headroom;
                         online: arrival_rate * output_len * headroom)
-        per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap with direct AIC.
+        per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap with Direct AIC.
                         Take the first DP whose TTFT/TPOT clear the SLO and keeps up;
                         the rest of the demand spills to the next rank.
         achieved_tps  = demand assigned to positive-throughput ranks (SUM across ranks).
 
     Online latency GATES the replica count in off mode. In advisory mode, a rank that
-    cannot provide full service first contributes a separately tested SLO-safe partial
-    load. If no safe point exists, a positive max-DP prediction remains available as a
-    best-effort telemetry candidate. meets_target still requires the whole demand
-    covered AND every serving rank in SLO.
+    cannot provide full service first contributes a separately tested Direct AIC
+    SLO-safe partial load. If no safe point exists, a positive max-DP prediction remains
+    available as a best-effort telemetry candidate. meets_target still requires the
+    whole demand covered AND every serving rank in SLO.
 
     Args:
         ranks: rank dicts (RankSpec.from_dict form) with role, env, config.
@@ -1911,8 +1910,8 @@ def size_ladder(
     regime = _job_mode(job_features)
     is_online = regime == "online"
     # utilization_target is accepted for backward compatibility but no longer used.
-    # Direct AIC supplies capacity and online latency for normal sizing. Explicit
-    # advisory partial-admission probes may opt into queue-aware DynoSim.
+    # Direct AIC supplies capacity and online latency for all production sizing,
+    # including advisory partial-admission probes.
     _ = utilization_target
     target = (
         float(target_tps)
@@ -2061,8 +2060,7 @@ def size_ladder(
         direct_predictions: dict[int, dict | None],
     ) -> dict | None:
         # Predict this rank at DP=d workers carrying `share_tps` tokens/s of demand.
-        # Direct AIC is the default sizing backend. Queue-aware DynoSim is reserved
-        # for explicit advisory partial-admission probes.
+        # Direct AIC is the production sizing backend, including advisory probes.
         # Returns:
         #   dict y_hat -> the DP-aggregate prediction,
         #   {}         -> overloaded/incomplete at this DP (try more replicas),
@@ -2167,7 +2165,10 @@ def size_ladder(
                     n_replicas, served, slo_ok, reason, met = d, share, True, "ok", True
                     break
             advisory_search = (
-                not met and PARTIAL_ONLINE_ADMISSION_MODE == "advisory" and verify_online_latency
+                not met
+                and PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
+                and verify_online_latency
+                and osl > 0
             )
             if advisory_search:
                 partial_search_attempted = True
@@ -2203,7 +2204,7 @@ def size_ladder(
                                 rank,
                                 partial_d,
                                 probe_load,
-                                _AIC_DYNOSIM_METHOD,
+                                _AIC_DIRECT_METHOD,
                             )
                         except SurrogateBudgetExceeded:
                             if not safe_y:
@@ -2273,8 +2274,6 @@ def size_ladder(
                                 _partial_online_admissions += 1
                         else:
                             reason = "no positive SLO-safe partial load at max usable DP"
-                elif osl <= 0:
-                    reason = "cannot test partial load without a positive output length"
                 else:
                     reason = "no positive conservative direct capacity at max usable DP"
             elif not met and fallback_y:
@@ -2705,8 +2704,8 @@ def predict_outcome(
         mechanism: Optional mechanism context, informational only.
         env: Optional canonical [market, cloud, region, zone, gpu_type].
         calibrate: Apply the residual correction (default True).
-        queue_aware: Use DynoSim queue verification instead of the default
-            inexpensive Direct prediction.
+        queue_aware: Deprecated compatibility input. It is ignored; production
+            predictions always use Direct AIC.
 
     Returns:
         {"y_hat": calibrated dict, "y_hat_raw": surrogate dict,
@@ -2723,18 +2722,13 @@ def predict_outcome(
     job_config = _sanitize_agent_config(dict(config.get("job_config", config)))
     if env and len(env) == 5 and not job_config.get("gpu_type"):
         job_config["gpu_type"] = env[4]
-    is_online = _job_mode(job_features) == "online"
-    method = (
-        _AIC_DYNOSIM_METHOD
-        if is_online and (queue_aware or scenario == "peak_all_multiturn_stress")
-        else _AIC_DIRECT_METHOD
-    )
+    _ = queue_aware
     return _predict_outcome_core(
         job_config,
         job_features,
         calibrate=calibrate,
         scenario=scenario,
-        method=method,
+        method=_AIC_DIRECT_METHOD,
     )
 
 
@@ -2761,17 +2755,6 @@ def _prediction_cache_key(
         return None
 
 
-def _aic_raw_cache_hit(prediction_lineage: Any) -> bool:
-    """Whether the primary AIC backend reports a successful cross-tick raw hit."""
-    if not isinstance(prediction_lineage, dict):
-        return False
-    components = prediction_lineage.get("components")
-    primary = components.get("primary") if isinstance(components, dict) else None
-    metadata = primary.get("metadata") if isinstance(primary, dict) else None
-    raw_cache = metadata.get("aic_raw_cache") if isinstance(metadata, dict) else None
-    return isinstance(raw_cache, dict) and raw_cache.get("hit") is True
-
-
 def _predict_outcome_core(
     job_config: dict[str, Any],
     job_features: dict[str, Any],
@@ -2785,13 +2768,13 @@ def _predict_outcome_core(
 
     Cache misses remain serialized because the composed surrogate is not thread-safe.
     The composer owns calibration; callers receive final values plus the raw and
-    calibration details carried in its prediction lineage.
+    calibration details carried in its prediction lineage. The method input remains
+    compatible with older callers but is canonicalized to Direct AIC.
     """
     _require("candidate_graph", "dro", "surrogate")
     global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
-    global _surrogate_raw_cache_hits
     global _surrogate_finalization_calls, _surrogate_stress_calls
-    selected_method = (method,) if isinstance(method, str) else tuple(method)
+    selected_method = _AIC_DIRECT_METHOD
     key = _prediction_cache_key(
         job_config,
         job_features,
@@ -2807,38 +2790,18 @@ def _predict_outcome_core(
             _surrogate_cache_hits += 1
         else:
             is_stress = scenario == "peak_all_multiturn_stress"
-            is_search = not _finalization and not is_stress
-            preflight_raw_hit = False
-            charged_search = False
             if _finalization:
                 _surrogate_finalization_calls += 1
             elif is_stress:
                 _surrogate_stress_calls += 1
             else:
                 if _surrogate_calls >= SURROGATE_CALL_BUDGET:
-                    cache_contains = getattr(_CTX.surrogate, "primary_cache_contains", None)
-                    if callable(cache_contains):
-                        try:
-                            preflight_raw_hit = bool(
-                                cache_contains(
-                                    job_config=job_config,
-                                    job_features=job_features,
-                                    candidate_graph=_CTX.candidate_graph,
-                                    method=selected_method,
-                                    scenario=scenario,
-                                )
-                            )
-                        except Exception:
-                            preflight_raw_hit = False
-                    if not preflight_raw_hit:
-                        _surrogate_budget_rejections += 1
-                        raise SurrogateBudgetExceeded(
-                            f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
-                            "narrow to your best few candidate configs and reuse scored results."
-                        )
-                else:
-                    _surrogate_calls += 1
-                    charged_search = True
+                    _surrogate_budget_rejections += 1
+                    raise SurrogateBudgetExceeded(
+                        f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
+                        "narrow to your best few candidate configs and reuse scored results."
+                    )
+                _surrogate_calls += 1
             if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
                 # Point-in-time cutoff prevents later evidence leaking into replayed predictions.
                 try:
@@ -2868,10 +2831,6 @@ def _predict_outcome_core(
                 else:
                     y_hat = getattr(result, "y_hat", {}) or {}
                     v_hat = getattr(result, "v_hat", {}) or {}
-            if is_search and (preflight_raw_hit or _aic_raw_cache_hit(prediction_lineage)):
-                if charged_search:
-                    _surrogate_calls = max(0, _surrogate_calls - 1)
-                _surrogate_raw_cache_hits += 1
             cached = copy.deepcopy(
                 {
                     "y_hat": dict(y_hat or {}),
@@ -2940,11 +2899,7 @@ def _attach_peak_multiturn_stress(action: dict[str, Any], job_features: dict[str
                 payload["job_features"],
                 calibrate=False,
                 scenario="peak_all_multiturn_stress",
-                method=(
-                    _AIC_DYNOSIM_METHOD
-                    if _job_mode(job_features) == "online"
-                    else _AIC_DIRECT_METHOD
-                ),
+                method=_AIC_DIRECT_METHOD,
             )
             y = dict(pred.get("y_hat_raw") or pred.get("y_hat") or {})
             v = dict(pred.get("v_hat") or {})

@@ -277,7 +277,6 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual(reset_status["limit"], 1)
         self.assertEqual(reset_status["calls_executed"], 0)
         self.assertEqual(reset_status["cache_hits"], 0)
-        self.assertEqual(reset_status["raw_cache_hits"], 0)
         self.assertEqual(reset_status["budget_rejections"], 0)
 
     def test_partial_admission_mode_is_guarded_hidden_and_survives_tick_reset(self):
@@ -302,72 +301,6 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
                 "truncated_searches": 0,
             },
         )
-
-    def test_cross_tick_aic_raw_hits_refund_only_search_calls(self):
-        class RawCacheSurrogate(_RecordingSurrogate):
-            def compose_prediction_with_trace(self, **kwargs):
-                y_hat, v_hat, lineage = super().compose_prediction_with_trace(**kwargs)
-                lineage["components"] = {"primary": {"metadata": {"aic_raw_cache": {"hit": True}}}}
-                return y_hat, v_hat, lineage
-
-        surrogate = self._bind_prediction_fakes(RawCacheSurrogate())
-        agent_tools.configure_surrogate_call_budget(1)
-
-        agent_tools._predict_outcome_core({"model_id": "raw-a"}, {"type": "online"})
-        agent_tools._predict_outcome_core({"model_id": "raw-b"}, {"type": "online"})
-        agent_tools._predict_outcome_core(
-            {"model_id": "final"},
-            {"type": "online"},
-            _finalization=True,
-        )
-        agent_tools._predict_outcome_core(
-            {"model_id": "stress"},
-            {"type": "online"},
-            scenario="peak_all_multiturn_stress",
-        )
-
-        status = agent_tools.get_surrogate_budget_status()
-        self.assertEqual(len(surrogate.calls), 4)
-        self.assertEqual(status["calls_executed"], 0)
-        self.assertEqual(status["raw_cache_hits"], 2)
-        self.assertEqual(status["finalization_calls"], 1)
-        self.assertEqual(status["stress_calls"], 1)
-        self.assertEqual(status["remaining"], 1)
-
-    def test_warmed_primary_cache_bypasses_an_exhausted_search_budget(self):
-        class WarmedCacheSurrogate(_RecordingSurrogate):
-            def __init__(self):
-                super().__init__()
-                self.warmed = False
-
-            def primary_cache_contains(self, **_kwargs):
-                return self.warmed
-
-            def compose_prediction_with_trace(self, **kwargs):
-                was_warmed = self.warmed
-                y_hat, v_hat, lineage = super().compose_prediction_with_trace(**kwargs)
-                self.warmed = True
-                lineage["components"] = {
-                    "primary": {"metadata": {"aic_raw_cache": {"hit": was_warmed}}}
-                }
-                return y_hat, v_hat, lineage
-
-        surrogate = self._bind_prediction_fakes(WarmedCacheSurrogate())
-        agent_tools.configure_surrogate_call_budget(1)
-        candidate = {"model_id": "raw-warmed"}
-        features = {"type": "online"}
-        agent_tools._predict_outcome_core(candidate, features)
-
-        agent_tools.reset_tick_caches()
-        agent_tools.configure_surrogate_call_budget(0)
-        result = agent_tools._predict_outcome_core(candidate, features)
-
-        status = agent_tools.get_surrogate_budget_status()
-        self.assertEqual(result["y_hat"]["throughput_token_per_sec"], 200.0)
-        self.assertEqual(len(surrogate.calls), 2)
-        self.assertEqual(status["calls_executed"], 0)
-        self.assertEqual(status["raw_cache_hits"], 1)
-        self.assertEqual(status["budget_rejections"], 0)
 
     def test_finalization_helper_is_not_exposed_to_the_llm(self):
         self.assertNotIn("stamp_plan_predictions", agent_tools.all_callables())
@@ -495,7 +428,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         )
         self.assertEqual(
             [call["method"] for call in calls],
-            [("AIC_DynoSim",), ("AIC_DynoSim",)],
+            [("AIC_Direct",), ("AIC_Direct",)],
         )
 
     def test_composed_online_score_uses_public_target_and_share_before_legacy_fallback(self):
@@ -536,6 +469,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         config, features, kwargs = calls[0]
         self.assertNotIn("_arrival_share_rps", config)
         self.assertEqual(features["request_arrival_rate"], 0.5)
+        self.assertEqual(kwargs["method"], ("AIC_Direct",))
         self.assertEqual(kwargs["scenario"], "peak")
 
     def test_finalization_bypasses_search_cap_and_stamps_decision_metadata(self):
@@ -606,7 +540,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         )
         self.assertEqual(
             [call["method"] for call in surrogate.calls],
-            [("AIC_Direct",), ("AIC_DynoSim",)],
+            [("AIC_Direct",), ("AIC_Direct",)],
         )
         self.assertEqual(surrogate.calls[-1]["job_features"]["request_arrival_rate"], 1.2)
         self.assertEqual(
@@ -620,19 +554,22 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             },
         )
 
-    def test_public_prediction_defaults_direct_and_queue_verification_is_explicit(self):
+    def test_public_prediction_ignores_queue_aware_and_always_uses_direct(self):
         surrogate = self._bind_prediction_fakes()
 
         online = {"job_config": {"model_id": "online"}, "job_features": {"type": "online"}}
         agent_tools.predict_outcome(online)
-        agent_tools.predict_outcome(online, queue_aware=True)
+        agent_tools.predict_outcome(
+            {"job_config": {"model_id": "online-queue"}, "job_features": {"type": "online"}},
+            queue_aware=True,
+        )
         agent_tools.predict_outcome(
             {"job_config": {"model_id": "batch"}, "job_features": {"type": "batch"}}
         )
 
         self.assertEqual(
             [call["method"] for call in surrogate.calls],
-            [("AIC_Direct",), ("AIC_DynoSim",), ("AIC_Direct",)],
+            [("AIC_Direct",), ("AIC_Direct",), ("AIC_Direct",)],
         )
 
     def test_priority_uses_nested_class_and_workload_signals(self):
@@ -1597,7 +1534,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             load = float(features["request_arrival_rate"])
             method = kwargs["method"]
             calls.append((method, load))
-            if method == ("AIC_Direct",):
+            if load == 100.0:
                 return {"y_hat": {"throughput_token_per_sec": 100.0}}
             safe = load <= 60.0
             return {
@@ -1611,7 +1548,8 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         agent_tools.configure_partial_online_admission("advisory")
         _env, _features, result = self._size_online(predict)
 
-        partial_loads = [load for method, load in calls if method == ("AIC_DynoSim",)]
+        self.assertTrue(all(method == ("AIC_Direct",) for method, _load in calls))
+        partial_loads = [load for _method, load in calls if load < 100.0]
         self.assertEqual(
             partial_loads,
             [50.0, 75.0, 62.5, 56.25, 59.375, 60.9375, 60.15625],
@@ -1639,7 +1577,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
     def test_partial_probe_requires_only_declared_latency_targets(self):
         def predict(_config, features, **kwargs):
             load = float(features["request_arrival_rate"])
-            if kwargs["method"] == ("AIC_Direct",):
+            if load == 100.0:
                 return {"y_hat": {"throughput_token_per_sec": 100.0}}
             return {
                 "y_hat": {
@@ -1658,7 +1596,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
     def test_partial_probe_retains_positive_best_effort_capacity(self):
         def predict(_config, features, **kwargs):
             load = float(features["request_arrival_rate"])
-            if kwargs["method"] == ("AIC_Direct",):
+            if load == 100.0:
                 return {"y_hat": {"throughput_token_per_sec": 100.0}}
             return {
                 "y_hat": {
@@ -1742,7 +1680,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
 
                 def predict(_config, features, kind=kind, **kwargs):
                     load = float(features["request_arrival_rate"])
-                    if kwargs["method"] == ("AIC_Direct",):
+                    if load == 100.0:
                         return {"y_hat": {"throughput_token_per_sec": 100.0}}
                     return {"y_hat": response(kind, load)}
 
@@ -1790,16 +1728,8 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         def predict(_config, features, **kwargs):
             nonlocal partial_calls
             load = float(features["request_arrival_rate"])
-            if kwargs["method"] == ("AIC_Direct",):
-                return {"y_hat": {"throughput_token_per_sec": 100.0}}
             if load == 100.0:
-                return {
-                    "y_hat": {
-                        "p99_ttft_ms": 200.0,
-                        "p99_tpot_ms": 20.0,
-                        "throughput_token_per_sec": 100.0,
-                    }
-                }
+                return {"y_hat": {"throughput_token_per_sec": 100.0}}
             partial_calls += 1
             if partial_calls > 1:
                 raise agent_tools.SurrogateBudgetExceeded("test budget exhausted")
@@ -1826,16 +1756,8 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
     def test_advisory_budget_exhaustion_before_a_safe_probe_propagates(self):
         def predict(_config, features, **kwargs):
             load = float(features["request_arrival_rate"])
-            if kwargs["method"] == ("AIC_Direct",):
-                return {"y_hat": {"throughput_token_per_sec": 100.0}}
             if load == 100.0:
-                return {
-                    "y_hat": {
-                        "p99_ttft_ms": 200.0,
-                        "p99_tpot_ms": 20.0,
-                        "throughput_token_per_sec": 100.0,
-                    }
-                }
+                return {"y_hat": {"throughput_token_per_sec": 100.0}}
             raise agent_tools.SurrogateBudgetExceeded("test budget exhausted")
 
         agent_tools.configure_partial_online_admission("advisory")
@@ -1913,7 +1835,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             patch.object(
                 agent_tools,
                 "_rank_prediction_payload",
-                side_effect=lambda rank, features: {
+                side_effect=lambda rank, features, **_kwargs: {
                     "job_config": {"dp": rank.n_replicas},
                     "job_features": features,
                 },
@@ -1936,11 +1858,10 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             tried,
             [
                 (("AIC_Direct",), 3),
-                (("AIC_DynoSim",), 3),
             ],
         )
 
-    def test_size_ladder_direct_screens_before_dynosim_and_can_find_smaller_dp(self):
+    def test_size_ladder_direct_predictions_can_find_smaller_dp(self):
         env = "reserved|aws|r1|z1|H100"
 
         class ResourceMap:
@@ -1967,8 +1888,6 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             method = kwargs["method"]
             dp = config["dp"]
             calls.append((method, dp))
-            if method == ("AIC_Direct",):
-                return {"y_hat": {"throughput_token_per_sec": direct_throughput[dp]}}
             return {
                 "y_hat": {
                     "p99_ttft_ms": 20.0 if dp == 2 else 200.0,
@@ -1985,7 +1904,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             patch.object(
                 agent_tools,
                 "_rank_prediction_payload",
-                side_effect=lambda rank, features: {
+                side_effect=lambda rank, features, **_kwargs: {
                     "job_config": {"dp": rank.n_replicas},
                     "job_features": features,
                 },
@@ -2010,10 +1929,8 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             [
                 (("AIC_Direct",), 3),
                 (("AIC_Direct",), 4),
-                (("AIC_DynoSim",), 4),
                 (("AIC_Direct",), 1),
                 (("AIC_Direct",), 2),
-                (("AIC_DynoSim",), 2),
             ],
         )
 

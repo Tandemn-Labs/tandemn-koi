@@ -155,23 +155,24 @@ FEATURES = {
 }
 
 
-def test_aic_backend_passes_dictionaries_method_scenario_and_failure_unchanged():
+def test_aic_backend_forces_direct_method_and_preserves_inputs_scenario_and_failures():
     primary = _Primary()
     backend = AICBackend(primary)
     config = {"dp": 3}
     features = {"type": "batch"}
     graph = object()
 
-    backend.estimate(
+    estimate = backend.estimate(
         SimpleNamespace(job_config=config, job_features=features),
         candidate_graph=graph,
         method=("custom",),
         scenario="peak",
     )
 
-    assert primary.calls[0] == (config, features, graph, ("custom",), "peak")
+    assert primary.calls[0] == (config, features, graph, ("AIC_Direct",), "peak")
     assert primary.calls[0][0] is config
     assert primary.calls[0][1] is features
+    assert estimate.metadata["method"] == ["AIC_Direct"]
 
     class _Fail(_Primary):
         def compose_prediction(self, *args, **kwargs):
@@ -236,7 +237,7 @@ def test_aic_backend_serializes_stateful_compatibility_metadata():
     assert results == ["A10G", "L4", "H100", "L40S"]
 
 
-def test_primary_passthrough_analytic_overlay_singular_dp_scenario_and_no_pp_derating():
+def test_composer_forces_direct_primary_trace_and_preserves_inputs_scenario():
     primary = _Primary()
     peers = _Peers()
     composer = SurrogateComposer(primary, peer_client=peers, peer_mode="shadow")
@@ -250,7 +251,7 @@ def test_primary_passthrough_analytic_overlay_singular_dp_scenario_and_no_pp_der
     )
 
     assert primary.calls[0][0]["dp"] == 2
-    assert primary.calls[0][3] == ("AIC_DynoSim",)
+    assert primary.calls[0][3] == ("AIC_Direct",)
     assert primary.calls[0][4] == "peak"
     assert peers.calls[0][0]["dp"] == 2
     assert peers.calls[0][2] == "peak"
@@ -261,6 +262,7 @@ def test_primary_passthrough_analytic_overlay_singular_dp_scenario_and_no_pp_der
     assert v_hat["kv_cache_util"] != 0.0
     assert v_hat["pipeline_bubble_fraction"] > 0
     assert trace["schema_version"] == 3
+    assert trace["method"] == ["AIC_Direct"]
     assert trace["components"]["primary"]["status"] == "success"
     assert trace["backends"]["solver"]["y_hat"]["throughput_token_per_sec"] == 200.0
     assert trace["fusion"]["applied"] is False
@@ -289,7 +291,7 @@ def test_perfdb_enabled_rederives_cost_and_slo_from_changed_throughput_and_laten
     y_hat, _, _ = composer.compose_prediction_with_trace(CONFIG, FEATURES, _Graph())
     assert y_hat["throughput_token_per_sec"] == 300.0
     assert y_hat["cost_per_token"] == 0.01 * 100.0 / 300.0
-    assert y_hat["slo_margin"] == min(20.0 - 15.0, 10.0 - 2.0)
+    assert y_hat["slo_margin"] == min((20.0 - 15.0) / 20.0, (10.0 - 2.0) / 10.0)
 
 
 def test_primary_failure_short_circuits_and_records_compact_failure():
@@ -475,15 +477,19 @@ def test_learned_fusion_trace_skips_residual_throughput_calibration():
 
 
 def test_stress_scenario_does_not_run_peers():
+    primary = _Primary()
     peers = _Peers()
-    composer = SurrogateComposer(_Primary(), peer_client=peers, peer_mode="enabled")
-    composer.compose_prediction(
+    composer = SurrogateComposer(primary, peer_client=peers, peer_mode="enabled")
+    _, _, trace = composer.compose_prediction_with_trace(
         CONFIG,
         FEATURES,
         _Graph(),
+        method=("AIC_DynoSim",),
         scenario="peak_all_multiturn_stress",
     )
     assert peers.calls == []
+    assert primary.calls[0][3] == ("AIC_Direct",)
+    assert trace["method"] == ["AIC_Direct"]
 
 
 def test_peer_failure_warns_once_and_falls_back():
