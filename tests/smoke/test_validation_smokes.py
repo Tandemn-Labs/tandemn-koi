@@ -343,6 +343,12 @@ class ValidationSmokeTests(unittest.TestCase):
 
         self.assertTrue(result.feasible, result.violations)
 
+        action["target_p99_ttft_ms"] = 100.0
+        action["meets_target"] = False
+        advisory_result = Validator(partial_online_admission_mode="advisory").val_plan(plan)
+
+        self.assertTrue(advisory_result.feasible, advisory_result.violations)
+
     def test_validator_accepts_legacy_batch_partial_without_online_admission_fields(self):
         plan = _raw_partial_plan()
         plan["actions"][0].pop("admitted_tps")

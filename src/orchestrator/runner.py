@@ -115,8 +115,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--partial-online-admission",
         choices=PARTIAL_ONLINE_ADMISSION_MODES,
-        default=os.getenv("KOI_PARTIAL_ONLINE_ADMISSION", "off"),
-        help="Partial online admission mode (KOI_PARTIAL_ONLINE_ADMISSION; default: off)",
+        default=os.getenv("KOI_PARTIAL_ONLINE_ADMISSION", "advisory"),
+        help="Partial online admission mode (KOI_PARTIAL_ONLINE_ADMISSION; default: advisory)",
     )
     parser.add_argument("--rust-log", default=os.getenv("RUST_LOG", "warn"))
     args = parser.parse_args(argv)
