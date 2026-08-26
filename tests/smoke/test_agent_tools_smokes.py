@@ -112,7 +112,7 @@ class _RecordingSurrogate:
         self.calls = []
 
     def compose_prediction(
-        self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",), scenario="mean"
+        self, job_config, job_features, candidate_graph, method=("AIC_Direct",), scenario="mean"
     ):
         self.calls.append((dict(job_config), dict(job_features)))
         return (
@@ -129,7 +129,7 @@ class _RecordingSurrogate:
         job_config,
         job_features,
         candidate_graph,
-        method=("AIC_DynoSim",),
+        method=("AIC_Direct",),
         scenario="mean",
         as_of_timestamp_utc=None,
     ):
@@ -537,7 +537,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 candidate_graph=object(),
                 dro=_DRO(),
             )
-            agent_tools._rank_prediction_payload = lambda rank, features: {
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
                 "job_config": {},
                 "job_features": {},
             }
@@ -660,7 +660,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 candidate_graph=object(),
                 dro=_DRO(),
             )
-            agent_tools._rank_prediction_payload = lambda rank, features: {
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
                 "job_config": {},
                 "job_features": {},
             }
@@ -710,7 +710,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 candidate_graph=object(),
                 dro=_DRO(),
             )
-            agent_tools._rank_prediction_payload = lambda rank, features: {
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
                 "job_config": {},
                 "job_features": {},
             }
@@ -745,7 +745,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 candidate_graph=object(),
                 dro=_DRO(),
             )
-            agent_tools._rank_prediction_payload = lambda rank, features: {
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
                 "job_config": {},
                 "job_features": {},
             }
@@ -988,7 +988,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
 
             def compose_prediction(self, **kwargs):
                 scenario = kwargs["scenario"]
-                self.calls.append(scenario)
+                self.calls.append((scenario, kwargs["method"]))
                 return ({"throughput_token_per_sec": 10.0 if scenario == "mean" else 20.0}, {})
 
         saved = {
@@ -1021,7 +1021,11 @@ class AgentToolsSmokeTests(unittest.TestCase):
         self.assertEqual(calls_after, 2)
         self.assertEqual(
             surrogate.calls,
-            ["mean", "peak", "peak_all_multiturn_stress"],
+            [
+                ("mean", ("AIC_Direct",)),
+                ("peak", ("AIC_Direct",)),
+                ("peak_all_multiturn_stress", ("AIC_Direct",)),
+            ],
         )
 
     def test_composer_trace_is_logged_once_per_cache_miss(self):
@@ -1107,7 +1111,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
         saved_payload = agent_tools._rank_prediction_payload
         try:
             agent_tools._predict_outcome_core = fail_stress
-            agent_tools._rank_prediction_payload = lambda rank, features: {
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
                 "job_config": {},
                 "job_features": features,
             }
@@ -1134,7 +1138,10 @@ class AgentToolsSmokeTests(unittest.TestCase):
         self.assertEqual(len(stressed["ladder"]), 1)
         self.assertIn("stress replay failed", diag["error"])
 
-        def predict_stress(*_args, **_kwargs):
+        stress_calls = []
+
+        def predict_stress(*_args, **kwargs):
+            stress_calls.append(kwargs)
             return {
                 "y_hat_raw": {
                     "p99_ttft_ms": 11.0,
@@ -1149,7 +1156,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
         saved_payload = agent_tools._rank_prediction_payload
         try:
             agent_tools._predict_outcome_core = predict_stress
-            agent_tools._rank_prediction_payload = lambda rank, features: {
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
                 "job_config": {},
                 "job_features": features,
             }
@@ -1164,6 +1171,8 @@ class AgentToolsSmokeTests(unittest.TestCase):
         self.assertEqual(ok_diag["throughput_token_per_sec"], 33.0)
         self.assertEqual(ok_diag["completed_requests"], 21)
         self.assertIsNone(ok_diag["error"])
+        self.assertEqual(stress_calls[0]["method"], ("AIC_Direct",))
+        self.assertEqual(stress_calls[0]["scenario"], "peak_all_multiturn_stress")
 
     def test_predict_outcome_derives_gpu_type_from_env(self):
         saved = {

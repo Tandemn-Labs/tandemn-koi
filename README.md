@@ -99,7 +99,7 @@ This repo — **Tandemn Intelligence (Koi)** — is the planning brain. **Tandem
 ```
 src/
   core/          data model · causal candidate graph · confidence · evidence · mechanism registry
-  prediction/    surrogate predictor (DynoSim/AIC) · Tchebycheff scalarization
+  prediction/    production Direct AIC surrogate · Tchebycheff scalarization
   cost/          DRO chance constraints · switch cost
   exploration/   EIG (expected information gain)
   validation/    CUSUM · ICP · four-quadrant classifier · C0–C7 plan validator
@@ -136,7 +136,8 @@ Runner logs are written under `logs/koi/<run-id>/`:
 `--trace no-llm` keeps logs compact. `--trace all` also records full LLM calls
 and agent REPL/tool traces before the runner clears per-tick memory buffers.
 
-Koi's DynoSim/AIC surrogate requires `aiconfigurator>=0.10.0` because Koi uses AIC's memory estimator before replay.
+Koi's production surrogate uses `AIC_Direct` and requires `aiconfigurator>=0.10.0`.
+The low-level DynoSim implementation remains available only for isolated legacy tests.
 
 ### Optional peer predictors
 

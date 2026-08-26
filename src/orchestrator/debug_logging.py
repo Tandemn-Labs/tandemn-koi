@@ -193,28 +193,19 @@ def _surrogate_summary(trace: dict[str, Any]) -> dict[str, Any]:
     calibration = trace.get("calibration") or {}
     compatibility = trace.get("compatibility") or {}
     failure = trace.get("failure") or None
-    component_summaries = {
-        name: {
-            "status": component.get("status"),
-            "version": component.get("version"),
-            "timing_ms": component.get("timing_ms"),
-        }
-        for name, component in components.items()
-    }
-    primary_cache = ((components.get("primary") or {}).get("metadata") or {}).get("aic_raw_cache")
-    if isinstance(primary_cache, dict) and "primary" in component_summaries:
-        component_summaries["primary"]["metadata"] = {
-            "aic_raw_cache": {
-                key: primary_cache.get(key)
-                for key in ("hit", "key_version", "entries", "max_entries")
-            }
-        }
     return {
         "schema_version": trace.get("schema_version"),
         "scenario": trace.get("scenario"),
         "method": trace.get("method"),
         "composite_version": trace.get("composite_version"),
-        "components": component_summaries,
+        "components": {
+            name: {
+                "status": component.get("status"),
+                "version": component.get("version"),
+                "timing_ms": component.get("timing_ms"),
+            }
+            for name, component in components.items()
+        },
         "backends": {
             name: {"status": backend.get("status"), "version": backend.get("version")}
             for name, backend in backends.items()

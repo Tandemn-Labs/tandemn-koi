@@ -1,5 +1,8 @@
 ### Surrogate Stack Installation
 
+Production predictions through `SurrogateComposer` and `AICBackend` are pinned to
+`AIC_Direct`. The DynoSim setup below supports isolated low-level legacy tests only.
+
 ```sudo apt update
 sudo apt install -y build-essential libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler python3-dev cmake curl git
 ```

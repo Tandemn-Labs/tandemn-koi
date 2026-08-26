@@ -27,12 +27,13 @@ from src.prediction.surrogate import SurrogateMemoryNoFit, SurrogateUnsupportedC
 log = logging.getLogger("koi.surrogate.composer")
 
 _MODES = frozenset({"off", "shadow", "enabled"})
+_AIC_DIRECT_METHOD = ("AIC_Direct",)
 _MEASURED_ONLY_MIN_COVERAGE = 0.8
 _FALLBACK_MIN_COVERAGE = 0.2
 
 
 class SurrogateComposer:
-    """Compose analytic V, measured shadows, peers, fusion, and one calibration."""
+    """Compose predictions while canonicalizing production execution to Direct AIC."""
 
     def __init__(
         self,
@@ -71,27 +72,6 @@ class SurrogateComposer:
 
     def bind_evidence_store(self, evidence_store) -> None:
         self.evidence_store = evidence_store
-
-    def primary_cache_contains(
-        self,
-        job_config,
-        job_features,
-        candidate_graph,
-        method=("AIC_Direct",),
-        scenario="mean",
-    ) -> bool:
-        """Check the primary backend's exact process-local raw-cache key."""
-        contains = getattr(self.primary, "has_cached", None)
-        if not callable(contains):
-            return False
-        return bool(
-            contains(
-                Candidate(job_config, job_features),
-                candidate_graph=candidate_graph,
-                method=method,
-                scenario=scenario,
-            )
-        )
 
     def compose_prediction(
         self,
@@ -143,6 +123,7 @@ class SurrogateComposer:
         scenario,
         as_of_timestamp_utc,
     ):
+        method = _AIC_DIRECT_METHOD
         started = time.perf_counter()
         prediction_timestamp = time.time()
         timings: dict[str, float] = {}

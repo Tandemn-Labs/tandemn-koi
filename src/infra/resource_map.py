@@ -324,27 +324,59 @@ class ResourceMapManager:
                 body.setdefault("market", market)
             else:
                 env_key = str(key)
-            pools = []
+            pools_by_instance: dict[str, dict[str, Any]] = {}
+            pool_shapes: dict[str, tuple[str, int]] = {}
             for raw_pool in body.get("pools") or []:
                 pool = dict(raw_pool)
                 instance_type = str(pool.get("instance_type"))
-                # Cloud pools reserve whole instances; on-prem pools may reserve GPUs.
                 kind = str(
                     pool.get("allocation_kind") or pool.get("allocation_unit") or "instance"
                 ).lower()
+                gpus_per_instance = int(pool.get("gpus_per_instance", 1))
+                total_instances = int(pool.get("total_instances", 0))
+                raw_total = pool.get("total")
+                total = (
+                    int(raw_total) if raw_total is not None else total_instances * gpus_per_instance
+                )
+                aggregate = pools_by_instance.get(instance_type)
+                if aggregate is None:
+                    pool["total_instances"] = total_instances
+                    pool["total"] = total
+                    pools_by_instance[instance_type] = pool
+                    pool_shapes[instance_type] = (kind, gpus_per_instance)
+                    continue
+
+                first_kind, first_gpus_per_instance = pool_shapes[instance_type]
+                if kind != first_kind:
+                    raise ValueError(
+                        f"duplicate pool {instance_type!r} in env {env_key!r} has conflicting "
+                        f"allocation kind: {first_kind!r} != {kind!r}"
+                    )
+                if gpus_per_instance != first_gpus_per_instance:
+                    raise ValueError(
+                        f"duplicate pool {instance_type!r} in env {env_key!r} has conflicting "
+                        "gpus_per_instance: "
+                        f"{first_gpus_per_instance} != {gpus_per_instance}"
+                    )
+                aggregate["total_instances"] += total_instances
+                aggregate["total"] += total
+
+            pools = []
+            for instance_type, pool in pools_by_instance.items():
+                kind, gpus_per_instance = pool_shapes[instance_type]
+                total_instances = int(pool["total_instances"])
                 if kind == "gpu":
-                    free_instances = int(pool.get("total_instances", 0))
+                    free_instances = total_instances
                     free_gpus = max(
                         0,
-                        int(pool.get("total", 0)) - used_pool_gpus.get((env_key, instance_type), 0),
+                        int(pool["total"]) - used_pool_gpus.get((env_key, instance_type), 0),
                     )
                 else:
                     free_instances = max(
                         0,
-                        int(pool.get("total_instances", 0))
-                        - used_instances.get((env_key, instance_type), 0),
+                        total_instances - used_instances.get((env_key, instance_type), 0),
                     )
-                    free_gpus = free_instances * int(pool.get("gpus_per_instance", 1))
+                    free_gpus = free_instances * gpus_per_instance
                 pool["free_instances"] = free_instances
                 pool["free"] = free_gpus
                 pools.append(pool)
