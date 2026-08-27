@@ -200,7 +200,7 @@ class PredictionSmokeTests(unittest.TestCase):
     def test_unexpected_gpu_labels_resolve_to_best_effort_aic_systems(self):
         predictor = SurrogatePrediction()
 
-        self.assertEqual(predictor.map_gpu_to_aic_system("nvidia-a10g"), "a30")
+        self.assertEqual(predictor.map_gpu_to_aic_system("nvidia-a10g"), "l4")
         self.assertEqual(
             predictor.last_metadata["compatibility"]["gpu"]["kind"],
             "nearest",
@@ -1021,6 +1021,8 @@ class PredictionSmokeTests(unittest.TestCase):
                 "profile_id": "first",
                 "aic_system": "first_system",
                 "model_id": "first-model",
+                "engine_name": "vllm",
+                "engine_version": "0.22.0",
                 "prefill_speed_ratio": 0.5,
                 "decode_speed_ratio": 0.25,
             },
@@ -1028,6 +1030,8 @@ class PredictionSmokeTests(unittest.TestCase):
                 "profile_id": "second",
                 "aic_system": "second_system",
                 "model_id": "second-model",
+                "engine_name": "sglang",
+                "engine_version": "0.5.14",
                 "prefill_speed_ratio": 0.8,
                 "decode_speed_ratio": 0.4,
             },
@@ -1052,8 +1056,80 @@ class PredictionSmokeTests(unittest.TestCase):
 
         self.assertEqual([attempt["aic_system"] for attempt in attempts], ["first_system", "second_system"])
         self.assertEqual(y_hat["throughput_token_per_sec"], 50.0)
+        self.assertEqual(attempts[1]["aic_backend"], "sglang")
+        self.assertEqual(attempts[1]["aic_backend_version"], "0.5.14")
         self.assertEqual(predictor.last_metadata["aic_profile_match"]["profile_id"], "second")
         self.assertEqual(predictor.last_metadata["aic_profile_attempts"][0]["profile_id"], "first")
+
+    def test_direct_retries_proxy_oom_but_preserves_native_oom(self):
+        predictor = SurrogatePrediction()
+        matches = (
+            {
+                "profile_id": "proxy",
+                "aic_system": "proxy-system",
+                "model_id": "proxy-model",
+                "engine_name": "vllm",
+                "engine_version": "0.22.0",
+                "prefill_speed_ratio": 1.0,
+                "decode_speed_ratio": 1.0,
+            },
+            {
+                "profile_id": "fallback",
+                "aic_system": "fallback-system",
+                "model_id": "fallback-model",
+                "engine_name": "vllm",
+                "engine_version": "0.22.0",
+                "prefill_speed_ratio": 1.0,
+                "decode_speed_ratio": 1.0,
+            },
+        )
+        attempts = []
+
+        def proxy_modes(surrogate_input, _modes):
+            model_id = surrogate_input["engine_args"]["aic_model_path"]
+            attempts.append(model_id)
+            if model_id == "proxy-model":
+                raise SurrogateMemoryNoFit("proxy OOM")
+            return {"throughput_token_per_sec": 25.0}, {}
+
+        predictor._run_aic_modes = proxy_modes
+        y_hat, _ = predictor.run_aic_only(
+            {
+                "requested_model_id": "target-model",
+                "requested_aic_system": "target-system",
+                "engine_args": {
+                    "aic_system": "target-system",
+                    "aic_model_path": "target-model",
+                },
+                "aic_profile_matches": matches,
+            }
+        )
+
+        self.assertEqual(attempts, ["proxy-model", "fallback-model"])
+        self.assertEqual(y_hat["throughput_token_per_sec"], 25.0)
+
+        def native_modes(*_args, **_kwargs):
+            raise SurrogateMemoryNoFit("native OOM")
+
+        predictor._run_aic_modes = native_modes
+        with self.assertRaisesRegex(SurrogateMemoryNoFit, "native OOM"):
+            predictor.run_aic_only(
+                {
+                    "requested_model_id": "target-model",
+                    "requested_aic_system": "target-system",
+                    "engine_args": {
+                        "aic_system": "target-system",
+                        "aic_model_path": "target-model",
+                    },
+                    "aic_profile_matches": (
+                        {
+                            **matches[0],
+                            "model_id": "target-model",
+                            "aic_system": "target-system",
+                        },
+                    ),
+                }
+            )
 
     def test_huggingface_enrichment_falls_back_from_aic_lookup(self):
         predictor = SurrogatePrediction()
@@ -1104,7 +1180,10 @@ class PredictionSmokeTests(unittest.TestCase):
                 ("AIC_Direct",),
             )
 
-        self.assertEqual(predictor.last_metadata["target_memory_fit"]["status"], "no_fit")
+        self.assertEqual(
+            predictor.last_metadata["target_memory_fit"]["status"],
+            "physical_no_fit",
+        )
 
     def test_profile_uses_fp8_quantization_method(self):
         profile = model_profile_from_values(
@@ -1207,13 +1286,87 @@ class PredictionSmokeTests(unittest.TestCase):
             "engine_name": "vllm",
         }
 
-        with patch("src.prediction.aic_support.load_aic_support_profiles", return_value=profiles):
+        def load_profiles(backend, _version):
+            return profiles if backend == "vllm" else ()
+
+        with patch(
+            "src.prediction.aic_support.load_aic_support_profiles",
+            side_effect=load_profiles,
+        ):
             matches = predictor._rank_aic_profiles(values, aic_system="a100_sxm")
 
         self.assertEqual(
             [match.supported.model.model_id for match in matches],
             ["aic/dense-32b", "aic/dense-70b"],
         )
+
+    def test_aggregate_profile_search_does_not_apply_second_memory_veto(self):
+        gpu = GPUProfile(
+            "A100",
+            vendor="nvidia",
+            architecture="ampere",
+            memory_gb=80,
+            memory_bandwidth_gbps=2039,
+            fp16_tflops=312,
+        )
+        model = ModelProfile(
+            model_id="aic/dense-70b",
+            architecture="DenseForCausalLM",
+            layers=80,
+            hidden_size=8192,
+            intermediate_size=28672,
+            attention_heads=64,
+            kv_heads=8,
+            head_dim=128,
+            vocab_size=128256,
+            parameter_count=70e9,
+            is_moe=False,
+            routed_experts=0,
+            active_experts=0,
+            weight_dtype="bf16",
+            max_context=8192,
+        )
+        predictor = SurrogatePrediction()
+        predictor._enrich_requested_model_values = lambda values: values
+        values = {
+            "model_id": "acme/dense-70b",
+            "model_params_b": 70,
+            "model_architecture": model.architecture,
+            "num_hidden_layers": 80,
+            "hidden_size": 8192,
+            "intermediate_size": 28672,
+            "num_attn_heads": 64,
+            "num_kv_heads": 8,
+            "weight_dtype": "bf16",
+            "gpu_type": "A100-SXM-80GB",
+            "gpu_mem_gb": 1,
+            "type": "online",
+            "isl_token_avg": 512,
+            "osl_token_avg": 128,
+            "max_num_seq": 8,
+            "tp": 1,
+            "pp": 1,
+            "engine_name": "vllm",
+        }
+        profile = SupportedProfile(
+            "a100-dense-70b",
+            gpu,
+            model,
+            "vllm",
+            "0.22.0",
+            "a100_sxm",
+        )
+
+        def load_profiles(backend, _version):
+            return (profile,) if backend == "vllm" else ()
+
+        with patch(
+            "src.prediction.aic_support.load_aic_support_profiles",
+            side_effect=load_profiles,
+        ):
+            matches = predictor._rank_aic_profiles(values, aic_system="a100_sxm")
+
+        self.assertEqual([match.supported.model.model_id for match in matches], ["aic/dense-70b"])
 
     def test_direct_finds_proxy_alternates_for_phi_and_mixtral(self):
         models = (
@@ -1281,7 +1434,12 @@ class PredictionSmokeTests(unittest.TestCase):
                 self.assertNotEqual(second_proxy, model["model_id"])
                 attempts = []
 
-                def run_modes(surrogate_input, _modes):
+                def run_modes(
+                    surrogate_input,
+                    _modes,
+                    attempts=attempts,
+                    first_proxy=first_proxy,
+                ):
                     model_path = surrogate_input["engine_args"]["aic_model_path"]
                     attempts.append(model_path)
                     if model_path == first_proxy:
@@ -1346,6 +1504,8 @@ class PredictionSmokeTests(unittest.TestCase):
                 "profile_id": "first",
                 "aic_system": "first_system",
                 "model_id": "first-model",
+                "engine_name": "vllm",
+                "engine_version": "0.22.0",
                 "prefill_speed_ratio": 0.5,
                 "decode_speed_ratio": 0.25,
             },
@@ -1353,6 +1513,8 @@ class PredictionSmokeTests(unittest.TestCase):
                 "profile_id": "second",
                 "aic_system": "second_system",
                 "model_id": "second-model",
+                "engine_name": "vllm",
+                "engine_version": "0.22.0",
                 "prefill_speed_ratio": 0.8,
                 "decode_speed_ratio": 0.4,
             },

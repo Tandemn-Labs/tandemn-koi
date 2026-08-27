@@ -2003,6 +2003,7 @@ def size_ladder(
         return ds
 
     physical_rejections: list[str] = []
+    prediction_rejections: list[dict[str, str]] = []
 
     def _run_at_load(
         rank: RankSpec,
@@ -2028,11 +2029,48 @@ def size_ladder(
                 method=method,
             )
             y_hat = dict(prediction.get("y_hat", {}))
+            if not y_hat:
+                lineage = prediction.get("prediction_lineage") or {}
+                primary = ((lineage.get("backends") or {}).get("primary") or {})
+                primary_status = primary.get("status")
+                metadata = primary.get("metadata") or {}
+                if primary_status == "failed":
+                    status = "prediction_failed"
+                    reason = str(metadata.get("error") or "Direct prediction failed")
+                elif primary_status == "unsupported":
+                    status = "unsupported_prediction"
+                    reason = str(metadata.get("error") or "Direct prediction is unsupported")
+                else:
+                    status = "prediction_empty"
+                    reason = "surrogate prediction returned no Y values"
+                prediction_rejections.append({"status": status, "reason": reason})
+                return None
+            throughput = y_hat.get("throughput_token_per_sec")
+            if throughput is None:
+                prediction_rejections.append(
+                    {
+                        "status": "prediction_incomplete",
+                        "reason": "surrogate prediction omitted throughput_token_per_sec",
+                    }
+                )
+                return None
+            try:
+                throughput_value = float(throughput)
+            except (TypeError, ValueError, OverflowError):
+                throughput_value = math.nan
+            if not math.isfinite(throughput_value) or throughput_value <= 0:
+                prediction_rejections.append(
+                    {
+                        "status": "zero_predicted_capacity",
+                        "reason": f"surrogate predicted unusable throughput {throughput!r}",
+                    }
+                )
+                return None
             lower = prediction.get("throughput_token_per_sec_lower")
             if lower is not None:
                 y_hat["_throughput_token_per_sec_lower"] = lower
             return y_hat
-        except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
+        except SurrogateMemoryNoFit as exc:
             log.warning(
                 "size_ladder rejected candidate: model=%s gpu=%s instance=%s "
                 "tp=%s pp=%s dp=%d error=%s",
@@ -2045,13 +2083,40 @@ def size_ladder(
                 exc,
             )
             physical_rejections.append(str(exc))
+            prediction_rejections.append(
+                {"status": "physical_no_fit", "reason": str(exc)}
+            )
+            return None
+        except SurrogateUnsupportedConfig as exc:
+            log.warning(
+                "size_ladder unsupported prediction: model=%s gpu=%s instance=%s "
+                "tp=%s pp=%s dp=%d error=%s",
+                payload["job_config"].get("model_id")
+                or payload["job_features"].get("model_id"),
+                payload["job_features"].get("gpu_type")
+                or payload["job_config"].get("gpu_type"),
+                r.config.get("instance_type"),
+                r.config.get("tp"),
+                r.config.get("pp"),
+                d,
+                exc,
+            )
+            prediction_rejections.append(
+                {"status": "unsupported_prediction", "reason": str(exc)}
+            )
             return None
         except SurrogateExecutionError as exc:
             message = str(exc)
             if message.startswith("completed ") and message.endswith(" requests"):
                 log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
+                prediction_rejections.append(
+                    {"status": "prediction_incomplete", "reason": message}
+                )
                 return {}
-            raise
+            prediction_rejections.append(
+                {"status": "prediction_failed", "reason": message}
+            )
+            return None
 
     def _predict_at(
         rank: RankSpec,
@@ -2089,6 +2154,7 @@ def size_ladder(
     # rank within SLO.
     for raw in ranks:
         physical_rejection_start = len(physical_rejections)
+        prediction_rejection_start = len(prediction_rejections)
         rank = RankSpec.from_dict(raw)
         preferred_replicas = max(1, int(rank.n_replicas or 1))
         gpus_per_chain = rank.gpus_per_chain()
@@ -2126,6 +2192,7 @@ def size_ladder(
         served = 0.0
         slo_ok = False
         reason: str | None = None
+        failure_status: str | None = None
         y_hat: dict[str, Any] = {}
         dp_tried = 0
         direct_predictions: dict[int, dict | None] = {}
@@ -2136,8 +2203,10 @@ def size_ladder(
         partial_admission = False
 
         if not runnable:
+            failure_status = "invalid_config"
             reason = f"config not runnable: {validity_reason}"
         elif max_by_cap < 1:
+            failure_status = "no_pool_capacity"
             reason = "no free capacity in pool"
         elif share <= 0:
             reason = "demand already covered by earlier ranks"
@@ -2149,7 +2218,15 @@ def size_ladder(
                 dp_tried = max(dp_tried, d)
                 y = _predict_at(rank, d, share, direct_predictions)
                 if y is None:
-                    reason = "does not fit (memory/physical)"
+                    rejection = next(
+                        iter(prediction_rejections[prediction_rejection_start:]),
+                        None,
+                    )
+                    if rejection is not None:
+                        failure_status = rejection["status"]
+                        reason = rejection["reason"]
+                    else:
+                        reason = "does not fit (memory/physical)"
                     break
                 if not y:
                     # overloaded / requests did not all complete at this DP - add
@@ -2292,6 +2369,14 @@ def size_ladder(
                 reason = "cannot meet SLO/keep-up at any replica count"
 
         rank.n_replicas = n_replicas
+        if n_replicas < 1 and failure_status is None:
+            rejection = next(
+                iter(reversed(prediction_rejections[prediction_rejection_start:])),
+                None,
+            )
+            if rejection is not None:
+                failure_status = rejection["status"]
+                reason = rejection["reason"]
         if n_replicas >= 1:
             rank.rank_traffic_share = served / target if target > 0 else 1.0
             rank.config.pop("_arrival_share_rps", None)
@@ -2328,7 +2413,9 @@ def size_ladder(
                 "partial_admission": partial_admission,
                 "admitted_tps": served if partial_admission else None,
                 "reason": reason,
+                "failure_status": failure_status,
                 "physical_violations": physical_rejections[physical_rejection_start:],
+                "prediction_failures": prediction_rejections[prediction_rejection_start:],
             }
         )
         if partial_search_truncated:
@@ -2338,6 +2425,14 @@ def size_ladder(
     # AND every serving rank inside its latency SLO.
     achieved_tps = max(0.0, target - remaining)
     serving = [r for r in per_rank if r["n_replicas"] >= 1]
+    failure = next(
+        (
+            {"status": rank["failure_status"], "reason": rank["reason"]}
+            for rank in per_rank
+            if rank.get("failure_status")
+        ),
+        None,
+    )
     served_slo_ok = bool(serving) and all(r["slo_ok"] for r in serving)
     meets_target = remaining <= max(1e-6, 1e-3 * target) and served_slo_ok
     partial_online_admission = (
@@ -2358,6 +2453,8 @@ def size_ladder(
         "partial_search_probes": sum(r["partial_search_probes"] for r in per_rank),
         "partial_search_truncated": any(r["partial_search_truncated"] for r in per_rank),
         "per_rank": per_rank,
+        "failure_status": failure["status"] if failure else None,
+        "failure_reason": failure["reason"] if failure else None,
         "marginal_value": marginal,
     }
 
@@ -3701,8 +3798,17 @@ def _online_sizing_rejection(
         achieved_tps = float(sized.get("achieved_tps") or 0.0)
     except (TypeError, ValueError, OverflowError):
         achieved_tps = 0.0
-    if not sized.get("ranks") or not math.isfinite(achieved_tps) or achieved_tps <= 0:
-        return "no_fit", "online frame has no positive admitted throughput"
+    if not sized.get("ranks") and sized.get("failure_status") in {
+        "invalid_config",
+        "no_pool_capacity",
+        "physical_no_fit",
+        "prediction_empty",
+        "prediction_failed",
+        "prediction_incomplete",
+        "unsupported_prediction",
+        "zero_predicted_capacity",
+    }:
+        return str(sized["failure_status"]), str(sized.get("failure_reason") or "")
 
     under_slo = has_latency_target and any(
         rank.get("slo_ok") is False
@@ -3712,8 +3818,12 @@ def _online_sizing_rejection(
     if PARTIAL_ONLINE_ADMISSION_MODE == "off":
         if under_slo:
             return "under_slo", "predicted TTFT/TPOT does not meet the declared online SLO"
+        if not sized.get("ranks") or not math.isfinite(achieved_tps) or achieved_tps <= 0:
+            return "prediction_incomplete", "online frame has no usable completed prediction"
         if not sized.get("meets_target"):
             return "under_target", "online frame does not provide full-service throughput"
+    if not sized.get("ranks") or not math.isfinite(achieved_tps) or achieved_tps <= 0:
+        return "prediction_incomplete", "online frame has no usable completed prediction"
     return None
 
 
@@ -3803,7 +3913,7 @@ def _score_one_frame(
     }
     runnable, reason = config_runnable(cfg, features)
     if not runnable:
-        diag.update(status="unrunnable", reason=reason)
+        diag.update(status="invalid_config", reason=reason)
         return {"candidate": None, "meets_target": False, "diag": diag}
     mid = _applicable_mechanism_id(rank, features)
     if not mid:
@@ -3847,10 +3957,11 @@ def _score_one_frame(
             "diag": diag,
         }
     if not ranks:
+        failure_status = sized.get("failure_status")
         diag.update(
-            status="no_fit",
-            reason=f"does not fit/meet SLO (achieved {sized.get('achieved_tps')} of "
-            f"{sized.get('target_tps')} tps)",
+            status=failure_status or "prediction_incomplete",
+            reason=sized.get("failure_reason")
+            or "no deployable rank produced a complete prediction",
         )
         return {"candidate": None, "meets_target": False, "diag": diag}
     if slo_risk:
@@ -3975,6 +4086,13 @@ def _score_composite(
     if online_rejection is not None:
         status, reason = online_rejection
         diag.update(status=status, reason=reason)
+        return {"candidate": None, "meets_target": False, "diag": diag}
+    if not sized_ranks:
+        diag.update(
+            status=sized.get("failure_status") or "prediction_incomplete",
+            reason=sized.get("failure_reason")
+            or "no composite rank produced a complete prediction",
+        )
         return {"candidate": None, "meets_target": False, "diag": diag}
     if len(sized_ranks) < 2:
         # size_ladder covered the target (or ran out) on ONE rank - no composite;

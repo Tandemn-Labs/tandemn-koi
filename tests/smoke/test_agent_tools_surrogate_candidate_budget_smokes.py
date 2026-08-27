@@ -1674,7 +1674,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         for kind, expected_status in (
             ("unsafe", "ok"),
             ("incomplete", "prediction_incomplete"),
-            ("zero", "no_fit"),
+            ("zero", "zero_predicted_capacity"),
         ):
             with self.subTest(kind=kind):
 
