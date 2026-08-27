@@ -529,6 +529,8 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertIn("POINT-ESTIMATE ONLINE MODE: admission metadata is off", prompt)
         self.assertIn("point capacity and base service latency", prompt)
         self.assertIn("queue SLOs remain unverified", prompt)
+        self.assertIn("PLACEMENT POLICY CONTRACT", prompt)
+        self.assertIn("Phi-4 never uses TP=8", prompt)
         self.assertIn("Any allowed batch partial candidate", prompt)
         self.assertIn("meets_target and served_fraction", prompt)
         self.assertIn("Optional point-estimate accounting", prompt)
@@ -544,6 +546,7 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         )
         self.assertNotIn("predicted_y", specialist_prompt)
         self.assertNotIn("predicted_sigma", specialist_prompt)
+        self.assertIn("placement_policy is a hard baseline constraint", specialist_prompt)
         for field in (
             "achieved_tps",
             "unmet_tps",

@@ -396,6 +396,15 @@ class PlanAction:
     served_fraction: float | None = None
     admission_mode: str | None = None
     prediction_assessment: dict | None = None
+    point_capacity_covers_target: bool | None = None
+    base_latency_within_target: bool | None = None
+    queue_state: str | None = None
+    queue_slo_verified: bool | None = None
+    observed_slo_met: bool | None = None
+    rehabilitation_status: str | None = None
+    rehabilitation_reasons: list[str] | None = None
+    keep_baseline_sigma: float | None = None
+    swap_gain_over_keep: float | None = None
 
     @classmethod
     def from_dict(cls, raw, job_id: str | None = None) -> "PlanAction":
@@ -446,6 +455,15 @@ class PlanAction:
             served_fraction=raw.get("served_fraction"),
             admission_mode=raw.get("admission_mode"),
             prediction_assessment=raw.get("prediction_assessment"),
+            point_capacity_covers_target=raw.get("point_capacity_covers_target"),
+            base_latency_within_target=raw.get("base_latency_within_target"),
+            queue_state=raw.get("queue_state"),
+            queue_slo_verified=raw.get("queue_slo_verified"),
+            observed_slo_met=raw.get("observed_slo_met"),
+            rehabilitation_status=raw.get("rehabilitation_status"),
+            rehabilitation_reasons=raw.get("rehabilitation_reasons"),
+            keep_baseline_sigma=raw.get("keep_baseline_sigma"),
+            swap_gain_over_keep=raw.get("swap_gain_over_keep"),
             target_p99_ttft_ms=raw.get("target_p99_ttft_ms"),
             target_p99_tpot_ms=raw.get("target_p99_tpot_ms"),
             mechanism_id=raw.get("mechanism_id"),
@@ -491,6 +509,15 @@ class PlanAction:
             "served_fraction",
             "admission_mode",
             "prediction_assessment",
+            "point_capacity_covers_target",
+            "base_latency_within_target",
+            "queue_state",
+            "queue_slo_verified",
+            "observed_slo_met",
+            "rehabilitation_status",
+            "rehabilitation_reasons",
+            "keep_baseline_sigma",
+            "swap_gain_over_keep",
         ):
             value = getattr(self, field_name)
             if value is not None:

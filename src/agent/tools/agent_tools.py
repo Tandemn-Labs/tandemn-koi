@@ -93,6 +93,7 @@ from threading import Lock
 from typing import Any
 
 from src.config.hyperparameters import GAMMA_SLO
+from src.config.policy import MODEL_MAX_TP, VALID_TP_DEGREES, load_config_policy
 from src.core.models import (
     LADDER_ACTIONS,
     SWAP_BUDGET_ACTIONS,
@@ -500,6 +501,7 @@ _partial_online_queue_aware_probes = 0
 _partial_online_safe_probes = 0
 _partial_online_admissions = 0
 _partial_online_truncated_searches = 0
+_placement_decision_sequence = 0
 # Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
 # scenario, calibration, method, accounting mode). Direct AIC is deterministic,
 # so re-probing a config the LLM already evaluated THIS tick returns identical
@@ -592,6 +594,7 @@ def reset_tick_caches() -> None:
     global _partial_online_admissions, _partial_online_queue_aware_probes
     global _partial_online_safe_probes, _partial_online_searches
     global _partial_online_truncated_searches
+    global _placement_decision_sequence
     _CTX.user_envelopes = None
     _CTX.validated_budget_book = None
     with _SURROGATE_EXECUTION_LOCK:
@@ -605,6 +608,7 @@ def reset_tick_caches() -> None:
         _partial_online_safe_probes = 0
         _partial_online_admissions = 0
         _partial_online_truncated_searches = 0
+        _placement_decision_sequence = 0
         _prediction_cache.clear()
     _specialist_results_cache.clear()
     _scored_candidates_cache.clear()
@@ -1260,6 +1264,15 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         features.get("workload_type") or features.get("type") or (descriptor or {}).get("kind")
     )
     mechanisms = get_scope(mechanism_context)
+    available_instances = instance_catalog()
+    hardware = sorted(
+        {
+            str(info.get("gpu_type") or str(env).split("|")[-1])
+            for env, pools in available_instances.items()
+            for info in pools.values()
+        }
+    )
+    policy_rules = load_config_policy().rules_for_model(str(model_id or ""), hardware)
 
     return {
         "job_id": job_id,
@@ -1271,7 +1284,11 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         "recent_theory_blobs": blobs,
         "similar_deployments": get_similar_deployments(features, top_k=5),
         "mechanism_candidates": mechanisms,
-        "instance_catalog": instance_catalog(),
+        "placement_policy": {
+            gpu: {"precision": rule.precision, "allowed_tp": list(rule.allowed_tp)}
+            for gpu, rule in policy_rules.items()
+        },
+        "instance_catalog": available_instances,
     }
 
 
@@ -1852,6 +1869,7 @@ def _model_num_heads(config: dict[str, Any], job_features: dict[str, Any] | None
 def config_runnable(
     config: dict[str, Any],
     job_features: dict[str, Any] | None = None,
+    gpu_type: str | None = None,
 ) -> tuple[bool, str]:
     """Deterministic physical-validity pre-check for a rank config.
 
@@ -1876,6 +1894,25 @@ def config_runnable(
     heads = _model_num_heads(config, job_features)
     if heads and heads % tp != 0:
         return False, f"tp={tp} does not divide the model's {heads} attention heads (cannot shard)"
+    model_id = str(config.get("model_id") or (job_features or {}).get("model_id") or "")
+    hardware = str(gpu_type or config.get("gpu_type") or (job_features or {}).get("gpu_type") or "")
+    policy = load_config_policy()
+    if model_id in MODEL_MAX_TP and tp > MODEL_MAX_TP[model_id]:
+        return False, f"{model_id} policy limits TP to {MODEL_MAX_TP[model_id]} (got TP={tp})"
+    rule = policy.rule_for(hardware, model_id) if hardware and model_id else None
+    if rule is not None:
+        if tp not in rule.allowed_tp:
+            return False, (
+                f"{model_id} policy on {hardware} allows TP {list(rule.allowed_tp)} (got TP={tp})"
+            )
+        precision_ok = policy.precision_matches(
+            rule,
+            config.get("weight_dtype") or (job_features or {}).get("weight_dtype"),
+            config.get("weight_quantization_method")
+            or (job_features or {}).get("weight_quantization_method"),
+        )
+        if precision_ok is False:
+            return False, f"{model_id} policy on {hardware} requires {rule.precision} precision"
     return True, ""
 
 
@@ -2928,6 +2965,7 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
                 "served_fraction": action.served_fraction,
                 "enforced": False,
             }
+        stamped_queue_states: list[str] = []
         for rank in action.ladder:
             payload = _rank_prediction_payload(rank, job_features)
             try:
@@ -2988,6 +3026,9 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
                         peak_to_mean_ratio=_feature_value(job_features, "peak_to_mean_ratio")
                         or 1.0,
                     )
+                    stamped_queue_states.append(
+                        str(lineage["queue_shadow"].get("status") or "unmodeled")
+                    )
                 except Exception as exc:
                     lineage["queue_shadow"] = {
                         "model": "erlang_c_v1",
@@ -2996,6 +3037,7 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
                         "reason": f"queue shadow failed: {exc}",
                         "affects_selection": False,
                     }
+                    stamped_queue_states.append("unmodeled")
             if pred.get("dro_band"):
                 lineage["decision_dro_band"] = copy.deepcopy(pred["dro_band"])
             lineage["decision_required_objectives"] = list(required_objectives)
@@ -3006,6 +3048,41 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
             if partial_admission is not None:
                 lineage["partial_admission"] = copy.deepcopy(partial_admission)
             rank.prediction_lineage = lineage
+        if "unstable" in stamped_queue_states:
+            action.queue_state = "unstable"
+        elif stamped_queue_states and all(state == "stable" for state in stamped_queue_states):
+            action.queue_state = "stable"
+        elif stamped_queue_states:
+            action.queue_state = "unmodeled"
+        action.queue_slo_verified = False
+    write_event = getattr(getattr(_CTX, "trace_logger", None), "write_event", None)
+    if callable(write_event):
+        try:
+            write_event(
+                "placement_decision_committed",
+                {
+                    "actions": [
+                        {
+                            "job_id": action.job_id,
+                            "type": action.type.value,
+                            "ranks": [
+                                {
+                                    "rank_id": rank.rank_id,
+                                    "env": list(rank.env or []),
+                                    "instance_type": rank.config.get("instance_type"),
+                                    "tp": rank.config.get("tp"),
+                                    "n_replicas": rank.n_replicas,
+                                }
+                                for rank in action.ladder or []
+                            ],
+                        }
+                        for action in typed.actions
+                    ]
+                },
+                tick=typed.tick,
+            )
+        except Exception:
+            log.exception("committed placement decision trace failed")
     return typed
 
 
@@ -3673,12 +3750,25 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
         value_bonus = max(0.0, opt_bonus - cost_penalty)
         sigma_i = J + value_bonus + beta * eig_value - GAMMA_SLO * pr_slo - lam * switch_total
         model_sigma = sigma_i
+        rehabilitation_credit = 0.0
+        if action.type == ActionType.SWAP:
+            severity = (
+                1.0
+                if action.rehabilitation_status == "critical"
+                else 0.5
+                if action.rehabilitation_status == "degraded"
+                else 0.0
+            )
+            rehabilitation_credit = (
+                UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * severity
+            )
+            sigma_i += rehabilitation_credit
         if isinstance(assessment, dict) and assessment.get("selection_mode") == "work_conserving":
             fraction = served_fraction_by_job.get(job_id, 0.0)
             avoided_penalty = (
                 UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * fraction
             )
-            if sigma_i + avoided_penalty <= 0:
+            if action.queue_state == "unstable" or sigma_i + avoided_penalty <= 0:
                 sigma_i = -avoided_penalty + _WORK_CONSERVING_GAIN_FLOOR
         per_job[job_id] = {
             "J": J,
@@ -3688,6 +3778,9 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
             "cost_penalty": cost_penalty,
             "opt_bonus": opt_bonus,
             "value_bonus": value_bonus,
+            "rehabilitation_credit": rehabilitation_credit,
+            "keep_baseline_sigma": -rehabilitation_credit,
+            "swap_gain_over_keep": model_sigma + rehabilitation_credit,
             "model_sigma": model_sigma,
             "sigma": sigma_i,
         }
@@ -3808,6 +3901,37 @@ def _replica_options(cap: int) -> list[int]:
     return options
 
 
+def _generated_tp_options(
+    *,
+    heads: int | None,
+    gpu_cap: int,
+    gpu_type: str,
+    model_id: str,
+    allocation_kind: str,
+) -> list[int]:
+    """Return policy-valid TP alternatives for one generated pool frame."""
+    rule = load_config_policy().rule_for(gpu_type, model_id)
+    if rule is not None:
+        return [
+            tp for tp in rule.allowed_tp if tp <= gpu_cap and (not heads or int(heads) % tp == 0)
+        ]
+    max_tp = MODEL_MAX_TP.get(model_id)
+    if max_tp is not None:
+        return [
+            tp
+            for tp in sorted(VALID_TP_DEGREES)
+            if tp <= min(gpu_cap, max_tp) and (not heads or int(heads) % tp == 0)
+        ]
+    if allocation_kind == "gpu":
+        options = []
+        tp = 1
+        while tp <= gpu_cap and (not heads or int(heads) % tp == 0):
+            options.append(tp)
+            tp *= 2
+        return options
+    return [_largest_pow2_divisor_leq(heads, gpu_cap)]
+
+
 def _applicable_mechanism_id(rank: dict[str, Any], features: dict[str, Any]) -> str | None:
     """Best applicable mechanism id for a rank (exact, then partial), or None."""
     try:
@@ -3852,9 +3976,38 @@ def _online_sizing_rejection(
 
 def _prediction_assessment(sized: dict[str, Any], features: dict[str, Any]) -> dict[str, Any]:
     """Summarize Direct's point estimate without implying queue verification."""
-    del features
     status = str(sized.get("failure_status") or "success")
     semantics = dict(sized.get("prediction_semantics") or _DIRECT_PREDICTION_SEMANTICS)
+    queue_state = "not_applicable" if _job_mode(features) != "online" else "unmodeled"
+    queue_utilization = None
+    if _job_mode(features) == "online" and status == "success":
+        per_rank = [
+            rank for rank in (sized.get("per_rank") or []) if int(rank.get("n_replicas") or 0) > 0
+        ]
+        try:
+            shadow = estimate_queue_shadow(
+                arrival_rate_rps=_feature_value(features, "request_arrival_rate"),
+                output_tokens_per_request=_feature_value(
+                    features, "osl_token_avg", "output_len_tokens_avg"
+                ),
+                aggregate_capacity_tps=sized.get("point_capacity_tps"),
+                replicas=sum(int(rank.get("n_replicas") or 0) for rank in per_rank),
+                base_ttft_ms=max(
+                    (
+                        float(rank["base_p99_ttft_ms"])
+                        for rank in per_rank
+                        if rank.get("base_p99_ttft_ms") is not None
+                    ),
+                    default=None,
+                ),
+                homogeneous=len(per_rank) == 1,
+                scenario="peak",
+                peak_to_mean_ratio=_feature_value(features, "peak_to_mean_ratio") or 1.0,
+            )
+            queue_state = str(shadow.get("status") or "unmodeled")
+            queue_utilization = shadow.get("utilization")
+        except Exception:
+            queue_state = "unmodeled"
     return {
         **semantics,
         "kind": "exploratory" if status in _SOFT_PREDICTION_FAILURES else "point",
@@ -3863,6 +4016,8 @@ def _prediction_assessment(sized: dict[str, Any], features: dict[str, Any]) -> d
         "point_capacity_tps": sized.get("point_capacity_tps"),
         "capacity_fraction": sized.get("capacity_fraction"),
         "base_latency_within_target": sized.get("base_latency_within_target"),
+        "queue_state": queue_state,
+        "queue_utilization": queue_utilization,
     }
 
 
@@ -3942,6 +4097,22 @@ def _rank_shape_key(rank: dict[str, Any]) -> tuple:
     )
 
 
+def _deployment_shape_key(raw: dict[str, Any], replicas: int | None = None) -> tuple:
+    shape = dict(raw.get("shape_json") or raw)
+    cfg = dict(shape.get("config") or shape)
+    return (
+        tuple(shape.get("env") or []),
+        cfg.get("instance_type"),
+        cfg.get("tp"),
+        cfg.get("pp"),
+        cfg.get("sp"),
+        cfg.get("ep"),
+        cfg.get("cp"),
+        cfg.get("num_nodes_per_chain"),
+        int(replicas if replicas is not None else shape.get("n_replicas") or 1),
+    )
+
+
 def _candidate_budget_errors(jid: str, action: dict[str, Any]) -> list[str]:
     """Return BudgetSlice violations when a validated book is active."""
     book = getattr(_CTX, "validated_budget_book", None)
@@ -3956,7 +4127,12 @@ def _candidate_budget_errors(jid: str, action: dict[str, Any]) -> list[str]:
 
 
 def _score_one_frame(
-    jid: str, user_id: Any, slice_id: Any, rank: dict[str, Any], features: dict[str, Any]
+    jid: str,
+    user_id: Any,
+    slice_id: Any,
+    rank: dict[str, Any],
+    features: dict[str, Any],
+    action_type: str = "place",
 ) -> dict[str, Any]:
     """The proven per-frame pipeline: runnable -> mechanism -> size_ladder ->
     feasibility -> per-job sigma. Returns {candidate|None, meets_target, diag}."""
@@ -3975,7 +4151,7 @@ def _score_one_frame(
         "sigma": None,
         "slo_risk": False,
     }
-    runnable, reason = config_runnable(cfg, features)
+    runnable, reason = config_runnable(cfg, features, gpu_type=gpu_type)
     if not runnable:
         diag.update(status="invalid_config", reason=reason)
         return {"candidate": None, "meets_target": False, "diag": diag}
@@ -3989,7 +4165,7 @@ def _score_one_frame(
         jid,
         {
             "job_id": jid,
-            "type": "place",
+            "type": action_type,
             "user_id": user_id,
             "ladder": [scored_rank],
             "mechanism_id": mid,
@@ -4045,6 +4221,71 @@ def _score_one_frame(
     assessment = _prediction_assessment(sized, features)
     assessment["proposal_source"] = rank.get("proposal_source", "specialist")
     exploratory = assessment["kind"] == "exploratory"
+    if action_type == "swap" and not exploratory:
+        health = features.get("_active_health") or {}
+        observed = health.get("observed") or {}
+        reasons = set(health.get("reasons") or [])
+        per_rank = sized.get("per_rank") or []
+        predicted_ttft = max(
+            (
+                float(item["base_p99_ttft_ms"])
+                for item in per_rank
+                if item.get("base_p99_ttft_ms") is not None
+            ),
+            default=None,
+        )
+        predicted_tpot = max(
+            (
+                float(item["base_p99_tpot_ms"])
+                for item in per_rank
+                if item.get("base_p99_tpot_ms") is not None
+            ),
+            default=None,
+        )
+        predicted_capacity = float(sized.get("point_capacity_tps") or 0.0)
+        current_capacity = observed.get("current_point_capacity_tps")
+        current_ttft = observed.get("current_base_p99_ttft_ms")
+        current_tpot = observed.get("current_base_p99_tpot_ms")
+        baseline_available = any(
+            value is not None for value in (current_capacity, current_ttft, current_tpot)
+        )
+        not_worse = (
+            (current_capacity is None or predicted_capacity >= float(current_capacity))
+            and (
+                current_ttft is None
+                or (predicted_ttft is not None and predicted_ttft <= float(current_ttft))
+            )
+            and (
+                current_tpot is None
+                or (predicted_tpot is not None and predicted_tpot <= float(current_tpot))
+            )
+        )
+        improves = (
+            (
+                "ttft_breach" in reasons
+                and predicted_ttft is not None
+                and current_ttft is not None
+                and predicted_ttft < 0.9 * float(current_ttft)
+            )
+            or (
+                "tpot_breach" in reasons
+                and predicted_tpot is not None
+                and current_tpot is not None
+                and predicted_tpot < 0.9 * float(current_tpot)
+            )
+            or (
+                bool(reasons & {"zero_throughput", "throughput_shortfall", "queue_growing"})
+                and current_capacity is not None
+                and predicted_capacity > float(current_capacity) * 1.1
+            )
+        )
+        if reasons and (not baseline_available or not improves or not not_worse):
+            diag.update(
+                status="no_rehabilitation_gain",
+                reason="SWAP is not Pareto-better than the unhealthy KEEP baseline",
+                prediction_assessment=assessment,
+            )
+            return {"candidate": None, "meets_target": False, "diag": diag}
     if exploratory:
         service_label = f"exploratory ({assessment['status']})"
     elif slo_risk:
@@ -4055,16 +4296,25 @@ def _score_one_frame(
         service_label = "point capacity below target; queue behavior unmodeled"
     act = {
         "job_id": jid,
-        "type": "place",
+        "type": action_type,
         "user_id": user_id,
         "ladder": ranks,
         "target_tps": target_tps,
         "mechanism_id": mid,
         "budget_ref": slice_id,
         "prediction_assessment": assessment,
+        "point_capacity_covers_target": bool(target_tps > 0 and achieved_tps >= target_tps),
+        "base_latency_within_target": sized.get("base_latency_within_target"),
+        "queue_state": assessment.get("queue_state"),
+        "queue_slo_verified": False,
         **_online_slo_targets(features),
         "rationale": f"Deterministic {gpu_type} candidate ({service_label}).",
     }
+    if action_type == "swap":
+        act["swap_reason"] = "replace"
+        health = features.get("_active_health") or {}
+        act["rehabilitation_status"] = health.get("status")
+        act["rehabilitation_reasons"] = list(health.get("reasons") or [])
     if not exploratory and target_tps > 0:
         act.update(
             achieved_tps=achieved_tps,
@@ -4091,6 +4341,9 @@ def _score_one_frame(
         else:
             score = compute_sigma(one)["per_job"][jid]
         act["sigma"] = score["sigma"]
+        if action_type == "swap":
+            act["keep_baseline_sigma"] = score.get("keep_baseline_sigma")
+            act["swap_gain_over_keep"] = score.get("swap_gain_over_keep")
     except SurrogateBudgetExceeded as exc:
         diag.update(status="budget_exhausted", reason=str(exc))
         return {"candidate": None, "meets_target": meets, "diag": diag}
@@ -4130,7 +4383,9 @@ def _score_composite(
     }
     scored_ranks: list[dict[str, Any]] = []
     for rank in ranks:
-        runnable, _ = config_runnable(dict(rank.get("config") or {}), features)
+        runnable, _ = config_runnable(
+            dict(rank.get("config") or {}), features, gpu_type=env_gpu_type(rank.get("env"))
+        )
         if not runnable:
             continue
         mid = _applicable_mechanism_id(rank, features)
@@ -4235,6 +4490,10 @@ def _score_composite(
         "mechanism_id": sized_ranks[0].get("mechanism_id"),
         "budget_ref": slice_id,
         "prediction_assessment": assessment,
+        "point_capacity_covers_target": bool(target_tps > 0 and achieved_tps >= target_tps),
+        "base_latency_within_target": sized.get("base_latency_within_target"),
+        "queue_state": assessment.get("queue_state"),
+        "queue_slo_verified": False,
         **_online_slo_targets(features),
         "rationale": f"Deterministic composite candidate ({label}) ({service_state}).",
     }
@@ -4365,15 +4624,26 @@ def build_scored_candidates(
     # small-tp frames (right for small models), big instances give the tp ladder
     # (tp2*DP4 .. tp8*DP1) for big ones; the solver picks the best-sigma survivor.
     frames_by_job: dict[str, list[dict[str, Any]]] = {}
-    ctx_by_job: dict[str, tuple[Any, Any, dict[str, Any]]] = {}
+    ctx_by_job: dict[str, tuple[Any, Any, dict[str, Any], str]] = {}
     pending_jobs = sorted(
         get_pending_jobs(), key=lambda job: str(job.get("job_id", job.get("id", "")))
     )
-    for job in pending_jobs:
+    active_rehabilitation = sorted(
+        [
+            job
+            for job in get_active_jobs()
+            if (job.get("health") or {}).get("rehabilitation_eligible") is True
+        ],
+        key=lambda job: str(job.get("job_id", job.get("id", ""))),
+    )
+    pending_ids = {str(job.get("job_id", job.get("id"))) for job in pending_jobs}
+    for job in [*pending_jobs, *active_rehabilitation]:
         jid = job.get("job_id", job.get("id"))
         if not jid:
             continue
         features = _job_features_for(snapshot, jid) or dict(job.get("job_features") or {})
+        if str(jid) not in pending_ids:
+            features["_active_health"] = copy.deepcopy(job.get("health") or {})
         model_id = features.get("model_id") or job.get("model_id")
         user_id = job.get("user_id") or features.get("user_id")
         slice_ = budgets.get(jid) or {}
@@ -4382,6 +4652,13 @@ def build_scored_candidates(
 
         frames: list[dict[str, Any]] = []
         seen: set = set()
+        if job.get("deployment_status") in {
+            "deployment_pending",
+            "deployment_not_materialized",
+        }:
+            frames_by_job[jid] = []
+            ctx_by_job[jid] = (user_id, slice_id, features, "place")
+            continue
         for raw in (spec_by_job.get(jid) or {}).get("ladder") or []:
             rank = _normalize_candidate_rank(raw)
             if rank is not None and _rank_shape_key(rank) not in seen:
@@ -4407,15 +4684,16 @@ def build_scored_candidates(
                 if gpi <= 0 or int(spec.get("free_instances", 0) or 0) <= 0:
                     continue
                 allocation_kind = spec.get("allocation_kind")
-                if allocation_kind == "gpu":
-                    cap = int(spec.get("candidate_gpu_cap", 0) or 0)
-                    tp_options = []
-                    tp = 1
-                    while tp <= cap and (not heads or int(heads) % tp == 0):
-                        tp_options.append(tp)
-                        tp *= 2
-                else:
-                    tp_options = [_largest_pow2_divisor_leq(heads, gpi)]
+                gpu_cap = (
+                    int(spec.get("candidate_gpu_cap", 0) or 0) if allocation_kind == "gpu" else gpi
+                )
+                tp_options = _generated_tp_options(
+                    heads=heads,
+                    gpu_cap=gpu_cap,
+                    gpu_type=str(env[4]),
+                    model_id=str(model_id or ""),
+                    allocation_kind=str(allocation_kind or "instance"),
+                )
                 for tp in tp_options:
                     max_replicas = int(spec.get("free_instances", 0) or 0)
                     capacity_per_replica = tp if allocation_kind == "gpu" else gpi
@@ -4454,8 +4732,26 @@ def build_scored_candidates(
                             rank["proposal_source"] = "generated"
                             seen.add(_rank_shape_key(rank))
                             frames.append(rank)
+        if str(jid) not in pending_ids:
+            current_groups: dict[str, list[dict[str, Any]]] = {}
+            for index, chain in enumerate(
+                job.get("current_ladder") or job.get("active_chains") or []
+            ):
+                shape = dict(chain.get("shape_json") or chain)
+                rank_id = str(shape.get("rank_id") or f"chain-{index}")
+                current_groups.setdefault(rank_id, []).append(chain)
+            current_shapes = {
+                _deployment_shape_key(chains[0], replicas=len(chains))
+                for chains in current_groups.values()
+            }
+            frames = [rank for rank in frames if _deployment_shape_key(rank) not in current_shapes]
         frames_by_job[jid] = frames
-        ctx_by_job[jid] = (user_id, slice_id, features)
+        ctx_by_job[jid] = (
+            user_id,
+            slice_id,
+            features,
+            "place" if str(jid) in pending_ids else "swap",
+        )
 
     # Phase 2 (surrogate-heavy): deterministic round-robin over jobs. The surrogate
     # is globally serialized, so threads add no throughput and obscure which jobs
@@ -4468,8 +4764,19 @@ def build_scored_candidates(
         for jid, frames in frames_by_job.items():
             if frame_index >= len(frames):
                 continue
-            user_id, slice_id, features = ctx_by_job[jid]
-            scored = _score_one_frame(jid, user_id, slice_id, frames[frame_index], features)
+            user_id, slice_id, features, action_type = ctx_by_job[jid]
+            scored = (
+                _score_one_frame(jid, user_id, slice_id, frames[frame_index], features)
+                if action_type == "place"
+                else _score_one_frame(
+                    jid,
+                    user_id,
+                    slice_id,
+                    frames[frame_index],
+                    features,
+                    action_type="swap",
+                )
+            )
             scored_by_job[jid].append(scored)
             if scored.get("diag", {}).get("status") == "budget_exhausted":
                 budget_exhausted = True
@@ -4540,7 +4847,9 @@ def build_scored_candidates(
                 if rank_key > current_key:
                     best_by_pool[key] = (frame, result)
             composable = list(best_by_pool.values())
-            user_id, slice_id, features = ctx_by_job[jid]
+            user_id, slice_id, features, action_type = ctx_by_job[jid]
+            if action_type == "swap":
+                continue
             single_meets = any(r.get("meets_target") for _, r in composable)
             orders: list[list[dict[str, Any]]] = []
             if not single_meets:
@@ -4701,9 +5010,89 @@ def jointly_select_placements(
     (cap_key is 'gpu:<env>' or 'pool:<env>:<instance_type>')
     """
     _require("resource_map")
+    global _placement_decision_sequence
+    _placement_decision_sequence += 1
+    decision_index = _placement_decision_sequence
     reserve_map = {_env_key(env): int(n) for env, n in (reserves or {}).items()}
     resources = get_resource_map()
     specs = instance_catalog()
+    original_candidates = list(candidates or [])
+
+    def footprint(candidate: dict[str, Any]) -> int:
+        return sum(_ladder_capacity_cost(candidate.get("ladder") or [], specs).values())
+
+    def dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        left_cost = _ladder_capacity_cost(left.get("ladder") or [], specs)
+        right_cost = _ladder_capacity_cost(right.get("ladder") or [], specs)
+        keys = set(left_cost) | set(right_cost)
+        no_more_resource = all(left_cost.get(key, 0) <= right_cost.get(key, 0) for key in keys)
+        no_less_capacity = float(left.get("achieved_tps") or 0.0) >= float(
+            right.get("achieved_tps") or 0.0
+        )
+        no_worse_score = float(left.get("sigma") or 0.0) >= float(right.get("sigma") or 0.0)
+        queue_quality = {"stable": 2, "unmodeled": 1, "not_applicable": 1, "unstable": 0}
+        no_worse_queue = queue_quality.get(str(left.get("queue_state")), 1) >= queue_quality.get(
+            str(right.get("queue_state")), 1
+        )
+        strictly_better = (
+            any(left_cost.get(key, 0) < right_cost.get(key, 0) for key in keys)
+            or float(left.get("achieved_tps") or 0.0) > float(right.get("achieved_tps") or 0.0)
+            or float(left.get("sigma") or 0.0) > float(right.get("sigma") or 0.0)
+        )
+        return (
+            no_more_resource
+            and no_less_capacity
+            and no_worse_score
+            and no_worse_queue
+            and strictly_better
+        )
+
+    grouped: dict[tuple[str, str, str | None], list[dict[str, Any]]] = {}
+    for candidate in original_candidates:
+        ladder = candidate.get("ladder") or []
+        first = ladder[0] if ladder else {}
+        cfg = first.get("config") or {}
+        key = (
+            str(candidate.get("job_id") or ""),
+            _env_key(first.get("env")),
+            cfg.get("instance_type"),
+        )
+        grouped.setdefault(key, []).append(candidate)
+
+    pruned_candidates: list[dict[str, Any]] = []
+    for entries in grouped.values():
+        if len(entries) <= 4:
+            pruned_candidates.extend(entries)
+            continue
+        specialists: list[dict[str, Any]] = [
+            entry
+            for entry in entries
+            if (entry.get("prediction_assessment") or {}).get("proposal_source") == "specialist"
+        ]
+        service = [
+            entry
+            for entry in entries
+            if not _is_exploratory_assessment(entry.get("prediction_assessment"))
+        ]
+        explorers = [
+            entry
+            for entry in entries
+            if _is_exploratory_assessment(entry.get("prediction_assessment"))
+        ]
+        retained = [
+            entry
+            for entry in service
+            if not any(other is not entry and dominates(other, entry) for other in service)
+        ]
+        retained.extend(specialists)
+        if explorers:
+            retained.append(min(explorers, key=footprint))
+        seen_ids: set[int] = set()
+        for entry in retained:
+            if id(entry) not in seen_ids:
+                seen_ids.add(id(entry))
+                pruned_candidates.append(entry)
+    candidates = pruned_candidates
     # Capacity is two-dimensional: env GPU totals AND per-pool whole-instance
     # limits. The pool dimension is what the old env-GPU-only check missed.
     capacity: dict[tuple, int] = {}
@@ -4718,6 +5107,14 @@ def jointly_select_placements(
     priority_by_job = {
         p.get("job_id"): float(p.get("priority_score", 1.0) or 1.0) for p in get_priority()
     }
+    pending_job_order = [str(job.get("job_id", job.get("id"))) for job in get_pending_jobs()]
+    pending_job_ids = set(pending_job_order)
+    slow_loop = getattr(_CTX, "slow_loop", None)
+    swap_budget = (
+        int(slow_loop.get_sss_swap_budget_t())
+        if slow_loop is not None and hasattr(slow_loop, "get_sss_swap_budget_t")
+        else 0
+    )
 
     def penalty(jid: str) -> float:
         return UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0))
@@ -4795,7 +5192,7 @@ def jointly_select_placements(
         served_fraction = candidate_served_fraction(cand)
         if served_fraction is None:
             continue
-        served_credit = penalty(jid) * served_fraction
+        served_credit = penalty(jid) * served_fraction if str(jid) in pending_job_ids else 0.0
         gain = float(cand.get("sigma", 0.0)) + served_credit
         assessment = cand.get("prediction_assessment") or {}
         exploratory = (
@@ -4819,7 +5216,19 @@ def jointly_select_placements(
                 )
             )
         )
-        if gain <= 0:
+        queue_unstable = (
+            cand.get("queue_state") == "unstable" or assessment.get("queue_state") == "unstable"
+        )
+        is_swap = str(cand.get("type") or "").lower() == "swap"
+        swap_gain_over_keep = finite_number(cand.get("swap_gain_over_keep"))
+        if is_swap and (queue_unstable or swap_gain_over_keep is None or swap_gain_over_keep <= 0):
+            continue
+        if queue_unstable:
+            gain = _WORK_CONSERVING_GAIN_FLOOR
+            cand["work_conserving_floor"] = True
+            if isinstance(assessment, dict):
+                assessment["selection_mode"] = "work_conserving"
+        elif gain <= 0:
             if not exploratory and not point_capacity_candidate:
                 continue
             gain = _WORK_CONSERVING_GAIN_FLOOR
@@ -4830,20 +5239,31 @@ def jointly_select_placements(
             cand["served_fraction"] = served_fraction
         cand["served_credit"] = served_credit
         cand["solver_gain"] = gain
+        floor_tier = (
+            2
+            if cand.get("work_conserving_floor") and (exploratory or queue_unstable)
+            else 1
+            if cand.get("work_conserving_floor")
+            else 0
+        )
+        cand["solver_tier"] = floor_tier
         by_job.setdefault(jid, []).append(
             {
                 "cand": cand,
                 "cost": cost,
                 "gain": gain,
                 "normal_gain": 0.0 if cand.get("work_conserving_floor") else gain,
-                "floor_value": penalty(jid) if cand.get("work_conserving_floor") else 0.0,
+                "stable_floor_value": penalty(jid) if floor_tier == 1 else 0.0,
+                "exploratory_floor_value": penalty(jid) if floor_tier == 2 else 0.0,
+                "swap_count": 1 if is_swap else 0,
             }
         )
     jobs = [jid for jid in by_job if by_job[jid]]
 
     best: dict[str, Any] = {
         "normal_objective": 0.0,
-        "floor_objective": 0.0,
+        "stable_floor_objective": 0.0,
+        "exploratory_floor_objective": 0.0,
         "chosen": [],
     }
 
@@ -4851,7 +5271,8 @@ def jointly_select_placements(
     for jid in jobs:
         space *= 1 + len(by_job[jid])
 
-    if space <= 200_000:
+    solver_mode = "exact" if space <= 200_000 else "greedy"
+    if solver_mode == "exact":
         # Exact branch-and-bound: every node is a capacity-feasible assignment
         # (deferring the remaining jobs), so its accumulated gain is a valid
         # objective; keep the best. Place-branches that overflow a pool are pruned.
@@ -4859,19 +5280,31 @@ def jointly_select_placements(
             i: int,
             used: dict[str, int],
             normal_gain: float,
-            floor_value: float,
+            stable_floor_value: float,
+            exploratory_floor_value: float,
+            swaps_used: int,
             chosen: list[dict[str, Any]],
         ) -> None:
-            if (normal_gain, floor_value) > (
+            if (normal_gain, stable_floor_value, exploratory_floor_value) > (
                 best["normal_objective"],
-                best["floor_objective"],
+                best["stable_floor_objective"],
+                best["exploratory_floor_objective"],
             ):
                 best["normal_objective"] = normal_gain
-                best["floor_objective"] = floor_value
+                best["stable_floor_objective"] = stable_floor_value
+                best["exploratory_floor_objective"] = exploratory_floor_value
                 best["chosen"] = list(chosen)
             if i >= len(jobs):
                 return
-            dfs(i + 1, used, normal_gain, floor_value, chosen)  # defer job i
+            dfs(
+                i + 1,
+                used,
+                normal_gain,
+                stable_floor_value,
+                exploratory_floor_value,
+                swaps_used,
+                chosen,
+            )  # defer job i
             for entry in by_job[jobs[i]]:
                 new_used = dict(used)
                 over = False
@@ -4882,17 +5315,21 @@ def jointly_select_placements(
                         break
                 if over:
                     continue
+                if swaps_used + entry["swap_count"] > swap_budget:
+                    continue
                 chosen.append(entry["cand"])
                 dfs(
                     i + 1,
                     new_used,
                     normal_gain + entry["normal_gain"],
-                    floor_value + entry["floor_value"],
+                    stable_floor_value + entry["stable_floor_value"],
+                    exploratory_floor_value + entry["exploratory_floor_value"],
+                    swaps_used + entry["swap_count"],
                     chosen,
                 )
                 chosen.pop()
 
-        dfs(0, {}, 0.0, 0.0, [])
+        dfs(0, {}, 0.0, 0.0, 0.0, 0, [])
     else:
         # Greedy fallback for a large choice space: best-gain frame per job in
         # priority order, taking each only if it still fits. Bounded, never over
@@ -4901,16 +5338,17 @@ def jointly_select_placements(
         used: dict[str, int] = {}
         chosen: list[dict[str, Any]] = []
         total = 0.0
+        swaps_used = 0
         placed_greedy: set[str] = set()
         ordered_jobs = sorted(jobs, key=lambda j: priority_by_job.get(j, 1.0), reverse=True)
-        for floor_pass in (False, True):
+        for tier in (0, 1, 2):
             for jid in ordered_jobs:
                 if jid in placed_greedy:
                     continue
                 entries = [
                     entry
                     for entry in by_job[jid]
-                    if bool(entry["cand"].get("work_conserving_floor")) is floor_pass
+                    if int(entry["cand"].get("solver_tier") or 0) == tier
                 ]
                 for entry in sorted(entries, key=lambda item: item["gain"], reverse=True):
                     trial = dict(used)
@@ -4921,7 +5359,10 @@ def jointly_select_placements(
                             over = True
                             break
                     if not over:
+                        if swaps_used + entry["swap_count"] > swap_budget:
+                            continue
                         used, total = trial, total + entry["gain"]
+                        swaps_used += entry["swap_count"]
                         chosen.append(entry["cand"])
                         placed_greedy.add(jid)
                         break
@@ -4931,10 +5372,15 @@ def jointly_select_placements(
                 for candidate in chosen
                 if not candidate.get("work_conserving_floor")
             ),
-            "floor_objective": sum(
+            "stable_floor_objective": sum(
                 penalty(str(candidate.get("job_id")))
                 for candidate in chosen
-                if candidate.get("work_conserving_floor")
+                if candidate.get("solver_tier") == 1
+            ),
+            "exploratory_floor_objective": sum(
+                penalty(str(candidate.get("job_id")))
+                for candidate in chosen
+                if candidate.get("solver_tier") == 2
             ),
             "chosen": chosen,
         }
@@ -4946,18 +5392,63 @@ def jointly_select_placements(
     for c in chosen:
         for key, need in _ladder_capacity_cost(c.get("ladder") or [], specs).items():
             used_final[_cap_key_str(key)] = used_final.get(_cap_key_str(key), 0) + need
-    deferred = [
-        jid
-        for jid in (j.get("job_id", j.get("id")) for j in get_pending_jobs())
-        if jid and jid not in placed_ids
-    ]
-    return {
+    deferred = [jid for jid in pending_job_order if jid and jid not in placed_ids]
+    result = {
         "chosen": chosen,
         "deferred": deferred,
         "objective": objective,
         "used": used_final,
         "capacity": {_cap_key_str(k): v for k, v in capacity.items()},
+        "solver_mode": solver_mode,
+        "candidate_count_before_pruning": len(original_candidates),
+        "candidate_count_after_pruning": len(candidates),
+        "combination_count": space,
+        "decision_index": decision_index,
+        "swap_budget": swap_budget,
+        "swap_count": sum(1 for candidate in chosen if candidate.get("type") == "swap"),
     }
+    write_event = getattr(getattr(_CTX, "trace_logger", None), "write_event", None)
+    if callable(write_event):
+        try:
+            write_event(
+                "placement_decision",
+                {
+                    "solver_mode": solver_mode,
+                    "decision_index": decision_index,
+                    "objective": objective,
+                    "candidate_count_before_pruning": len(original_candidates),
+                    "candidate_count_after_pruning": len(candidates),
+                    "combination_count": space,
+                    "surrogate_budget": get_surrogate_budget_status(),
+                    "chosen": [
+                        {
+                            "job_id": candidate.get("job_id"),
+                            "solver_gain": candidate.get("solver_gain"),
+                            "queue_state": candidate.get("queue_state"),
+                            "prediction_status": (candidate.get("prediction_assessment") or {}).get(
+                                "status"
+                            ),
+                            "ladder": [
+                                {
+                                    "env": rank.get("env"),
+                                    "instance_type": (rank.get("config") or {}).get(
+                                        "instance_type"
+                                    ),
+                                    "tp": (rank.get("config") or {}).get("tp"),
+                                    "n_replicas": rank.get("n_replicas"),
+                                }
+                                for rank in candidate.get("ladder") or []
+                            ],
+                        }
+                        for candidate in chosen
+                    ],
+                    "deferred": deferred,
+                },
+                tick=getattr(getattr(_CTX, "cluster_snapshot", None), "tick", None),
+            )
+        except Exception:
+            log.exception("placement decision trace failed")
+    return result
 
 
 def check_feasibility(plan) -> dict[str, Any]:
@@ -5004,6 +5495,7 @@ def check_feasibility(plan) -> dict[str, Any]:
                 ok_cfg, reason = config_runnable(
                     dict(getattr(rank, "config", {}) or {}),
                     _job_features_for(snapshot, action.job_id),
+                    gpu_type=env_gpu_type(getattr(rank, "env", None)),
                 )
                 if not ok_cfg:
                     feasible = False

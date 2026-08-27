@@ -58,6 +58,7 @@ from src.core.models import (
     ActionType,
     Plan,
     PlanAction,
+    env_gpu_type,
 )
 from src.infra.deployment_x import materialize_launch_config
 
@@ -227,6 +228,9 @@ class SpecialistRunner:
             "bandwidth, compute, instance size, and cost; do not choose merely the "
             "smallest frame that fits or reserve premium GPUs for other jobs. Explain "
             "the target, GPU/instance, parallelism, replicas, and fitness briefly.\n\n"
+            "The Job brief's placement_policy is a hard baseline constraint: use only "
+            "the listed TP degrees for a matching model/GPU pair. Its precision is "
+            "catalog-owned; do not invent engine or dtype overrides.\n\n"
             "Constraints:\n"
             "- type is place, keep, swap, or defer. Do not defer a physically valid "
             "frame solely because prediction coverage is unavailable; the root will "
@@ -1098,6 +1102,53 @@ class KoiAgentHarness:
         if not action.ladder:
             raise PlanMaterializationError(f"job {jid}: ladder is empty")
 
+        descriptor = None
+        if cluster_snapshot is not None:
+            for accessor in ("active_jobs_summary", "pending_jobs_summary"):
+                if not hasattr(cluster_snapshot, accessor):
+                    continue
+                descriptor = next(
+                    (
+                        job
+                        for job in getattr(cluster_snapshot, accessor)() or []
+                        if str(job.get("job_id", job.get("id"))) == jid
+                    ),
+                    descriptor,
+                )
+        if action.type == ActionType.PLACE and descriptor is not None:
+            deployment_status = descriptor.get("deployment_status")
+            if deployment_status == "deployment_pending":
+                raise PlanMaterializationError(
+                    f"job {jid}: prior placement is still deployment_pending"
+                )
+            if deployment_status == "deployment_not_materialized":
+                raise PlanMaterializationError(
+                    f"job {jid}: prior placement has no terminal executor result; diagnose it "
+                    "before another PLACE"
+                )
+        if action.type == ActionType.SWAP:
+            health = (descriptor or {}).get("health") or {}
+            if health.get("rehabilitation_eligible") is not True:
+                raise PlanMaterializationError(
+                    f"job {jid}: SWAP requires deterministic rehabilitation eligibility"
+                )
+            trusted_shapes = [
+                agent_tools._rank_shape_key(rank)
+                for rank in (trusted_candidate or {}).get("ladder") or []
+                if isinstance(rank, dict)
+            ]
+            submitted_shapes = [
+                agent_tools._rank_shape_key(rank.to_dict()) for rank in action.ladder
+            ]
+            if (trusted_candidate or {}).get(
+                "type"
+            ) != "swap" or trusted_shapes != submitted_shapes:
+                raise PlanMaterializationError(
+                    f"job {jid}: SWAP must match a jointly selected rehabilitation candidate"
+                )
+            action.rehabilitation_status = health.get("status")
+            action.rehabilitation_reasons = list(health.get("reasons") or [])
+
         assessment = action.prediction_assessment
         if assessment is not None:
             if not isinstance(assessment, dict):
@@ -1151,6 +1202,12 @@ class KoiAgentHarness:
                     "meets_target",
                     "served_fraction",
                     "admission_mode",
+                    "point_capacity_covers_target",
+                    "base_latency_within_target",
+                    "queue_state",
+                    "queue_slo_verified",
+                    "keep_baseline_sigma",
+                    "swap_gain_over_keep",
                     "mechanism_id",
                     "budget_ref",
                 )
@@ -1194,6 +1251,11 @@ class KoiAgentHarness:
                 raise PlanMaterializationError(
                     f"job {jid} rank {i}: unknown mechanism_id {rank.mechanism_id!r}"
                 ) from None
+            runnable, policy_reason = agent_tools.config_runnable(
+                dict(rank.config), job_features, gpu_type=env_gpu_type(rank.env)
+            )
+            if not runnable:
+                raise PlanMaterializationError(f"job {jid} rank {i}: {policy_reason}")
             context = agent_tools._rank_mechanism_context(rank, job_features)
             match = registry.match_scope(mechanism, context)
             if match["quality"] == "reject":
@@ -1500,8 +1562,9 @@ class KoiAgentHarness:
             "physically valid candidate carrying one of those statuses may be selected "
             "as zero-credit exploratory work when capacity would otherwise idle. It "
             "must never displace a supported positive-value candidate. queue_shadow is "
-            "an uncalibrated diagnostic only and never changes selection.\n\n"
-            "PRIMARY WORKFLOW. Run this pipeline exactly once, in order, and keep its "
+            "uncalibrated and never a hard veto; only mathematical instability lowers "
+            "a candidate to the work-conserving tier.\n\n"
+            "PRIMARY WORKFLOW. Run each successful stage once, in order, and keep its "
             "outputs in the REPL:\n"
             "    build_user_envelopes()\n"
             "    priority = get_priority()\n"
@@ -1511,8 +1574,10 @@ class KoiAgentHarness:
             "        specialist_results = run_job_specialists()\n"
             "        scored = build_scored_candidates(budget_book, specialist_results)\n"
             "        joint = jointly_select_placements(scored['candidates'])\n"
-            "Specialists and candidate construction each run ONCE. Do not rerun any "
-            "earlier stage after seeing `joint`. If budget validation fails, do not run "
+            "If a REPL error occurs before FINAL_VAR, retry using existing variables or "
+            "cached tool outputs; do not intentionally recompute a successful specialist "
+            "or prediction stage. Do not rerun earlier stages after seeing `joint`. "
+            "If budget validation fails, do not run "
             "specialists; build a conservative keep/defer plan and record the violations.\n\n"
             "Write the pipeline and its commit path in one REPL block. Immediately after "
             "`joint` returns a nonempty `joint['chosen']`, build `plan` from those chosen "
@@ -1541,6 +1606,12 @@ class KoiAgentHarness:
             "place/swap actions must copy their job's slice_id into budget_ref. Slices are "
             "permissive upper bounds and may overlap, so shared contention is reconciled "
             "jointly after specialists propose job-local placements.\n\n"
+            "PLACEMENT POLICY CONTRACT. For a model/GPU pair listed in the cluster "
+            "configuration policy, only its listed TP degrees are launchable. The policy "
+            "is enforced deterministically before prediction, during candidate scoring, "
+            "and again at commit. For example, Phi-4 never uses TP=8: it is limited to "
+            "TP 1 or 2. A missing policy entry adds no policy restriction beyond the "
+            "normal physical, capacity, and BudgetSlice checks.\n\n"
             "CANDIDATE CONTRACT. The deterministic candidate builder treats specialist "
             "ladders as fixed-capacity proposals, generates explicit replica alternatives "
             "across available GPU types and instance pools, adds a heterogeneous frame "
@@ -1553,6 +1624,12 @@ class KoiAgentHarness:
             "budget_limited identifies work skipped at the "
             "surrogate cap. Mechanism IDs are opaque Store IDs: use applicable exact or "
             "partial matches and never invent an ID.\n\n"
+            "ACTIVE HEALTH CONTRACT. Active jobs include deterministic health summaries. "
+            "A critical job or a job degraded for two consecutive ticks may receive SWAP "
+            "candidates, subject to B_t and a two-tick cooldown. Compare KEEP against those "
+            "already-scored SWAP candidates; do not blindly keep a queue-growing or zero-"
+            "throughput deployment. Pending jobs with deployment_not_materialized should "
+            "not receive the identical placement indefinitely.\n\n"
             "TOOL CONTRACTS. Guard outputs before indexing. predict_outcome scores one "
             "config dict, never a ladder. size_ladder returns its target_tps and sized "
             "ranks; do not derive target throughput twice. compute_sigma and "
@@ -1593,6 +1670,8 @@ class KoiAgentHarness:
                 "SLO/DRO scoring rank candidates but do not simulate queue dynamics. "
                 "A base-latency or capacity-target miss remains placeable. Prediction-only "
                 "failures become zero-credit exploratory candidates after physical checks. "
+                "A queue-unstable point candidate is work-conserving only and cannot "
+                "displace a stable or queue-unmodeled supported candidate. "
                 "Preserve prediction_assessment and point-capacity accounting exactly. "
                 "Do not emit an admitted rate or claim traffic throttling: the current "
                 "Orca/router does not provide an enforcement acknowledgement. "
@@ -1628,6 +1707,10 @@ class KoiAgentHarness:
             "   'meets_target': bool,               # point capacity/base latency pass\n"
             "   'served_fraction': float,           # estimated capacity coverage\n"
             "   'prediction_assessment': dict,      # status, basis, and queue limitation\n"
+            "   'point_capacity_covers_target': bool, # point-capacity result only\n"
+            "   'base_latency_within_target': bool, # Direct base-latency result only\n"
+            "   'queue_state': str,                 # stable/unstable/unmodeled\n"
+            "   'queue_slo_verified': bool,         # false for Direct-only prediction\n"
             "   'target_p99_ttft_ms': float,        # online SLA, copied from job_features\n"
             "   'target_p99_tpot_ms': float,        # online SLA, copied from job_features\n"
             "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"

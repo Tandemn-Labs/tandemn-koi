@@ -30,6 +30,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.config.policy import MODEL_MAX_TP, load_config_policy
 from src.core.models import (
     LADDER_ACTIONS,
     REQUIRED_JOB_STATE,
@@ -38,6 +39,7 @@ from src.core.models import (
     Mechanism,
     Plan,
 )
+from src.infra.deployment_x import materialize_launch_config
 
 # Actions whose target job must already exist in the cluster snapshot. PLACE and
 # DEFER admit waiting jobs; DIAGNOSE/TERMINATE may reference jobs outside the
@@ -333,6 +335,18 @@ class Validator:
         """
         resources = self._resources(snapshot)
         violations: list[str] = []
+        jobs: list[dict[str, Any]] = []
+        if snapshot is not None:
+            for accessor in ("active_jobs_summary", "pending_jobs_summary"):
+                if hasattr(snapshot, accessor):
+                    jobs.extend(getattr(snapshot, accessor)() or [])
+        model_by_job = {
+            str(job.get("job_id", job.get("id"))): str(
+                (job.get("job_features") or {}).get("model_id") or job.get("model_id") or ""
+            )
+            for job in jobs
+        }
+        policy = load_config_policy()
         for action in typed.actions:
             if action.type not in LADDER_ACTIONS:
                 continue
@@ -369,6 +383,43 @@ class Validator:
                         f"C6 physics: job {action.job_id} rank {i} {error}" for error in rank_errors
                     )
                     continue
+                model_id = model_by_job.get(action.job_id, "")
+                tp = int(cfg["tp"])
+                gpu_type = str(rank.env[4])
+                max_tp = MODEL_MAX_TP.get(model_id)
+                if max_tp is not None and tp > max_tp:
+                    violations.append(
+                        f"C6 policy: job {action.job_id} rank {i} {model_id} TP={tp} "
+                        f"exceeds maximum {max_tp}"
+                    )
+                rule = policy.rule_for(gpu_type, model_id) if model_id else None
+                if rule is not None and tp not in rule.allowed_tp:
+                    violations.append(
+                        f"C6 policy: job {action.job_id} rank {i} {model_id} on {gpu_type} "
+                        f"allows TP {list(rule.allowed_tp)}, got {tp}"
+                    )
+                if rule is not None:
+                    launch = {}
+                    if self.resource_map is not None and hasattr(
+                        self.resource_map, "model_catalog"
+                    ):
+                        try:
+                            launch = materialize_launch_config(
+                                self.resource_map.model_catalog(model_id), gpu_type
+                            )
+                        except Exception:
+                            launch = {}
+                    precision_ok = policy.precision_matches(
+                        rule,
+                        cfg.get("weight_dtype") or launch.get("weight_dtype"),
+                        cfg.get("weight_quantization_method")
+                        or launch.get("weight_quantization_method"),
+                    )
+                    if precision_ok is False:
+                        violations.append(
+                            f"C6 policy: job {action.job_id} rank {i} {model_id} on "
+                            f"{gpu_type} requires {rule.precision} precision"
+                        )
                 per_chain, gpu_error = self._rank_engine_gpus(rank)
                 if gpu_error:
                     violations.append(f"C6 physics: job {action.job_id} rank {i} {gpu_error}")
@@ -434,6 +485,25 @@ class Validator:
             and assessment.get("status") != "success"
         ):
             violations.append(f"{prefix} point prediction status must be 'success'")
+        if (
+            point_estimate
+            and action.queue_slo_verified is not None
+            and action.queue_slo_verified is not False
+        ):
+            violations.append(f"{prefix} queue_slo_verified must be false for point prediction")
+        if action.queue_state is not None and action.queue_state not in {
+            "stable",
+            "unstable",
+            "unmodeled",
+            "not_applicable",
+        }:
+            violations.append(f"{prefix} queue_state is invalid")
+        if action.type == ActionType.SWAP and action.rehabilitation_status is not None:
+            if action.rehabilitation_status not in {"critical", "degraded"}:
+                violations.append(f"{prefix} SWAP requires critical/degraded rehabilitation")
+            swap_gain = self._finite_number(action.swap_gain_over_keep)
+            if swap_gain is None or swap_gain <= 0:
+                violations.append(f"{prefix} SWAP must improve on KEEP baseline")
         accounting_present = any(
             getattr(action, name) is not None for name in _SERVICE_ACCOUNTING_FIELDS
         )

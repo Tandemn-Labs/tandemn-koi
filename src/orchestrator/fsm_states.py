@@ -64,8 +64,10 @@ regret / slow_loop / dro / eig / tchebecheff / switchcost; the planning
 lives in agent.py; the tools live in agent_tools.py.
 """
 
+import copy
 import logging
 import time
+from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -122,6 +124,8 @@ class TickContext:
     candidate_plan: Any = None
     validated_plan: Any = None
     deploy_acks: list[Any] = field(default_factory=list)
+    deployment_reconciliation: list[dict[str, Any]] = field(default_factory=list)
+    active_health: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     s5_repair_count: int = 0
     max_s5_repairs: int = 1
@@ -246,6 +250,9 @@ class TickRunner:
         # Swap bookkeeping recorded in S6, consumed by next tick's S3.
         self._last_swap_count: int = 0
         self._last_active_count: int = 0
+        self._deployment_ledger: dict[str, dict[str, Any]] = {}
+        self._prediction_ledger: dict[tuple[str, str], dict[str, Any]] = {}
+        self._health_state: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Entry point
@@ -327,6 +334,7 @@ class TickRunner:
         if self.on_tick_start is not None:
             self.on_tick_start()
         ctx.cluster_snapshot = self.resource_map.snapshot_cluster_state(ctx.tick)
+        ctx.deployment_reconciliation = self._reconcile_deployments(ctx)
         return FSMState.S1_OBSERVE
 
     def S1(self, ctx: TickContext) -> FSMState:
@@ -372,6 +380,7 @@ class TickRunner:
             str(job.get("job_id", job.get("id"))): dict(job.get("job_features") or {})
             for job in jobs or []
         }
+        health_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
         # if ctx.deployment_x is None:
         #     ctx.deployment_x = self._build_deployment_x_index(ctx)
@@ -391,8 +400,21 @@ class TickRunner:
             residuals_per_v = self._residuals(v_obs, v_pred)
             residuals_per_y = self._residuals(y_obs, y_pred)
             y_observed_mean = {name: float(np.mean(arr)) for name, arr in y_obs.items() if len(arr)}
+            health_sample = dict(y_observed_mean)
+            if len(v_obs.get("depth_req_q", [])):
+                health_sample["depth_req_q"] = max(float(value) for value in v_obs["depth_req_q"])
+            health_sample["telemetry_complete"] = bool(
+                getattr(rank_telem, "health_observed_replicas", 1)
+                >= getattr(rank_telem, "expected_replicas", 1)
+            )
+            health_sample["current_point_capacity_tps"] = y_pred.get("throughput_token_per_sec")
+            health_sample["current_base_p99_ttft_ms"] = y_pred.get("p99_ttft_ms")
+            health_sample["current_base_p99_tpot_ms"] = y_pred.get("p99_tpot_ms")
+            health_samples[job_id].append(health_sample)
 
-            committed = self._committed_mechanism_id(rank_telem)
+            committed = self._committed_mechanism_id(rank_telem) or (
+                self._prediction_ledger.get((job_id, rank_id), {}).get("mechanism_id")
+            )
             mechanism_context = {
                 key: value
                 for key, value in {**job_features.get(job_id, {}), **x}.items()
@@ -510,6 +532,8 @@ class TickRunner:
             )
             self.evidence_store.append_row(row)
             ctx.evidence_rows.append(row)
+
+        ctx.active_health = self._update_active_health(ctx, job_features, health_samples)
 
         return FSMState.S3_SLOW_UPDATE
 
@@ -710,6 +734,8 @@ class TickRunner:
         The swap count recorded here feeds next tick's observed_swap_rate,
         which drives lambda_swit.
         """
+        self._record_deployment_requests(ctx)
+        self._record_prediction_ledger(ctx)
         ctx.deploy_acks = self.executor.send_to_executor(ctx.validated_plan)
 
         self._last_swap_count = self._count_plan_swaps(ctx)
@@ -724,6 +750,353 @@ class TickRunner:
             except Exception:
                 log.exception("trace persist failed at tick %d", ctx.tick)
         return FSMState.S7_EXIT_TICK
+
+    def _reconcile_deployments(self, ctx: TickContext) -> list[dict[str, Any]]:
+        """Compare prior PLACE/SWAP requests with the next frozen active snapshot."""
+        snapshot = ctx.cluster_snapshot
+        active_jobs = (
+            list(snapshot.active_jobs_summary() or [])
+            if snapshot is not None and hasattr(snapshot, "active_jobs_summary")
+            else []
+        )
+        pending_jobs = (
+            list(snapshot.pending_jobs_summary() or [])
+            if snapshot is not None and hasattr(snapshot, "pending_jobs_summary")
+            else []
+        )
+        active_ranks: dict[str, set[str]] = defaultdict(set)
+        active_chains: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for job in active_jobs:
+            jid = str(job.get("job_id", job.get("id")))
+            for chain in job.get("active_chains") or job.get("current_ladder") or []:
+                rank_id = (chain.get("shape_json") or {}).get("rank_id") or chain.get("rank_id")
+                if rank_id:
+                    active_ranks[jid].add(str(rank_id))
+                    active_chains[jid][str(rank_id)].append(chain)
+        active_shapes = {
+            jid: {rank_id: self._rank_group_signature(chains) for rank_id, chains in groups.items()}
+            for jid, groups in active_chains.items()
+        }
+        pending_by_id = {str(job.get("job_id", job.get("id"))): job for job in pending_jobs}
+        active_by_id = {str(job.get("job_id", job.get("id"))): job for job in active_jobs}
+        reconciled = []
+        completed = []
+        for jid, request in self._deployment_ledger.items():
+            attempts = request.get("attempt_details") or [
+                {"rank_ids": rank_ids, "rank_shapes": {}}
+                for rank_ids in request.get("rank_id_attempts") or [request.get("rank_ids") or []]
+            ]
+            if any(
+                self._deployment_attempt_active(
+                    attempt,
+                    active_ranks.get(jid, set()),
+                    active_shapes.get(jid, {}),
+                )
+                for attempt in attempts
+            ):
+                status = "active"
+                completed.append(jid)
+            elif ctx.tick - request["request_tick"] <= 1:
+                status = "deployment_pending"
+            else:
+                status = "deployment_not_materialized"
+            row = {
+                **request,
+                "job_id": jid,
+                "status": status,
+                "observed_rank_ids": sorted(active_ranks.get(jid, set())),
+            }
+            reconciled.append(row)
+            descriptor = pending_by_id.get(jid) or active_by_id.get(jid)
+            if descriptor is not None:
+                descriptor["deployment_status"] = status
+                descriptor["deployment_attempts"] = request.get("attempts", 1)
+                descriptor["last_requested_shapes"] = copy.deepcopy(request.get("shapes") or [])
+                if status == "deployment_not_materialized":
+                    descriptor["recent_failures"] = max(
+                        1, int(descriptor.get("recent_failures") or 0)
+                    )
+        for jid in completed:
+            self._deployment_ledger.pop(jid, None)
+        return reconciled
+
+    def _record_deployment_requests(self, ctx: TickContext) -> None:
+        for action in getattr(ctx.validated_plan, "actions", []) or []:
+            if action.type not in {ActionType.PLACE, ActionType.SWAP} or not action.ladder:
+                continue
+            shapes = [
+                {
+                    "env": list(rank.env or []),
+                    "instance_type": rank.config.get("instance_type"),
+                    "tp": rank.config.get("tp"),
+                    "pp": rank.config.get("pp"),
+                    "sp": rank.config.get("sp"),
+                    "ep": rank.config.get("ep"),
+                    "cp": rank.config.get("cp"),
+                    "num_nodes_per_chain": rank.config.get("num_nodes_per_chain"),
+                    "interconnect_type": rank.config.get("interconnect_type"),
+                    "n_replicas": rank.n_replicas,
+                }
+                for rank in action.ladder
+            ]
+            previous = self._deployment_ledger.get(action.job_id)
+            previous_record = previous or {}
+            current_rank_ids = {str(rank.rank_id) for rank in action.ladder if rank.rank_id}
+            rank_shapes = {
+                str(rank.rank_id): self._deployment_shape_signature(rank.to_dict())
+                for rank in action.ladder
+                if rank.rank_id
+            }
+            attempt = {"rank_ids": sorted(current_rank_ids), "rank_shapes": rank_shapes}
+            attempt_details = [*list(previous_record.get("attempt_details") or []), attempt]
+            self._deployment_ledger[action.job_id] = {
+                "request_tick": ctx.tick,
+                "first_tick": previous_record.get("first_tick", ctx.tick),
+                "attempts": int(previous_record.get("attempts", 0)) + 1,
+                "action_type": action.type.value,
+                "rank_ids": sorted(current_rank_ids),
+                "rank_shapes": rank_shapes,
+                "attempt_details": attempt_details,
+                "shapes": shapes,
+            }
+            if action.type == ActionType.SWAP:
+                self._health_state.setdefault(action.job_id, {})["last_swap_tick"] = ctx.tick
+
+    @staticmethod
+    def _deployment_shape_signature(raw: dict[str, Any], replicas: int | None = None) -> tuple:
+        shape = dict(raw.get("shape_json") or raw)
+        config = dict(shape.get("config") or shape)
+        return (
+            tuple(shape.get("env") or []),
+            config.get("instance_type"),
+            config.get("gpu_count", config.get("count")),
+            config.get("tp"),
+            config.get("pp"),
+            config.get("sp"),
+            config.get("ep"),
+            config.get("cp"),
+            config.get("model_id"),
+            config.get("weight_dtype"),
+            config.get("activation_dtype"),
+            config.get("kvcache_dtype"),
+            config.get("weight_quantization_bits"),
+            config.get("weight_quantization_method"),
+            config.get("engine_name"),
+            config.get("engine_version"),
+            config.get("router_policy"),
+            config.get("scheduling_policy"),
+            config.get("preemption_policy"),
+            config.get("prefix_cache_enabled"),
+            config.get("chunked_prefill_enable"),
+            config.get("num_nodes_per_chain"),
+            config.get("interconnect_type"),
+            int(replicas if replicas is not None else shape.get("n_replicas") or 1),
+        )
+
+    @staticmethod
+    def _deployment_attempt_active(
+        attempt: dict[str, Any],
+        observed_rank_ids: set[str],
+        observed_shapes: dict[str, tuple],
+    ) -> bool:
+        expected_ids = set(attempt.get("rank_ids") or [])
+        expected_shapes = dict(attempt.get("rank_shapes") or {})
+        ids_active = bool(expected_ids) and expected_ids <= observed_rank_ids
+        if not expected_shapes:
+            return ids_active
+        return ids_active and all(
+            observed_shapes.get(rank_id) == tuple(expected_shapes.get(rank_id) or ())
+            for rank_id in expected_ids
+        )
+
+    @classmethod
+    def _rank_group_signature(cls, chains: list[dict[str, Any]]) -> tuple:
+        signatures = {cls._deployment_shape_signature(chain, len(chains)) for chain in chains}
+        return next(iter(signatures)) if len(signatures) == 1 else ("mixed_replica_shapes",)
+
+    def _record_prediction_ledger(self, ctx: TickContext) -> None:
+        for action in getattr(ctx.validated_plan, "actions", []) or []:
+            for rank in action.ladder or []:
+                if not rank.rank_id:
+                    continue
+                self._prediction_ledger[(action.job_id, str(rank.rank_id))] = {
+                    "predicted_y": copy.deepcopy(rank.predicted_y or {}),
+                    "predicted_v": copy.deepcopy(rank.predicted_v or {}),
+                    "prediction_lineage": copy.deepcopy(rank.prediction_lineage or {}),
+                    "mechanism_id": rank.mechanism_id or action.mechanism_id,
+                    "shape_signature": self._deployment_shape_signature(rank.to_dict()),
+                }
+
+    def _update_active_health(
+        self,
+        ctx: TickContext,
+        job_features: dict[str, dict[str, Any]],
+        samples: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, dict[str, Any]]:
+        health: dict[str, dict[str, Any]] = {}
+        active_jobs = list(ctx.cluster_snapshot.active_jobs_summary() or [])
+        incomplete_jobs = {
+            str(item.get("job_id"))
+            for item in (ctx.telemetry_diagnostics.get("missing_ranks") or [])
+            if item.get("job_id")
+        }
+        for job in active_jobs:
+            jid = str(job.get("job_id", job.get("id")))
+            rows = samples.get(jid, [])
+            features = job_features.get(jid, {})
+            observed = {
+                name: max(
+                    (float(row[name]) for row in rows if row.get(name) is not None),
+                    default=None,
+                )
+                for name in ("p99_ttft_ms", "p99_tpot_ms", "depth_req_q")
+            }
+            throughput_values = [
+                float(row["throughput_token_per_sec"])
+                for row in rows
+                if row.get("throughput_token_per_sec") is not None
+            ]
+            observed_throughput = sum(throughput_values) if throughput_values else None
+            observed["throughput_token_per_sec"] = observed_throughput
+            current_capacity_values = [
+                float(row["current_point_capacity_tps"])
+                for row in rows
+                if row.get("current_point_capacity_tps") is not None
+            ]
+            observed["current_point_capacity_tps"] = (
+                sum(current_capacity_values) if current_capacity_values else None
+            )
+            for metric in ("current_base_p99_ttft_ms", "current_base_p99_tpot_ms"):
+                observed[metric] = max(
+                    (float(row[metric]) for row in rows if row.get(metric) is not None),
+                    default=None,
+                )
+            reasons = []
+            ttft_target = features.get("target_p99_ttft_ms")
+            tpot_target = features.get("target_p99_tpot_ms")
+            try:
+                job_type = str(
+                    features.get("type")
+                    or features.get("workload_type")
+                    or job.get("kind")
+                    or "online"
+                ).lower()
+                if job_type == "batch":
+                    deadline_hours = features.get("deadline_hours")
+                    if deadline_hours is None:
+                        deadline_hours = features.get("deadline_hrs", 24.0)
+                    required_throughput = (
+                        float(features.get("total_token_budget") or 0.0)
+                        / max(
+                            1.0,
+                            float(deadline_hours) * 3600.0,
+                        )
+                        * float(features.get("headroom_factor") or 1.5)
+                    )
+                else:
+                    required_throughput = (
+                        float(features.get("request_arrival_rate") or 0.0)
+                        * float(
+                            features.get("osl_token_avg")
+                            or features.get("output_len_tokens_avg")
+                            or 0.0
+                        )
+                        * float(features.get("headroom_factor") or 1.5)
+                    )
+            except (TypeError, ValueError, OverflowError):
+                required_throughput = 0.0
+            if observed_throughput is not None and observed_throughput <= 0:
+                reasons.append("zero_throughput")
+            elif (
+                observed_throughput is not None
+                and required_throughput > 0
+                and observed_throughput < 0.5 * required_throughput
+            ):
+                reasons.append("throughput_shortfall")
+            if (
+                ttft_target
+                and observed["p99_ttft_ms"] is not None
+                and observed["p99_ttft_ms"] > float(ttft_target)
+            ):
+                reasons.append("ttft_breach")
+            if (
+                tpot_target
+                and observed["p99_tpot_ms"] is not None
+                and observed["p99_tpot_ms"] > float(tpot_target)
+            ):
+                reasons.append("tpot_breach")
+            previous = self._health_state.get(jid, {})
+            complete_samples = bool(rows) and all(
+                sample.get("telemetry_complete") is True for sample in rows
+            )
+            if jid in incomplete_jobs or not complete_samples:
+                entry = {
+                    "status": "unknown",
+                    "reasons": ["telemetry_incomplete"],
+                    "unhealthy_ticks": int(previous.get("unhealthy_ticks", 0)),
+                    "observed": observed,
+                    "observed_slo_met": None,
+                    "rehabilitation_eligible": False,
+                    "last_swap_tick": int(previous.get("last_swap_tick", -10_000)),
+                    "last_queue_depth": float(previous.get("last_queue_depth") or 0.0),
+                }
+                self._health_state[jid] = entry
+                job["health"] = copy.deepcopy(entry)
+                job["recent_failures"] = entry["unhealthy_ticks"]
+                health[jid] = entry
+                continue
+            previous_depth = float(previous.get("last_queue_depth") or 0.0)
+            current_depth = float(observed["depth_req_q"] or 0.0)
+            if current_depth >= 10 and current_depth > max(10.0, previous_depth * 1.1):
+                reasons.append("queue_growing")
+            streak = int(previous.get("unhealthy_ticks", 0)) + 1 if reasons else 0
+            critical = (
+                "zero_throughput" in reasons
+                or (
+                    observed_throughput is not None
+                    and required_throughput > 0
+                    and observed_throughput < 0.1 * required_throughput
+                )
+                or current_depth >= 100
+                or (
+                    ttft_target
+                    and observed["p99_ttft_ms"] is not None
+                    and observed["p99_ttft_ms"] >= 3 * float(ttft_target)
+                )
+            )
+            last_swap_tick = int(previous.get("last_swap_tick", -10_000))
+            status = (
+                "critical"
+                if critical
+                else "degraded"
+                if reasons
+                else "healthy"
+                if rows
+                else "unknown"
+            )
+            entry = {
+                "status": status,
+                "reasons": reasons,
+                "unhealthy_ticks": streak,
+                "observed": observed,
+                "observed_slo_met": bool(rows)
+                and not any(
+                    reason in reasons
+                    for reason in ("ttft_breach", "tpot_breach", "throughput_shortfall")
+                ),
+                "rehabilitation_eligible": bool(
+                    (critical or streak >= 2) and ctx.tick - last_swap_tick >= 2
+                ),
+                "last_swap_tick": last_swap_tick,
+                "last_queue_depth": current_depth,
+            }
+            self._health_state[jid] = entry
+            job["health"] = copy.deepcopy(entry)
+            job["recent_failures"] = streak
+            health[jid] = entry
+        return health
 
     # ------------------------------------------------------------------
     # Terminal handlers
@@ -772,12 +1145,38 @@ class TickRunner:
                 model_catalogs={},
                 x_fields=x_fields,
             )
-        return build_deployment_x_index(
+        index = build_deployment_x_index(
             ctx.cluster_snapshot,
             hardware_catalog=self._hardware_catalog(),
             model_catalogs=self._model_catalogs(ctx),
             x_fields=x_fields,
         )
+        observed_shapes: dict[tuple[str, str], tuple] = {}
+        for job in ctx.cluster_snapshot.active_jobs_summary() or []:
+            jid = str(job.get("job_id", job.get("id")))
+            groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for chain in job.get("active_chains") or job.get("current_ladder") or []:
+                shape = dict(chain.get("shape_json") or chain)
+                rank_id = shape.get("rank_id")
+                if rank_id:
+                    groups[str(rank_id)].append(chain)
+            for rank_id, chains in groups.items():
+                observed_shapes[(jid, rank_id)] = self._rank_group_signature(chains)
+        for key, deployment in index.by_rank.items():
+            cached = self._prediction_ledger.get(key)
+            if not cached or cached.get("shape_signature") != observed_shapes.get(key):
+                continue
+            if not deployment.prediction_lineage:
+                deployment.prediction_lineage = cached.get("prediction_lineage")
+            deployment.y_predicted = {
+                **dict(cached.get("predicted_y") or {}),
+                **deployment.y_predicted,
+            }
+            deployment.v_predicted = {
+                **dict(cached.get("predicted_v") or {}),
+                **deployment.v_predicted,
+            }
+        return index
 
     @staticmethod
     def _has_active_chains(ctx: TickContext) -> bool:
@@ -956,18 +1355,10 @@ class TickRunner:
     def _missing_bundle_inputs(bundle, v_obs, v_pred, y_obs, y_pred) -> dict[str, list[str]]:
         """Return missing CUSUM inputs grouped by trajectory type."""
         return {
-            "v_observed": [
-                name for name in bundle.bundle_v_variables if v_obs.get(name) is None
-            ],
-            "v_predicted": [
-                name for name in bundle.bundle_v_variables if v_pred.get(name) is None
-            ],
-            "y_observed": [
-                name for name in bundle.bundle_y_outcomes if y_obs.get(name) is None
-            ],
-            "y_predicted": [
-                name for name in bundle.bundle_y_outcomes if y_pred.get(name) is None
-            ],
+            "v_observed": [name for name in bundle.bundle_v_variables if v_obs.get(name) is None],
+            "v_predicted": [name for name in bundle.bundle_v_variables if v_pred.get(name) is None],
+            "y_observed": [name for name in bundle.bundle_y_outcomes if y_obs.get(name) is None],
+            "y_predicted": [name for name in bundle.bundle_y_outcomes if y_pred.get(name) is None],
         }
 
     def _cusum_diagnostics(self, bundle, v_obs, v_pred, y_obs, y_pred, v_params, y_params):
@@ -1156,8 +1547,16 @@ class TickRunner:
         for row in rows:
             lineage = getattr(row, "prediction_lineage", None)
             has_band = isinstance(lineage, Mapping) and "decision_dro_band" in lineage
-            band = lineage.get("decision_dro_band") if has_band else None
-            required = lineage.get("decision_required_objectives") if has_band else None
+            band = (
+                lineage.get("decision_dro_band")
+                if isinstance(lineage, Mapping) and has_band
+                else None
+            )
+            required = (
+                lineage.get("decision_required_objectives")
+                if isinstance(lineage, Mapping) and has_band
+                else None
+            )
             status = self.dro._coverage_status(row.y_observed_mean, band, required)
             row_inside = status is True
             if status is not None:

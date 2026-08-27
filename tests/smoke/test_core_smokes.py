@@ -106,6 +106,11 @@ class CoreSmokeTests(unittest.TestCase):
                 "status": "success",
                 "queue_slo_verified": False,
             },
+            "point_capacity_covers_target": False,
+            "base_latency_within_target": True,
+            "queue_state": "unmodeled",
+            "queue_slo_verified": False,
+            "observed_slo_met": None,
             "sigma": -1.0,
             "solver_gain": 2.0,
         }
@@ -121,6 +126,10 @@ class CoreSmokeTests(unittest.TestCase):
             "served_fraction",
             "admission_mode",
             "prediction_assessment",
+            "point_capacity_covers_target",
+            "base_latency_within_target",
+            "queue_state",
+            "queue_slo_verified",
         ):
             self.assertEqual(serialized[field_name], raw_action[field_name])
         self.assertNotIn("sigma", serialized)
