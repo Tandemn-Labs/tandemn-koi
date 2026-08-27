@@ -15,6 +15,7 @@ from src.core.models import (
     MechanismMetadata,
     Node,
     Plan,
+    RankSpec,
 )
 from src.prediction.calibration import build_prediction_context, calibrate_prediction
 from src.validation.icp import ICPResult
@@ -99,6 +100,12 @@ class CoreSmokeTests(unittest.TestCase):
             "meets_target": False,
             "served_fraction": 0.6,
             "admission_mode": "advisory",
+            "prediction_assessment": {
+                "basis": "aic_direct_point",
+                "kind": "point",
+                "status": "success",
+                "queue_slo_verified": False,
+            },
             "sigma": -1.0,
             "solver_gain": 2.0,
         }
@@ -113,6 +120,7 @@ class CoreSmokeTests(unittest.TestCase):
             "meets_target",
             "served_fraction",
             "admission_mode",
+            "prediction_assessment",
         ):
             self.assertEqual(serialized[field_name], raw_action[field_name])
         self.assertNotIn("sigma", serialized)
@@ -125,6 +133,18 @@ class CoreSmokeTests(unittest.TestCase):
             {"actions": [{"job_id": "job_legacy", "type": "defer"}]}, tick=1
         ).actions[0]
         self.assertNotIn("admitted_tps", legacy.to_dict())
+
+    def test_rank_rejects_nonpositive_replica_count(self):
+        for replicas in (0, -1, False, 1.5):
+            with self.subTest(replicas=replicas), self.assertRaisesRegex(ValueError, "n_replicas"):
+                RankSpec.from_dict(
+                    {
+                        "role": "aggregate",
+                        "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                        "config": {"gpu_count": 1},
+                        "n_replicas": replicas,
+                    }
+                )
 
     def test_plan_action_autofills_and_preserves_rank_ids(self):
         plan = Plan.from_raw(

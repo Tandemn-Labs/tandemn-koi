@@ -156,6 +156,7 @@ class SurrogateComposer:
             raw_v = dict(primary.v_hat)
             y_hat = dict(raw_y)
             v_hat = dict(raw_v)
+            composed_sources: list[str] = []
 
             stage = "analytic_memory"
             analytic_started = time.perf_counter()
@@ -181,8 +182,11 @@ class SurrogateComposer:
             if self.perfdb_mode != "off":
                 backends["perfdb"] = _backend_trace(perfdb_estimate)
             if self.perfdb_mode == "enabled" and perfdb_estimate.status == "success":
+                before_blend = dict(y_hat)
                 y_hat = _coverage_blend(y_hat, perfdb_estimate.y_hat, perfdb_estimate.coverage)
                 v_hat = _coverage_blend(v_hat, perfdb_estimate.v_hat, perfdb_estimate.coverage)
+                if y_hat != before_blend:
+                    composed_sources.append("perfdb_blend")
 
             stage = "peers"
             peer_entries, peer_timing = self._run_peers(job_config, job_features, scenario)
@@ -203,7 +207,13 @@ class SurrogateComposer:
 
             fallback_sources = []
             fallback_coverage = {}
-            if primary.status != "success":
+            required_y = {"throughput_token_per_sec"}
+            if features.get("target_p99_ttft_ms") is not None:
+                required_y.add("p99_ttft_ms")
+            if features.get("target_p99_tpot_ms") is not None:
+                required_y.add("p99_tpot_ms")
+            missing_primary_y = {node for node in required_y if y_hat.get(node) is None}
+            if primary.status != "success" or missing_primary_y:
                 if self.perfdb_mode != "off" and perfdb_estimate.status == "success":
                     missing_y = {node for node in perfdb_estimate.y_hat if y_hat.get(node) is None}
                     missing_v = {node for node in perfdb_estimate.v_hat if v_hat.get(node) is None}
@@ -216,25 +226,37 @@ class SurrogateComposer:
                 for name, entry in peer_entries.items():
                     if entry.get("status") != "success":
                         continue
-                    before = set(y_hat)
+                    missing_before = {
+                        node
+                        for node, value in (entry.get("y_hat") or {}).items()
+                        if value is not None and y_hat.get(node) is None
+                    }
                     y_hat = _fill_available(y_hat, entry.get("y_hat") or {})
-                    added = set(y_hat) - before
+                    added = {node for node in missing_before if y_hat.get(node) is not None}
                     if added:
                         fallback_sources.append(name)
                         confidence = (
                             0.5 if (entry.get("metadata") or {}).get("approximation") else 1.0
                         )
                         fallback_coverage.update(dict.fromkeys(added, confidence))
-                core_y = {"throughput_token_per_sec", "p99_ttft_ms", "p99_tpot_ms"}
                 components["fallback"] = {
-                    "status": "success" if core_y <= set(y_hat) else "partial",
+                    "status": "success"
+                    if all(y_hat.get(node) is not None for node in required_y)
+                    else "partial",
                     "version": "best-effort-v1",
                     "coverage": fallback_coverage,
                     "spread": {},
                     "metadata": {
-                        "reason": primary.metadata.get("error"),
+                        "reason": primary.metadata.get("error")
+                        or (
+                            f"primary omitted {sorted(missing_primary_y)}"
+                            if missing_primary_y
+                            else None
+                        ),
                         "sources": fallback_sources,
-                        "missing_core_y": sorted(core_y - set(y_hat)),
+                        "missing_core_y": sorted(
+                            node for node in required_y if y_hat.get(node) is None
+                        ),
                         "emergency_shadow_override": True,
                     },
                     "y_hat": dict(y_hat),
@@ -282,6 +304,7 @@ class SurrogateComposer:
             fusion_applied = fusion.status == "learned" and peer_fusion_enabled
             if fusion_applied:
                 y_hat["throughput_token_per_sec"] = fusion.throughput
+                composed_sources.append("peer_fusion")
             timings[stage] = _elapsed_ms(fusion_started)
             fusion_trace = {
                 "status": fusion.status,
@@ -342,6 +365,14 @@ class SurrogateComposer:
                 peer_compatibility = (entry.get("metadata") or {}).get("compatibility")
                 if peer_compatibility:
                     compatibility[name] = deepcopy(peer_compatibility)
+            prediction_semantics = deepcopy(primary.metadata.get("prediction_semantics") or {})
+            semantic_sources = list(dict.fromkeys([*composed_sources, *fallback_sources]))
+            if semantic_sources:
+                prediction_semantics.update(
+                    basis="composed_point_estimate",
+                    fallback_sources=semantic_sources,
+                    queue_slo_verified=False,
+                )
 
             trace = {
                 "schema_version": 3,
@@ -358,6 +389,7 @@ class SurrogateComposer:
                 "backends": backends,
                 "compatibility": compatibility,
                 "profile_match": deepcopy(primary.metadata.get("aic_profile_match")),
+                "prediction_semantics": prediction_semantics,
                 "raw": {"y_hat": raw_y, "v_hat": raw_v},
                 "pre_calibration": {
                     "y_hat": pre_calibration_y,
@@ -618,6 +650,25 @@ def _peer_component_status(entries: dict[str, dict[str, Any]]) -> str:
     return "failed"
 
 
+def _compact_backend_diagnostics(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Retain actionable provenance without persisting backend debug payloads."""
+    metadata = metadata or {}
+    keep = (
+        "error_type",
+        "error",
+        "reason",
+        "mode",
+        "aic_database_mode",
+        "aic_profile_attempts",
+        "aic_fallback",
+        "aic_profile_override",
+        "aic_profile_system_fallback",
+        "target_memory_fit",
+        "prediction_semantics",
+    )
+    return {key: deepcopy(metadata[key]) for key in keep if metadata.get(key) is not None}
+
+
 def compact_prediction_lineage(trace: dict[str, Any] | None) -> dict[str, Any]:
     """Keep only prediction provenance required for residual learning and replay."""
     if not trace:
@@ -632,10 +683,14 @@ def compact_prediction_lineage(trace: dict[str, Any] | None) -> dict[str, Any]:
         "method": deepcopy(trace.get("method")),
         "compatibility": deepcopy(trace.get("compatibility") or {}),
         "profile_match": deepcopy(trace.get("profile_match")),
+        "prediction_semantics": deepcopy(trace.get("prediction_semantics") or {}),
+        "failure": deepcopy(trace.get("failure")),
         "backends": {
             name: {
                 "status": backend.get("status"),
                 "version": backend.get("version"),
+                "coverage": deepcopy(backend.get("coverage") or {}),
+                "diagnostics": _compact_backend_diagnostics(backend.get("metadata")),
                 "y_hat": deepcopy(backend.get("y_hat") or {}),
                 "v_hat": deepcopy(backend.get("v_hat") or {}),
             }

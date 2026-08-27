@@ -13,6 +13,15 @@ if TYPE_CHECKING:
 
 
 _AIC_DIRECT_METHOD = ("AIC_Direct",)
+_DIRECT_PREDICTION_SEMANTICS = {
+    "basis": "aic_direct_point",
+    "throughput_token_per_sec": "point_capacity",
+    "p99_ttft_ms": "base_service_latency",
+    "p99_tpot_ms": "base_service_latency",
+    "slo_margin": "base_service_latency_margin",
+    "queue_model": "none",
+    "queue_slo_verified": False,
+}
 
 
 class AICBackend:
@@ -104,12 +113,14 @@ class AICBackend:
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     **dict(getattr(surrogate, "last_metadata", {}) or {}),
+                    "prediction_semantics": dict(_DIRECT_PREDICTION_SEMANTICS),
                 },
             )
         nodes = set(y_hat or {}) | set(v_hat or {})
         metadata = {
             "method": list(method) if isinstance(method, list | tuple) else method,
             **dict(getattr(surrogate, "last_metadata", {}) or {}),
+            "prediction_semantics": dict(_DIRECT_PREDICTION_SEMANTICS),
         }
         version = self.version
         if metadata.get("aic_database_mode"):

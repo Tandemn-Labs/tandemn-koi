@@ -588,7 +588,11 @@ class AgentToolsSmokeTests(unittest.TestCase):
             self.assertEqual(
                 [rank["max_replicas_by_capacity"] for rank in result["per_rank"]], [4, 3]
             )
-            self.assertEqual([rank["n_replicas"] for rank in result["ranks"]], [4, 3])
+            self.assertEqual([rank["n_replicas"] for rank in result["ranks"]], [1, 1])
+            self.assertAlmostEqual(
+                sum(rank["rank_traffic_share"] for rank in result["ranks"]),
+                1.0,
+            )
 
             shared = agent_tools.size_ladder(
                 [
@@ -608,8 +612,9 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 target_tps=10_000,
             )
             self.assertEqual(
-                [rank["max_replicas_by_capacity"] for rank in shared["per_rank"]], [3, 0]
+                [rank["max_replicas_by_capacity"] for rank in shared["per_rank"]], [3, 2]
             )
+            self.assertEqual([rank["n_replicas"] for rank in shared["ranks"]], [1, 1])
         finally:
             agent_tools._rank_prediction_payload = saved_payload
             agent_tools._predict_outcome_core = saved_predict
@@ -691,6 +696,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 setattr(agent_tools._CTX, name, value)
 
         self.assertEqual(result["ranks"], [])
+        self.assertEqual(result["candidate_kind"], "rejected")
         self.assertEqual(result["failure_status"], "physical_no_fit")
         self.assertEqual(result["per_rank"][0]["n_replicas"], 0)
         self.assertEqual(result["per_rank"][0]["failure_status"], "physical_no_fit")
@@ -753,7 +759,9 @@ class AgentToolsSmokeTests(unittest.TestCase):
             for name, value in saved_context.items():
                 setattr(agent_tools._CTX, name, value)
 
-        self.assertEqual(result["ranks"], [])
+        self.assertEqual(len(result["ranks"]), 1)
+        self.assertEqual(result["ranks"][0]["n_replicas"], 1)
+        self.assertEqual(result["candidate_kind"], "exploratory")
         self.assertEqual(result["failure_status"], "unsupported_prediction")
         self.assertEqual(result["per_rank"][0]["failure_status"], "unsupported_prediction")
         self.assertEqual(result["per_rank"][0]["physical_violations"], [])
@@ -766,10 +774,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(
-            agent_tools._online_sizing_rejection(result, features)[0],
-            "unsupported_prediction",
-        )
+        self.assertIsNone(agent_tools._online_sizing_rejection(result, features))
 
     def test_score_one_frame_reports_invalid_config_before_prediction(self):
         result = agent_tools._score_one_frame(
@@ -903,11 +908,10 @@ class AgentToolsSmokeTests(unittest.TestCase):
 
         self.assertEqual(result["failure_status"], "prediction_failed")
         self.assertEqual(result["failure_reason"], "AIC database unavailable")
+        self.assertEqual(result["candidate_kind"], "exploratory")
+        self.assertEqual(len(result["ranks"]), 1)
         self.assertEqual(result["per_rank"][0]["physical_violations"], [])
-        self.assertEqual(
-            agent_tools._online_sizing_rejection(result, features)[0],
-            "prediction_failed",
-        )
+        self.assertIsNone(agent_tools._online_sizing_rejection(result, features))
 
     def test_size_ladder_classifies_unusable_prediction_outputs(self):
         saved_context = {
@@ -951,9 +955,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 (
                     {
                         "y_hat": {},
-                        "prediction_lineage": {
-                            "backends": {"primary": {"status": "success"}}
-                        },
+                        "prediction_lineage": {"backends": {"primary": {"status": "success"}}},
                     },
                     "prediction_empty",
                     "surrogate prediction returned no Y values",
@@ -1002,10 +1004,9 @@ class AgentToolsSmokeTests(unittest.TestCase):
                     )
                     self.assertEqual(result["failure_status"], expected_status)
                     self.assertEqual(result["failure_reason"], expected_reason)
-                    self.assertEqual(
-                        agent_tools._online_sizing_rejection(result, features)[0],
-                        expected_status,
-                    )
+                    self.assertEqual(result["candidate_kind"], "exploratory")
+                    self.assertEqual(len(result["ranks"]), 1)
+                    self.assertIsNone(agent_tools._online_sizing_rejection(result, features))
         finally:
             agent_tools._rank_prediction_payload = saved_payload
             agent_tools._predict_outcome_core = saved_predict
@@ -1058,7 +1059,9 @@ class AgentToolsSmokeTests(unittest.TestCase):
 
         self.assertFalse(result["meets_target"])
         self.assertFalse(result["per_rank"][0]["slo_ok"])
-        self.assertEqual(result["per_rank"][0]["reason"], "under-SLO at max DP")
+        self.assertEqual(result["failure_status"], "prediction_incomplete")
+        self.assertEqual(result["candidate_kind"], "exploratory")
+        self.assertIn("omitted a declared", result["per_rank"][0]["reason"])
 
     def test_budget_book_tracks_and_enforces_instance_pools(self):
         env = "reserved|aws|us-east-1|us-east-1b|L40S"

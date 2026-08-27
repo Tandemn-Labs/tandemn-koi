@@ -221,14 +221,16 @@ class SpecialistRunner:
             "cluster allocation and the final decision.\n"
             f"BudgetSlice: {json.dumps(slice_, separators=(',', ':'), default=str)}\n"
             f"Job brief: {json.dumps(brief, separators=(',', ':'), default=str)}\n\n"
-            "Choose the best-value frame that sustains required throughput and "
-            "meets latency SLOs. Compare the listed GPU types using their memory, "
+            "Choose the best-value physically launchable frame. Direct predictions "
+            "provide point capacity and base service latency, not queue-inclusive "
+            "p99 guarantees. Compare the listed GPU types using their memory, "
             "bandwidth, compute, instance size, and cost; do not choose merely the "
             "smallest frame that fits or reserve premium GPUs for other jobs. Explain "
             "the target, GPU/instance, parallelism, replicas, and fitness briefly.\n\n"
             "Constraints:\n"
-            "- type is place, keep, swap, or defer. If no safe ladder fits, use keep "
-            "for a running job or defer for a waiting job.\n"
+            "- type is place, keep, swap, or defer. Do not defer a physically valid "
+            "frame solely because prediction coverage is unavailable; the root will "
+            "classify and arbitrate that uncertainty.\n"
             "- Never exceed the slice. Report fitness as starved, happy, "
             "overprovisioned, or blocked.\n"
             "- used_capacity, unused_capacity, marginal_value_of_more, and "
@@ -812,7 +814,7 @@ class KoiAgentHarness:
 
             def _joint_capture(*a, __orig=_orig_joint, __rt=runtime, **kw):
                 result = __orig(*a, **kw)
-                __rt.last_joint = result
+                __rt.last_joint = copy.deepcopy(result)
                 return result
 
             callables["jointly_select_placements"] = _joint_capture
@@ -1013,6 +1015,11 @@ class KoiAgentHarness:
         self._materialize_launch_configs(plan, cluster_snapshot)
         states = self._job_states(cluster_snapshot)
         book = agent_tools._CTX.validated_budget_book
+        trusted_joint = {
+            str(candidate.get("job_id")): candidate
+            for candidate in (joint_recommendation or {}).get("chosen", [])
+            if isinstance(candidate, dict) and candidate.get("job_id")
+        }
 
         seen: set = set()
         for action in plan.actions:
@@ -1034,7 +1041,12 @@ class KoiAgentHarness:
                     )
 
             if action.type in LADDER_ACTIONS:
-                self._validate_ladder(action, book, cluster_snapshot)
+                self._validate_ladder(
+                    action,
+                    book,
+                    cluster_snapshot,
+                    trusted_candidate=trusted_joint.get(jid),
+                )
 
         if states is not None:
             self._autofill_coverage(plan, states)
@@ -1072,13 +1084,88 @@ class KoiAgentHarness:
                     continue
                 rank.config.update(materialize_launch_config(catalog, rank.env[4]))
 
-    def _validate_ladder(self, action: PlanAction, book, cluster_snapshot=None) -> None:
+    def _validate_ladder(
+        self,
+        action: PlanAction,
+        book,
+        cluster_snapshot=None,
+        trusted_candidate: dict[str, Any] | None = None,
+    ) -> None:
         """Validate a ladder-bearing action; raise on hard violations."""
         jid = action.job_id
         if action.ladder is None:
             raise PlanMaterializationError(f"job {jid}: {action.type.value} requires a ladder")
         if not action.ladder:
             raise PlanMaterializationError(f"job {jid}: ladder is empty")
+
+        assessment = action.prediction_assessment
+        if assessment is not None:
+            if not isinstance(assessment, dict):
+                raise PlanMaterializationError(f"job {jid}: prediction_assessment must be a dict")
+            if assessment.get("basis") not in agent_tools._POINT_PREDICTION_BASES:
+                raise PlanMaterializationError(
+                    f"job {jid}: unsupported prediction assessment basis"
+                )
+            kind = assessment.get("kind")
+            status = assessment.get("status")
+            if kind == "exploratory" and status not in agent_tools._SOFT_PREDICTION_FAILURES:
+                raise PlanMaterializationError(
+                    f"job {jid}: {status!r} is not an exploratory prediction status"
+                )
+            if kind == "exploratory" and action.type != ActionType.PLACE:
+                raise PlanMaterializationError(
+                    f"job {jid}: exploratory prediction is supported only for PLACE"
+                )
+            if kind == "point" and status != "success":
+                raise PlanMaterializationError(
+                    f"job {jid}: point prediction status must be 'success'"
+                )
+            if kind not in {"point", "exploratory"}:
+                raise PlanMaterializationError(
+                    f"job {jid}: prediction assessment kind must be point or exploratory"
+                )
+            if assessment.get("queue_slo_verified") is not False:
+                raise PlanMaterializationError(
+                    f"job {jid}: Direct prediction cannot claim queue SLO verification"
+                )
+            if assessment.get("selection_mode") == "work_conserving":
+                trusted_assessment = (trusted_candidate or {}).get("prediction_assessment") or {}
+                trusted_ladder = (trusted_candidate or {}).get("ladder") or []
+                submitted_shapes = [
+                    agent_tools._rank_shape_key(rank.to_dict()) for rank in action.ladder
+                ]
+                trusted_shapes = [
+                    agent_tools._rank_shape_key(rank)
+                    for rank in trusted_ladder
+                    if isinstance(rank, dict)
+                ]
+                accounting_fields = (
+                    "type",
+                    "user_id",
+                    "target_tps",
+                    "target_p99_ttft_ms",
+                    "target_p99_tpot_ms",
+                    "admitted_tps",
+                    "achieved_tps",
+                    "unmet_tps",
+                    "meets_target",
+                    "served_fraction",
+                    "admission_mode",
+                    "mechanism_id",
+                    "budget_ref",
+                )
+                submitted_action = action.to_dict()
+                if (
+                    assessment != trusted_assessment
+                    or submitted_shapes != trusted_shapes
+                    or any(
+                        submitted_action.get(field) != (trusted_candidate or {}).get(field)
+                        for field in accounting_fields
+                    )
+                ):
+                    raise PlanMaterializationError(
+                        f"job {jid}: work-conserving status must come from the joint solver"
+                    )
 
         try:
             PlanAction.assign_rank_ids(jid, action.ladder)
@@ -1353,9 +1440,9 @@ class KoiAgentHarness:
             # ---------- YOUR JOB THIS TICK ----------
             "YOUR JOB: produce one cluster-wide plan that maximizes aggregate "
             "sigma, subject to user policy/quota, reserved GPU capacity, "
-            "physical chain feasibility, the swap budget B_t, and admission "
-            "control, while using SLO chance under worst-case demand (DRO) to "
-            "rank risk. Only the "
+            "physical chain feasibility and the swap budget B_t, while using "
+            "point-capacity, base-latency, and DRO estimates to rank risk. Direct "
+            "does not model request queues. Only the "
             "reserved market exists this version - never plan spot or "
             "on-demand capacity.\n\n"
             # ---------- THE OBJECTIVE, EXACTLY ----------
@@ -1376,9 +1463,9 @@ class KoiAgentHarness:
             "gain from actually trying this ladder. High when the mechanism is "
             "low-confidence - an uncertain-but-promising config is rewarded "
             "because Koi LEARNS from deploying it.\n"
-            "  - Pr_DRO (weighted by gamma, risk): probability ANY SLO is "
-            "violated under the worst-case demand band (Wasserstein-DRO). "
-            "Placements sitting on the SLO edge cost you here.\n"
+            "  - Pr_DRO (weighted by gamma, risk): uncertainty around the available "
+            "point predictions. With Direct-only latency this is base-latency risk, "
+            "not a queue-inclusive SLO guarantee.\n"
             "  - SwitchCost (weighted by lambda, churn): cost of moving a job "
             "off its current ladder (migration, reprice, disruption). Keeping "
             "a good-enough config beats churning for a tiny gain.\n"
@@ -1399,6 +1486,21 @@ class KoiAgentHarness:
             "replaces your cluster-level judgment. Negative sigma is normal because J "
             "is a distance. Never defer merely because a placement has sigma < 0; "
             "compare it with the explicit unserved-demand penalty.\n\n"
+            "DIRECT PREDICTION CONTRACT. AIC_Direct is a point estimator. Throughput "
+            "is estimated capacity for the exact rank geometry and replica count. "
+            "TTFT/TPOT are base service-latency estimates, not queue-aware end-to-end "
+            "p99 values. queue_slo_verified is therefore false. Telemetry is the "
+            "authority on deployed queue behavior. Never call a Direct result "
+            "queue-safe or treat a lower offered rate as a new Direct operating point.\n\n"
+            "FAILURE CONTRACT. invalid_config, no_pool_capacity, physical_no_fit, "
+            "no_mechanism, infeasible, and BudgetSlice/resource violations are hard "
+            "rejections. unsupported_prediction, prediction_failed, prediction_empty, "
+            "prediction_incomplete, zero_predicted_capacity, and demand_unmodeled are "
+            "prediction uncertainty: they do not prove physical infeasibility. A "
+            "physically valid candidate carrying one of those statuses may be selected "
+            "as zero-credit exploratory work when capacity would otherwise idle. It "
+            "must never displace a supported positive-value candidate. queue_shadow is "
+            "an uncalibrated diagnostic only and never changes selection.\n\n"
             "PRIMARY WORKFLOW. Run this pipeline exactly once, in order, and keep its "
             "outputs in the REPL:\n"
             "    build_user_envelopes()\n"
@@ -1440,14 +1542,15 @@ class KoiAgentHarness:
             "permissive upper bounds and may overlap, so shared contention is reconciled "
             "jointly after specialists propose job-local placements.\n\n"
             "CANDIDATE CONTRACT. The deterministic candidate builder treats specialist "
-            "ladders as hints, generates right-sized frames across available GPU types and "
-            "instance pools, adds a heterogeneous frame when useful, sizes them, removes "
-            "unrunnable/infeasible frames, and computes per-job sigma. "
+            "ladders as fixed-capacity proposals, generates explicit replica alternatives "
+            "across available GPU types and instance pools, adds a heterogeneous frame "
+            "when useful, removes hard-invalid frames, and computes per-job sigma. "
             f"{online_admission_contract}"
             "Any allowed batch partial candidate "
             "carries meets_target and served_fraction so you can reason about its shortfall. "
             "A specialist defer/blocked result is only a local hint. A job in exhausted has "
-            "no generated feasible frame; budget_limited identifies work skipped at the "
+            "no physically valid candidate; inspect diagnostics for the typed reason. "
+            "budget_limited identifies work skipped at the "
             "surrogate cap. Mechanism IDs are opaque Store IDs: use applicable exact or "
             "partial matches and never invent an ID.\n\n"
             "TOOL CONTRACTS. Guard outputs before indexing. predict_outcome scores one "
@@ -1486,22 +1589,17 @@ class KoiAgentHarness:
 
         if mode == "advisory":
             return (
-                "PARTIAL ONLINE ADMISSION MODE: advisory (benchmark/experimental). "
-                "Deterministic prediction, sizing, and SLO/DRO scoring advise and rank; "
-                "only physical no-fit, invalid configuration, shared-capacity violation, "
-                "incomplete prediction, and zero throughput are hard vetoes. A predicted "
-                "SLO or throughput-target miss can still be placed to collect telemetry. "
-                "An under-target action must preserve admitted_tps, achieved_tps, unmet_tps, "
-                "meets_target, served_fraction, and admission_mode, and every selected rank "
-                "must preserve rank_traffic_share. "
-                "WARNING: Store receives an advisory admitted target, but the current "
-                "Orca/router may still route full traffic; this mode does not imply "
-                "enforcement. It is benchmark-only and unsafe for production SLO guarantees. "
-                "Never claim full traffic is throttled. "
+                "POINT-ESTIMATE ONLINE MODE: advisory. Deterministic prediction and "
+                "SLO/DRO scoring rank candidates but do not simulate queue dynamics. "
+                "A base-latency or capacity-target miss remains placeable. Prediction-only "
+                "failures become zero-credit exploratory candidates after physical checks. "
+                "Preserve prediction_assessment and point-capacity accounting exactly. "
+                "Do not emit an admitted rate or claim traffic throttling: the current "
+                "Orca/router does not provide an enforcement acknowledgement. "
             )
         return (
-            "PARTIAL ONLINE ADMISSION MODE: off. Online throughput remains full-service "
-            "admission. Online candidates are SLO-complete, full-service placements. "
+            "POINT-ESTIMATE ONLINE MODE: admission metadata is off. Direct still provides "
+            "only point capacity and base service latency; queue SLOs remain unverified. "
         )
 
     @staticmethod
@@ -1524,13 +1622,12 @@ class KoiAgentHarness:
             "  {'job_id': str, 'type': <action>, 'user_id': str,\n"
             "   'ladder': [<rank>, ...],            # only for place/swap\n"
             "   'target_tps': float,                # required throughput for place/swap\n"
-            "   # Optional partial-admission metadata: preserve it as a unit from a candidate.\n"
-            "   'admitted_tps': float,              # tested admitted throughput\n"
-            "   'achieved_tps': float,              # predicted throughput at admitted load\n"
-            "   'unmet_tps': float,                 # target throughput shortfall\n"
-            "   'meets_target': bool,               # throughput and declared SLOs are met\n"
-            "   'served_fraction': float,           # fraction of target throughput served\n"
-            "   'admission_mode': str,              # candidate admission classification\n"
+            "   # Optional point-estimate accounting: preserve it as a unit from a candidate.\n"
+            "   'achieved_tps': float,              # target covered by point capacity\n"
+            "   'unmet_tps': float,                 # point-capacity shortfall\n"
+            "   'meets_target': bool,               # point capacity/base latency pass\n"
+            "   'served_fraction': float,           # estimated capacity coverage\n"
+            "   'prediction_assessment': dict,      # status, basis, and queue limitation\n"
             "   'target_p99_ttft_ms': float,        # online SLA, copied from job_features\n"
             "   'target_p99_tpot_ms': float,        # online SLA, copied from job_features\n"
             "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"
@@ -1578,8 +1675,8 @@ class KoiAgentHarness:
             "Jobs without a joint-chosen placement may be omitted and are auto-kept "
             "(running) or auto-deferred (waiting). Overriding a joint-chosen job still "
             "requires an explicit defer with rationale.\n"
-            "Use the already-sized ranks in scored candidates; do not guess replicas. "
-            "If a reasoned final adjustment changes rank geometry, size that adjustment "
-            "with size_ladder and validate the whole plan without rebuilding the global "
-            "candidate set.\n\n"
+            "Use the fixed replica counts in scored candidates; do not silently resize them. "
+            "If a reasoned final adjustment changes rank geometry, evaluate that exact "
+            "geometry with size_ladder and validate the whole plan without rebuilding the "
+            "global candidate set.\n\n"
         )

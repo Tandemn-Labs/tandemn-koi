@@ -60,6 +60,16 @@ _SERVICE_ACCOUNTING_FIELDS = (
 _PARTIAL_ONLINE_ADMISSION_MODES = frozenset({"off", "advisory"})
 _ADMISSION_REL_TOL = 1e-3
 _ADMISSION_ABS_TOL = 1e-6
+_SOFT_PREDICTION_STATUSES = frozenset(
+    {
+        "unsupported_prediction",
+        "prediction_failed",
+        "prediction_empty",
+        "prediction_incomplete",
+        "zero_predicted_capacity",
+        "demand_unmodeled",
+    }
+)
 
 
 @dataclass
@@ -398,6 +408,32 @@ class Validator:
         """Validate service accounting, rank shares, and guarded online admission."""
         prefix = f"C6 admission: job {action.job_id}"
         violations: list[str] = []
+        assessment = getattr(action, "prediction_assessment", None)
+        if assessment is not None and not isinstance(assessment, dict):
+            violations.append(f"{prefix} prediction_assessment must be a dict")
+            assessment = {}
+        assessment = assessment or {}
+        point_estimate = assessment.get("basis") in {
+            "aic_direct_point",
+            "composed_point_estimate",
+        }
+        exploratory = point_estimate and assessment.get("kind") == "exploratory"
+        if assessment and not point_estimate:
+            violations.append(f"{prefix} prediction_assessment basis is unsupported")
+        if point_estimate and assessment.get("queue_slo_verified") is not False:
+            violations.append(f"{prefix} Direct prediction cannot verify queue SLOs")
+        if point_estimate and assessment.get("kind") not in {"point", "exploratory"}:
+            violations.append(f"{prefix} prediction_assessment kind is invalid")
+        if exploratory and assessment.get("status") not in _SOFT_PREDICTION_STATUSES:
+            violations.append(f"{prefix} exploratory prediction status is not recognized")
+        if exploratory and action.type != ActionType.PLACE:
+            violations.append(f"{prefix} exploratory prediction is supported only for PLACE")
+        if (
+            point_estimate
+            and assessment.get("kind") == "point"
+            and assessment.get("status") != "success"
+        ):
+            violations.append(f"{prefix} point prediction status must be 'success'")
         accounting_present = any(
             getattr(action, name) is not None for name in _SERVICE_ACCOUNTING_FIELDS
         )
@@ -484,7 +520,7 @@ class Validator:
                     "and any declared latency SLO"
                 )
 
-        if has_latency_target and fraction is not None and fraction < 1.0:
+        if has_latency_target and fraction is not None and fraction < 1.0 and not point_estimate:
             if admitted is None:
                 violations.append(f"{prefix} online partial service requires admitted_tps")
             if action.admission_mode != "advisory":
@@ -506,8 +542,15 @@ class Validator:
         if not ranks:
             return []
         explicit_share = any(rank.rank_traffic_share is not None for rank in ranks)
+        assessment = getattr(action, "prediction_assessment", None) or {}
+        if assessment.get("kind") == "exploratory" and not explicit_share and len(ranks) == 1:
+            return []
         partial_service = fraction is not None and fraction < 1.0
-        if len(ranks) == 1 and not explicit_share and not partial_service:
+        point_estimate = assessment.get("basis") in {
+            "aic_direct_point",
+            "composed_point_estimate",
+        }
+        if len(ranks) == 1 and not explicit_share and (point_estimate or not partial_service):
             return []
 
         violations: list[str] = []
@@ -521,9 +564,15 @@ class Validator:
             else:
                 shares.append(share)
 
-        expected = fraction if fraction is not None else 1.0
+        expected = 1.0 if point_estimate else fraction if fraction is not None else 1.0
         if len(shares) == len(ranks) and not cls._admission_close(sum(shares), expected):
-            expected_name = "served_fraction" if action.served_fraction is not None else "1"
+            expected_name = (
+                "1 for point-estimate routing"
+                if point_estimate
+                else "served_fraction"
+                if action.served_fraction is not None
+                else "1"
+            )
             violations.append(
                 f"{prefix} rank_traffic_share sum must approximately equal {expected_name}"
             )

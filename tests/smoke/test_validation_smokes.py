@@ -349,6 +349,62 @@ class ValidationSmokeTests(unittest.TestCase):
 
         self.assertTrue(advisory_result.feasible, advisory_result.violations)
 
+    def test_validator_accepts_point_capacity_and_exploratory_accounting(self):
+        point = _raw_partial_plan()
+        point_action = point["actions"][0]
+        point_action.pop("admitted_tps")
+        point_action.pop("admission_mode")
+        point_action["ladder"][0].pop("rank_traffic_share")
+        point_action["target_p99_ttft_ms"] = 100.0
+        point_action["prediction_assessment"] = {
+            "basis": "aic_direct_point",
+            "kind": "point",
+            "status": "success",
+            "queue_slo_verified": False,
+        }
+
+        point_result = Validator().val_plan(point)
+
+        self.assertTrue(point_result.feasible, point_result.violations)
+
+        point_action["ladder"].append(
+            {
+                **point_action["ladder"][0],
+                "rank_traffic_share": 0.4,
+            }
+        )
+        point_action["ladder"][0]["rank_traffic_share"] = 0.6
+        multi_point_result = Validator().val_plan(point)
+
+        self.assertTrue(multi_point_result.feasible, multi_point_result.violations)
+
+        exploratory = _raw_place_plan(
+            {"instance_type": "p5.48xlarge", "gpu_count": 1, "tp": 1, "pp": 1}
+        )
+        exploratory["actions"][0]["prediction_assessment"] = {
+            "basis": "aic_direct_point",
+            "kind": "exploratory",
+            "status": "unsupported_prediction",
+            "queue_slo_verified": False,
+        }
+
+        exploratory_result = Validator().val_plan(exploratory)
+
+        self.assertTrue(exploratory_result.feasible, exploratory_result.violations)
+
+        exploratory["actions"][0]["ladder"].append(
+            {
+                **exploratory["actions"][0]["ladder"][0],
+                "rank_id": "second-exploratory-rank",
+            }
+        )
+        multi_exploratory = Validator().val_plan(exploratory)
+
+        self.assertFalse(multi_exploratory.feasible)
+        self.assertTrue(
+            any("rank_traffic_share" in violation for violation in multi_exploratory.violations)
+        )
+
     def test_validator_accepts_legacy_batch_partial_without_online_admission_fields(self):
         plan = _raw_partial_plan()
         plan["actions"][0].pop("admitted_tps")
