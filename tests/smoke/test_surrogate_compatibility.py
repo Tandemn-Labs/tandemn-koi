@@ -27,7 +27,7 @@ def test_gpu_aliases_are_canonical_and_exact_backend_values_are_preserved():
     assert resolution.confidence == 1.0
 
 
-def test_a10g_resolves_to_nearest_same_architecture_aic_gpu():
+def test_a10g_resolves_to_l4_aic_gpu_with_catalog_profiles():
     resolution = resolve_gpu(
         "nvidia-a10g",
         backend="aic",
@@ -35,11 +35,11 @@ def test_a10g_resolves_to_nearest_same_architecture_aic_gpu():
     )
 
     assert resolution.kind == "nearest"
-    assert resolution.resolved == "A30"
-    assert resolution.backend_value == "a30"
+    assert resolution.resolved == "L4"
+    assert resolution.backend_value == "l4"
     assert 0 < resolution.throughput_scale < 1
     assert resolution.latency_scale > 1
-    assert "same_architecture" in resolution.reasons
+    assert "preferred_backend_proxy" in resolution.reasons
 
 
 def test_unknown_gpu_uses_catalog_facts_and_conservative_scaling():
