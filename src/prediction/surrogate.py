@@ -7,6 +7,7 @@ from aiconfigurator.sdk.memory import (  # type: ignore[import-untyped]
     estimate_num_gpu_blocks,
 )
 
+from src.prediction.analytic_v import target_memory_fit
 from src.prediction.compatibility import (
     backend_dtype_name,
     canonicalize_dtype,
@@ -14,7 +15,6 @@ from src.prediction.compatibility import (
     resolve_dtype,
     resolve_gpu,
 )
-from src.prediction.analytic_v import target_memory_fit
 from src.prediction.normalization import normalize_candidate_inputs
 from src.prediction.profile_search import (
     model_profile_from_values,
@@ -630,7 +630,7 @@ class SurrogatePrediction:
         if method_name == "AIC_Direct":
             memory_fit = target_memory_fit(direct_x_values)
             self.last_metadata["target_memory_fit"] = memory_fit
-            if memory_fit["status"] == "no_fit":
+            if memory_fit["status"] == "physical_no_fit":
                 raise SurrogateMemoryNoFit(
                     "requested model memory no-fit: "
                     f"requires {memory_fit['required_gb']:.2f} GiB per GPU, "
@@ -760,6 +760,8 @@ class SurrogatePrediction:
         return {
             "method": method_name,
             "aic_only": aic_only,
+            "requested_model_id": model_id,
+            "requested_aic_system": requested_system,
             "aic_args": aic_args,
             "engine_args": engine_args,
             "replay_args": replay_args,
@@ -849,7 +851,7 @@ class SurrogatePrediction:
                 available,
                 limit=len(available),
                 match_engine=False,
-                require_weight_fit=estimate_only_system is None,
+                require_weight_fit=False,
             )
             matches = [
                 match
@@ -1106,6 +1108,19 @@ class SurrogatePrediction:
             self.last_metadata["aic_profile_match"] = dict(match)
             try:
                 result = self._run_aic_modes(attempt, ("SILICON", *_AIC_FALLBACK_MODES))
+            except SurrogateMemoryNoFit as exc:
+                if (
+                    match.get("model_id") == surrogate_input.get("requested_model_id")
+                    and match.get("aic_system") == surrogate_input.get("requested_aic_system")
+                ):
+                    raise
+                failures.append(
+                    {
+                        "profile_id": match.get("profile_id"),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
             except SurrogateUnsupportedConfig as exc:
                 if not self._is_retryable_profile_failure(exc):
                     raise
