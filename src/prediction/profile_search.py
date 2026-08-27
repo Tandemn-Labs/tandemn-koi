@@ -181,7 +181,11 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
     vocab = _integer(values.get("vocab") or values.get("vocab_size") or raw.get("vocab_size")) or 0
     experts = (
         _integer(
-            values.get("num_experts") or values.get("num_routed_experts") or raw.get("num_experts")
+            values.get("num_experts")
+            or values.get("num_routed_experts")
+            or values.get("num_local_experts")
+            or raw.get("num_experts")
+            or raw.get("num_local_experts")
         )
         or 0
     )
@@ -225,8 +229,11 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
             moe_intermediate,
         )
     )
+    quantization_method = str(values.get("weight_quantization_method") or "").lower()
+    quantization_dtype = "fp8" if "fp8" in quantization_method else None
     dtype = (
-        canonicalize_dtype(
+        quantization_dtype
+        or canonicalize_dtype(
             values.get("weight_dtype")
             or _dtype_from_model_id(model_id)
             or values.get("torch_dtype")
@@ -392,11 +399,13 @@ def rank_profiles(
     available: tuple[SupportedProfile, ...] | list[SupportedProfile],
     *,
     limit: int = 5,
+    match_engine: bool = True,
+    require_weight_fit: bool = True,
 ) -> tuple[ProfileMatch, ...]:
     """Rank backend support points by joint GPU/model/workload similarity."""
     matches = []
     for supported in available:
-        if supported.engine_name != requested.engine_name:
+        if match_engine and supported.engine_name != requested.engine_name:
             continue
         if supported.model.attention_heads % requested.topology.tp != 0:
             continue
@@ -406,7 +415,7 @@ def rank_profiles(
         requested_signature = build_operation_signature(
             completed_model, requested.workload, requested.topology
         )
-        if requested.gpu.memory_gb is not None and requested_signature.weight_bytes_per_gpu > (
+        if require_weight_fit and requested.gpu.memory_gb is not None and requested_signature.weight_bytes_per_gpu > (
             requested.gpu.memory_gb * (1 << 30)
         ):
             continue

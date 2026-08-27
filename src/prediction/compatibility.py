@@ -210,7 +210,7 @@ _GPU_PROFILES = {
 
 _PREFERRED_GPU_PROXIES = {
     "aic": {
-        "A10G": "A30",
+        "A10G": "L4",
         "A100 40GB": "A100",
         "GB10": "L40S",
         "L40": "L40S",

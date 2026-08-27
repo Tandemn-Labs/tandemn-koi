@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+from dataclasses import replace
 
 from aiconfigurator.sdk.memory import (  # type: ignore[import-untyped]
     estimate_num_gpu_blocks,
@@ -12,8 +14,13 @@ from src.prediction.compatibility import (
     resolve_dtype,
     resolve_gpu,
 )
+from src.prediction.analytic_v import target_memory_fit
 from src.prediction.normalization import normalize_candidate_inputs
-from src.prediction.profile_search import prediction_profile_from_values, rank_profiles
+from src.prediction.profile_search import (
+    model_profile_from_values,
+    prediction_profile_from_values,
+    rank_profiles,
+)
 
 for _logger_name in ("aiconfigurator", "aiconfigurator_core"):
     logging.getLogger(_logger_name).setLevel(logging.ERROR)
@@ -21,6 +28,12 @@ for _logger_name in ("aiconfigurator", "aiconfigurator_core"):
 ONLINE_REPLAY_WINDOW_S = 1
 ONLINE_MIN_REQUESTS = 20
 _AIC_FALLBACK_MODES = ("HYBRID", "EMPIRICAL", "SOL")
+_AIC_PROFILE_BACKENDS = (("vllm", "0.22.0"), ("sglang", "0.5.14"))
+_A10G_PROFILE_FALLBACK_SYSTEMS = ("l40s", "a100_sxm", "h100_sxm", "h200_sxm")
+_AGGREGATE_PROFILE_OVERRIDES = {
+    "moonshotai/Kimi-K2-Instruct": ("moonshotai/Kimi-K2.5", "sglang", "0.5.14", "h100_sxm"),
+    "deepseek-ai/DeepSeek-V3": ("deepseek-ai/DeepSeek-V3", "sglang", "0.5.14", "h200_sxm"),
+}
 _AIC_GPU_CHOICES = frozenset(
     {
         "A30",
@@ -56,7 +69,10 @@ AIC_MEMORY_X_FIELDS = frozenset(
         "fmha_quant_mode",
         "comm_quant_mode",
         "kvcache_dtype",
+        "model_size_gb",
         "weight_dtype",
+        "weight_quantization_bits",
+        "weight_quantization_method",
         "activation_dtype",
     }
 )
@@ -586,6 +602,7 @@ class SurrogatePrediction:
                 f"Unsupported method or multi method is not supported yet: {method}"
             )
 
+        direct_x_values = self._enrich_requested_model_values(direct_x_values)
         model_id = direct_x_values.get("model_id")
         if model_id is None:
             raise SurrogateUnsupportedConfig("AIC prediction needs model_id")
@@ -601,24 +618,52 @@ class SurrogatePrediction:
                 "AIC-only PP prediction supports aggregate serving only"
             )
 
-        profile_matches = self._rank_aic_profiles(direct_x_values)
+        requested_system = (
+            "a100_sxm"
+            if str(gpu_type).strip().upper().startswith("A100")
+            else self.map_gpu_to_aic_system(gpu_type, direct_x_values)
+        )
+        requested_gpu = gpu_profile_from_values(str(gpu_type), direct_x_values)
+        if direct_x_values.get("gpu_mem_gb") is None and requested_gpu and requested_gpu.memory_gb:
+            direct_x_values = {**direct_x_values, "gpu_mem_gb": requested_gpu.memory_gb}
+
+        if method_name == "AIC_Direct":
+            memory_fit = target_memory_fit(direct_x_values)
+            self.last_metadata["target_memory_fit"] = memory_fit
+            if memory_fit["status"] == "no_fit":
+                raise SurrogateMemoryNoFit(
+                    "requested model memory no-fit: "
+                    f"requires {memory_fit['required_gb']:.2f} GiB per GPU, "
+                    f"capacity {memory_fit['capacity_gb']:.2f} GiB"
+                )
+
+        profile_matches = self._rank_aic_profiles(
+            direct_x_values,
+            aic_system=requested_system,
+            enriched=True,
+        )
         selected_match = profile_matches[0] if profile_matches else None
         resolved_system = (
-            selected_match.supported.aic_system
-            if selected_match is not None
-            else self.map_gpu_to_aic_system(gpu_type, direct_x_values)
+            selected_match.supported.aic_system if selected_match is not None else requested_system
         )
         resolved_model = (
             selected_match.supported.model.model_id if selected_match is not None else model_id
         )
+        resolved_engine = (
+            selected_match.supported.engine_name
+            if selected_match is not None
+            else direct_x_values.get("engine_name", "vllm")
+        )
+        resolved_engine_version = (
+            selected_match.supported.engine_version if selected_match is not None else "0.22.0"
+        )
         engine_args = {
-            "engine_type": direct_x_values.get("engine_name", "vllm"),
+            "engine_type": resolved_engine,
             "block_size": direct_x_values.get("block_size", 64),
             "max_num_seqs": direct_x_values.get("max_num_seq"),
             "max_num_batched_tokens": direct_x_values.get("max_num_batched_tokens"),
-            "aic_backend": direct_x_values.get("engine_name", "vllm"),
-            # AIC's bundled performance database currently supports this version.
-            "aic_backend_version": "0.22.0",
+            "aic_backend": resolved_engine,
+            "aic_backend_version": resolved_engine_version,
             "aic_system": resolved_system,
             "aic_model_path": resolved_model,
             "aic_tp_size": direct_x_values.get("tp", 1),
@@ -649,18 +694,19 @@ class SurrogatePrediction:
             if name.endswith("_dtype")
         ):
             raise SurrogateUnsupportedConfig("AIC has no compatible dtype for this candidate")
-        memory_x_values = {
-            key: direct_x_values[key]
-            for key in AIC_MEMORY_X_FIELDS
-            if direct_x_values.get(key) is not None
-        }
-        if memory_x_values.get("gpu_mem_gb") is None:
-            requested_profile = gpu_profile_from_values(str(gpu_type), direct_x_values)
-            if requested_profile is not None and requested_profile.memory_gb is not None:
-                memory_x_values["gpu_mem_gb"] = requested_profile.memory_gb
-        memory_engine_args = {**engine_args, "aic_model_path": model_id}
-        self._resolve_aic_num_gpu_blocks(memory_engine_args, memory_x_values)
-        engine_args["num_gpu_blocks"] = memory_engine_args["num_gpu_blocks"]
+        if method_name == "AIC_DynoSim":
+            memory_x_values = {
+                key: direct_x_values[key]
+                for key in AIC_MEMORY_X_FIELDS
+                if direct_x_values.get(key) is not None
+            }
+            if memory_x_values.get("gpu_mem_gb") is None:
+                requested_profile = gpu_profile_from_values(str(gpu_type), direct_x_values)
+                if requested_profile is not None and requested_profile.memory_gb is not None:
+                    memory_x_values["gpu_mem_gb"] = requested_profile.memory_gb
+            memory_engine_args = {**engine_args, "aic_model_path": model_id}
+            self._resolve_aic_num_gpu_blocks(memory_engine_args, memory_x_values)
+            engine_args["num_gpu_blocks"] = memory_engine_args["num_gpu_blocks"]
 
         queue_policy = direct_x_values.get("scheduling_policy")
         if queue_policy in {"fcfs", "lcfs", "wspt"}:
@@ -720,13 +766,14 @@ class SurrogatePrediction:
             "aic_profile_matches": tuple(match.to_dict() for match in profile_matches),
         }
 
-    def _rank_aic_profiles(self, values):
+    def _rank_aic_profiles(self, values, *, aic_system=None, enriched=False):
         try:
             from src.prediction.aic_support import load_aic_support_profiles
 
             _, normalized_values = normalize_candidate_inputs({}, values)
             normalized_values = {**values, **normalized_values}
-            normalized_values = self._enrich_requested_model_values(normalized_values)
+            if not enriched:
+                normalized_values = self._enrich_requested_model_values(normalized_values)
             requested_gpu = gpu_profile_from_values(
                 str(normalized_values.get("gpu_type") or ""), normalized_values
             )
@@ -735,11 +782,110 @@ class SurrogatePrediction:
             requested = prediction_profile_from_values(normalized_values, requested_gpu)
             if requested is None:
                 return ()
-            available = load_aic_support_profiles(
-                str(normalized_values.get("engine_name") or "vllm"),
-                "0.22.0",
+            if not {"layers", "hidden_size", "attention_heads"} <= requested.model.known_fields:
+                self.last_metadata["aic_profile_search"] = {
+                    "status": "unavailable",
+                    "reason": "requested_model_structure_missing",
+                }
+                return ()
+            if aic_system is None:
+                gpu_type = normalized_values.get("gpu_type")
+                aic_system = (
+                    "a100_sxm"
+                    if str(gpu_type).strip().upper().startswith("A100")
+                    else self.map_gpu_to_aic_system(gpu_type, normalized_values)
+                )
+            available_all = tuple(
+                profile
+                for backend, version in _AIC_PROFILE_BACKENDS
+                for profile in load_aic_support_profiles(backend, version)
             )
-            return rank_profiles(requested, available, limit=5)
+            available = available_all
+            estimate_only_system = None
+            override = _AGGREGATE_PROFILE_OVERRIDES.get(requested.model.model_id)
+            if override is not None and aic_system == "h100_sxm":
+                model_id, backend, version, system = override
+                template = next(
+                    (profile for profile in available_all if profile.aic_system == system),
+                    None,
+                )
+                if template is not None:
+                    available = [
+                        replace(
+                            template,
+                            profile_id=f"override:{backend}:{version}:{system}:{model_id}",
+                            model=replace(requested.model, model_id=model_id),
+                            engine_name=backend,
+                            engine_version=version,
+                            aic_system=system,
+                        )
+                    ]
+                    self.last_metadata["aic_profile_override"] = {
+                        "requested_model_id": requested.model.model_id,
+                        "model_id": model_id,
+                        "engine_name": backend,
+                        "engine_version": version,
+                        "aic_system": system,
+                    }
+                else:
+                    available = []
+            else:
+                available = [profile for profile in available if profile.aic_system == aic_system]
+                if not available and aic_system == "l4":
+                    for system in _A10G_PROFILE_FALLBACK_SYSTEMS:
+                        available = [
+                            profile for profile in available_all if profile.aic_system == system
+                        ]
+                        if available:
+                            estimate_only_system = aic_system
+                            self.last_metadata["aic_profile_system_fallback"] = {
+                                "requested_system": aic_system,
+                                "model_source_system": system,
+                                "estimate_only_system": estimate_only_system,
+                            }
+                            break
+            matches = rank_profiles(
+                requested,
+                available,
+                limit=len(available),
+                match_engine=False,
+                require_weight_fit=estimate_only_system is None,
+            )
+            matches = [
+                match
+                for match in matches
+                if match.supported.model.is_moe == requested.model.is_moe
+            ]
+            matches.sort(
+                key=lambda match: (
+                    match.supported.model.model_id != requested.model.model_id,
+                    abs(
+                        math.log(
+                            match.supported.model.parameter_count / requested.model.parameter_count
+                        )
+                    ),
+                    match.supported.model.weight_dtype != requested.model.weight_dtype,
+                    match.supported.engine_name != requested.engine_name,
+                    match.distance,
+                    match.supported.profile_id,
+                )
+            )
+            if estimate_only_system is not None:
+                matches = [
+                    replace(
+                        match,
+                        supported=replace(
+                            match.supported,
+                            gpu=requested_gpu,
+                            aic_system=estimate_only_system,
+                        ),
+                        prefill_speed_ratio=1.0,
+                        decode_speed_ratio=1.0,
+                        reasons=(*match.reasons, "estimate_only_system_proxy"),
+                    )
+                    for match in matches
+                ]
+            return tuple(matches[:5])
         except Exception as exc:
             self.last_metadata["aic_profile_search"] = {
                 "status": "unavailable",
@@ -752,6 +898,7 @@ class SurrogatePrediction:
         model_id = values.get("model_id")
         if not model_id:
             return values
+        errors = []
         try:
             from aiconfigurator.sdk.utils import (  # type: ignore[import-untyped]
                 get_model_config_from_model_path,
@@ -759,16 +906,44 @@ class SurrogatePrediction:
 
             config = get_model_config_from_model_path(str(model_id))
         except Exception as exc:
+            errors.append(exc)
+        else:
+            if isinstance(config, dict):
+                self.last_metadata["model_profile_enrichment"] = {"status": "success", "source": "aic"}
+                return self._with_derived_model_parameters({**config, **values})
+
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(
+                str(model_id),
+                token=os.environ.get("HF_TOKEN"),
+            ).to_dict()
+        except Exception as exc:
+            errors.append(exc)
+        else:
             self.last_metadata["model_profile_enrichment"] = {
-                "status": "unavailable",
-                "error_type": type(exc).__name__,
-                "error": str(exc),
+                "status": "success",
+                "source": "huggingface",
             }
+            return self._with_derived_model_parameters({**config, **values})
+
+        error = errors[-1]
+        self.last_metadata["model_profile_enrichment"] = {
+            "status": "unavailable",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        return values
+
+    @staticmethod
+    def _with_derived_model_parameters(values):
+        if values.get("model_params_b") is not None or not values.get("model_id"):
             return values
-        if not isinstance(config, dict):
+        profile = model_profile_from_values(str(values["model_id"]), values)
+        if profile is None or not {"layers", "hidden_size", "attention_heads"} <= profile.known_fields:
             return values
-        self.last_metadata["model_profile_enrichment"] = {"status": "success"}
-        return {**config, **values}
+        return {**values, "model_params_b": profile.parameter_count / 1e9}
 
     def _resolve_aic_dtypes(self, values):
         requested = {
@@ -917,7 +1092,37 @@ class SurrogatePrediction:
             return self.run_aic_dynosim(surrogate_input)
 
     def run_aic_only(self, surrogate_input):
-        return self._run_aic_modes(surrogate_input, ("SILICON", *_AIC_FALLBACK_MODES))
+        matches = tuple(surrogate_input.get("aic_profile_matches") or ())
+        if not matches:
+            return self._run_aic_modes(surrogate_input, ("SILICON", *_AIC_FALLBACK_MODES))
+
+        failures = []
+        base_engine_args = surrogate_input["engine_args"]
+        for match in matches:
+            attempt = {
+                **surrogate_input,
+                "engine_args": self._engine_args_for_profile(base_engine_args, match),
+            }
+            self.last_metadata["aic_profile_match"] = dict(match)
+            try:
+                result = self._run_aic_modes(attempt, ("SILICON", *_AIC_FALLBACK_MODES))
+            except SurrogateUnsupportedConfig as exc:
+                if not self._is_retryable_profile_failure(exc):
+                    raise
+                failures.append(
+                    {
+                        "profile_id": match.get("profile_id"),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            if failures:
+                self.last_metadata["aic_profile_attempts"] = failures
+            return result
+
+        self.last_metadata["aic_profile_attempts"] = failures
+        details = "; ".join(attempt["error"] for attempt in failures)
+        raise SurrogateUnsupportedConfig(f"AIC has no usable estimate for ranked profiles: {details}")
 
     def _run_aic_modes(self, surrogate_input, modes, fallback_reason=None):
         failures = []
@@ -1190,6 +1395,9 @@ class SurrogatePrediction:
         decode_speed = max(float(match.get("decode_speed_ratio") or 1.0), 1e-12)
         engine_args.update(
             {
+                "engine_type": match["engine_name"],
+                "aic_backend": match["engine_name"],
+                "aic_backend_version": match["engine_version"],
                 "aic_system": match["aic_system"],
                 "aic_model_path": match["model_id"],
                 "speedup_ratio": prefill_speed,

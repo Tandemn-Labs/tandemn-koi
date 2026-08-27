@@ -9,6 +9,8 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from src.prediction import surrogate as surrogate_module
+from src.prediction.compatibility import GPUProfile
+from src.prediction.profile_search import ModelProfile, SupportedProfile, model_profile_from_values
 from src.prediction.surrogate import (
     ONLINE_MIN_REQUESTS,
     SurrogateExecutionError,
@@ -956,13 +958,13 @@ class PredictionSmokeTests(unittest.TestCase):
             "head_dim": 128,
             "vocab_size": 152064,
             "max_pos_embeddings": 32768,
-            "gpu_type": "NVIDIA RTX 8000",
+            "gpu_type": "H100",
             "gpu_vendor": "nvidia",
-            "gpu_generation": "turing",
-            "gpu_mem_gb": 48,
-            "gpu_bandwidth_gbps": 672,
-            "gpu_tflops_fp16": 130.5,
-            "pcie_bandwidth_gbps": 32,
+            "gpu_generation": "hopper",
+            "gpu_mem_gb": 80,
+            "gpu_bandwidth_gbps": 3350,
+            "gpu_tflops_fp16": 989,
+            "nvlink_bandwidth_gbps": 900,
             "weight_dtype": "fp16",
             "type": "online",
             "isl_token_avg": 512,
@@ -979,10 +981,7 @@ class PredictionSmokeTests(unittest.TestCase):
         matches = predictor._rank_aic_profiles(values)
 
         self.assertEqual(len(matches), 5)
-        self.assertEqual(
-            [match.distance for match in matches],
-            sorted(match.distance for match in matches),
-        )
+        self.assertTrue(all(match.supported.aic_system == "h100_sxm" for match in matches))
         self.assertTrue(all(match.prefill_speed_ratio > 0 for match in matches))
         self.assertTrue(all(match.decode_speed_ratio > 0 for match in matches))
 
@@ -1014,6 +1013,301 @@ class PredictionSmokeTests(unittest.TestCase):
 
         self.assertEqual(len(matches), 5)
         self.assertTrue(all(match.confidence < 1.0 for match in matches))
+
+    def test_direct_retries_next_ranked_aic_profile(self):
+        attempts = []
+        matches = (
+            {
+                "profile_id": "first",
+                "aic_system": "first_system",
+                "model_id": "first-model",
+                "prefill_speed_ratio": 0.5,
+                "decode_speed_ratio": 0.25,
+            },
+            {
+                "profile_id": "second",
+                "aic_system": "second_system",
+                "model_id": "second-model",
+                "prefill_speed_ratio": 0.8,
+                "decode_speed_ratio": 0.4,
+            },
+        )
+        predictor = SurrogatePrediction()
+
+        def run_modes(surrogate_input, _modes):
+            engine_args = surrogate_input["engine_args"]
+            attempts.append(engine_args)
+            if engine_args["aic_system"] == "first_system":
+                raise SurrogateUnsupportedConfig("PerfDataNotAvailableError: missing slice")
+            return {"throughput_token_per_sec": 50.0}, {}
+
+        predictor._run_aic_modes = run_modes
+        predictor.run_aic_dynosim = lambda *_args, **_kwargs: self.fail("Direct called DynoSim")
+        y_hat, _ = predictor.run_aic_only(
+            {
+                "engine_args": {"aic_system": "target", "aic_model_path": "target-model"},
+                "aic_profile_matches": matches,
+            }
+        )
+
+        self.assertEqual([attempt["aic_system"] for attempt in attempts], ["first_system", "second_system"])
+        self.assertEqual(y_hat["throughput_token_per_sec"], 50.0)
+        self.assertEqual(predictor.last_metadata["aic_profile_match"]["profile_id"], "second")
+        self.assertEqual(predictor.last_metadata["aic_profile_attempts"][0]["profile_id"], "first")
+
+    def test_huggingface_enrichment_falls_back_from_aic_lookup(self):
+        predictor = SurrogatePrediction()
+        config = {
+            "model_params_b": 14,
+            "num_hidden_layers": 40,
+            "hidden_size": 5120,
+            "num_attention_heads": 40,
+        }
+
+        with (
+            patch(
+                "aiconfigurator.sdk.utils.get_model_config_from_model_path",
+                side_effect=ValueError("unknown AIC model"),
+            ),
+            patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=SimpleNamespace(to_dict=lambda: config),
+            ) as load_config,
+        ):
+            enriched = predictor._enrich_requested_model_values({"model_id": "microsoft/phi-4"})
+
+        self.assertEqual(enriched["model_params_b"], 14)
+        self.assertEqual(predictor.last_metadata["model_profile_enrichment"], {
+            "status": "success",
+            "source": "huggingface",
+        })
+        self.assertEqual(load_config.call_args.kwargs["token"], None)
+
+    def test_direct_memory_fit_uses_enriched_requested_model(self):
+        predictor = SurrogatePrediction()
+        predictor._enrich_requested_model_values = lambda values: {
+            **values,
+            "model_params_b": 70,
+            "weight_dtype": "bf16",
+            "gpu_mem_gb": 24,
+        }
+
+        with self.assertRaisesRegex(SurrogateMemoryNoFit, "requested model memory no-fit"):
+            predictor.build_surrogate_inputs(
+                {
+                    "model_id": "acme/large-model",
+                    "gpu_type": "A10G",
+                    "tp": 1,
+                    "pp": 1,
+                },
+                {"request_count": 1, "replay_mode": "offline"},
+                ("AIC_Direct",),
+            )
+
+        self.assertEqual(predictor.last_metadata["target_memory_fit"]["status"], "no_fit")
+
+    def test_profile_uses_fp8_quantization_method(self):
+        profile = model_profile_from_values(
+            "acme/fp8-model",
+            {
+                "model_params_b": 8,
+                "num_hidden_layers": 32,
+                "hidden_size": 4096,
+                "num_attn_heads": 32,
+                "weight_dtype": "bf16",
+                "weight_quantization_method": "fp8",
+                "weight_quantization_bits": 8,
+            },
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.weight_dtype, "fp8")
+
+    def test_aggregate_profile_search_pins_system_and_ranks_parameters(self):
+        gpu = GPUProfile(
+            "A100",
+            vendor="nvidia",
+            architecture="ampere",
+            memory_gb=80,
+            memory_bandwidth_gbps=2039,
+            fp16_tflops=312,
+        )
+        target = ModelProfile(
+            model_id="acme/dense-30b",
+            architecture="DenseForCausalLM",
+            layers=32,
+            hidden_size=4096,
+            intermediate_size=16384,
+            attention_heads=32,
+            kv_heads=8,
+            head_dim=128,
+            vocab_size=32000,
+            parameter_count=30e9,
+            is_moe=False,
+            routed_experts=0,
+            active_experts=0,
+            weight_dtype="bf16",
+            max_context=8192,
+        )
+        profiles = (
+            SupportedProfile(
+                "a100-near",
+                gpu,
+                ModelProfile(**{**target.__dict__, "model_id": "aic/dense-32b", "parameter_count": 32e9}),
+                "vllm",
+                "0.22.0",
+                "a100_sxm",
+            ),
+            SupportedProfile(
+                "a100-far",
+                gpu,
+                ModelProfile(**{**target.__dict__, "model_id": "aic/dense-70b", "parameter_count": 70e9}),
+                "vllm",
+                "0.22.0",
+                "a100_sxm",
+            ),
+            SupportedProfile(
+                "a100-moe",
+                gpu,
+                ModelProfile(
+                    **{
+                        **target.__dict__,
+                        "model_id": "aic/moe-30b",
+                        "is_moe": True,
+                        "routed_experts": 8,
+                        "active_experts": 2,
+                    }
+                ),
+                "vllm",
+                "0.22.0",
+                "a100_sxm",
+            ),
+            SupportedProfile("b200-near", gpu, target, "vllm", "0.22.0", "b200_sxm"),
+        )
+        predictor = SurrogatePrediction()
+        predictor._enrich_requested_model_values = lambda values: values
+        values = {
+            "model_id": target.model_id,
+            "model_params_b": 30,
+            "model_architecture": target.architecture,
+            "num_hidden_layers": 32,
+            "hidden_size": 4096,
+            "intermediate_size": 16384,
+            "num_attn_heads": 32,
+            "num_kv_heads": 8,
+            "weight_dtype": "bf16",
+            "gpu_type": "A100-PCIe-40GB",
+            "gpu_mem_gb": 80,
+            "type": "online",
+            "isl_token_avg": 512,
+            "osl_token_avg": 128,
+            "max_num_seq": 8,
+            "tp": 8,
+            "pp": 1,
+            "engine_name": "vllm",
+        }
+
+        with patch("src.prediction.aic_support.load_aic_support_profiles", return_value=profiles):
+            matches = predictor._rank_aic_profiles(values, aic_system="a100_sxm")
+
+        self.assertEqual(
+            [match.supported.model.model_id for match in matches],
+            ["aic/dense-32b", "aic/dense-70b"],
+        )
+
+    def test_direct_finds_proxy_alternates_for_phi_and_mixtral(self):
+        models = (
+            {
+                "model_id": "microsoft/phi-4",
+                "architecture": "Phi3ForCausalLM",
+                "model_params_b": 14,
+                "num_hidden_layers": 40,
+                "hidden_size": 5120,
+                "intermediate_size": 17920,
+                "num_attn_heads": 40,
+                "num_kv_heads": 10,
+                "head_dim": 128,
+                "vocab_size": 100352,
+                "weight_dtype": "bf16",
+                "kvcache_dtype": "bf16",
+                "tp": 2,
+            },
+            {
+                "model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                "architecture": "MixtralForCausalLM",
+                "model_params_b": 46.7,
+                "num_hidden_layers": 32,
+                "hidden_size": 4096,
+                "intermediate_size": 14336,
+                "num_attn_heads": 32,
+                "num_kv_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 32000,
+                "is_moe": True,
+                "num_experts": 8,
+                "num_active_experts": 2,
+                "moe_intermediate_size": 14336,
+                "weight_dtype": "bf16",
+                "kvcache_dtype": "bf16",
+                "tp": 8,
+            },
+        )
+
+        for model in models:
+            with self.subTest(model=model["model_id"]):
+                values = {
+                    **model,
+                    "gpu_type": "H100",
+                    "gpu_mem_gb": 80,
+                    "gpu_bandwidth_gbps": 3350,
+                    "gpu_tflops_fp16": 989,
+                    "type": "online",
+                    "isl_token_avg": 512,
+                    "osl_token_avg": 128,
+                    "max_num_seq": 8,
+                    "max_num_batched_tokens": 8192,
+                    "pp": 1,
+                    "dp": 1,
+                    "engine_name": "vllm",
+                }
+                predictor = SurrogatePrediction()
+                predictor._enrich_requested_model_values = lambda candidate: candidate
+                matches = predictor._rank_aic_profiles(values)
+
+                self.assertGreaterEqual(len(matches), 2)
+                first_proxy = matches[0].supported.model.model_id
+                second_proxy = matches[1].supported.model.model_id
+                self.assertNotEqual(first_proxy, model["model_id"])
+                self.assertNotEqual(second_proxy, model["model_id"])
+                attempts = []
+
+                def run_modes(surrogate_input, _modes):
+                    model_path = surrogate_input["engine_args"]["aic_model_path"]
+                    attempts.append(model_path)
+                    if model_path == first_proxy:
+                        raise SurrogateUnsupportedConfig("unsupported model")
+                    return {"throughput_token_per_sec": 50.0}, {}
+
+                predictor._run_aic_modes = run_modes
+                predictor.run_aic_dynosim = lambda *_args, **_kwargs: self.fail(
+                    "Direct called DynoSim"
+                )
+                y_hat, _ = predictor.run_aic_only(
+                    {
+                        "engine_args": {
+                            "aic_system": "target",
+                            "aic_model_path": model["model_id"],
+                        },
+                        "aic_profile_matches": tuple(match.to_dict() for match in matches),
+                    }
+                )
+
+                self.assertEqual(attempts, [first_proxy, second_proxy])
+                self.assertEqual(y_hat["throughput_token_per_sec"], 50.0)
+                self.assertEqual(
+                    predictor.last_metadata["aic_profile_match"]["model_id"],
+                    second_proxy,
+                )
 
     def test_dynosim_retries_next_ranked_aic_profile(self):
         class PanicException(BaseException):
@@ -1125,13 +1419,13 @@ class PredictionSmokeTests(unittest.TestCase):
             "head_dim": 128,
             "vocab_size": 152064,
             "max_pos_embeddings": 32768,
-            "gpu_type": "NVIDIA RTX 8000",
+            "gpu_type": "H100",
             "gpu_vendor": "nvidia",
-            "gpu_generation": "turing",
-            "gpu_mem_gb": 48,
-            "gpu_bandwidth_gbps": 672,
-            "gpu_tflops_fp16": 130.5,
-            "pcie_bandwidth_gbps": 32,
+            "gpu_generation": "hopper",
+            "gpu_mem_gb": 80,
+            "gpu_bandwidth_gbps": 3350,
+            "gpu_tflops_fp16": 989,
+            "nvlink_bandwidth_gbps": 900,
             "weight_dtype": "fp16",
             "activation_dtype": "fp16",
             "kvcache_dtype": "fp16",
