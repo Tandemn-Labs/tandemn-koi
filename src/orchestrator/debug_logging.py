@@ -13,17 +13,18 @@ from typing import Any
 from src.agent.tools import agent_tools
 
 RAW_STATE_FIELDS = {
-    "S0_ENTER_TICK": ("cluster_snapshot",),
+    "S0_ENTER_TICK": ("cluster_snapshot", "deployment_reconciliation"),
     "S1_OBSERVE": ("telemetry", "deployment_x", "telemetry_diagnostics"),
-    "S2_VALIDATE": ("evidence_rows", "mechanism_diagnostics"),
+    "S2_VALIDATE": ("evidence_rows", "mechanism_diagnostics", "active_health"),
     "S3_SLOW_UPDATE": ("new_slow_state", "confidence_diagnostics", "slow_update_diagnostics"),
     "S4_AGENTIC_PLAN": ("candidate_plan",),
     "S5_VALIDATE_PLAN": ("validated_plan", "s5_repair_count"),
     "S6_DEPLOY": ("validated_plan", "deploy_acks"),
 }
 CURATED_STATE_FIELDS = {
+    "S0_ENTER_TICK": ("deployment_reconciliation",),
     "S1_OBSERVE": ("telemetry_diagnostics",),
-    "S2_VALIDATE": ("mechanism_diagnostics",),
+    "S2_VALIDATE": ("mechanism_diagnostics", "active_health"),
     "S3_SLOW_UPDATE": ("confidence_diagnostics", "slow_update_diagnostics"),
     "S5_VALIDATE_PLAN": ("s5_repair_count",),
     "S6_DEPLOY": ("deploy_acks",),
@@ -129,6 +130,10 @@ class DebugLogger:
             "error": repr(getattr(ctx, "error", None)) if getattr(ctx, "error", None) else None,
             "state_durations_ms": getattr(ctx, "state_durations_ms", {}) or {},
             "surrogate_budget": _compact(agent_tools.get_surrogate_budget_status(), "no-llm"),
+            "deployment_reconciliation": _compact(
+                getattr(ctx, "deployment_reconciliation", []) or [], "no-llm"
+            ),
+            "active_health": _compact(getattr(ctx, "active_health", {}) or {}, "no-llm"),
         }
         if self.trace == "all":
             summary["candidate_plan"] = _compact(getattr(ctx, "candidate_plan", None), self.trace)

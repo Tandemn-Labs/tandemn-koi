@@ -1342,6 +1342,48 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
 
         self.assertEqual(replicas, [1, 2, 3])
 
+    def test_unhealthy_active_job_generates_swap_candidates(self):
+        env = "reserved|aws|r1|a|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"new-pool": {"gpus_per_instance": 1, "free_instances": 1}}}
+        active = {
+            "job_id": "active-job",
+            "health": {"rehabilitation_eligible": True},
+            "current_ladder": [
+                {
+                    "shape_json": {
+                        "env": env.split("|"),
+                        "instance_type": "old-pool",
+                        "tp": 1,
+                        "pp": 1,
+                        "ep": 1,
+                        "n_replicas": 1,
+                    }
+                }
+            ],
+        }
+        action_types = []
+
+        def score(jid, _user_id, _slice_id, rank, _features, action_type="place"):
+            action_types.append(action_type)
+            return {
+                "candidate": {"job_id": jid, "type": action_type, "ladder": [rank]},
+                "meets_target": True,
+                "diag": {"status": "ok", "reason": None},
+            }
+
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        with (
+            self._candidate_patches(resources, specs, [], score),
+            patch.object(agent_tools, "get_active_jobs", return_value=[active]),
+        ):
+            result = agent_tools.build_scored_candidates({}, {})
+
+        self.assertEqual(action_types, ["swap"])
+        self.assertEqual(result["candidates"][0]["type"], "swap")
+
     def test_under_target_online_frames_remain_available_to_composites(self):
         env = "reserved|aws|r1|a|H100"
         resources = {env: {"free": 2, "gpu_type": "H100"}}
@@ -1738,6 +1780,137 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
 
         self.assertEqual(cost[("gpu", env)], 16)
         self.assertEqual(cost[("pool", env, "p5.48xlarge")], 2)
+
+    def test_queue_unstable_candidate_is_only_work_conserving(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 1}}}
+        base = {
+            "type": "place",
+            "ladder": [_rank(env, "p5")],
+            "target_tps": 100.0,
+            "achieved_tps": 100.0,
+            "served_fraction": 1.0,
+            "prediction_assessment": {
+                "basis": "aic_direct_point",
+                "kind": "point",
+                "status": "success",
+                "queue_slo_verified": False,
+            },
+        }
+        candidates = [
+            {
+                **base,
+                "job_id": "unstable",
+                "queue_state": "unstable",
+                "sigma": 100.0,
+                "prediction_assessment": dict(base["prediction_assessment"]),
+            },
+            {
+                **base,
+                "job_id": "stable",
+                "queue_state": "stable",
+                "sigma": -100.0,
+                "prediction_assessment": dict(base["prediction_assessment"]),
+            },
+        ]
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(
+                agent_tools,
+                "get_pending_jobs",
+                return_value=[{"job_id": "unstable"}, {"job_id": "stable"}],
+            ),
+            patch.object(
+                agent_tools,
+                "get_priority",
+                return_value=[
+                    {"job_id": "unstable", "priority_score": 100.0},
+                    {"job_id": "stable", "priority_score": 1.0},
+                ],
+            ),
+        ):
+            result = agent_tools.jointly_select_placements(candidates)
+
+        self.assertEqual([candidate["job_id"] for candidate in result["chosen"]], ["stable"])
+        self.assertEqual(result["solver_mode"], "exact")
+
+    def test_candidate_pruning_reports_before_and_after_counts(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 8, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 8}}}
+        candidates = [
+            {
+                "job_id": "job",
+                "type": "place",
+                "ladder": [_rank(env, "p5", n_replicas=replicas)],
+                "target_tps": 100.0,
+                "achieved_tps": 100.0,
+                "served_fraction": 1.0,
+                "meets_target": True,
+                "sigma": 1.0,
+                "prediction_assessment": {
+                    "basis": "aic_direct_point",
+                    "kind": "point",
+                    "status": "success",
+                    "queue_slo_verified": False,
+                    "proposal_source": "generated",
+                },
+            }
+            for replicas in range(1, 9)
+        ]
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(agent_tools, "get_pending_jobs", return_value=[{"job_id": "job"}]),
+            patch.object(agent_tools, "get_priority", return_value=[]),
+        ):
+            result = agent_tools.jointly_select_placements(candidates)
+
+        self.assertEqual(result["candidate_count_before_pruning"], 8)
+        self.assertLess(result["candidate_count_after_pruning"], 8)
+
+    def test_joint_solver_enforces_aggregate_swap_budget(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 2, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 2}}}
+        candidates = [
+            {
+                "job_id": f"active-{index}",
+                "type": "swap",
+                "ladder": [_rank(env, "p5")],
+                "target_tps": 100.0,
+                "achieved_tps": 100.0,
+                "served_fraction": 1.0,
+                "sigma": 10.0 - index,
+                "keep_baseline_sigma": -10.0,
+                "swap_gain_over_keep": 10.0 - index,
+                "prediction_assessment": {
+                    "basis": "aic_direct_point",
+                    "kind": "point",
+                    "status": "success",
+                    "queue_slo_verified": False,
+                },
+            }
+            for index in range(2)
+        ]
+        slow_loop = type("SlowLoop", (), {"get_sss_swap_budget_t": lambda self: 1})()
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools._CTX, "slow_loop", slow_loop),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(agent_tools, "get_pending_jobs", return_value=[]),
+            patch.object(agent_tools, "get_priority", return_value=[]),
+        ):
+            result = agent_tools.jointly_select_placements(candidates)
+
+        self.assertEqual(result["swap_budget"], 1)
+        self.assertEqual(result["swap_count"], 1)
+        self.assertEqual(len(result["chosen"]), 1)
 
     def test_finalization_preserves_soft_failure_for_exploratory_action(self):
         plan = self._sigma_plan("p5")
