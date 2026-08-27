@@ -118,7 +118,7 @@ def target_memory_fit(values: dict) -> dict[str, float | str]:
         "required_gb": used_gb,
     }
     if used_gb > capacity_gb:
-        result["status"] = "no_fit"
+        result["status"] = "physical_no_fit"
         return result
 
     kv_per_token = kv_bytes_per_token(values)
@@ -131,7 +131,7 @@ def target_memory_fit(values: dict) -> dict[str, float | str]:
     used_gb += demand * kv_per_token / kv_shards / GIB
     result["required_gb"] = used_gb
     if used_gb > capacity_gb:
-        result["status"] = "no_fit"
+        result["status"] = "physical_no_fit"
     return result
 
 
