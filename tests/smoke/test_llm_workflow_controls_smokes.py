@@ -283,7 +283,8 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         raw_plan, snapshot, last_joint = attempt.call_args.args
         self.assertIs(result, materialized)
         self.assertIsNone(snapshot)
-        self.assertIs(last_joint, recommendation)
+        self.assertEqual(last_joint, recommendation)
+        self.assertIsNot(last_joint, recommendation)
         self.assertEqual(raw_plan["actions"], chosen)
         self.assertIsNot(raw_plan["actions"], chosen)
         self.assertIsNot(raw_plan["actions"][0], chosen[0])
@@ -525,13 +526,12 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertIn("not a mandatory extra turn", prompt)
         self.assertIn("scored['diagnostics']", prompt)
         self.assertIn("scored['budget_limited']", prompt)
-        self.assertIn("PARTIAL ONLINE ADMISSION MODE: off", prompt)
-        self.assertIn("Online throughput remains full-service admission", prompt)
-        self.assertIn("Online candidates are SLO-complete, full-service", prompt)
-        self.assertNotIn("positive partial throughput candidates can be selected", prompt)
+        self.assertIn("POINT-ESTIMATE ONLINE MODE: admission metadata is off", prompt)
+        self.assertIn("point capacity and base service latency", prompt)
+        self.assertIn("queue SLOs remain unverified", prompt)
         self.assertIn("Any allowed batch partial candidate", prompt)
         self.assertIn("meets_target and served_fraction", prompt)
-        self.assertIn("Optional partial-admission metadata", prompt)
+        self.assertIn("Optional point-estimate accounting", prompt)
         self.assertIn("include an explicit DEFER action", prompt)
         self.assertNotIn("solver owns the pick", prompt)
         self.assertNotIn("FINAL_VAR(plan_tick())", prompt)
@@ -545,12 +545,11 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertNotIn("predicted_y", specialist_prompt)
         self.assertNotIn("predicted_sigma", specialist_prompt)
         for field in (
-            "admitted_tps",
             "achieved_tps",
             "unmet_tps",
             "meets_target",
             "served_fraction",
-            "admission_mode",
+            "prediction_assessment",
             "rank_traffic_share",
         ):
             self.assertIn(field, prompt)
@@ -568,37 +567,21 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         ):
             prompt = harness.build_root_prompt(tick=9)
 
-        self.assertIn("PARTIAL ONLINE ADMISSION MODE: advisory", prompt)
-        self.assertIn("benchmark/experimental", prompt)
-        self.assertIn(
-            "Deterministic prediction, sizing, and SLO/DRO scoring advise and rank", prompt
-        )
-        self.assertIn("incomplete prediction, and zero throughput are hard vetoes", prompt)
-        self.assertIn("predicted SLO or throughput-target miss can still be placed", prompt)
-        self.assertIn(
-            "must preserve admitted_tps, achieved_tps, unmet_tps, meets_target, "
-            "served_fraction, and admission_mode",
-            prompt,
-        )
-        self.assertIn("every selected rank must preserve rank_traffic_share", prompt)
-        self.assertIn(
-            "WARNING: Store receives an advisory admitted target, but the current "
-            "Orca/router may still route full traffic; this mode does not imply enforcement. "
-            "It is benchmark-only and unsafe for production SLO guarantees.",
-            prompt,
-        )
-        self.assertIn("Never claim full traffic is throttled", prompt)
-        self.assertNotIn("Online candidates are SLO-complete, full-service", prompt)
+        self.assertIn("POINT-ESTIMATE ONLINE MODE: advisory", prompt)
+        self.assertIn("do not simulate queue dynamics", prompt)
+        self.assertIn("Prediction-only failures become zero-credit exploratory candidates", prompt)
+        self.assertIn("Do not emit an admitted rate or claim traffic throttling", prompt)
+        self.assertIn("unsupported_prediction", prompt)
+        self.assertIn("physical_no_fit", prompt)
         self.assertIn("in that same REPL turn", prompt)
         self.assertIn("You are the final decision-maker", prompt)
-        self.assertIn("Optional partial-admission metadata", prompt)
+        self.assertIn("Optional point-estimate accounting", prompt)
         for field in (
-            "admitted_tps",
             "achieved_tps",
             "unmet_tps",
             "meets_target",
             "served_fraction",
-            "admission_mode",
+            "prediction_assessment",
             "rank_traffic_share",
         ):
             self.assertIn(field, prompt)
@@ -684,7 +667,7 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertEqual(event["payload"]["surrogate_budget"], budget_status)
         self.assertEqual(event["payload"]["config"]["surrogate_call_budget"], 100)
         self.assertEqual(event["payload"]["config"]["surrogate_lower_quantile"], 0.05)
-        self.assertEqual(event["payload"]["config"]["partial_online_admission"], "off")
+        self.assertEqual(event["payload"]["config"]["partial_online_admission"], "advisory")
         self.assertEqual(event["payload"]["partial_online_admission"], admission_status)
         self.assertNotIn("do-not-log", json.dumps(event))
         self.assertNotIn("api_key", json.dumps(event))

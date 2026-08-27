@@ -173,6 +173,15 @@ def test_aic_backend_forces_direct_method_and_preserves_inputs_scenario_and_fail
     assert primary.calls[0][0] is config
     assert primary.calls[0][1] is features
     assert estimate.metadata["method"] == ["AIC_Direct"]
+    assert estimate.metadata["prediction_semantics"] == {
+        "basis": "aic_direct_point",
+        "throughput_token_per_sec": "point_capacity",
+        "p99_ttft_ms": "base_service_latency",
+        "p99_tpot_ms": "base_service_latency",
+        "slo_margin": "base_service_latency_margin",
+        "queue_model": "none",
+        "queue_slo_verified": False,
+    }
 
     class _Fail(_Primary):
         def compose_prediction(self, *args, **kwargs):
@@ -200,6 +209,7 @@ def test_aic_backend_forces_direct_method_and_preserves_inputs_scenario_and_fail
     assert unsupported.status == "unsupported"
     assert unsupported.metadata["error"] == "no AIC estimate"
     assert unsupported.metadata["compatibility"]["gpu"]["requested"] == "MI300"
+    assert unsupported.metadata["prediction_semantics"]["queue_slo_verified"] is False
 
 
 def test_aic_backend_serializes_stateful_compatibility_metadata():
@@ -357,6 +367,41 @@ def test_unsupported_primary_uses_perfdb_best_effort_in_shadow_mode():
     assert y_hat["p99_ttft_ms"] == 15.0
     assert v_hat["sm_utilization"] == 0.7
     assert trace["metadata"]["fallback_sources"] == ["perfdb"]
+
+
+def test_incomplete_successful_primary_uses_available_fallback_outputs():
+    class IncompletePrimary:
+        name = "primary"
+
+        @staticmethod
+        def provides():
+            return {"throughput_token_per_sec"}
+
+        @staticmethod
+        def estimate(*_args, **_kwargs):
+            return SurrogateEstimate(
+                y_hat={"throughput_token_per_sec": 100.0},
+                status="success",
+                version="aic-v1",
+                source="primary",
+            )
+
+    composer = SurrogateComposer(
+        IncompletePrimary(),
+        perfdb_backend=_PerfDB(),
+        perfdb_mode="shadow",
+        peer_mode="off",
+    )
+
+    y_hat, _, trace = composer.compose_prediction_with_trace(CONFIG, FEATURES, _Graph())
+
+    assert y_hat["throughput_token_per_sec"] == 100.0
+    assert y_hat["p99_ttft_ms"] == 15.0
+    assert y_hat["p99_tpot_ms"] == 2.0
+    assert trace["components"]["fallback"]["status"] == "success"
+    assert trace["metadata"]["fallback_sources"] == ["perfdb"]
+    assert trace["prediction_semantics"]["basis"] == "composed_point_estimate"
+    assert trace["prediction_semantics"]["queue_slo_verified"] is False
 
 
 def test_unsupported_primary_ignores_very_low_coverage_perfdb_values():
@@ -524,6 +569,10 @@ def test_compact_prediction_lineage_excludes_debug_payloads():
         "schema_version": 3,
         "context": {"hard": {"model_id": "model"}},
         "scenario": "peak",
+        "prediction_semantics": {
+            "basis": "aic_direct_point",
+            "queue_slo_verified": False,
+        },
         "compatibility": {
             "primary": {
                 "gpu": {
@@ -538,7 +587,11 @@ def test_compact_prediction_lineage_excludes_debug_payloads():
                 "status": "success",
                 "version": "aic-v1",
                 "y_hat": {"throughput_token_per_sec": 10.0},
-                "metadata": {"large": "debug-only"},
+                "metadata": {
+                    "large": "debug-only",
+                    "error_type": "ExampleError",
+                    "error": "useful failure",
+                },
             }
         },
         "pre_calibration": {"y_hat": {"throughput_token_per_sec": 10.0}},
@@ -552,6 +605,11 @@ def test_compact_prediction_lineage_excludes_debug_payloads():
 
     assert lineage["backends"]["primary"]["version"] == "aic-v1"
     assert lineage["compatibility"]["primary"]["gpu"]["resolved"] == "A30"
+    assert lineage["prediction_semantics"]["queue_slo_verified"] is False
+    assert lineage["backends"]["primary"]["diagnostics"] == {
+        "error_type": "ExampleError",
+        "error": "useful failure",
+    }
     assert "metadata" not in lineage["backends"]["primary"]
     assert "timings_ms" not in lineage
     assert "components" not in lineage

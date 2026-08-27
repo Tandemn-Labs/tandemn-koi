@@ -217,6 +217,23 @@ def env_gpu_type(env) -> str | None:
     return str(env_tuple[ENV_GPU_TYPE_INDEX])
 
 
+def _positive_replica_count(value) -> int:
+    value = 1 if value is None else value
+    if isinstance(value, bool):
+        raise ValueError("rank n_replicas must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("rank n_replicas must be a positive integer") from exc
+    try:
+        exact = float(value) == parsed
+    except (TypeError, ValueError, OverflowError):
+        exact = False
+    if parsed < 1 or not exact:
+        raise ValueError("rank n_replicas must be a positive integer")
+    return parsed
+
+
 @dataclass
 class RankSpec:
     """One rank in a ladder: a role-tagged chain config in one environment.
@@ -284,8 +301,8 @@ class RankSpec:
                 predicted_y = inner.pop("predicted_y", None)
                 predicted_v = inner.pop("predicted_v", None)
                 prediction_lineage = inner.pop("prediction_lineage", None)
-                n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1)) or 1
-                n_rep = int(n_rep_raw)
+                n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1))
+                n_rep = _positive_replica_count(n_rep_raw)
                 return cls(
                     role=only_key,
                     env=_as_env_tuple(env),
@@ -306,11 +323,12 @@ class RankSpec:
         n_rep_raw = (
             raw.get("n_replicas") if raw.get("n_replicas") is not None else raw.get("chains", 1)
         )
+        n_replicas = _positive_replica_count(n_rep_raw)
         return cls(
             role=role,
             env=_as_env_tuple(raw.get("env")),
             config=_strip_engine_knobs(raw.get("config", {})),
-            n_replicas=int(n_rep_raw or 1),
+            n_replicas=n_replicas,
             rank_id=raw.get("rank_id"),
             mechanism_id=raw.get("mechanism_id"),
             chain_id=raw.get("chain_id"),
@@ -377,6 +395,7 @@ class PlanAction:
     meets_target: bool | None = None
     served_fraction: float | None = None
     admission_mode: str | None = None
+    prediction_assessment: dict | None = None
 
     @classmethod
     def from_dict(cls, raw, job_id: str | None = None) -> "PlanAction":
@@ -426,6 +445,7 @@ class PlanAction:
             meets_target=raw.get("meets_target"),
             served_fraction=raw.get("served_fraction"),
             admission_mode=raw.get("admission_mode"),
+            prediction_assessment=raw.get("prediction_assessment"),
             target_p99_ttft_ms=raw.get("target_p99_ttft_ms"),
             target_p99_tpot_ms=raw.get("target_p99_tpot_ms"),
             mechanism_id=raw.get("mechanism_id"),
@@ -470,6 +490,7 @@ class PlanAction:
             "meets_target",
             "served_fraction",
             "admission_mode",
+            "prediction_assessment",
         ):
             value = getattr(self, field_name)
             if value is not None:
