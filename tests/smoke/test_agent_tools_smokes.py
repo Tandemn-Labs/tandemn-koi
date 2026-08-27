@@ -7,7 +7,11 @@ from src.core.candidate_graph import CandidateGraph
 from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import Edge, EdgeMetadata, Mechanism, Node, PlanAction, RankSpec
 from src.infra.resource_map import ClusterResourceSnapshot, ResourceMapManager
-from src.prediction.surrogate import SurrogateExecutionError, SurrogateMemoryNoFit
+from src.prediction.surrogate import (
+    SurrogateExecutionError,
+    SurrogateMemoryNoFit,
+    SurrogateUnsupportedConfig,
+)
 
 
 class _DRO:
@@ -612,7 +616,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
             for name, value in saved_context.items():
                 setattr(agent_tools._CTX, name, value)
 
-    def test_size_ladder_marks_aic_memory_preflight_failure_no_fit(self):
+    def test_size_ladder_marks_aic_memory_preflight_failure_physical_no_fit(self):
         env = "reserved|aws|us-east-1|us-east-1b|H100"
 
         class ResourceMap:
@@ -687,12 +691,174 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 setattr(agent_tools._CTX, name, value)
 
         self.assertEqual(result["ranks"], [])
+        self.assertEqual(result["failure_status"], "physical_no_fit")
         self.assertEqual(result["per_rank"][0]["n_replicas"], 0)
+        self.assertEqual(result["per_rank"][0]["failure_status"], "physical_no_fit")
         self.assertIn(
             "AIC memory preflight no-fit", result["per_rank"][0]["physical_violations"][0]
         )
+        self.assertEqual(
+            agent_tools._online_sizing_rejection(
+                result,
+                {"type": "online", "target_p99_ttft_ms": 100.0},
+            )[0],
+            "physical_no_fit",
+        )
 
-    def test_size_ladder_propagates_surrogate_execution_error(self):
+    def test_size_ladder_keeps_unsupported_prediction_out_of_physical_failures(self):
+        class UnsupportedSurrogate:
+            @staticmethod
+            def compose_prediction(**_kwargs):
+                raise SurrogateUnsupportedConfig("AIC has no supported profile")
+
+        saved_context = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("resource_map", "surrogate", "candidate_graph", "dro")
+        }
+        saved_payload = agent_tools._rank_prediction_payload
+        try:
+            agent_tools.bind_tools(
+                resource_map=_ResourceMap(),
+                surrogate=UnsupportedSurrogate(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
+                "job_config": {},
+                "job_features": {},
+            }
+            features = {
+                "type": "online",
+                "target_p99_ttft_ms": 100.0,
+                "target_p99_tpot_ms": 10.0,
+            }
+            result = agent_tools.size_ladder(
+                [
+                    {
+                        "role": "aggregate",
+                        "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                        "config": {
+                            "instance_type": "p5.48xlarge",
+                            "gpu_count": 1,
+                            "tp": 1,
+                            "pp": 1,
+                        },
+                    }
+                ],
+                features,
+                target_tps=100,
+            )
+        finally:
+            agent_tools._rank_prediction_payload = saved_payload
+            for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertEqual(result["ranks"], [])
+        self.assertEqual(result["failure_status"], "unsupported_prediction")
+        self.assertEqual(result["per_rank"][0]["failure_status"], "unsupported_prediction")
+        self.assertEqual(result["per_rank"][0]["physical_violations"], [])
+        self.assertEqual(
+            result["per_rank"][0]["prediction_failures"],
+            [
+                {
+                    "status": "unsupported_prediction",
+                    "reason": "AIC has no supported profile",
+                }
+            ],
+        )
+        self.assertEqual(
+            agent_tools._online_sizing_rejection(result, features)[0],
+            "unsupported_prediction",
+        )
+
+    def test_score_one_frame_reports_invalid_config_before_prediction(self):
+        result = agent_tools._score_one_frame(
+            "job",
+            "user",
+            "slice",
+            {
+                "role": "aggregate",
+                "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                "config": {
+                    "instance_type": "p5.48xlarge",
+                    "gpu_count": 1,
+                    "tp": 2,
+                    "pp": 1,
+                },
+            },
+            {},
+        )
+
+        self.assertIsNone(result["candidate"])
+        self.assertEqual(result["diag"]["status"], "invalid_config")
+        self.assertIn("tp*pp=2 exceeds gpu_count=1", result["diag"]["reason"])
+
+    def test_size_ladder_reports_no_pool_capacity_without_prediction(self):
+        class EmptyResourceMap(_ResourceMap):
+            def resources_summary(self):
+                resources = super().resources_summary()
+                resources["reserved|aws|us-east-1|use1-az1|H100"]["free"] = 0
+                return resources
+
+        class UnusedSurrogate:
+            @staticmethod
+            def compose_prediction(**_kwargs):
+                raise AssertionError("surrogate should not run without pool capacity")
+
+        saved_context = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("resource_map", "surrogate", "candidate_graph", "dro")
+        }
+        saved_payload = agent_tools._rank_prediction_payload
+        try:
+            agent_tools.bind_tools(
+                resource_map=EmptyResourceMap(),
+                surrogate=UnusedSurrogate(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
+                "job_config": {},
+                "job_features": {},
+            }
+            features = {
+                "type": "online",
+                "target_p99_ttft_ms": 100.0,
+                "target_p99_tpot_ms": 10.0,
+            }
+            result = agent_tools.size_ladder(
+                [
+                    {
+                        "role": "aggregate",
+                        "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                        "config": {
+                            "instance_type": "p5.48xlarge",
+                            "gpu_count": 1,
+                            "tp": 1,
+                            "pp": 1,
+                        },
+                    }
+                ],
+                features,
+                target_tps=100,
+            )
+        finally:
+            agent_tools._rank_prediction_payload = saved_payload
+            for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertEqual(result["ranks"], [])
+        self.assertEqual(result["failure_status"], "no_pool_capacity")
+        self.assertEqual(result["failure_reason"], "no free capacity in pool")
+        self.assertEqual(result["per_rank"][0]["failure_status"], "no_pool_capacity")
+        self.assertEqual(result["per_rank"][0]["prediction_failures"], [])
+        self.assertEqual(result["per_rank"][0]["physical_violations"], [])
+        self.assertEqual(
+            agent_tools._online_sizing_rejection(result, features)[0],
+            "no_pool_capacity",
+        )
+
+    def test_size_ladder_reports_surrogate_execution_error_as_prediction_failed(self):
         class FailingSurrogate:
             @staticmethod
             def compose_prediction(**_kwargs):
@@ -714,20 +880,135 @@ class AgentToolsSmokeTests(unittest.TestCase):
                 "job_config": {},
                 "job_features": {},
             }
-            with self.assertRaisesRegex(SurrogateExecutionError, "database unavailable"):
-                agent_tools.size_ladder(
-                    [
-                        {
-                            "role": "aggregate",
-                            "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
-                            "config": {"instance_type": "p5.48xlarge", "gpu_count": 1},
-                        }
-                    ],
-                    {"type": "online", "target_p99_ttft_ms": 100.0, "target_p99_tpot_ms": 10.0},
-                    target_tps=100,
-                )
+            features = {
+                "type": "online",
+                "target_p99_ttft_ms": 100.0,
+                "target_p99_tpot_ms": 10.0,
+            }
+            result = agent_tools.size_ladder(
+                [
+                    {
+                        "role": "aggregate",
+                        "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                        "config": {"instance_type": "p5.48xlarge", "gpu_count": 1},
+                    }
+                ],
+                features,
+                target_tps=100,
+            )
         finally:
             agent_tools._rank_prediction_payload = saved_payload
+            for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertEqual(result["failure_status"], "prediction_failed")
+        self.assertEqual(result["failure_reason"], "AIC database unavailable")
+        self.assertEqual(result["per_rank"][0]["physical_violations"], [])
+        self.assertEqual(
+            agent_tools._online_sizing_rejection(result, features)[0],
+            "prediction_failed",
+        )
+
+    def test_size_ladder_classifies_unusable_prediction_outputs(self):
+        saved_context = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("resource_map", "surrogate", "candidate_graph", "dro")
+        }
+        saved_payload = agent_tools._rank_prediction_payload
+        saved_predict = agent_tools._predict_outcome_core
+        features = {
+            "type": "online",
+            "target_p99_ttft_ms": 100.0,
+            "target_p99_tpot_ms": 10.0,
+        }
+        try:
+            agent_tools.bind_tools(
+                resource_map=_ResourceMap(),
+                surrogate=object(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            agent_tools._rank_prediction_payload = lambda rank, values, **_kwargs: {
+                "job_config": {},
+                "job_features": {},
+            }
+            cases = (
+                (
+                    {
+                        "y_hat": {},
+                        "prediction_lineage": {
+                            "backends": {
+                                "primary": {
+                                    "status": "failed",
+                                    "metadata": {"error": "AIC runtime unavailable"},
+                                }
+                            }
+                        },
+                    },
+                    "prediction_failed",
+                    "AIC runtime unavailable",
+                ),
+                (
+                    {
+                        "y_hat": {},
+                        "prediction_lineage": {
+                            "backends": {"primary": {"status": "success"}}
+                        },
+                    },
+                    "prediction_empty",
+                    "surrogate prediction returned no Y values",
+                ),
+                (
+                    {"y_hat": {"p99_ttft_ms": 10.0, "p99_tpot_ms": 1.0}},
+                    "prediction_incomplete",
+                    "surrogate prediction omitted throughput_token_per_sec",
+                ),
+                (
+                    {
+                        "y_hat": {
+                            "throughput_token_per_sec": 0.0,
+                            "p99_ttft_ms": 10.0,
+                            "p99_tpot_ms": 1.0,
+                        }
+                    },
+                    "zero_predicted_capacity",
+                    "surrogate predicted unusable throughput 0.0",
+                ),
+            )
+            for prediction, expected_status, expected_reason in cases:
+                with self.subTest(status=expected_status):
+                    agent_tools._predict_outcome_core = (
+                        lambda config, values, result=prediction, **_kwargs: result
+                    )
+                    result = agent_tools.size_ladder(
+                        [
+                            {
+                                "role": "aggregate",
+                                "env": [
+                                    "reserved",
+                                    "aws",
+                                    "us-east-1",
+                                    "use1-az1",
+                                    "H100",
+                                ],
+                                "config": {
+                                    "instance_type": "p5.48xlarge",
+                                    "gpu_count": 1,
+                                },
+                            }
+                        ],
+                        features,
+                        target_tps=100,
+                    )
+                    self.assertEqual(result["failure_status"], expected_status)
+                    self.assertEqual(result["failure_reason"], expected_reason)
+                    self.assertEqual(
+                        agent_tools._online_sizing_rejection(result, features)[0],
+                        expected_status,
+                    )
+        finally:
+            agent_tools._rank_prediction_payload = saved_payload
+            agent_tools._predict_outcome_core = saved_predict
             for name, value in saved_context.items():
                 setattr(agent_tools._CTX, name, value)
 
