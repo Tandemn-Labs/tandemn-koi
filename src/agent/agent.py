@@ -38,9 +38,11 @@ v0 scope: reserved market only; K_P = 1 (code supports more).
 """
 
 import contextlib
+import copy
 import io
 import json
 import logging
+import math
 import re
 import time
 import traceback
@@ -50,12 +52,15 @@ from typing import Any
 
 import src.agent.tools.agent_tools as agent_tools
 from src.config.hyperparameters import K_MAX, K_P
+from src.config.policy import SUPPORTED_EP
 from src.core.models import (
     LADDER_ACTIONS,
     REQUIRED_JOB_STATE,
     ActionType,
     Plan,
     PlanAction,
+    deployment_ladder_identity,
+    env_gpu_type,
 )
 from src.infra.deployment_x import materialize_launch_config
 
@@ -191,11 +196,11 @@ class RLMRuntime:
 class SpecialistRunner:
     """Run bounded per-job specialists under validated BudgetSlices.
 
-    A specialist is one LLM call that optimizes a single job inside its
-    BudgetSlice and returns a JobSpecialistResult dict. Results are
+    A specialist gets at most two total LLM calls to optimize one job inside
+    its BudgetSlice and return a JobSpecialistResult dict. Results are
     validated deterministically: schema, capacity within slice, legal
-    fitness value. One retry with the violation message; then a safe
-    keep/defer fallback for that job.
+    fitness value. One correction attempt follows any rejected response;
+    then the job receives a safe keep/defer fallback.
 
     The harness binds an instance into agent_tools at construction so
     the root can call run_job_specialists from its REPL.
@@ -215,85 +220,54 @@ class SpecialistRunner:
     def _default_prompt(job_id: str, slice_: dict[str, Any], brief: dict[str, Any]) -> str:
         return (
             f"You are the bounded specialist for job {job_id}.\n"
-            "You are not the cluster planner. You do not own resource "
-            "allocation. You must stay inside the BudgetSlice.\n\n"
-            f"BudgetSlice:\n{json.dumps(slice_, indent=2, default=str)}\n\n"
-            f"Job brief:\n{json.dumps(brief, indent=2, default=str)}\n\n"
-            "OBJECTIVE - what 'best' MEANS here. The best frame SERVES this "
-            "workload: it sustains the workload's REQUIRED THROUGHPUT (the "
-            "tokens/sec implied by the brief - arrival rate x output length for "
-            "online, or token budget / deadline for batch) AND meets its latency "
-            "SLOs, at the best value. A frame that merely fits the model in memory "
-            "and clears the (often loose) latency SLO is NOT sufficient if it "
-            "cannot sustain the required throughput - that is UNDER-served. Do NOT "
-            "optimize for the smallest GPU footprint, and do NOT conserve a "
-            "'premium' GPU type for its own sake.\n\n"
-            "CHOOSING THE GPU TYPE. Judge by value-to-target, not by whether the "
-            "model merely fits. For each GPU type in the brief, reason from ITS "
-            "listed characteristics (memory, bandwidth, compute) and THIS model's "
-            "size/shape how many GPUs it would take to sustain the required "
-            "throughput within the latency SLO. A faster type often needs fewer "
-            "GPUs for the same target and can be the better VALUE even at a higher "
-            "unit price; a cheaper type can win when it still clears the target. "
-            "Let the objective weights (throughput/latency vs cost) define 'value' "
-            "- do not apply a fixed preference for any tier. Never avoid a type to "
-            "'save it': the planner owns scarcity and reassigns under contention, "
-            "so propose the type you genuinely believe serves this job best.\n\n"
-            "Task:\n"
-            "1. Explore candidate ladders internally, then return the single best one inside the budget.\n"
-            "2. Choose existing mechanisms or propose a new valid mechanism.\n"
-            "3. Estimate predicted_y and predicted_sigma.\n"
-            "4. Report exact budget utilization as a FLAT dict keyed by "
-            "canonical 5-part env: {env_key: {used, budgeted, fraction}}. Do "
-            "NOT nest it under 'pool' or an instance type.\n"
-            "5. Report fitness as starved, happy, overprovisioned, or blocked.\n"
-            "6. If starved, give marginal value of more capacity by env.\n"
-            "7. If overprovisioned, give unused capacity by env.\n\n"
-            "Do not exceed budget. If you want more, report it as fitness, "
-            "not as allocated ladder demand.\n\n"
-            "Mechanism IDs are opaque Store IDs: prefer exact entries in "
-            "mechanism_candidates, then partial entries. "
-            "If none fits, submit new_mechanism_proposals without inventing an ID.\n\n"
-            "Your output is a PROPOSAL to the root cluster planner, not a "
-            "decision. The root may accept, modify, or discard it during "
-            "cluster-level reconciliation. Do not reason about other jobs "
-            "or cluster tradeoffs - that is the root's job, and you cannot "
-            "see the information needed to do it.\n\n"
-            "type must be one of: place, keep, swap, defer. You CANNOT "
-            "terminate or diagnose - those are root-only. "
-            "Preempt/resume/retry are disabled in MVP v0. If no "
-            "safe ladder fits the budget, return keep (running job) or "
-            "defer (waiting job) and report fitness=starved or blocked.\n\n"
-            "Output a single JSON object with keys: job_id, user_id, "
-            "type, ladder, predicted_y, predicted_sigma, "
-            "budget_utilization, used_capacity, fitness, "
-            "marginal_value_of_more, unused_capacity, mechanism_ids (multiple mechanisms are allowed), "
-            "new_mechanism_proposals, reasoning. No prose outside the JSON. "
-            "Env keys MUST be canonical 5-part labels including market: "
-            "market|cloud|region|zone|gpu_type - copy the exact 5-part env values "
-            "from the brief's resource map / instance_catalog; never omit market. "
-            "Ladder entries MUST be canonical rank dicts: "
-            "{'role':'aggregate','env':[market,cloud,region,zone,gpu_type],"
-            "'config':{'instance_type':str,'gpu_count':int,'tp':int,'pp':int,"
-            "'sp':int,'ep':int,'cp':int},'n_replicas':int,'mechanism_id':'M_...'}. "
-            "You may ONLY set placement (instance_type), parallelism "
-            "(tp/pp/sp/ep/cp), and n_replicas. Do NOT set engine_name, "
-            "engine_version, router_policy, scheduling_policy, preemption_policy, "
-            "weight/kvcache dtype, quantization, prefix/chunked-prefill flags, "
-            "gpu_mem_util, kv_transfer_method, or any max_num_*/block_size - the "
-            "engine/catalog owns those and Koi drops them if you set them. "
-            "Do not emit shorthand ladder entries like {'env': ..., 'count': ...}. "
-            "You do NOT need config.gpu_type or config.model_id - Koi derives "
-            "gpu_type from env[4] and model_id from the job; you may omit them.\n\n"
-            "SIZING THE INSTANCE. The brief's instance_catalog lists, per env, each "
-            "instance_type with its gpus_per_instance and free_instances. "
-            "config.gpu_count is the GPUs used per replica on ONE instance and MUST "
-            "be <= that instance_type's gpus_per_instance (raise num_nodes_per_chain "
-            "only to span several instances). Match the instance to your "
-            "parallelism: for tp*pp = N pick an instance_type whose gpus_per_instance "
-            ">= N, not a smaller one you then have to span across nodes. The UNIT "
-            "counts in pool_budget are how many whole instances are free - that is "
-            "NOT the GPUs per instance; read gpus_per_instance from instance_catalog."
+            "Return one job-level proposal inside its BudgetSlice; the root owns "
+            "cluster allocation and the final decision.\n"
+            f"BudgetSlice: {json.dumps(slice_, separators=(',', ':'), default=str)}\n"
+            f"Job brief: {json.dumps(brief, separators=(',', ':'), default=str)}\n\n"
+            "Choose the best-value physically launchable frame. Direct predictions "
+            "provide point capacity and base service latency, not queue-inclusive "
+            "p99 guarantees. Compare the listed GPU types using their memory, "
+            "bandwidth, compute, instance size, and cost; do not choose merely the "
+            "smallest frame that fits or reserve premium GPUs for other jobs. Explain "
+            "the target, GPU/instance, parallelism, replicas, and fitness briefly.\n\n"
+            "The Job brief's placement_policy is a hard baseline constraint: use only "
+            "the listed TP degrees for a matching model/GPU pair. Its precision is "
+            "catalog-owned; do not invent engine or dtype overrides.\n\n"
+            "Constraints:\n"
+            "- type is place, keep, swap, or defer. Do not defer a physically valid "
+            "frame solely because prediction coverage is unavailable; the root will "
+            "classify and arbitrate that uncertainty.\n"
+            "- Never exceed the slice. Report fitness as starved, happy, "
+            "overprovisioned, or blocked.\n"
+            "- used_capacity, unused_capacity, marginal_value_of_more, and "
+            "budget_utilization must always be JSON objects. Use {} when a map is not "
+            "applicable. Every nonempty key must be a canonical "
+            "market|cloud|region|zone|gpu_type env.\n"
+            "- Mechanism IDs are opaque: use exact mechanism_candidates first, then "
+            "partial matches. If none applies, propose one without inventing an ID.\n"
+            "- Every ladder rank's mechanism_id must also appear in the top-level "
+            "mechanism_ids list.\n"
+            "- Every env is [market,cloud,region,zone,gpu_type]. Every ladder rank is "
+            "{'role':'aggregate','env':[...],'config':{'instance_type':str,"
+            "'gpu_count':int,'tp':int,'pp':int,'sp':int,'cp':int},"
+            "'n_replicas':int,'mechanism_id':'M_...'}. Do not use shorthand ranks.\n"
+            "- Ladder ranks are simultaneous deployment components, not alternatives. "
+            "For place or swap, return exactly one ladder rank; the deterministic "
+            "candidate builder owns alternatives and composites.\n"
+            "- gpu_count, tp, pp, and n_replicas are positive integers. gpu_count must "
+            "equal tp*pp exactly. EP is unsupported in this version; omit it and Koi "
+            "will fix it to 1. "
+            "The engine demand must fit gpus_per_instance unless "
+            "num_nodes_per_chain spans multiple instances. pool_budget counts whole "
+            "instances, not GPUs.\n"
+            "- Set only instance_type, parallelism, optional num_nodes_per_chain/"
+            "interconnect_type, and replicas. Omit model_id/gpu_type (derived) and "
+            "all engine, dtype, quantization, cache, batching, routing, and scheduling knobs.\n\n"
+            "Output only one JSON object with keys: job_id, user_id, type, ladder, "
+            "budget_utilization, used_capacity, fitness, marginal_value_of_more, "
+            "unused_capacity, mechanism_ids, new_mechanism_proposals, reasoning. "
+            "For starved fitness report marginal capacity by canonical env; for "
+            "overprovisioned fitness report unused capacity by canonical env."
         )
 
     def run_many(
@@ -337,45 +311,27 @@ class SpecialistRunner:
         prompt = self.prompt_builder(job_id, slice_, brief)
         messages = [{"role": "user", "content": prompt}]
 
-        content_attempts = 0
-        empty_retries = 0
-        max_content_attempts = 2
-        max_empty_retries = 2
         last_rejected_result: dict[str, Any] | None = None
         last_rejected_violations: list[str] = []
-        while content_attempts < max_content_attempts:
+        for attempt in range(2):
             try:
                 response = self.llm.complete(messages)
             except Exception:
                 log.exception("specialist LLM call failed for %s", job_id)
                 break
             if not (response or "").strip():
-                # Empty completion (usually reasoning-token exhaustion). Retry
-                # with a firmer instruction WITHOUT spending a content attempt,
-                # so an empty first reply does not consume the only real retry.
-                if empty_retries >= max_empty_retries:
-                    break
-                empty_retries += 1
-                self.trace.add("specialist_empty_response", job_id=job_id)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "You returned empty output. Respond with ONLY the "
-                            "single JSON object described above - no reasoning "
-                            "or prose outside the JSON."
-                        ),
-                    }
-                )
-                continue
-            result = self._parse_json(response)
-            if isinstance(result, dict):
-                self._backfill_derived_fields(result, brief)
-            violations = self._validate(result, job_id, slice_)
+                result = None
+                violations = ["response was empty"]
+                self.trace.add("specialist_empty_response", job_id=job_id, attempt=attempt + 1)
+            else:
+                result = self._parse_json(response)
+                if isinstance(result, dict):
+                    self._backfill_derived_fields(result, brief)
+                violations = self._validate(result, job_id, slice_)
             self.trace.add(
                 "specialist_result",
                 job_id=job_id,
-                attempt=content_attempts,
+                attempt=attempt + 1,
                 violations=violations,
             )
             if not violations:
@@ -384,18 +340,19 @@ class SpecialistRunner:
             if isinstance(result, dict):
                 last_rejected_result = result
                 last_rejected_violations = list(violations)
-            content_attempts += 1
-            messages.append({"role": "assistant", "content": response})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Your output was rejected: "
-                        + "; ".join(violations)
-                        + ". Emit a corrected JSON object only."
-                    ),
-                }
-            )
+            if attempt == 0:
+                if response:
+                    messages.append({"role": "assistant", "content": response})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Rejected: "
+                            + "; ".join(violations)
+                            + ". Return one corrected JSON object only."
+                        ),
+                    }
+                )
 
         is_active = brief.get("current_ladder") is not None
         fallback: dict[str, Any] = {
@@ -403,8 +360,6 @@ class SpecialistRunner:
             "user_id": slice_.get("user_id"),
             "type": "keep" if is_active else "defer",
             "ladder": [],
-            "predicted_y": {},
-            "predicted_sigma": 0.0,
             "budget_utilization": {},
             "used_capacity": {},
             "fitness": "blocked",
@@ -422,13 +377,31 @@ class SpecialistRunner:
 
     @staticmethod
     def _backfill_derived_fields(result: dict[str, Any], brief: dict[str, Any]) -> None:
-        """Fill rank-config fields Koi derives, so the specialist need not emit them.
+        """Fill deterministic fields the specialist may safely omit.
 
         gpu_type comes from env[4]; model_id from the job brief. Downstream
         (deployment_x, the surrogate) derives these regardless; backfilling
         keeps the committed rank config self-describing and lets validation
         pass without asking a weak model for redundant, error-prone fields.
+        Missing diagnostic maps default to empty objects. A sole valid top-level
+        mechanism id is unambiguous, so ranks may inherit it.
         """
+        for field in (
+            "used_capacity",
+            "unused_capacity",
+            "marginal_value_of_more",
+            "budget_utilization",
+        ):
+            if field not in result:
+                result[field] = {}
+
+        mechanism_ids = result.get("mechanism_ids")
+        sole_mechanism_id = None
+        if isinstance(mechanism_ids, list) and len(mechanism_ids) == 1:
+            candidate = mechanism_ids[0]
+            if isinstance(candidate, str) and candidate.strip():
+                sole_mechanism_id = candidate
+
         model_id = ((brief or {}).get("job_features") or {}).get("model_id")
         ladder = result.get("ladder")
         if not isinstance(ladder, list):
@@ -436,6 +409,8 @@ class SpecialistRunner:
         for rank in ladder:
             if not isinstance(rank, dict):
                 continue
+            if sole_mechanism_id is not None and "mechanism_id" not in rank:
+                rank["mechanism_id"] = sole_mechanism_id
             config = rank.get("config")
             if not isinstance(config, dict):
                 continue
@@ -486,12 +461,13 @@ class SpecialistRunner:
             "marginal_value_of_more",
             "budget_utilization",
         ):
-            value = result.get(field) or {}
+            value = result.get(field)
             if not isinstance(value, dict):
                 violations.append(f"{field} must be a dict keyed by canonical env")
                 continue
             for env in value:
-                if len(agent_tools._env_key(env).split("|")) != 5:
+                parts = env.split("|") if isinstance(env, str) else []
+                if len(parts) != 5 or any(not part.strip() for part in parts):
                     violations.append(
                         f"{field} env {env!r} must be market|cloud|region|zone|gpu_type"
                     )
@@ -501,9 +477,19 @@ class SpecialistRunner:
         if action_name in (ActionType.PLACE.value, ActionType.SWAP.value):
             if not isinstance(mechanism_ids, list) or not mechanism_ids:
                 violations.append(f"{action_name} requires non-empty mechanism_ids")
+            elif any(
+                not isinstance(mechanism_id, str) or not mechanism_id.strip()
+                for mechanism_id in mechanism_ids
+            ):
+                violations.append("mechanism_ids must contain non-empty strings")
             if not isinstance(ladder, list) or not ladder:
                 violations.append(f"{action_name} requires non-empty canonical ladder")
             else:
+                if len(ladder) != 1:
+                    violations.append(
+                        f"{action_name} must return exactly one ladder rank; "
+                        "ladder ranks are simultaneous deployment components"
+                    )
                 for i, rank in enumerate(ladder):
                     violations.extend(
                         SpecialistRunner._validate_rank_schema(
@@ -594,6 +580,25 @@ class SpecialistRunner:
             value = config.get(key)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 violations.append(f"{prefix}.config.{key} must be a positive int")
+        ep = config.get("ep", SUPPORTED_EP)
+        if type(ep) is not int or ep != SUPPORTED_EP:
+            violations.append(f"{prefix}.config.ep must be exactly {SUPPORTED_EP}")
+        gpu_count = config.get("gpu_count")
+        tp = config.get("tp")
+        pp = config.get("pp")
+        if (
+            isinstance(gpu_count, int)
+            and not isinstance(gpu_count, bool)
+            and isinstance(tp, int)
+            and not isinstance(tp, bool)
+            and isinstance(pp, int)
+            and not isinstance(pp, bool)
+        ):
+            expected_gpu_count = tp * pp
+            if gpu_count != expected_gpu_count:
+                violations.append(
+                    f"{prefix}.config.gpu_count must equal tp*pp={expected_gpu_count}"
+                )
 
         replicas = rank.get("n_replicas")
         if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas <= 0:
@@ -601,7 +606,9 @@ class SpecialistRunner:
         mechanism_id = rank.get("mechanism_id")
         if not mechanism_id:
             violations.append(f"{prefix}.mechanism_id is required")
-        elif mechanism_ids and mechanism_id not in mechanism_ids:
+        elif not isinstance(mechanism_id, str):
+            violations.append(f"{prefix}.mechanism_id must be a non-empty string")
+        elif not isinstance(mechanism_ids, list) or mechanism_id not in mechanism_ids:
             violations.append(f"{prefix}.mechanism_id must be present in mechanism_ids")
         return violations
 
@@ -712,7 +719,7 @@ class KoiAgentHarness:
 
         Runs K_P independent trajectories, pre-screens each plan with the
         bound validator when available, scores survivors with
-        agent_tools.compute_sigma, and returns the best plan. Returns the
+        agent_tools.compute_sigma_for_commit, and returns the best plan. Returns the
         keep-all/defer-pending fallback when no trajectory produces a
         usable plan.
 
@@ -779,6 +786,9 @@ class KoiAgentHarness:
                 except Exception:
                     log.exception("pre-screen validation failed; passing plan to S5")
             score = self._score_plan(plan)
+            if score is None:
+                self.trace.add("kp_candidate_unscorable", k_idx=k_idx, score=None)
+                continue
             self.trace.add("kp_candidate_scored", k_idx=k_idx, score=score)
             candidates.append((score, plan))
 
@@ -830,21 +840,31 @@ class KoiAgentHarness:
         """
         self._current_tick = tick
         runtime = RLMRuntime(stdout_limit=self.stdout_limit, trace=self.trace)
-        # Capture the LLM's OWN jointly_select_placements result (side-effect-free)
-        # so the commit-time placement floor can hold the committed plan to at least
-        # what the solver handed it - without recomputing the pipeline or mutating
-        # _CTX. This is the net for the observed weak-root failure: solver returns
-        # chosen placements, then the root commits all-defer with rationale=null.
+        # Capture the root's jointly_select_placements recommendation (side-effect-free)
+        # so the commit-time placement floor can restore accidentally omitted choices
+        # without recomputing the pipeline or mutating _CTX.
         callables = agent_tools.all_callables()
         _orig_joint = callables.get("jointly_select_placements")
         if callable(_orig_joint):
 
             def _joint_capture(*a, __orig=_orig_joint, __rt=runtime, **kw):
                 result = __orig(*a, **kw)
-                __rt.last_joint = result
+                __rt.last_joint = copy.deepcopy(result)
                 return result
 
             callables["jointly_select_placements"] = _joint_capture
+        _orig_plan_tick = callables.get("plan_tick")
+        if callable(_orig_plan_tick):
+
+            def _plan_tick_capture(*a, __orig=_orig_plan_tick, __rt=runtime, **kw):
+                result = __orig(*a, **kw)
+                if isinstance(result, dict):
+                    __rt.last_joint = {
+                        "chosen": copy.deepcopy(result.get("actions") or []),
+                    }
+                return result
+
+            callables["plan_tick"] = _plan_tick_capture
         runtime.bind(
             cluster_snapshot=cluster_snapshot,
             state=cluster_snapshot,
@@ -926,9 +946,31 @@ class KoiAgentHarness:
             )
             history = self._compact_history(history)
 
+        final = runtime.final_value
+        if final is not None:
+            return self._try_materialize(final, cluster_snapshot, runtime.last_joint)
+
         leftover = runtime.namespace.get("plan")
         if leftover is not None:
             return self._try_materialize(leftover, cluster_snapshot, runtime.last_joint)
+
+        last_joint = runtime.last_joint
+        chosen = last_joint.get("chosen") if isinstance(last_joint, dict) else None
+        if isinstance(chosen, list) and chosen:
+            raw_plan = {
+                "tick_rationale": (
+                    "Root turn limit ended before the root finalized a plan; its last "
+                    "joint recommendation was salvaged."
+                ),
+                "actions": copy.deepcopy(chosen),
+            }
+            self.trace.add(
+                "joint_recommendation_salvaged",
+                tick=tick,
+                k_idx=k_idx,
+                action_count=len(chosen),
+            )
+            return self._try_materialize(raw_plan, cluster_snapshot, last_joint)
         return None
 
     def _compact_history(self, history: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -959,16 +1001,18 @@ class KoiAgentHarness:
     # Plan materialization and fallback
     # ------------------------------------------------------------------
 
-    def _try_materialize(self, raw_plan, cluster_snapshot, baseline_joint=None) -> Plan | None:
+    def _try_materialize(
+        self, raw_plan, cluster_snapshot, joint_recommendation=None
+    ) -> Plan | None:
         """Materialize a raw plan into a typed Plan, None when malformed."""
         try:
-            return self.materialize_plan(raw_plan, cluster_snapshot, baseline_joint)
+            return self.materialize_plan(raw_plan, cluster_snapshot, joint_recommendation)
         except (PlanMaterializationError, ValueError) as exc:
             self.trace.add("plan_materialization_failed", reason=str(exc))
             log.warning("plan materialization failed: %s", exc)
             return None
 
-    def materialize_plan(self, raw_plan, cluster_snapshot, baseline_joint=None) -> Plan:
+    def materialize_plan(self, raw_plan, cluster_snapshot, joint_recommendation=None) -> Plan:
         """Parse and validate the LLM's committed plan into a typed Plan.
 
         Parsing (Plan.from_raw) accepts the Plan-shaped dict, a plain
@@ -1006,6 +1050,11 @@ class KoiAgentHarness:
         self._materialize_launch_configs(plan, cluster_snapshot)
         states = self._job_states(cluster_snapshot)
         book = agent_tools._CTX.validated_budget_book
+        trusted_joint = {
+            str(candidate.get("job_id")): candidate
+            for candidate in (joint_recommendation or {}).get("chosen", [])
+            if isinstance(candidate, dict) and candidate.get("job_id")
+        }
 
         seen: set = set()
         for action in plan.actions:
@@ -1027,16 +1076,23 @@ class KoiAgentHarness:
                     )
 
             if action.type in LADDER_ACTIONS:
-                self._validate_ladder(action, book, cluster_snapshot)
+                self._validate_ladder(
+                    action,
+                    book,
+                    cluster_snapshot,
+                    trusted_candidate=trusted_joint.get(jid),
+                )
 
         if states is not None:
             self._autofill_coverage(plan, states)
-            # Placement floor: never SILENTLY discard a placement the solver found.
+            # Placement floor: never silently discard a recommended placement.
             # Wrapped so a floor failure can only no-op (today's behavior), never
             # break the commit.
-            if baseline_joint:
+            if joint_recommendation:
                 try:
-                    self._apply_placement_floor(plan, states, baseline_joint, cluster_snapshot)
+                    self._apply_placement_floor(
+                        plan, states, joint_recommendation, cluster_snapshot
+                    )
                 except Exception as exc:
                     log.warning("placement floor skipped (error): %s", exc)
 
@@ -1063,13 +1119,177 @@ class KoiAgentHarness:
                     continue
                 rank.config.update(materialize_launch_config(catalog, rank.env[4]))
 
-    def _validate_ladder(self, action: PlanAction, book, cluster_snapshot=None) -> None:
+    def _validate_ladder(
+        self,
+        action: PlanAction,
+        book,
+        cluster_snapshot=None,
+        trusted_candidate: dict[str, Any] | None = None,
+    ) -> None:
         """Validate a ladder-bearing action; raise on hard violations."""
         jid = action.job_id
         if action.ladder is None:
             raise PlanMaterializationError(f"job {jid}: {action.type.value} requires a ladder")
         if not action.ladder:
             raise PlanMaterializationError(f"job {jid}: ladder is empty")
+
+        descriptor = None
+        if cluster_snapshot is not None:
+            for accessor in ("active_jobs_summary", "pending_jobs_summary"):
+                if not hasattr(cluster_snapshot, accessor):
+                    continue
+                descriptor = next(
+                    (
+                        job
+                        for job in getattr(cluster_snapshot, accessor)() or []
+                        if str(job.get("job_id", job.get("id"))) == jid
+                    ),
+                    descriptor,
+                )
+        if action.type == ActionType.PLACE and descriptor is not None:
+            deployment_status = descriptor.get("deployment_status")
+            if deployment_status == "deployment_pending":
+                raise PlanMaterializationError(
+                    f"job {jid}: prior placement is still deployment_pending"
+                )
+            if deployment_status == "deployment_not_materialized":
+                if descriptor.get("deployment_retry_allowed") is not True:
+                    reason = (
+                        "deployment retry limit reached"
+                        if descriptor.get("deployment_retry_exhausted") is True
+                        else "deployment retry backoff has not elapsed"
+                    )
+                    raise PlanMaterializationError(f"job {jid}: {reason}")
+                submitted_identity = deployment_ladder_identity(
+                    rank.to_dict() for rank in action.ladder
+                )
+                attempted = descriptor.get("attempted_deployment_identities") or []
+                if any(submitted_identity == identity for identity in attempted):
+                    raise PlanMaterializationError(
+                        f"job {jid}: retry must use a different deployment shape"
+                    )
+        if action.type == ActionType.SWAP:
+            health = (descriptor or {}).get("health") or {}
+            if health.get("rehabilitation_eligible") is not True:
+                raise PlanMaterializationError(
+                    f"job {jid}: SWAP requires deterministic rehabilitation eligibility"
+                )
+            trusted_shapes = [
+                agent_tools._rank_shape_key(rank)
+                for rank in (trusted_candidate or {}).get("ladder") or []
+                if isinstance(rank, dict)
+            ]
+            submitted_shapes = [
+                agent_tools._rank_shape_key(rank.to_dict()) for rank in action.ladder
+            ]
+            if (trusted_candidate or {}).get(
+                "type"
+            ) != "swap" or trusted_shapes != submitted_shapes:
+                raise PlanMaterializationError(
+                    f"job {jid}: SWAP must match a jointly selected rehabilitation candidate"
+                )
+            if (descriptor or {}).get("deployment_action_type") == "swap" and (
+                descriptor or {}
+            ).get("deployment_status") in {
+                "deployment_pending",
+                "deployment_not_materialized",
+            }:
+                if (descriptor or {}).get("deployment_retry_allowed") is not True:
+                    raise PlanMaterializationError(
+                        f"job {jid}: prior SWAP is pending, in backoff, or exhausted"
+                    )
+                submitted_identity = deployment_ladder_identity(
+                    rank.to_dict() for rank in action.ladder
+                )
+                attempted = (descriptor or {}).get("attempted_deployment_identities") or []
+                if any(submitted_identity == identity for identity in attempted):
+                    raise PlanMaterializationError(
+                        f"job {jid}: SWAP retry must use a different deployment shape"
+                    )
+            action.rehabilitation_status = health.get("status")
+            action.rehabilitation_reasons = list(health.get("reasons") or [])
+
+        trusted_service_class = (trusted_candidate or {}).get("service_class")
+        if trusted_service_class is not None and action.service_class != trusted_service_class:
+            raise PlanMaterializationError(
+                f"job {jid}: service_class must match the jointly selected candidate"
+            )
+
+        assessment = action.prediction_assessment
+        if assessment is not None:
+            if not isinstance(assessment, dict):
+                raise PlanMaterializationError(f"job {jid}: prediction_assessment must be a dict")
+            if assessment.get("basis") not in agent_tools._POINT_PREDICTION_BASES:
+                raise PlanMaterializationError(
+                    f"job {jid}: unsupported prediction assessment basis"
+                )
+            kind = assessment.get("kind")
+            status = assessment.get("status")
+            if kind == "exploratory" and status not in agent_tools._SOFT_PREDICTION_FAILURES:
+                raise PlanMaterializationError(
+                    f"job {jid}: {status!r} is not an exploratory prediction status"
+                )
+            if kind == "exploratory" and action.type != ActionType.PLACE:
+                raise PlanMaterializationError(
+                    f"job {jid}: exploratory prediction is supported only for PLACE"
+                )
+            if kind == "point" and status != "success":
+                raise PlanMaterializationError(
+                    f"job {jid}: point prediction status must be 'success'"
+                )
+            if kind not in {"point", "exploratory"}:
+                raise PlanMaterializationError(
+                    f"job {jid}: prediction assessment kind must be point or exploratory"
+                )
+            if assessment.get("queue_slo_verified") is not False:
+                raise PlanMaterializationError(
+                    f"job {jid}: Direct prediction cannot claim queue SLO verification"
+                )
+            if assessment.get("selection_mode") in {"work_conserving", "emergency_recovery"}:
+                trusted_assessment = (trusted_candidate or {}).get("prediction_assessment") or {}
+                trusted_ladder = (trusted_candidate or {}).get("ladder") or []
+                submitted_shapes = [
+                    agent_tools._rank_shape_key(rank.to_dict()) for rank in action.ladder
+                ]
+                trusted_shapes = [
+                    agent_tools._rank_shape_key(rank)
+                    for rank in trusted_ladder
+                    if isinstance(rank, dict)
+                ]
+                accounting_fields = (
+                    "type",
+                    "user_id",
+                    "target_tps",
+                    "target_p99_ttft_ms",
+                    "target_p99_tpot_ms",
+                    "admitted_tps",
+                    "achieved_tps",
+                    "unmet_tps",
+                    "meets_target",
+                    "served_fraction",
+                    "admission_mode",
+                    "point_capacity_covers_target",
+                    "base_latency_within_target",
+                    "queue_state",
+                    "queue_slo_verified",
+                    "keep_baseline_sigma",
+                    "swap_gain_over_keep",
+                    "service_class",
+                    "mechanism_id",
+                    "budget_ref",
+                )
+                submitted_action = action.to_dict()
+                if (
+                    assessment != trusted_assessment
+                    or submitted_shapes != trusted_shapes
+                    or any(
+                        submitted_action.get(field) != (trusted_candidate or {}).get(field)
+                        for field in accounting_fields
+                    )
+                ):
+                    raise PlanMaterializationError(
+                        f"job {jid}: fallback status must come from the joint solver"
+                    )
 
         try:
             PlanAction.assign_rank_ids(jid, action.ladder)
@@ -1098,6 +1318,11 @@ class KoiAgentHarness:
                 raise PlanMaterializationError(
                     f"job {jid} rank {i}: unknown mechanism_id {rank.mechanism_id!r}"
                 ) from None
+            runnable, policy_reason = agent_tools.config_runnable(
+                dict(rank.config), job_features, gpu_type=env_gpu_type(rank.env)
+            )
+            if not runnable:
+                raise PlanMaterializationError(f"job {jid} rank {i}: {policy_reason}")
             context = agent_tools._rank_mechanism_context(rank, job_features)
             match = registry.match_scope(mechanism, context)
             if match["quality"] == "reject":
@@ -1141,59 +1366,76 @@ class KoiAgentHarness:
             )
 
     def _apply_placement_floor(
-        self, plan: Plan, states: dict[str, str], baseline_joint, cluster_snapshot
+        self, plan: Plan, states: dict[str, str], joint_recommendation, cluster_snapshot
     ) -> None:
-        """Never SILENTLY discard a placement the solver already found.
+        """Never silently discard a PLACE or SWAP in the joint recommendation.
 
-        The floor: a waiting job the plan defers WITHOUT a rationale is treated as a
-        fumbled commit - the observed weak-root failure, where the solver returned
-        chosen placements and the root then committed all-defer with rationale=null.
-        Such a job is back-filled from ``baseline_joint`` - the LLM's OWN last
-        jointly_select_placements result this trajectory - so the committed plan
-        serves at least what the solver handed it. This does NOT cap agency:
+        A waiting DEFER or running KEEP without rationale is treated as a fumbled
+        commit when the joint solver selected a corresponding PLACE or SWAP. This
+        does not cap root agency:
 
-          - A DEFER that carries an explicit rationale is an intentional
-            domain-knowledge call (e.g. saving capacity for an incoming job) and is
-            left untouched.
-          - The LLM may place MORE than the solver's baseline (enriched candidates);
-            the floor only prevents serving strictly FEWER by accident.
+          - A DEFER/KEEP carrying an explicit rationale is intentional and remains.
+          - The root may otherwise accept or adjust the recommendation; the floor
+            only repairs an unexplained no-op.
           - No recompute and no _CTX mutation - we reuse the result the LLM already
             produced, so there are no pipeline side effects at commit time.
         """
-        chosen = (baseline_joint or {}).get("chosen") or []
+        chosen = (joint_recommendation or {}).get("chosen") or []
         if not chosen:
             return
         unexplained_ids = {
             a.job_id
             for a in plan.actions
-            if a.type == ActionType.DEFER
-            and states.get(a.job_id) == "waiting"
+            if (
+                (a.type == ActionType.DEFER and states.get(a.job_id) == "waiting")
+                or (a.type == ActionType.KEEP and states.get(a.job_id) == "running")
+            )
             and not str(getattr(a, "rationale", "") or "").strip()
         }
         if not unexplained_ids:
             return
-        baseline_plan = Plan.from_raw(chosen, tick=self._current_tick)
+        recommended_plan = Plan.from_raw(chosen, tick=self._current_tick)
+        self._materialize_launch_configs(recommended_plan, cluster_snapshot)
         book = agent_tools._CTX.validated_budget_book
-        baseline_by_job = {
+        raw_by_job = {
+            str(candidate.get("job_id")): candidate
+            for candidate in chosen
+            if isinstance(candidate, dict) and candidate.get("job_id")
+        }
+        recommended_by_job = {
             a.job_id: a
-            for a in baseline_plan.actions
+            for a in recommended_plan.actions
             if a.type in LADDER_ACTIONS and a.job_id in unexplained_ids
         }
-        if not baseline_by_job:
+        if not recommended_by_job:
             return
         patched: list = []
         filled: list = []
         for a in plan.actions:
-            repl = baseline_by_job.get(a.job_id) if a.type == ActionType.DEFER else None
+            candidate = recommended_by_job.get(a.job_id)
+            repl = (
+                candidate
+                if candidate is not None
+                and (
+                    (a.type == ActionType.DEFER and candidate.type == ActionType.PLACE)
+                    or (a.type == ActionType.KEEP and candidate.type == ActionType.SWAP)
+                )
+                else None
+            )
             if repl is None:
                 patched.append(a)
                 continue
             try:
-                self._validate_ladder(repl, book, cluster_snapshot)
+                self._validate_ladder(
+                    repl,
+                    book,
+                    cluster_snapshot,
+                    trusted_candidate=raw_by_job.get(a.job_id),
+                )
             except PlanMaterializationError as exc:
-                # Baseline placement no longer validates (rare) - keep the defer.
+                # The recommended placement no longer validates (rare) - keep the defer.
                 log.warning(
-                    "placement floor: baseline placement for %s failed validation, "
+                    "placement floor: recommended placement for %s failed validation, "
                     "leaving deferred: %s",
                     a.job_id,
                     exc,
@@ -1206,8 +1448,8 @@ class KoiAgentHarness:
             return
         plan.actions = patched
         note = (
-            f"[placement-floor] {len(filled)} job(s) deferred with no rationale but "
-            f"already placed by the solver; back-filled from the solver result: "
+            f"[placement-floor] {len(filled)} unexplained no-op action(s) present in "
+            f"the joint recommendation; restored: "
             f"{', '.join(filled)}."
         )
         plan.tick_rationale = ((plan.tick_rationale or "") + " " + note).strip()
@@ -1238,13 +1480,32 @@ class KoiAgentHarness:
                 states[j.get("job_id", j.get("id"))] = j.get("state", "waiting")
         return states if has_any else None
 
-    def _score_plan(self, plan: Plan) -> float:
-        """Score a plan by aggregate sigma; 0.0 when scoring fails."""
+    def _score_plan(self, plan: Plan) -> float | None:
+        """Score a plan by aggregate sigma, or return None when unscorable."""
         try:
-            return float(agent_tools.compute_sigma(plan)["aggregate_sigma"])
+            result = agent_tools.compute_sigma_for_commit(plan)
+            per_job = result.get("per_job") or {}
+            scored_jobs = set(per_job)
+            required_jobs = {
+                action.job_id
+                for action in plan.actions
+                if action.type in LADDER_ACTIONS and action.ladder
+            }
+            if not required_jobs <= scored_jobs:
+                missing = sorted(required_jobs - scored_jobs)
+                log.error("compute_sigma_for_commit omitted ladder jobs: %s", missing)
+                return None
+            score = float(result["aggregate_sigma"])
         except Exception:
-            log.exception("compute_sigma failed during K_P scoring")
-            return 0.0
+            log.exception("compute_sigma_for_commit failed during K_P scoring")
+            return None
+        if not math.isfinite(score):
+            log.error(
+                "compute_sigma_for_commit returned a non-finite aggregate score: %r",
+                score,
+            )
+            return None
+        return score
 
     def _fallback_plan(self, cluster_snapshot) -> Plan:
         """Build the typed keep-all / defer-pending fallback Plan.
@@ -1292,6 +1553,8 @@ class KoiAgentHarness:
                 + "\nFix these specific violations and re-commit.\n\n"
             )
 
+        online_admission_contract = self._partial_online_admission_contract()
+
         return (
             f"{repair_section}"
             # ---------- WHO YOU ARE ----------
@@ -1325,8 +1588,9 @@ class KoiAgentHarness:
             # ---------- YOUR JOB THIS TICK ----------
             "YOUR JOB: produce one cluster-wide plan that maximizes aggregate "
             "sigma, subject to user policy/quota, reserved GPU capacity, "
-            "physical chain feasibility, SLO chance under worst-case demand "
-            "(DRO), the swap budget B_t, and admission control. Only the "
+            "physical chain feasibility and the swap budget B_t, while using "
+            "point-capacity, base-latency, and DRO estimates to rank risk. Direct "
+            "does not model request queues. Only the "
             "reserved market exists this version - never plan spot or "
             "on-demand capacity.\n\n"
             # ---------- THE OBJECTIVE, EXACTLY ----------
@@ -1347,9 +1611,9 @@ class KoiAgentHarness:
             "gain from actually trying this ladder. High when the mechanism is "
             "low-confidence - an uncertain-but-promising config is rewarded "
             "because Koi LEARNS from deploying it.\n"
-            "  - Pr_DRO (weighted by gamma, risk): probability ANY SLO is "
-            "violated under the worst-case demand band (Wasserstein-DRO). "
-            "Placements sitting on the SLO edge cost you here.\n"
+            "  - Pr_DRO (weighted by gamma, risk): uncertainty around the available "
+            "point predictions. With Direct-only latency this is base-latency risk, "
+            "not a queue-inclusive SLO guarantee.\n"
             "  - SwitchCost (weighted by lambda, churn): cost of moving a job "
             "off its current ladder (migration, reprice, disruption). Keeping "
             "a good-enough config beats churning for a tiny gain.\n"
@@ -1361,191 +1625,112 @@ class KoiAgentHarness:
             "/ lower latency / cheaper, but can NEVER outrank another job's target "
             "MISS. So Koi satisfices EVERY job's target first (fairness), then spends "
             "leftover capacity optimizing the mode axis. The per-mode objective "
-            "weights set the emphasis; SLO/demand targets stay HARD constraints "
-            "regardless of weights.\n\n"
-            # ---------- WHEN TO DEFER ----------
-            "WHEN TO DEFER - READ THIS. Do NOT gate placement on 'sigma > 0'. J "
-            "is a distance to the ideal, so a good placement's sigma is typically "
-            "NEGATIVE - that is expected, not a failure. Leaving a waiting job "
-            "unserved is itself PENALIZED in the objective (an unserved-demand "
-            "opportunity cost), so do NOT decide place-vs-defer one job at a "
-            "time - decide ALL waiting jobs JOINTLY against the one shared pool. "
-            "For each waiting job, build one or more candidate frames - ideally "
-            "one per GPU TYPE it could use, so a scarce type goes to whichever job "
-            "gains most - then size and "
-            "check_feasibility each and record its PER-JOB sigma, "
-            "compute_sigma(one_job_plan)['per_job'][job_id]['sigma'] (the per-job "
-            "value, NOT aggregate_sigma). Then call "
-            "jointly_select_placements(candidates): it returns the assignment "
-            "(<=1 frame per job, or defer) that MAXIMIZES total sigma minus the "
-            "unserved penalty subject to the shared capacity - the joint optimum "
-            "that greedy per-job picking misses. Build P_t from result['chosen'] "
-            "and run check_feasibility on the whole plan. A placement with "
-            "negative J still WINS when serving beats the unserved penalty; the "
-            "solver accounts for that. defer / keep-all is a LAST RESORT, valid "
-            "ONLY when the joint solver places nothing, AFTER you tried to fix "
-            "configs with get_influencing_knobs + optimize_config and re-sized "
-            "with size_ladder. Never defer a job you gave the solver no candidate "
-            "for: if a job could use a given GPU type, ensure it has a candidate "
-            "there - do not box it onto whatever merely fits. If you are about to "
-            "defer most jobs, "
-            "re-check z*, your candidates, and your sizing first.\n\n"
-            # ---------- HOW TO REASON ----------
-            "HOW TO REASON. Before committing P_t, sketch several allocation "
-            "frames psi_t - internal scratch reasoning only, not physical "
-            "cluster state, not deployable objects, not part of the final "
-            "schema. For non-trivial ticks compare several angles: "
-            "feasibility/SLO-first, aggregate-sigma-first, "
-            "churn/B_t-minimizing, and scarce-resource/user-fair. For each "
-            "serious candidate, use tools to size ladders, simulate resources, "
-            "compute_sigma, and check_feasibility. Independent config evaluations "
-            "must run concurrently, never in a serial loop: define evaluate_config, "
-            "then use `from concurrent.futures import ThreadPoolExecutor` and "
-            "`with ThreadPoolExecutor(max_workers=5) as pool: results = "
-            "list(pool.map(evaluate_config, configs))`. Keep compact summaries, "
-            "then choose exactly one final Plan P_t and call "
-            "FINAL_VAR(plan).\n\n"
-            # ---------- MANDATORY ORDER ----------
-            "MANDATORY ORDER. plan_tick() is your SAFE BASELINE - it runs the whole "
-            "pipeline below and returns a ready, feasible plan from the joint solver's "
-            "chosen placements: a guaranteed non-defer FLOOR you can commit as-is when "
-            "you have nothing to add. Your DOMAIN KNOWLEDGE and creativity belong in "
-            "the CANDIDATE SET, not in overriding the solver: propose "
-            "creative/heterogeneous ranks (spill a job across pools, pair a "
-            "low-latency rank with a cheap high-throughput one, try a quant or GPU the "
-            "mechanical menu skipped), size and score them, and ADD them to the pool "
-            "the solver chooses from - that is how you shape the decision. The solver "
-            "then makes the serve-vs-defer PICK; that arithmetic is ITS job. What you "
-            "must NEVER do is regress BELOW the baseline - do not commit a plan that "
-            "defers a job the solver placed feasibly just because its sigma is "
-            "negative (negative sigma is NORMAL and expected). If you enrich the "
-            "candidates, commit the solver's chosen from the enriched set (it serves "
-            "at least what plan_tick serves); otherwise commit FINAL_VAR(plan_tick()). "
-            "The pipeline (budgets before specialists; cross-job GPU "
-            "competition is resolved JOINTLY via "
-            "jointly_select_placements, NOT by the permissive budget), "
-            "with no extra arguments: "
-            "build_user_envelopes(); priority = get_priority(); "
-            "budget_book = allocate_budget_book(); "
-            "validation = validate_budget_book(budget_book); "
-            "if validation['ok']: specialist_results = run_job_specialists(); "
-            "scored = build_scored_candidates(budget_book, specialist_results); "
-            "joint = jointly_select_placements(scored['candidates']); the plan is "
-            "built from joint['chosen'] and check_feasibility'd before FINAL_VAR. "
-            "budget_book is NOT a pre-existing REPL variable and NOT an "
-            "object - you CREATE it by calling allocate_budget_book(); do not "
-            "call budget_book.allocate(). It returns a dict shaped: "
-            "{'tick': int, 'job_budgets': {job_id: {'slice_id': str, "
-            "'job_id': str, 'user_id': str, 'env_budget': {env_key: gpus}, "
-            "'pool_budget': {env_key: {instance_type: units}}, "
-            "'allowed_actions': [...], 'strategy_hint': str, 'canary_cap': "
-            "int, 'priority_score': float}}, 'reserves': {env_key: int}, "
-            "'rationale': str}. Read a job's slice id as "
-            "budget_book['job_budgets'][job_id]['slice_id'] and set that "
-            "action's budget_ref to it. Do not pass cluster_snapshot into "
-            "get_priority, allocate_budget_book, validate_budget_book, or "
-            "run_job_specialists. Each job's budget is a PERMISSIVE upper bound "
-            "(specialists see the FULL free pool; budgets OVERLAP, they are not "
-            "exclusive slices), so specialists just PROPOSE the best GPU for their "
-            "own job - they do not resolve cross-job contention. You do NOT "
-            "hand-write the candidate/sizing loop: build_scored_candidates("
-            "budget_book, specialist_results) does the mechanical work "
-            "deterministically - it takes specialist ladders as HINTS, then "
-            "GENERATES the full right-sized menu (one fill-tp frame per GPU type and "
-            "instance size with free capacity, so every job is weighed on every "
-            "hardware option, not just the one its specialist named - plus a "
-            "heterogeneous composite ladder spanning pools for any job no single pool "
-            "can serve alone), sizes each with "
-            "size_ladder, drops only UNRUNNABLE/INFEASIBLE frames, and returns every "
-            "feasible frame (incl. under-target ones - placing beats deferring) with "
-            "its per-job sigma, plus exhausted[job_id] for jobs with NO feasible "
-            "frame at all. You are the SUPERVISOR: pick the search emphasis and READ "
-            "scored['diagnostics'] when coverage looks off. Do NOT parse "
-            "pending_jobs, dedupe ranks, resize replicas, or decide meets_target "
-            "yourself - the tool owns that, and the joint solver decides serve-vs-"
-            "defer from sigma. A specialist defer/blocked is a LOCAL hint; a job is "
-            "only truly deferred when it is in scored['exhausted'] or the solver "
-            "leaves it out. "
-            "Mechanism IDs are opaque Store IDs: never author one. Use "
-            "an applicable ID, or call set_new_mechanisms and use its returned ID. "
-            "After proposing a rank, call get_applicable_mechanisms(rank, "
-            "job_features); prefer exact matches, then partial matches.\n\n"
-            # ---------- SHARPEN BEFORE YOU SCORE ----------
-            "SHARPEN EACH JOB BEFORE YOU SCORE IT. predict_outcome returns "
-            "predictions already CALIBRATED against the evidence database "
-            "(plus y_hat_raw and the calibration_offsets applied); trust the "
-            "calibrated y_hat - it is what compute_sigma and size_ladder use, "
-            "so a surrogate that was wrong last tick is self-correcting. To "
-            "improve a config: get_influencing_knobs(job_features, objective) "
-            "ranks which X knobs move that objective and how confident we are, "
-            "then optimize_config(base_config, candidates, job_features, env=rank['env']) runs a "
-            "calibrated coordinate descent over candidate values YOU choose and "
-            "returns the best config by Tchebycheff J. These are optional "
-            "refinement aids - use them on a config you reasoned to; you stay "
-            "free to propose configs directly, and they never replace "
-            "cluster-level reconciliation.\n\n"
-            # ---------- TOOL CONTRACTS (exact call shapes) ----------
-            "TOOL CONTRACTS - follow these EXACTLY:\n"
-            "  - predict_outcome(config) scores ONE config dict: "
-            "predict_outcome({'job_config': rank['config'], 'job_features': {...}}, env=rank['env']). "
-            "Pass env when scoring a rank so Koi can derive gpu_type. "
-            "NEVER pass a ladder or a list of ranks - that raises a ValueError.\n"
-            "  - size_ladder(ranks, job_features) sizes replicas and RETURNS the "
-            "throughput target it used as sized['target_tps']; reuse THAT for the "
-            "action - do NOT compute target_tps yourself (that double-counts input "
-            "tokens). size_ladder may return ranks=[] with meets_target=False; an "
-            "empty ladder means 'this frame does not fit', not a crash.\n"
-            "  - compute_sigma(plan) and check_feasibility(plan) take a whole PLAN "
-            "dict ({'tick_rationale', 'actions': [...]}), never a bare action or a "
-            "y_hat. check_feasibility returns {'feasible': bool, 'ok': bool (same "
-            "value), 'violations': [...]}; read feas['feasible'] (or feas['ok']). "
-            "feasible=True means SCORE it with compute_sigma - it is NOT a "
-            "failure. compute_sigma returns {'aggregate_sigma': float, 'per_job': "
-            "{job_id: {'sigma': float, ...}}, ...}; for the joint solver read the "
-            "PER-JOB value per_job[job_id]['sigma'], NOT aggregate_sigma (the "
-            "aggregate mixes in other jobs' unserved penalty).\n"
-            "  - jointly_select_placements(candidates) does the JOINT GPU "
-            "selection across ALL waiting jobs against the one shared pool "
-            "(enforcing per-env GPU AND per-pool instance capacity). Pass it "
-            "scored['candidates'] from build_scored_candidates - that already "
-            "covers each GPU type per job. candidates is a "
-            "LIST of scored, feasibility-passed frames; each is "
-            "{'job_id', 'sigma' (the per-job sigma above), 'ladder' (sized ranks, "
-            "each carrying env + config.gpu_count + n_replicas), plus your action "
-            "fields}. It returns {'chosen': [winning candidate per placed job], "
-            "'deferred': [job_id], 'objective': float}. Build plan['actions'] "
-            "straight from result['chosen'] (they keep your passthrough fields), "
-            "then check_feasibility the whole plan.\n"
-            "  - build_scored_candidates(budget_book, specialist_results) "
-            "is the DETERMINISTIC candidate pipeline - it, not you, generates the "
-            "cross-GPU-type frames, sizes them, drops only unrunnable/infeasible "
-            "ones, and scores per-job sigma. Returns {'candidates': [...], "
-            "'exhausted': {job_id: reason}, 'diagnostics': {job_id: [...]}}.\n"
-            "Worked pipeline (you SUPERVISE and may ENRICH; the solver owns the pick):\n"
-            "    # Baseline floor - one call, guaranteed feasible non-defer plan:\n"
-            "    plan = plan_tick()\n"
-            "    # To inject domain knowledge, ENRICH the candidate pool, then let the\n"
-            "    # solver pick - do NOT hand-write defers:\n"
-            "    scored = build_scored_candidates(budget_book, specialist_results)\n"
-            "    # candidates are sized, feasibility-passed, sigma-scored (incl. under-target);\n"
-            "    # append your own creative frames here (size_ladder + compute_sigma them first)\n"
-            "    result = jointly_select_placements(scored['candidates'])  # solver makes the pick\n"
-            "    plan = {'tick_rationale': '...', 'actions': result['chosen']}  # commit chosen, never all-defer\n"
-            "    if check_feasibility(plan)['feasible']: FINAL_VAR(plan)\n"
-            "COMMIT result['chosen'] AS-IS. The solver already made the "
-            "serve-vs-defer call for every job (weighing each frame's sigma against "
-            "the unserved penalty), so do NOT drop a placement it chose or add your "
-            "own defers - a negative sigma is normal and NOT a reason to defer. The "
-            "ONLY jobs left unplaced are result['deferred'] / scored['exhausted']. "
-            "Do not replace a non-empty result['chosen'] with an all-defer plan. "
-            "A job in scored['exhausted'] has NO runnable frame at all; record the "
-            "reason in tick_rationale. Guard tool outputs before indexing. "
-            "DEFER CONTRACT: if you deliberately defer a job the solver COULD place "
-            "(domain-knowledge call - e.g. saving capacity for an incoming job), you "
-            "MUST put your reason in that action's 'rationale' field; it is then "
-            "honored. An UNEXPLAINED defer of a placeable job is treated as a mistake "
-            "and is automatically back-filled from the solver's placement, so silence "
-            "is never a way to drop a servable job.\n\n"
+            "weights set the emphasis; the admission policy below determines "
+            "whether a predicted target miss is a veto.\n\n"
+            # ---------- ONE WORKFLOW, ROOT DECISION ----------
+            "DECISION OWNERSHIP. You are the final decision-maker. Deterministic tools "
+            "enforce budgets, physical feasibility, and shared capacity; their joint "
+            "result is a recommendation for you to inspect, not an instruction that "
+            "replaces your cluster-level judgment. Negative sigma is normal because J "
+            "is a distance. Never defer merely because a placement has sigma < 0; "
+            "compare it with the explicit unserved-demand penalty.\n\n"
+            "DIRECT PREDICTION CONTRACT. AIC_Direct is a point estimator. Throughput "
+            "is estimated capacity for the exact rank geometry and replica count. "
+            "TTFT/TPOT are base service-latency estimates, not queue-aware end-to-end "
+            "p99 values. queue_slo_verified is therefore false. Telemetry is the "
+            "authority on deployed queue behavior. Never call a Direct result "
+            "queue-safe or treat a lower offered rate as a new Direct operating point.\n\n"
+            "FAILURE CONTRACT. invalid_config, no_pool_capacity, physical_no_fit, "
+            "no_mechanism, infeasible, and BudgetSlice/resource violations are hard "
+            "rejections. unsupported_prediction, prediction_failed, prediction_empty, "
+            "prediction_incomplete, zero_predicted_capacity, and demand_unmodeled are "
+            "prediction uncertainty: they do not prove physical infeasibility. A "
+            "physically valid candidate carrying one of those statuses may be selected "
+            "as zero-credit exploratory work when capacity would otherwise idle. It "
+            "must never displace a supported positive-value candidate. queue_shadow is "
+            "uncalibrated and never a hard veto; only mathematical instability lowers "
+            "a candidate to the work-conserving tier.\n\n"
+            "PRIMARY WORKFLOW. Run each successful stage once, in order, and keep its "
+            "outputs in the REPL:\n"
+            "    build_user_envelopes()\n"
+            "    priority = get_priority()\n"
+            "    budget_book = allocate_budget_book()\n"
+            "    validation = validate_budget_book(budget_book)\n"
+            "    if validation['ok']:\n"
+            "        specialist_results = run_job_specialists()\n"
+            "        scored = build_scored_candidates(budget_book, specialist_results)\n"
+            "        joint = jointly_select_placements(scored['candidates'])\n"
+            "If a REPL error occurs before FINAL_VAR, retry using existing variables or "
+            "cached tool outputs; do not intentionally recompute a successful specialist "
+            "or prediction stage. Do not rerun earlier stages after seeing `joint`. "
+            "If budget validation fails, do not run "
+            "specialists; build a conservative keep/defer plan and record the violations.\n\n"
+            "Write the pipeline and its commit path in one REPL block. Immediately after "
+            "`joint` returns a nonempty `joint['chosen']`, build `plan` from those chosen "
+            "actions (or a reasoned adjustment using already-scored feasible candidates), "
+            "add your rationale, call `feas = check_feasibility(plan)`, and, when feasible, "
+            "call `FINAL_VAR(plan)` in that same REPL turn. Do not postpone finalization to "
+            "a follow-up turn. Inspect `priority` and current cluster evidence as needed for "
+            "your root-owned judgment. `joint['deferred']`, `scored['exhausted']`, "
+            "`scored['budget_limited']`, and `scored['diagnostics']` are troubleshooting aids "
+            "for an empty or suspicious recommendation, not a mandatory extra turn. "
+            "You still own whether to accept or reasonedly adjust the recommendation. "
+            "To override a job in joint['chosen'], include an explicit DEFER (for PLACE) or "
+            "KEEP (for SWAP) with a non-empty rationale; omission is not an override. The "
+            "deterministic placement floor restores an omitted or unexplained no-op from the "
+            "recommendation. Resolve "
+            "any feasibility violations without rerunning the pipeline.\n\n"
+            "SHORTCUT/FALLBACK. As an alternative to the primary workflow, you may call "
+            "plan_tick() exactly once and inspect its returned plan before accepting it or "
+            "making a reasoned feasible adjustment. If you use this shortcut, do not call "
+            "any primary workflow stage before or after it. It is never a baseline followed "
+            "by another pipeline run. You still own the final decision and FINAL_VAR.\n\n"
+            # ---------- CONTRACTS AND GUARDRAILS ----------
+            "BUDGET CONTRACT. budget_book is created by allocate_budget_book; it is a "
+            "dict, not a pre-existing object. Never call budget_book.allocate() and never "
+            "pass cluster_snapshot to budget tools or run_job_specialists. A validated "
+            "job slice supplies env_budget, pool_budget, allowed_actions, and slice_id; "
+            "place/swap actions must copy their job's slice_id into budget_ref. Slices are "
+            "permissive upper bounds and may overlap, so shared contention is reconciled "
+            "jointly after specialists propose job-local placements.\n\n"
+            "PLACEMENT POLICY CONTRACT. For a model/GPU pair listed in the cluster "
+            "configuration policy, only its listed TP degrees are launchable. The policy "
+            "is enforced deterministically before prediction, during candidate scoring, "
+            "and again at commit. For example, Phi-4 never uses TP=8: it is limited to "
+            "TP 1 or 2. A missing policy entry adds no policy restriction beyond the "
+            "normal physical, capacity, and BudgetSlice checks.\n\n"
+            "CANDIDATE CONTRACT. The deterministic candidate builder treats specialist "
+            "ladders as fixed-capacity proposals, generates explicit replica alternatives "
+            "across available GPU types and instance pools, adds a heterogeneous frame "
+            "when useful, removes hard-invalid frames, and computes per-job sigma. "
+            f"{online_admission_contract}"
+            "Any allowed batch partial candidate "
+            "carries meets_target and served_fraction so you can reason about its shortfall. "
+            "You classify each final place/swap action's service_class: supported when a "
+            "supported prediction meets the target, partial when supported service covers "
+            "only part of the target, exploratory when prediction support is unavailable, "
+            "or idle_capacity_fallback when a non-positive or queue-unstable candidate is "
+            "selected only for capacity that would otherwise remain idle. Do not add "
+            "service_class to keep/defer. "
+            "A specialist defer/blocked result is only a local hint. A job in exhausted has "
+            "no physically valid candidate; inspect diagnostics for the typed reason. "
+            "budget_limited identifies work skipped at the "
+            "surrogate cap. Mechanism IDs are opaque Store IDs: use applicable exact or "
+            "partial matches and never invent an ID.\n\n"
+            "ACTIVE HEALTH CONTRACT. Active jobs include deterministic health summaries. "
+            "A critical job or a job degraded for two consecutive ticks may receive SWAP "
+            "candidates, subject to B_t and a two-tick cooldown. Compare KEEP against those "
+            "already-scored SWAP candidates; do not blindly keep a queue-growing or zero-"
+            "throughput deployment. Pending jobs with deployment_not_materialized should "
+            "not receive the identical placement indefinitely.\n\n"
+            "TOOL CONTRACTS. Guard outputs before indexing. predict_outcome scores one "
+            "config dict, never a ladder. size_ladder returns its target_tps and sized "
+            "ranks; do not derive target throughput twice. compute_sigma and "
+            "check_feasibility take a whole plan dict, never a bare action. The latter "
+            "returns feasible/ok plus violations. jointly_select_placements enforces "
+            "per-env GPU and per-pool instance capacity across all waiting jobs and returns "
+            "chosen, deferred, and objective. These deterministic checks are guardrails; "
+            "they do not transfer final plan ownership away from you.\n\n"
             f"{self._plan_schema_section()}"
             # ---------- MECHANICS ----------
             "Write Python in ```repl blocks. Print what you need to see. Think "
@@ -1554,6 +1739,39 @@ class KoiAgentHarness:
             "never deploy anything - the executor runs only after validation. "
             "Call FINAL_VAR(plan) exactly once, when the plan is coherent and "
             "feasible."
+        )
+
+    @staticmethod
+    def _partial_online_admission_contract() -> str:
+        """Describe the effective guarded online-admission mode for the root."""
+        mode = "advisory"
+        status_fn = getattr(agent_tools, "get_partial_online_admission_status", None)
+        if callable(status_fn):
+            try:
+                status = status_fn()
+            except Exception:
+                log.exception("could not read partial online admission status")
+            else:
+                if isinstance(status, dict):
+                    mode = str(status.get("mode", status.get("effective_mode", "advisory")))
+                elif isinstance(status, str):
+                    mode = status
+
+        if mode == "advisory":
+            return (
+                "POINT-ESTIMATE ONLINE MODE: advisory. Deterministic prediction and "
+                "SLO/DRO scoring rank candidates but do not simulate queue dynamics. "
+                "A base-latency or capacity-target miss remains placeable. Prediction-only "
+                "failures become zero-credit exploratory candidates after physical checks. "
+                "A queue-unstable point candidate is work-conserving only and cannot "
+                "displace a stable or queue-unmodeled supported candidate. "
+                "Preserve prediction_assessment and point-capacity accounting exactly. "
+                "Do not emit an admitted rate or claim traffic throttling: the current "
+                "Orca/router does not provide an enforcement acknowledgement. "
+            )
+        return (
+            "POINT-ESTIMATE ONLINE MODE: admission metadata is off. Direct still provides "
+            "only point capacity and base service latency; queue SLOs remain unverified. "
         )
 
     @staticmethod
@@ -1575,7 +1793,19 @@ class KoiAgentHarness:
             "Action dict:\n"
             "  {'job_id': str, 'type': <action>, 'user_id': str,\n"
             "   'ladder': [<rank>, ...],            # only for place/swap\n"
+            "   'service_class': 'supported|partial|exploratory|idle_capacity_fallback',\n"
+            "                                            # optional; place/swap only\n"
             "   'target_tps': float,                # required throughput for place/swap\n"
+            "   # Optional point-estimate accounting: preserve it as a unit from a candidate.\n"
+            "   'achieved_tps': float,              # target covered by point capacity\n"
+            "   'unmet_tps': float,                 # point-capacity shortfall\n"
+            "   'meets_target': bool,               # point capacity/base latency pass\n"
+            "   'served_fraction': float,           # estimated capacity coverage\n"
+            "   'prediction_assessment': dict,      # status, basis, and queue limitation\n"
+            "   'point_capacity_covers_target': bool, # point-capacity result only\n"
+            "   'base_latency_within_target': bool, # Direct base-latency result only\n"
+            "   'queue_state': str,                 # stable/unstable/unmodeled\n"
+            "   'queue_slo_verified': bool,         # false for Direct-only prediction\n"
             "   'target_p99_ttft_ms': float,        # online SLA, copied from job_features\n"
             "   'target_p99_tpot_ms': float,        # online SLA, copied from job_features\n"
             "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"
@@ -1586,7 +1816,7 @@ class KoiAgentHarness:
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
             "   'rank_id': 'rank_<ULID>', # omit rank_id; Koi generates a Store-compatible ID\n"
             "   'env': [market, cloud, region, zone, gpu_type],   # REQUIRED - launch target + ICP key\n"
-            "   'config': {instance_type, gpu_count, tp, pp, sp, ep, cp,\n"
+            "   'config': {instance_type, gpu_count, tp, pp, sp, cp,\n"
             "              num_nodes_per_chain, interconnect_type},  # the ONLY config knobs you set\n"
             "   # Koi/the engine own everything else - do NOT set engine_name,\n"
             "   # engine_version, router_policy, scheduling_policy, preemption_policy,\n"
@@ -1595,22 +1825,14 @@ class KoiAgentHarness:
             "   # kv_transfer_method, max_num_seq, max_num_batched_tokens, block_size.\n"
             "   # Any such key you set is dropped; the engine/catalog supplies it.\n"
             "   'n_replicas': int,       # rank DP / max endpoint count; do NOT put dp in config\n"
+            "   'rank_traffic_share': float,        # optional partial-admission traffic share\n"
             "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
             "v0 is AGGREGATE-ONLY per rank: every rank is one full "
             "prefill+decode engine (role 'aggregate'); do NOT split prefill/"
             "decode or set pd_enabled / prefill_worker_count / "
-            "decode_worker_count. But a ladder MAY mix multiple HETEROGENEOUS "
-            "ranks - different gpu_type, tp/pp, quant, even different clouds - "
-            "whenever that improves the job's sigma or cost (e.g. spill a job "
-            "across two different GPU-type pools, or pair a low-latency rank with a "
-            "cheap high-throughput one). Koi validates each config's physical "
-            "feasibility for you (parallelism vs the instance's GPUs, and model "
-            "sharding) and marks any unrunnable frame infeasible with a reason - "
-            "so do NOT hand-check things like tp dividing head counts; just "
-            "propose configs and read the feasibility result. Explore as many as "
-            "you want to find the best plan. Pick "
-            "whatever mix of ranks maximizes sigma - scoring and sizing compose "
-            "your ranks for you (see size_ladder below).\n"
+            "decode_worker_count. A ladder may mix heterogeneous aggregate ranks "
+            "across GPU types or pools when the scored candidates provide them. "
+            "Koi validates parallelism, model sharding, and physical capacity.\n"
             "Action types and the job state each needs:\n"
             "  place    waiting->running   (needs ladder, target_tps; online needs p99 TTFT/TPOT targets)\n"
             "  keep     running->running   (no ladder)\n"
@@ -1621,38 +1843,19 @@ class KoiAgentHarness:
             "Every ladder rank MUST carry a unique rank_id (or let Koi auto-fill one), "
             "MUST carry a 5-element env, and MUST resolve a "
             "mechanism_id, either on the rank or inherited from the action. "
-            "config.instance_type, gpu_count, tp, and pp are required; sp/ep/cp "
-            "default to 1 when omitted. For cloud instance pools, "
+            "config.instance_type, gpu_count, tp, and pp are required; sp/cp default "
+            "to 1 when omitted and EP is fixed to 1. gpu_count MUST equal tp*pp. "
+            "For cloud instance pools, "
             "config.instance_type is required when the env has multiple pools. "
             "gpu_count is engine GPU demand, not "
             "reserved capacity; Koi reserves and charges one full instance per "
             "n_replicas. n_replicas is the rank's DP/max endpoint count; do not "
             "set dp separately. Discrete on-prem GPU pools may remain GPU-granular. "
-            "Jobs you omit are auto-kept (running) or auto-deferred (waiting), "
-            "so list only the jobs you actually decide.\n"
-            "Do NOT guess n_replicas. Call size_ladder(ranks, job_features): "
-            "it SHARES one throughput target across your ranks (filling them in "
-            "the order you list, each covering the remaining target) and sizes "
-            "each rank's n_replicas; achieved_tps is the SUM across ranks, so "
-            "heterogeneous ranks add capacity. For online it EXCLUDES any rank "
-            "whose predicted p99 TTFT/TPOT exceeds target (latency is "
-            "per-replica - replicas cannot fix it) and spills its share to the "
-            "others. size_ladder SEARCHES each rank's replica count (DP) against "
-            "the surrogate's own p99 latency at the rank's share of the arrival "
-            "rate - more replicas cut queue wait - and sums achieved throughput "
-            "across ranks to cover the demand. compute_sigma scores the composed "
-            "job-level y_hat using worst-case latency, throughput/cost rollups, DRO "
-            "risk, EIG, and switch cost, so a heterogeneous ladder is scored "
-            "as the whole job, not one rank. Use it as: sized = size_ladder(ranks, "
-            "job_features); action['ladder'] = sized['ranks']. The other fields "
-            "(meets_target, unmet_tps, per-rank slo_ok/reason, marginal_value) "
-            "are diagnostics. If meets_target is False (unmet_tps > 0) the frame "
-            "UNDER-serves demand: before you accept it OR defer, try a BIGGER "
-            "frame - a larger instance / higher tp (e.g. the 4-GPU pool at tp4), "
-            "more n_replicas, or a HETEROGENEOUS ladder that ADDS capacity (append "
-            "another rank; achieved_tps SUMS across ranks). marginal_value tells "
-            "you how many more GPUs per env would close the gap. Score the "
-            "best-serving feasible frame with compute_sigma and place it; accept "
-            "an under-target frame only if it still beats defer and no bigger "
-            "feasible frame scores higher.\n\n"
+            "Jobs without a joint-chosen placement may be omitted and are auto-kept "
+            "(running) or auto-deferred (waiting). Overriding a joint-chosen job still "
+            "requires an explicit defer with rationale.\n"
+            "Use the fixed replica counts in scored candidates; do not silently resize them. "
+            "If a reasoned final adjustment changes rank geometry, evaluate that exact "
+            "geometry with size_ladder and validate the whole plan without rebuilding the "
+            "global candidate set.\n\n"
         )

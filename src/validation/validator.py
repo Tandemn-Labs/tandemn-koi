@@ -20,15 +20,17 @@ Constraint hierarchy (tenant policy ahead of resource feasibility):
     C3 tenant/budget  per-tenant policy (skipped when no tenant_registry)
     C4 swap budget    active-job churn does not exceed B_t
     C5 capacity       allocation-unit footprint fits snapshot free capacity
-    C6 chain physics  each rank is launchable (5-tuple env, >=1 replica, fits)
+    C6 chain physics  each rank is launchable; partial-admission accounting is coherent
 
 MVP note: SLO/DRO risk is score-only via compute_sigma, not validation-gated.
 TODO(v1): revisit a hard SLO gate once the cutoff policy is well understood.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.config.policy import MODEL_MAX_TP, SUPPORTED_EP, load_config_policy
 from src.core.models import (
     LADDER_ACTIONS,
     REQUIRED_JOB_STATE,
@@ -37,6 +39,7 @@ from src.core.models import (
     Mechanism,
     Plan,
 )
+from src.infra.deployment_x import materialize_launch_config
 
 # Actions whose target job must already exist in the cluster snapshot. PLACE and
 # DEFER admit waiting jobs; DIAGNOSE/TERMINATE may reference jobs outside the
@@ -48,6 +51,27 @@ _KNOWN_WORKLOAD_TYPES = frozenset({"any", "online", "batch"})
 _KNOWN_MODEL_TYPES = frozenset({"any", "moe", "dense_small", "dense_large"})
 _CONDITION_OPERATORS = frozenset({">", "<", ">=", "<=", "=="})
 _ALLOWED_SCOPE_KEYS = frozenset({"x", "v", "workload_type", "model_type", "conditions"})
+_SERVICE_ACCOUNTING_FIELDS = (
+    "achieved_tps",
+    "unmet_tps",
+    "meets_target",
+    "served_fraction",
+    "admitted_tps",
+    "admission_mode",
+)
+_PARTIAL_ONLINE_ADMISSION_MODES = frozenset({"off", "advisory"})
+_ADMISSION_REL_TOL = 1e-3
+_ADMISSION_ABS_TOL = 1e-6
+_SOFT_PREDICTION_STATUSES = frozenset(
+    {
+        "unsupported_prediction",
+        "prediction_failed",
+        "prediction_empty",
+        "prediction_incomplete",
+        "zero_predicted_capacity",
+        "demand_unmodeled",
+    }
+)
 
 
 @dataclass
@@ -89,13 +113,17 @@ class Validator:
         slo_predictor=None,
         slo_breach_threshold: float = 0.5,
         resource_map=None,
+        partial_online_admission_mode: str = "off",
     ):
+        if partial_online_admission_mode not in _PARTIAL_ONLINE_ADMISSION_MODES:
+            raise ValueError("partial_online_admission_mode must be exactly 'off' or 'advisory'")
         self.candidate_graph = candidate_graph
         self.mechanism_registry = mechanism_registry
         self.tenant_registry = tenant_registry
         self.resource_map = resource_map
         self.slo_predictor = slo_predictor
         self.slo_breach_threshold = float(slo_breach_threshold)
+        self.partial_online_admission_mode = partial_online_admission_mode
 
     # ------------------------------------------------------------------
     # Plan validation
@@ -298,7 +326,7 @@ class Validator:
     # ----- C6 chain physics -----
 
     def _check_chain_physics(self, typed: Plan, snapshot) -> list[str]:
-        """Each deployed rank must be physically launchable.
+        """Each deployed rank and its optional admission metadata must be valid.
 
         env must be a 5-tuple (market, cloud, region, zone, gpu_type); replicas >= 1;
         a single chain's GPU footprint must not exceed the env's total GPUs (a
@@ -307,9 +335,22 @@ class Validator:
         """
         resources = self._resources(snapshot)
         violations: list[str] = []
+        jobs: list[dict[str, Any]] = []
+        if snapshot is not None:
+            for accessor in ("active_jobs_summary", "pending_jobs_summary"):
+                if hasattr(snapshot, accessor):
+                    jobs.extend(getattr(snapshot, accessor)() or [])
+        model_by_job = {
+            str(job.get("job_id", job.get("id"))): str(
+                (job.get("job_features") or {}).get("model_id") or job.get("model_id") or ""
+            )
+            for job in jobs
+        }
+        policy = load_config_policy()
         for action in typed.actions:
             if action.type not in LADDER_ACTIONS:
                 continue
+            violations.extend(self._check_partial_admission(action))
             if not action.ladder:
                 violations.append(
                     f"C6 physics: job {action.job_id} {action.type.value} has no ladder"
@@ -342,6 +383,56 @@ class Validator:
                         f"C6 physics: job {action.job_id} rank {i} {error}" for error in rank_errors
                     )
                     continue
+                tp = int(cfg["tp"])
+                pp = int(cfg["pp"])
+                assert isinstance(gpu_count, int)
+                if gpu_count != tp * pp:
+                    violations.append(
+                        f"C6 physics: job {action.job_id} rank {i} gpu_count must equal "
+                        f"tp*pp={tp * pp}, got {gpu_count}"
+                    )
+                ep = cfg.get("ep", SUPPORTED_EP)
+                if type(ep) is not int or ep != SUPPORTED_EP:
+                    violations.append(
+                        f"C6 physics: job {action.job_id} rank {i} ep must be exactly "
+                        f"{SUPPORTED_EP}, got {ep!r}"
+                    )
+                model_id = model_by_job.get(action.job_id, "")
+                gpu_type = str(rank.env[4])
+                max_tp = MODEL_MAX_TP.get(model_id)
+                if max_tp is not None and tp > max_tp:
+                    violations.append(
+                        f"C6 policy: job {action.job_id} rank {i} {model_id} TP={tp} "
+                        f"exceeds maximum {max_tp}"
+                    )
+                rule = policy.rule_for(gpu_type, model_id) if model_id else None
+                if rule is not None and tp not in rule.allowed_tp:
+                    violations.append(
+                        f"C6 policy: job {action.job_id} rank {i} {model_id} on {gpu_type} "
+                        f"allows TP {list(rule.allowed_tp)}, got {tp}"
+                    )
+                if rule is not None:
+                    launch = {}
+                    if self.resource_map is not None and hasattr(
+                        self.resource_map, "model_catalog"
+                    ):
+                        try:
+                            launch = materialize_launch_config(
+                                self.resource_map.model_catalog(model_id), gpu_type
+                            )
+                        except Exception:
+                            launch = {}
+                    precision_ok = policy.precision_matches(
+                        rule,
+                        cfg.get("weight_dtype") or launch.get("weight_dtype"),
+                        cfg.get("weight_quantization_method")
+                        or launch.get("weight_quantization_method"),
+                    )
+                    if precision_ok is False:
+                        violations.append(
+                            f"C6 policy: job {action.job_id} rank {i} {model_id} on "
+                            f"{gpu_type} requires {rule.precision} precision"
+                        )
                 per_chain, gpu_error = self._rank_engine_gpus(rank)
                 if gpu_error:
                     violations.append(f"C6 physics: job {action.job_id} rank {i} {gpu_error}")
@@ -376,6 +467,215 @@ class Validator:
                                 f"GPUs/replica but env total is {total}"
                             )
         return violations
+
+    def _check_partial_admission(self, action) -> list[str]:
+        """Validate service accounting, rank shares, and guarded online admission."""
+        prefix = f"C6 admission: job {action.job_id}"
+        violations: list[str] = []
+        assessment = getattr(action, "prediction_assessment", None)
+        if assessment is not None and not isinstance(assessment, dict):
+            violations.append(f"{prefix} prediction_assessment must be a dict")
+            assessment = {}
+        assessment = assessment or {}
+        point_estimate = assessment.get("basis") in {
+            "aic_direct_point",
+            "composed_point_estimate",
+        }
+        exploratory = point_estimate and assessment.get("kind") == "exploratory"
+        if assessment and not point_estimate:
+            violations.append(f"{prefix} prediction_assessment basis is unsupported")
+        if point_estimate and assessment.get("queue_slo_verified") is not False:
+            violations.append(f"{prefix} Direct prediction cannot verify queue SLOs")
+        if point_estimate and assessment.get("kind") not in {"point", "exploratory"}:
+            violations.append(f"{prefix} prediction_assessment kind is invalid")
+        if exploratory and assessment.get("status") not in _SOFT_PREDICTION_STATUSES:
+            violations.append(f"{prefix} exploratory prediction status is not recognized")
+        if exploratory and action.type != ActionType.PLACE:
+            violations.append(f"{prefix} exploratory prediction is supported only for PLACE")
+        if (
+            point_estimate
+            and assessment.get("kind") == "point"
+            and assessment.get("status") != "success"
+        ):
+            violations.append(f"{prefix} point prediction status must be 'success'")
+        if (
+            point_estimate
+            and action.queue_slo_verified is not None
+            and action.queue_slo_verified is not False
+        ):
+            violations.append(f"{prefix} queue_slo_verified must be false for point prediction")
+        if action.queue_state is not None and action.queue_state not in {
+            "stable",
+            "unstable",
+            "unmodeled",
+            "not_applicable",
+        }:
+            violations.append(f"{prefix} queue_state is invalid")
+        if action.type == ActionType.SWAP and action.rehabilitation_status is not None:
+            if action.rehabilitation_status not in {"critical", "degraded"}:
+                violations.append(f"{prefix} SWAP requires critical/degraded rehabilitation")
+            swap_gain = self._finite_number(action.swap_gain_over_keep)
+            if swap_gain is None or swap_gain <= 0:
+                violations.append(f"{prefix} SWAP must improve on KEEP baseline")
+        accounting_present = any(
+            getattr(action, name) is not None for name in _SERVICE_ACCOUNTING_FIELDS
+        )
+        fraction = self._finite_number(action.served_fraction)
+        if not accounting_present:
+            return self._check_rank_traffic_shares(action, fraction, prefix)
+
+        positive: dict[str, float] = {}
+        for name in ("target_tps", "achieved_tps"):
+            number = self._finite_number(getattr(action, name))
+            if number is None or number <= 0.0:
+                violations.append(f"{prefix} {name} must be a finite positive number")
+            else:
+                positive[name] = number
+
+        admitted = None
+        if action.admitted_tps is not None:
+            admitted = self._finite_number(action.admitted_tps)
+            if admitted is None or admitted <= 0.0:
+                violations.append(f"{prefix} admitted_tps must be a finite positive number")
+                admitted = None
+
+        unmet = self._finite_number(action.unmet_tps)
+        if unmet is None or unmet < 0.0:
+            violations.append(f"{prefix} unmet_tps must be a finite non-negative number")
+
+        if fraction is None or fraction <= 0.0 or fraction > 1.0:
+            violations.append(f"{prefix} served_fraction must be finite and in (0, 1]")
+
+        if not isinstance(action.meets_target, bool):
+            violations.append(f"{prefix} meets_target must be a boolean")
+        if action.admission_mode == "enforced":
+            violations.append(
+                f"{prefix} admission_mode='enforced' is unsupported by the downstream router"
+            )
+        elif action.admission_mode is not None and action.admission_mode != "advisory":
+            violations.append(f"{prefix} admission_mode must be 'advisory' when present")
+
+        target = positive.get("target_tps")
+        achieved = positive.get("achieved_tps")
+        has_latency_target = any(
+            target_value is not None
+            for target_value in (action.target_p99_ttft_ms, action.target_p99_tpot_ms)
+        )
+        if (
+            admitted is not None
+            and achieved is not None
+            and not self._admission_close(admitted, achieved)
+        ):
+            violations.append(f"{prefix} admitted_tps must approximately equal achieved_tps")
+        if target is not None:
+            for name, value in (("admitted_tps", admitted), ("achieved_tps", achieved)):
+                if (
+                    value is not None
+                    and value > target
+                    and not self._admission_close(value, target)
+                ):
+                    violations.append(f"{prefix} {name} must be <= target_tps")
+        if (
+            target is not None
+            and achieved is not None
+            and unmet is not None
+            and not self._admission_close(unmet, max(0.0, target - achieved))
+        ):
+            violations.append(
+                f"{prefix} unmet_tps must approximately equal target_tps - achieved_tps"
+            )
+        if (
+            target is not None
+            and achieved is not None
+            and fraction is not None
+            and not self._admission_close(fraction, min(1.0, achieved / target))
+        ):
+            violations.append(
+                f"{prefix} served_fraction must approximately equal achieved_tps / target_tps"
+            )
+        if target is not None and achieved is not None and isinstance(action.meets_target, bool):
+            throughput_met = achieved >= target or self._admission_close(achieved, target)
+            invalid_meets_target = action.meets_target and not throughput_met
+            invalid_miss = not action.meets_target and throughput_met and not has_latency_target
+            if invalid_meets_target or invalid_miss:
+                violations.append(
+                    f"{prefix} meets_target must match whether achieved_tps meets target_tps "
+                    "and any declared latency SLO"
+                )
+
+        if has_latency_target and fraction is not None and fraction < 1.0 and not point_estimate:
+            if admitted is None:
+                violations.append(f"{prefix} online partial service requires admitted_tps")
+            if action.admission_mode != "advisory":
+                violations.append(
+                    f"{prefix} online partial service requires admission_mode='advisory'"
+                )
+            if self.partial_online_admission_mode != "advisory":
+                violations.append(
+                    f"{prefix} advisory online partial service is disabled by the validator"
+                )
+
+        violations.extend(self._check_rank_traffic_shares(action, fraction, prefix))
+        return violations
+
+    @classmethod
+    def _check_rank_traffic_shares(cls, action, fraction, prefix: str) -> list[str]:
+        """Validate explicit shares and require them for partial or multi-rank service."""
+        ranks = list(action.ladder or [])
+        if not ranks:
+            return []
+        explicit_share = any(rank.rank_traffic_share is not None for rank in ranks)
+        assessment = getattr(action, "prediction_assessment", None) or {}
+        if assessment.get("kind") == "exploratory" and not explicit_share and len(ranks) == 1:
+            return []
+        partial_service = fraction is not None and fraction < 1.0
+        point_estimate = assessment.get("basis") in {
+            "aic_direct_point",
+            "composed_point_estimate",
+        }
+        if len(ranks) == 1 and not explicit_share and (point_estimate or not partial_service):
+            return []
+
+        violations: list[str] = []
+        shares: list[float] = []
+        for index, rank in enumerate(ranks):
+            share = cls._finite_number(rank.rank_traffic_share)
+            if share is None or share <= 0.0 or share > 1.0:
+                violations.append(
+                    f"{prefix} rank {index} rank_traffic_share must be finite and in (0, 1]"
+                )
+            else:
+                shares.append(share)
+
+        expected = 1.0 if point_estimate else fraction if fraction is not None else 1.0
+        if len(shares) == len(ranks) and not cls._admission_close(sum(shares), expected):
+            expected_name = (
+                "1 for point-estimate routing"
+                if point_estimate
+                else "served_fraction"
+                if action.served_fraction is not None
+                else "1"
+            )
+            violations.append(
+                f"{prefix} rank_traffic_share sum must approximately equal {expected_name}"
+            )
+        return violations
+
+    @staticmethod
+    def _finite_number(value) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _admission_close(left: float, right: float) -> bool:
+        return math.isclose(
+            left,
+            right,
+            rel_tol=_ADMISSION_REL_TOL,
+            abs_tol=_ADMISSION_ABS_TOL,
+        )
 
     # ----- Future C7 SLO chance (disabled in MVP) -----
 

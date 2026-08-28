@@ -82,6 +82,10 @@ class RankTelemetry:
     y_predicted: dict[str, float]
     committed_mechanism_id: str | None = None
     deploy_timestamp_utc: float | None = None
+    expected_replicas: int = 1
+    observed_replicas: int = 1
+    throughput_observed_replicas: int = 1
+    health_observed_replicas: int = 1
 
 
 @dataclass(frozen=True)
@@ -210,6 +214,34 @@ class StoreTelemetry:
             y_observed = {name: values for name, values in observed.items() if name in y_names}
             if not v_observed and not y_observed:
                 continue
+            observed_chain_ids = {
+                chain_id for chains in bucket_rows.values() for chain_id in chains
+            }
+            throughput_chain_ids = {
+                chain_id
+                for chains in bucket_rows.values()
+                for chain_id, rows in chains.items()
+                if self._chain_value("throughput_token_per_sec", rows) is not None
+            }
+            required_health_metrics = {"throughput_token_per_sec"}
+            job_type = str(
+                rank.job_features.get("type") or rank.job_features.get("workload_type") or "online"
+            ).lower()
+            if job_type == "online":
+                if rank.job_features.get("target_p99_ttft_ms") is not None:
+                    required_health_metrics.add("p99_ttft_ms")
+                if rank.job_features.get("target_p99_tpot_ms") is not None:
+                    required_health_metrics.add("p99_tpot_ms")
+                required_health_metrics.add("depth_req_q")
+            health_chain_ids = {
+                chain_id
+                for chains in bucket_rows.values()
+                for chain_id, rows in chains.items()
+                if all(
+                    self._chain_value(metric, rows) is not None
+                    for metric in required_health_metrics
+                )
+            }
             yield RankTelemetry(
                 job_id=rank.job_id,
                 rank_id=rank.rank_id,
@@ -218,6 +250,10 @@ class StoreTelemetry:
                 y_observed=y_observed,
                 y_predicted={},
                 committed_mechanism_id=self._committed_mechanism_id(rank),
+                expected_replicas=len(rank.chains),
+                observed_replicas=len(observed_chain_ids),
+                throughput_observed_replicas=len(throughput_chain_ids),
+                health_observed_replicas=len(health_chain_ids),
             )
 
     @staticmethod
@@ -234,6 +270,7 @@ class StoreTelemetry:
         for job in self._active_jobs(snapshot):
             job_id = str(job["job_id"])
             job_features = dict(job.get("job_features") or {})
+            job_features.setdefault("type", job.get("kind"))
             for chain in job.get("active_chains") or job.get("current_ladder") or []:
                 chain_id = chain.get("chain_id")
                 shape = dict(chain.get("shape_json") or {})

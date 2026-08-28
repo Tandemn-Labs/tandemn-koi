@@ -163,6 +163,39 @@ class ConfidenceService:
         mechanism_metadata.q_histogram[q_key] = mechanism_metadata.q_histogram.get(q_key, 0) + 1
         return self.get_mechanism_confidence(mechanism_id), True
 
+    def apply_partial_divergence(
+        self,
+        mechanism_id: str,
+        edge_ids: list[str],
+        beta_delta: float,
+        icp_results: dict[str, Any] | None = None,
+        env_label: Any = None,
+        tick: int | None = None,
+    ) -> None:
+        """Penalize observable partial divergence without claiming a Q label."""
+        scale = float(beta_delta) / float(MECHANISM_BETA_UPDATE["Q4"][1])
+        mechanism_metadata = self.mechanism_registry.mechanism_metadata_table[mechanism_id]
+        mechanism_alpha, mechanism_beta = self.get_delta_c_mechanism("Q4")
+        mechanism_metadata.alpha += mechanism_alpha * scale
+        mechanism_metadata.beta += mechanism_beta * scale
+        mechanism_metadata.visit_count += 1
+        if env_label is not None:
+            mechanism_metadata.envs_seen.add(env_label)
+        if tick is not None:
+            mechanism_metadata.last_touched_tick = int(tick)
+
+        for edge_id in edge_ids:
+            edge_metadata = self.candidate_graph.edge_metadata_table[edge_id]
+            icp_result = (icp_results or {}).get(edge_id, "undecided")
+            edge_alpha, edge_beta = self.get_delta_c_edge("Q4", icp_result)
+            edge_metadata.alpha += edge_alpha * scale
+            edge_metadata.beta += edge_beta * scale
+            edge_metadata.visit_count += 1
+            if env_label is not None:
+                edge_metadata.envs_seen.add(env_label)
+            if tick is not None:
+                edge_metadata.last_touched_tick = int(tick)
+
     def seed_new_mechanism_confidence(
         self,
         mechanism_id: str,

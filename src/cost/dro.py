@@ -14,7 +14,7 @@ switch cost only, not by a hard validator gate.
 """
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import numpy as np
 
@@ -166,26 +166,90 @@ class DRO:
         if bands is None or len(bands) != len(outcomes):
             return self.target
 
-        inside_count = 0
+        evaluations: list[bool] = []
         for outcome, band in zip(outcomes, bands, strict=False):
-            if self._all_objectives_inside(outcome, band):
-                inside_count += 1
-        return inside_count / len(outcomes)
+            status = self._coverage_status(outcome, band)
+            if status is not None:
+                evaluations.append(status)
+        if not evaluations:
+            return self.target
+        return sum(evaluations) / len(evaluations)
 
     @staticmethod
     def _all_objectives_inside(
         outcome: dict[str, float],
         band: dict[str, dict[str, float]],
+        required_objectives: Iterable[str] | None = None,
     ) -> bool:
-        for obj, y in outcome.items():
-            if y is None:
-                continue
-            b = band.get(obj)
-            if b is None:
-                continue
-            if y < b["lower"] or y > b["upper"]:
+        return DRO._coverage_status(outcome, band, required_objectives) is True
+
+    @staticmethod
+    def _coverage_status(
+        outcome: dict[str, float],
+        band: object,
+        required_objectives: Iterable[str] | None = None,
+    ) -> bool | None:
+        """Return coverage, or None when the band or required observations are absent."""
+        if band is None:
+            return None
+        if not isinstance(outcome, Mapping) or not any(
+            observed is not None for observed in outcome.values()
+        ):
+            return None
+        if not isinstance(band, Mapping):
+            return False
+
+        if required_objectives is None:
+            required = tuple(band)
+        else:
+            if isinstance(required_objectives, (str, bytes)):
+                return False
+            try:
+                required = tuple(dict.fromkeys(required_objectives))
+            except TypeError:
+                return False
+        if not required or any(not isinstance(obj, str) or not obj for obj in required):
+            return False
+
+        if any(obj not in outcome or outcome[obj] is None for obj in required):
+            return None
+
+        for obj in required:
+            bounds = DRO._valid_band_bounds(band.get(obj))
+            if bounds is None:
+                return False
+            try:
+                observed = float(outcome[obj])
+            except (TypeError, ValueError, OverflowError):
+                return False
+            lower, upper = bounds
+            if not np.isfinite(observed) or observed < lower or observed > upper:
                 return False
         return True
+
+    @staticmethod
+    def _valid_band_bounds(candidate: object) -> tuple[float, float] | None:
+        """Return finite, ordered bounds from one objective band."""
+        if not isinstance(candidate, Mapping):
+            return None
+        try:
+            lower_value = candidate["lower"]
+            upper_value = candidate["upper"]
+        except KeyError:
+            return None
+        numeric_types = (int, float, np.integer, np.floating)
+        if (
+            isinstance(lower_value, bool)
+            or isinstance(upper_value, bool)
+            or not isinstance(lower_value, numeric_types)
+            or not isinstance(upper_value, numeric_types)
+        ):
+            return None
+        lower = float(lower_value)
+        upper = float(upper_value)
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower > upper:
+            return None
+        return lower, upper
 
     # CONTROLLER
 
@@ -193,7 +257,7 @@ class DRO:
         self,
         current_epsilon: float,
         observed_coverage: float,
-        target: float = DEFAULT_TARGET_COVERAGE,
+        target: float | None = None,
     ) -> float:
         """
         Definition: Empirical-coverage controller for epsilon_DRO.
@@ -205,16 +269,17 @@ class DRO:
         Inputs:
             current_epsilon   : previous epsilon_DRO
             observed_coverage : fraction of recent outcomes inside the band
-            target            : desired coverage (default 0.90)
+            target            : desired coverage (default self.target)
         Outputs:
             new epsilon_DRO (also written into self.epsilon)
         Notes:
             Dead band prevents controller oscillation near target.
         """
         eps = float(current_epsilon)
-        if observed_coverage < target - self.dead_band:
+        target_value = self.target if target is None else float(target)
+        if observed_coverage < target_value - self.dead_band:
             eps = min(eps * (1.0 + self.eta), self.eps_max)
-        elif observed_coverage > target + self.dead_band:
+        elif observed_coverage > target_value + self.dead_band:
             eps = max(eps * (1.0 - self.eta), self.eps_min)
         self.epsilon = eps
         return eps
@@ -255,8 +320,8 @@ class DRO:
                         r = obs_y - pred_y
                     Objectives absent from one side are skipped (handles
                     latency objectives missing on batch jobs cleanly).
-        Usage:      Validator.s2_validate calls after each rank's telemetry
-                    is processed. Feeds DRO band & chance-constraint logic.
+        Usage:      TickRunner.S3 calls after evaluating each rank's observed
+                    coverage against its immutable decision-time DRO band.
         Inputs:
             pred_y : objective -> y_hat_j  (from SurrogatePrediction.compose_prediction)
             obs_y  : objective -> realized y_j (from Telemetry)
@@ -282,8 +347,8 @@ class DRO:
         """
         Definition: Per-objective Pr_DRO[g_j(y) > 0] using Wasserstein duality:
                         Pr_DRO[g > 0] <= Pr_{P_hat_t}[g > 0] + epsilon * Lip(g) / sigma
-                    Plus aggregate "_any_violated" via union bound:
-                        1 - prod(1 - p_j)  (treating SLOs as independent)
+                    Plus aggregate "_any_violated" via the union bound:
+                        min(1, sum_j p_j)
         Usage:      Agent scoring and SwitchCost risk computation. MVP does
                     not use DRO as a hard validator gate. Caller passes per-objective SLO
                     thresholds and gets back DRO-bounded violation probs.
@@ -294,7 +359,8 @@ class DRO:
             epsilon_dro       : optional override; default self.epsilon
             lipschitz_per_obj : objective -> Lipschitz of g_j (default 1.0)
         Outputs:
-            Dict[obj -> Pr_DRO[g_j > 0]] plus "_any_violated"
+            Dict[obj -> Pr_DRO[g_j > 0]] plus "_any_violated". All values
+            are numeric probabilities.
         Notes:
             Returns Pr = 1.0 for objectives without residual history
             (conservative cold-start behavior).
@@ -302,13 +368,17 @@ class DRO:
         eps = self.epsilon if epsilon_dro is None else float(epsilon_dro)
         lip = lipschitz_per_obj or {}
         out: dict[str, float] = {}
+        risks: list[float] = []
 
         for obj, thr in slo_thresholds.items():
             if obj not in pred_y or pred_y[obj] is None:
+                out[obj] = 1.0
+                risks.append(1.0)
                 continue
             residuals = self.get_residual_history(obj)
             if residuals.size == 0:
                 out[obj] = 1.0
+                risks.append(1.0)
                 continue
 
             y_hat = float(pred_y[obj])
@@ -316,12 +386,11 @@ class DRO:
             nominal = float(np.mean(residuals > critical))
             sigma = float(np.std(residuals)) + 1e-9
             dro_bonus = (eps * lip.get(obj, 1.0)) / sigma
-            out[obj] = float(min(nominal + dro_bonus, 1.0))
+            risk = float(min(nominal + dro_bonus, 1.0))
+            out[obj] = risk
+            risks.append(risk)
 
-        if out:
-            out["_any_violated"] = 1.0 - float(np.prod([1.0 - p for p in out.values()]))
-        else:
-            out["_any_violated"] = 0.0
+        out["_any_violated"] = float(min(1.0, sum(risks)))
         return out
 
     # INTERNALS

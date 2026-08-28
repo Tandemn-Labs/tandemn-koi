@@ -3,7 +3,9 @@ import io
 import unittest
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import patch
 
+from src.agent.tools import agent_tools
 from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
@@ -203,6 +205,161 @@ class EigResourceSmokeTests(unittest.TestCase):
             ],
         )
 
+    def test_duplicate_p5_pools_aggregate_before_subtracting_running_instances(self):
+        env = "reserved|aws|us-east-1|use1-az1|H100"
+        first_pool = {
+            "instance_type": "p5.48xlarge",
+            "gpu_type": "H100",
+            "gpus_per_instance": 8,
+            "total_instances": 3,
+            "total": 24,
+            "allocation_kind": "instance",
+            "price_per_instance_hour": 98.32,
+            "fabric": "first-fabric",
+        }
+
+        class FakeResourceMap:
+            market = ("reserved",)
+
+            @staticmethod
+            def scheduling_summary():
+                return {
+                    env: {
+                        "gpu_type": "H100",
+                        "total": 48,
+                        "pools": [
+                            first_pool,
+                            {
+                                **first_pool,
+                                "price_per_instance_hour": 99.0,
+                                "fabric": "second-fabric",
+                            },
+                        ],
+                    }
+                }
+
+        class SmokeManager(ResourceMapManager):
+            def __init__(self):
+                super().__init__(user_id="duplicate_p5_pool_smoke")
+
+            def get_resource_map(self, user_id=None):
+                return FakeResourceMap()
+
+            def get_running_chains(self, user_id=None):
+                return [
+                    {
+                        "chain_id": f"chain_{index}",
+                        "target_node": env,
+                        "shape_json": {"count": 1, "instance_type": "p5.48xlarge"},
+                    }
+                    for index in range(3)
+                ]
+
+        manager = SmokeManager()
+        resources = manager.resources_summary()
+        pool = resources[env]["pools"][0]
+
+        self.assertEqual(len(resources[env]["pools"]), 1)
+        self.assertEqual(pool["total_instances"], 6)
+        self.assertEqual(pool["total"], 48)
+        self.assertEqual(pool["free_instances"], 3)
+        self.assertEqual(pool["free"], 24)
+        self.assertEqual(resources[env]["free"], 24)
+        self.assertEqual(pool["price_per_instance_hour"], 98.32)
+        self.assertEqual(pool["fabric"], "first-fabric")
+        self.assertEqual(pool["merged_pool_count"], 2)
+        self.assertEqual(
+            [source["price_per_instance_hour"] for source in pool["merged_pool_sources"]],
+            [98.32, 99.0],
+        )
+
+        capacity = manager.pool_capacity(resources)[(env, "p5.48xlarge")]
+        self.assertEqual(capacity["available_units"], 3)
+        self.assertEqual(capacity["free_gpus"], 24)
+
+        with patch.object(agent_tools, "get_resource_map", return_value=resources):
+            catalog = agent_tools.instance_catalog()
+        self.assertEqual(catalog[env]["p5.48xlarge"]["free_instances"], 3)
+        self.assertEqual(catalog[env]["p5.48xlarge"]["gpus_per_instance"], 8)
+
+    def test_duplicate_a100_nc_and_nd_pools_aggregate_independently(self):
+        env = "reserved|azure|eastus|zone-1|A100"
+        nc_pool = {
+            "instance_type": "Standard_NC24ads_A100_v4",
+            "gpus_per_instance": 1,
+            "total_instances": 2,
+            "total": 2,
+            "allocation_kind": "instance",
+        }
+        nd_pool = {
+            "instance_type": "Standard_ND96amsr_A100_v4",
+            "gpus_per_instance": 8,
+            "total_instances": 3,
+            "total": 24,
+            "allocation_kind": "instance",
+        }
+
+        class FakeResourceMap:
+            market = ("reserved",)
+
+            @staticmethod
+            def scheduling_summary():
+                return {
+                    env: {
+                        "gpu_type": "A100",
+                        "total": 52,
+                        "pools": [nc_pool, nd_pool, dict(nc_pool), dict(nd_pool)],
+                    }
+                }
+
+        resources = ResourceMapManager._normalized_scheduling_summary(FakeResourceMap())[env]
+        pools = {pool["instance_type"]: pool for pool in resources["pools"]}
+
+        self.assertEqual(len(pools), 2)
+        self.assertEqual(pools["Standard_NC24ads_A100_v4"]["total_instances"], 4)
+        self.assertEqual(pools["Standard_NC24ads_A100_v4"]["total"], 4)
+        self.assertEqual(pools["Standard_NC24ads_A100_v4"]["free_instances"], 4)
+        self.assertEqual(pools["Standard_NC24ads_A100_v4"]["free"], 4)
+        self.assertEqual(pools["Standard_NC24ads_A100_v4"]["merged_pool_count"], 2)
+        self.assertEqual(pools["Standard_ND96amsr_A100_v4"]["total_instances"], 6)
+        self.assertEqual(pools["Standard_ND96amsr_A100_v4"]["total"], 48)
+        self.assertEqual(pools["Standard_ND96amsr_A100_v4"]["free_instances"], 6)
+        self.assertEqual(pools["Standard_ND96amsr_A100_v4"]["free"], 48)
+        self.assertEqual(resources["free"], 52)
+
+    def test_duplicate_pool_shape_conflicts_fail_clearly(self):
+        env = "reserved|aws|us-east-1|use1-az1|H100"
+        first_pool = {
+            "instance_type": "p5.48xlarge",
+            "gpus_per_instance": 8,
+            "total_instances": 3,
+            "total": 24,
+            "allocation_kind": "instance",
+        }
+
+        class FakeResourceMap:
+            market = ("reserved",)
+
+            def __init__(self, second_pool):
+                self.second_pool = second_pool
+
+            def scheduling_summary(self):
+                return {
+                    env: {
+                        "gpu_type": "H100",
+                        "total": 48,
+                        "pools": [first_pool, self.second_pool],
+                    }
+                }
+
+        conflicts = [
+            ({**first_pool, "allocation_kind": "gpu"}, "conflicting allocation kind"),
+            ({**first_pool, "gpus_per_instance": 4}, "conflicting gpus_per_instance"),
+        ]
+        for second_pool, message in conflicts:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                ResourceMapManager._normalized_scheduling_summary(FakeResourceMap(second_pool))
+
     def test_mixed_instance_pools_expose_free_instances(self):
         env = "reserved|aws|us-east-1|us-east-1b|L40S"
 
@@ -245,8 +402,12 @@ class EigResourceSmokeTests(unittest.TestCase):
         pools = {pool["instance_type"]: pool for pool in resources["pools"]}
 
         self.assertEqual(resources["free"], 16)
+        self.assertEqual(pools["g6e.xlarge"]["total_instances"], 4)
+        self.assertEqual(pools["g6e.xlarge"]["total"], 4)
         self.assertEqual(pools["g6e.xlarge"]["free_instances"], 4)
         self.assertEqual(pools["g6e.xlarge"]["free"], 4)
+        self.assertEqual(pools["g6e.12xlarge"]["total_instances"], 3)
+        self.assertEqual(pools["g6e.12xlarge"]["total"], 12)
         self.assertEqual(pools["g6e.12xlarge"]["free_instances"], 3)
         self.assertEqual(pools["g6e.12xlarge"]["free"], 12)
 
@@ -302,9 +463,16 @@ class EigResourceSmokeTests(unittest.TestCase):
                                 "instance_type": "gpu-pool",
                                 "allocation_unit": "gpu",
                                 "gpus_per_unit": 1,
-                                "total": 4,
-                                "total_instances": 4,
-                            }
+                                "total": 2,
+                                "total_instances": 2,
+                            },
+                            {
+                                "instance_type": "gpu-pool",
+                                "allocation_unit": "gpu",
+                                "gpus_per_unit": 1,
+                                "total": 2,
+                                "total_instances": 2,
+                            },
                         ],
                     }
                 }
@@ -325,8 +493,13 @@ class EigResourceSmokeTests(unittest.TestCase):
                     }
                 ]
 
-        pool = SmokeManager().resources_summary()[env]["pools"][0]
+        resources = SmokeManager().resources_summary()[env]
+        pool = resources["pools"][0]
+        self.assertEqual(len(resources["pools"]), 1)
+        self.assertEqual(pool["total_instances"], 4)
+        self.assertEqual(pool["total"], 4)
         self.assertEqual(pool["free"], 2)
+        self.assertEqual(resources["free"], 2)
 
 
 if __name__ == "__main__":

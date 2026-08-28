@@ -1,5 +1,8 @@
 ### Surrogate Stack Installation
 
+Production predictions through `SurrogateComposer` and `AICBackend` are pinned to
+`AIC_Direct`. The DynoSim setup below supports isolated low-level legacy tests only.
+
 ```sudo apt update
 sudo apt install -y build-essential libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler python3-dev cmake curl git
 ```
@@ -124,3 +127,16 @@ Modes are `off` (disabled), `shadow` (record only), and `enabled` (permit learne
 fusion). The default is `shadow`; the CLI flag overrides the environment variable.
 Missing peer dependencies produce one warning and Koi continues with AIC,
 analytic, and PerfDB estimates.
+
+### AIC Profile Matching
+
+Koi builds a cached support index from AIC's public aggregate silicon support
+matrix. For candidates with complete hardware and model catalog facts, it ranks
+the five closest supported GPU/model/dtype profiles using operation signatures
+and workload-range penalties. The requested workload and VRAM are unchanged.
+
+The selected proxy's prefill and decode normalization is passed to DynoSim via
+`speedup_ratio` and `decode_speedup_ratio`, so queueing and percentile latency
+are simulated at the normalized service rate. A typed AIC coverage miss retries
+the next ranked profile; failed profile/workload slices are cached. Prediction
+lineage records the selected profile, distance, confidence, and phase ratios.

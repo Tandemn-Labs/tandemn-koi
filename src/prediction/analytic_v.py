@@ -97,6 +97,44 @@ def compute_memory_v(
     return output
 
 
+def target_memory_fit(values: dict) -> dict[str, float | str]:
+    """Classify requested-model GPU memory fit without using a proxy model."""
+    weight_gb = model_weight_gb(values)
+    gpu_mem_gb = _get(values, "gpu_mem_gb", "gpu_memory_gb", "vram_gb_per_gpu")
+    if weight_gb is None or gpu_mem_gb is None:
+        return {"status": "unknown"}
+
+    try:
+        capacity_gb = float(gpu_mem_gb) * float(_get(values, "gpu_mem_util") or 0.9)
+    except (TypeError, ValueError):
+        return {"status": "unknown"}
+    if capacity_gb <= 0:
+        return {"status": "unknown"}
+
+    used_gb = weight_gb / _weight_shards(values) + ACTIVATION_RESERVE_GB
+    result: dict[str, float | str] = {
+        "status": "fit",
+        "capacity_gb": capacity_gb,
+        "required_gb": used_gb,
+    }
+    if used_gb > capacity_gb:
+        result["status"] = "physical_no_fit"
+        return result
+
+    kv_per_token = kv_bytes_per_token(values)
+    kv_shards = _kv_shards(values)
+    demand = _kv_token_demand(values)
+    if kv_per_token is None or kv_shards is None or demand is None:
+        result["status"] = "unknown"
+        return result
+
+    used_gb += demand * kv_per_token / kv_shards / GIB
+    result["required_gb"] = used_gb
+    if used_gb > capacity_gb:
+        result["status"] = "physical_no_fit"
+    return result
+
+
 def _get(values: dict, *names):
     return next((values[name] for name in names if values.get(name) is not None), None)
 
@@ -114,11 +152,15 @@ def _weight_bytes_per_param(values: dict) -> float | None:
 
 def _kv_bytes_per_elem(values: dict) -> float | None:
     dtype = _get(values, "kvcache_dtype", "kvcache_quantization")
+    if dtype is not None and str(dtype).lower() == "auto":
+        dtype = _get(values, "activation_dtype", "weight_dtype")
     return _DTYPE_BYTES.get(str(dtype).lower()) if dtype is not None else None
 
 
 def _weight_shards(values: dict) -> int:
-    return max(1, int(_get(values, "tp") or 1) * int(_get(values, "pp") or 1))
+    tp = int(_get(values, "tp") or 1)
+    pp = int(_get(values, "pp") or 1)
+    return max(1, tp * pp)
 
 
 def _kv_shards(values: dict) -> int | None:

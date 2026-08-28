@@ -1,8 +1,25 @@
 import logging
 import math
+import os
+from dataclasses import replace
 
 from aiconfigurator.sdk.memory import (  # type: ignore[import-untyped]
     estimate_num_gpu_blocks,
+)
+
+from src.prediction.analytic_v import target_memory_fit
+from src.prediction.compatibility import (
+    backend_dtype_name,
+    canonicalize_dtype,
+    gpu_profile_from_values,
+    resolve_dtype,
+    resolve_gpu,
+)
+from src.prediction.normalization import normalize_candidate_inputs
+from src.prediction.profile_search import (
+    model_profile_from_values,
+    prediction_profile_from_values,
+    rank_profiles,
 )
 
 for _logger_name in ("aiconfigurator", "aiconfigurator_core"):
@@ -10,6 +27,33 @@ for _logger_name in ("aiconfigurator", "aiconfigurator_core"):
 
 ONLINE_REPLAY_WINDOW_S = 1
 ONLINE_MIN_REQUESTS = 20
+_AIC_FALLBACK_MODES = ("HYBRID", "EMPIRICAL", "SOL")
+_AIC_PROFILE_BACKENDS = (("vllm", "0.22.0"), ("sglang", "0.5.14"))
+_A10G_PROFILE_FALLBACK_SYSTEMS = ("l40s", "a100_sxm", "h100_sxm", "h200_sxm")
+_AGGREGATE_PROFILE_OVERRIDES = {
+    "moonshotai/Kimi-K2-Instruct": ("moonshotai/Kimi-K2.5", "sglang", "0.5.14", "h100_sxm"),
+    "deepseek-ai/DeepSeek-V3": ("deepseek-ai/DeepSeek-V3", "sglang", "0.5.14", "h200_sxm"),
+}
+_AIC_GPU_CHOICES = frozenset(
+    {
+        "A30",
+        "A100",
+        "A100 80GB",
+        "A100 PCIE",
+        "B200",
+        "B300",
+        "B60",
+        "GB200",
+        "GB300",
+        "H100",
+        "H100 PCIE",
+        "H200",
+        "L4",
+        "L40S",
+        "RTX PRO 6000",
+    }
+)
+_AIC_DTYPES = frozenset({"bf16", "fp8", "fp8_e4m3", "fp8_e5m2", "int8"})
 
 AIC_MEMORY_X_FIELDS = frozenset(
     {
@@ -24,6 +68,12 @@ AIC_MEMORY_X_FIELDS = frozenset(
         "kvcache_quant_mode",
         "fmha_quant_mode",
         "comm_quant_mode",
+        "kvcache_dtype",
+        "model_size_gb",
+        "weight_dtype",
+        "weight_quantization_bits",
+        "weight_quantization_method",
+        "activation_dtype",
     }
 )
 AIC_PERFORMANCE_X_FIELDS = frozenset(
@@ -74,11 +124,50 @@ POST_PROCESSING_X_FIELDS = frozenset(
         "ep",
     }
 )
+PROFILE_X_FIELDS = frozenset(
+    {
+        "activation_dtype",
+        "architectures",
+        "effective_batch_size",
+        "gpu_bandwidth_gbps",
+        "gpu_generation",
+        "gpu_vendor",
+        "gpu_tflops_fp16",
+        "head_dim",
+        "hidden_size",
+        "intermediate_size",
+        "is_moe",
+        "model_architecture",
+        "model_config",
+        "model_config_json",
+        "model_metadata",
+        "model_params_b",
+        "max_pos_embeddings",
+        "moe_intermediate_size",
+        "num_active_experts",
+        "num_attention_heads",
+        "num_attn_heads",
+        "num_experts",
+        "num_hidden_layers",
+        "num_key_value_heads",
+        "num_kv_heads",
+        "num_layers",
+        "num_routed_experts",
+        "nvlink_bandwidth_gbps",
+        "pcie_bandwidth_gbps",
+        "supported_dtypes",
+        "context",
+        "type",
+        "vocab_size",
+        "params_billion",
+    }
+)
 SURROGATE_CONSUMED_X_FIELDS = (
     AIC_MEMORY_X_FIELDS
     | AIC_PERFORMANCE_X_FIELDS
     | DYNOSIM_WORKLOAD_X_FIELDS
     | POST_PROCESSING_X_FIELDS
+    | PROFILE_X_FIELDS
 )
 
 
@@ -97,10 +186,13 @@ class SurrogateExecutionError(Exception):
 class SurrogatePrediction:
     def __init__(self, objective="batch"):
         self.objective = objective
+        self.last_metadata = {}
+        self._failed_profile_slices = set()
 
     def compose_prediction(
-        self, job_config, job_features, candidate_graph, method=("AIC_DynoSim",), scenario="mean"
+        self, job_config, job_features, candidate_graph, method=("AIC_Direct",), scenario="mean"
     ):
+        self.last_metadata = {}
         env_vector = self.get_env_row(job_features)
         price_vector = self.fetch_cloud_prices(job_config, job_features, env_vector)
         # 1. Resolve what this surrogate is allowed to use/produce in the prediction
@@ -118,7 +210,7 @@ class SurrogatePrediction:
         )
         model_id = job_config.get("model_id") or job_features.get("model_id")
         if model_id is None:
-            raise SurrogateUnsupportedConfig("AIC_DynoSim needs model_id")
+            raise SurrogateUnsupportedConfig("AIC prediction needs model_id")
         direct_x_values["model_id"] = model_id
         # field names -> actual values from job_config/env_vector
 
@@ -143,6 +235,8 @@ class SurrogatePrediction:
             simulator_controls,
             method,
         )
+        surrogate_input["objective"] = objective
+        surrogate_input["scenario"] = scenario
         # direct_x_values + simulator_controls -> AIC_dynosim args
 
         # 5. Run DynoSim/AIC and get direct outputs
@@ -204,52 +298,18 @@ class SurrogatePrediction:
 
         return direct_x_values
 
-    def map_gpu_to_aic_system(self, gpu_type):
-        # TODO - general helper, can be moved out of this file/class
-        # Convert common GPU names into Dynamo/AIC system names.
-        gpu_to_aic_system = {
-            "GB200": "gb200_sxm",
-            "GB200_SXM": "gb200_sxm",
-            "GB10": "gb10",
-            "B200": "b200_sxm",
-            "B200_SXM": "b200_sxm",
-            "B300": "b300_sxm",
-            "B300_SXM": "b300_sxm",
-            "H200": "h200_sxm",
-            "H200_SXM": "h200_sxm",
-            "H100": "h100_sxm",
-            "H100_SXM": "h100_sxm",
-            "H100_PCIE": "h100_pcie",
-            "A100": "a100_sxm",
-            "A100_SXM": "a100_sxm",
-            "A100_PCIE": "a100_sxm",
-            "A30": "a30",
-            "L40S": "l40s",
-            "L40": "l40",
-            "L4": "l4",
-            "V100": "v100_sxm",
-            "V100_SXM": "v100_sxm",
-            "V100_PCIE": "v100_pcie",
-            "T4": "t4",
-            "MI200": "mi200",
-            "MI300": "mi300",
-        }
-
-        supported_aic_systems = set(gpu_to_aic_system.values())
-        normalized_gpu_type = str(gpu_type).strip()
-        normalized_key = normalized_gpu_type.upper().replace("-", "_").replace(" ", "_")
-        normalized_value = normalized_gpu_type.lower()
-
-        if normalized_key.startswith("A100"):
-            return "a100_sxm"
-
-        if normalized_value in supported_aic_systems:
-            return normalized_value
-
-        if normalized_key in gpu_to_aic_system:
-            return gpu_to_aic_system[normalized_key]
-
-        raise SurrogateUnsupportedConfig(f"No AIC system mapping for gpu_type={gpu_type}")
+    def map_gpu_to_aic_system(self, gpu_type, values=None):
+        resolution = resolve_gpu(
+            gpu_type,
+            backend="aic",
+            available=_AIC_GPU_CHOICES,
+            requested_profile=values,
+            allow_larger_memory_proxy=True,
+        )
+        self.last_metadata.setdefault("compatibility", {})["gpu"] = resolution.to_dict()
+        if not resolution.supported or resolution.backend_value is None:
+            raise SurrogateUnsupportedConfig(f"No compatible AIC system for gpu_type={gpu_type}")
+        return resolution.backend_value
 
     def resolve_prediction_scope(self, candidate_graph, method):
         # Resolve the prediction scope for the surrogate stack
@@ -336,6 +396,7 @@ class SurrogatePrediction:
                 "derive_y": {"cost_per_token", "slo_margin"},
             }
         }
+        method_scope["AIC_Direct"] = method_scope["AIC_DynoSim"]
         if method_name not in method_scope:
             raise SurrogateUnsupportedConfig(f"Unsupported surrogate method: {method_name}")
 
@@ -536,48 +597,116 @@ class SurrogatePrediction:
             method[0] if isinstance(method, (list, tuple)) and len(method) == 1 else method
         )
 
-        if method_name != "AIC_DynoSim":
+        if method_name not in {"AIC_Direct", "AIC_DynoSim"}:
             raise SurrogateUnsupportedConfig(
                 f"Unsupported method or multi method is not supported yet: {method}"
             )
 
+        direct_x_values = self._enrich_requested_model_values(direct_x_values)
         model_id = direct_x_values.get("model_id")
         if model_id is None:
-            raise SurrogateUnsupportedConfig("AIC_DynoSim needs model_id")
+            raise SurrogateUnsupportedConfig("AIC prediction needs model_id")
 
         gpu_type = direct_x_values.get("gpu_type")
         if gpu_type is None:
-            raise SurrogateUnsupportedConfig("AIC_DynoSim needs gpu_type")
+            raise SurrogateUnsupportedConfig("AIC prediction needs gpu_type")
 
         pp = int(direct_x_values.get("pp") or 1)
-        aic_only = pp != 1
+        aic_only = method_name == "AIC_Direct" or pp != 1
         if aic_only and direct_x_values.get("pd_enabled", False):
             raise SurrogateUnsupportedConfig(
                 "AIC-only PP prediction supports aggregate serving only"
             )
 
+        requested_system = (
+            "a100_sxm"
+            if str(gpu_type).strip().upper().startswith("A100")
+            else self.map_gpu_to_aic_system(gpu_type, direct_x_values)
+        )
+        requested_gpu = gpu_profile_from_values(str(gpu_type), direct_x_values)
+        if direct_x_values.get("gpu_mem_gb") is None and requested_gpu and requested_gpu.memory_gb:
+            direct_x_values = {**direct_x_values, "gpu_mem_gb": requested_gpu.memory_gb}
+
+        if method_name == "AIC_Direct":
+            memory_fit = target_memory_fit(direct_x_values)
+            self.last_metadata["target_memory_fit"] = memory_fit
+            if memory_fit["status"] == "physical_no_fit":
+                raise SurrogateMemoryNoFit(
+                    "requested model memory no-fit: "
+                    f"requires {memory_fit['required_gb']:.2f} GiB per GPU, "
+                    f"capacity {memory_fit['capacity_gb']:.2f} GiB"
+                )
+
+        profile_matches = self._rank_aic_profiles(
+            direct_x_values,
+            aic_system=requested_system,
+            enriched=True,
+        )
+        selected_match = profile_matches[0] if profile_matches else None
+        resolved_system = (
+            selected_match.supported.aic_system if selected_match is not None else requested_system
+        )
+        resolved_model = (
+            selected_match.supported.model.model_id if selected_match is not None else model_id
+        )
+        resolved_engine = (
+            selected_match.supported.engine_name
+            if selected_match is not None
+            else direct_x_values.get("engine_name", "vllm")
+        )
+        resolved_engine_version = (
+            selected_match.supported.engine_version if selected_match is not None else "0.22.0"
+        )
         engine_args = {
-            "engine_type": direct_x_values.get("engine_name", "vllm"),
+            "engine_type": resolved_engine,
             "block_size": direct_x_values.get("block_size", 64),
             "max_num_seqs": direct_x_values.get("max_num_seq"),
             "max_num_batched_tokens": direct_x_values.get("max_num_batched_tokens"),
-            "aic_backend": direct_x_values.get("engine_name", "vllm"),
-            # AIC's bundled performance database currently supports this version.
-            "aic_backend_version": "0.22.0",
-            "aic_system": self.map_gpu_to_aic_system(gpu_type),
-            "aic_model_path": model_id,
+            "aic_backend": resolved_engine,
+            "aic_backend_version": resolved_engine_version,
+            "aic_system": resolved_system,
+            "aic_model_path": resolved_model,
             "aic_tp_size": direct_x_values.get("tp", 1),
             "aic_moe_ep_size": direct_x_values.get("ep", 1),
             "enable_prefix_caching": direct_x_values.get("prefix_cache_enabled", False),
             "enable_chunked_prefill": direct_x_values.get("chunked_prefill_enable", False),
             "preemption_mode": direct_x_values.get("preemption_policy"),
         }
-        memory_x_values = {
-            key: direct_x_values[key]
-            for key in AIC_MEMORY_X_FIELDS
-            if direct_x_values.get(key) is not None
-        }
-        self._resolve_aic_num_gpu_blocks(engine_args, memory_x_values)
+        if selected_match is not None:
+            engine_args["speedup_ratio"] = selected_match.prefill_speed_ratio
+            engine_args["decode_speedup_ratio"] = (
+                selected_match.decode_speed_ratio / selected_match.prefill_speed_ratio
+            )
+            self.last_metadata["aic_profile_match"] = selected_match.to_dict()
+            self.last_metadata["aic_profile_candidates"] = [
+                match.to_dict() for match in profile_matches
+            ]
+            self.last_metadata["engine_resolution"] = {
+                "requested_name": direct_x_values.get("engine_name"),
+                "requested_version": direct_x_values.get("engine_version"),
+                "resolved_name": selected_match.supported.engine_name,
+                "resolved_version": selected_match.supported.engine_version,
+            }
+        self._resolve_aic_dtypes(direct_x_values)
+        if any(
+            resolution.get("kind") == "unsupported"
+            for name, resolution in (self.last_metadata.get("compatibility") or {}).items()
+            if name.endswith("_dtype")
+        ):
+            raise SurrogateUnsupportedConfig("AIC has no compatible dtype for this candidate")
+        if method_name == "AIC_DynoSim":
+            memory_x_values = {
+                key: direct_x_values[key]
+                for key in AIC_MEMORY_X_FIELDS
+                if direct_x_values.get(key) is not None
+            }
+            if memory_x_values.get("gpu_mem_gb") is None:
+                requested_profile = gpu_profile_from_values(str(gpu_type), direct_x_values)
+                if requested_profile is not None and requested_profile.memory_gb is not None:
+                    memory_x_values["gpu_mem_gb"] = requested_profile.memory_gb
+            memory_engine_args = {**engine_args, "aic_model_path": model_id}
+            self._resolve_aic_num_gpu_blocks(memory_engine_args, memory_x_values)
+            engine_args["num_gpu_blocks"] = memory_engine_args["num_gpu_blocks"]
 
         queue_policy = direct_x_values.get("scheduling_policy")
         if queue_policy in {"fcfs", "lcfs", "wspt"}:
@@ -622,15 +751,231 @@ class SurrogatePrediction:
         replay_args = {key: value for key, value in replay_args.items() if value is not None}
         aic_args = {
             "pp_size": pp,
+            "gemm_quant_mode": self._resolved_aic_dtype("weights_dtype"),
+            "fmha_quant_mode": self._resolved_aic_dtype("fmha_dtype"),
+            "kvcache_quant_mode": self._resolved_aic_dtype("kv_cache_dtype"),
         }
+        aic_args = {key: value for key, value in aic_args.items() if value is not None}
 
         return {
             "method": method_name,
             "aic_only": aic_only,
+            "requested_model_id": model_id,
+            "requested_aic_system": requested_system,
             "aic_args": aic_args,
             "engine_args": engine_args,
             "replay_args": replay_args,
+            "aic_profile_matches": tuple(match.to_dict() for match in profile_matches),
         }
+
+    def _rank_aic_profiles(self, values, *, aic_system=None, enriched=False):
+        try:
+            from src.prediction.aic_support import load_aic_support_profiles
+
+            _, normalized_values = normalize_candidate_inputs({}, values)
+            normalized_values = {**values, **normalized_values}
+            if not enriched:
+                normalized_values = self._enrich_requested_model_values(normalized_values)
+            requested_gpu = gpu_profile_from_values(
+                str(normalized_values.get("gpu_type") or ""), normalized_values
+            )
+            if requested_gpu is None:
+                return ()
+            requested = prediction_profile_from_values(normalized_values, requested_gpu)
+            if requested is None:
+                return ()
+            if not {"layers", "hidden_size", "attention_heads"} <= requested.model.known_fields:
+                self.last_metadata["aic_profile_search"] = {
+                    "status": "unavailable",
+                    "reason": "requested_model_structure_missing",
+                }
+                return ()
+            if aic_system is None:
+                gpu_type = normalized_values.get("gpu_type")
+                aic_system = (
+                    "a100_sxm"
+                    if str(gpu_type).strip().upper().startswith("A100")
+                    else self.map_gpu_to_aic_system(gpu_type, normalized_values)
+                )
+            available_all = tuple(
+                profile
+                for backend, version in _AIC_PROFILE_BACKENDS
+                for profile in load_aic_support_profiles(backend, version)
+            )
+            available = available_all
+            estimate_only_system = None
+            override = _AGGREGATE_PROFILE_OVERRIDES.get(requested.model.model_id)
+            if override is not None and aic_system == "h100_sxm":
+                model_id, backend, version, system = override
+                template = next(
+                    (profile for profile in available_all if profile.aic_system == system),
+                    None,
+                )
+                if template is not None:
+                    available = [
+                        replace(
+                            template,
+                            profile_id=f"override:{backend}:{version}:{system}:{model_id}",
+                            model=replace(requested.model, model_id=model_id),
+                            engine_name=backend,
+                            engine_version=version,
+                            aic_system=system,
+                        )
+                    ]
+                    self.last_metadata["aic_profile_override"] = {
+                        "requested_model_id": requested.model.model_id,
+                        "model_id": model_id,
+                        "engine_name": backend,
+                        "engine_version": version,
+                        "aic_system": system,
+                    }
+                else:
+                    available = []
+            else:
+                available = [profile for profile in available if profile.aic_system == aic_system]
+                if not available and aic_system == "l4":
+                    for system in _A10G_PROFILE_FALLBACK_SYSTEMS:
+                        available = [
+                            profile for profile in available_all if profile.aic_system == system
+                        ]
+                        if available:
+                            estimate_only_system = aic_system
+                            self.last_metadata["aic_profile_system_fallback"] = {
+                                "requested_system": aic_system,
+                                "model_source_system": system,
+                                "estimate_only_system": estimate_only_system,
+                            }
+                            break
+            matches = rank_profiles(
+                requested,
+                available,
+                limit=len(available),
+                match_engine=False,
+                require_weight_fit=False,
+            )
+            matches = [
+                match
+                for match in matches
+                if match.supported.model.is_moe == requested.model.is_moe
+            ]
+            matches.sort(
+                key=lambda match: (
+                    match.supported.model.model_id != requested.model.model_id,
+                    abs(
+                        math.log(
+                            match.supported.model.parameter_count / requested.model.parameter_count
+                        )
+                    ),
+                    match.supported.model.weight_dtype != requested.model.weight_dtype,
+                    match.supported.engine_name != requested.engine_name,
+                    match.distance,
+                    match.supported.profile_id,
+                )
+            )
+            if estimate_only_system is not None:
+                matches = [
+                    replace(
+                        match,
+                        supported=replace(
+                            match.supported,
+                            gpu=requested_gpu,
+                            aic_system=estimate_only_system,
+                        ),
+                        prefill_speed_ratio=1.0,
+                        decode_speed_ratio=1.0,
+                        reasons=(*match.reasons, "estimate_only_system_proxy"),
+                    )
+                    for match in matches
+                ]
+            return tuple(matches[:5])
+        except Exception as exc:
+            self.last_metadata["aic_profile_search"] = {
+                "status": "unavailable",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            return ()
+
+    def _enrich_requested_model_values(self, values):
+        model_id = values.get("model_id")
+        if not model_id:
+            return values
+        errors = []
+        try:
+            from aiconfigurator.sdk.utils import (  # type: ignore[import-untyped]
+                get_model_config_from_model_path,
+            )
+
+            config = get_model_config_from_model_path(str(model_id))
+        except Exception as exc:
+            errors.append(exc)
+        else:
+            if isinstance(config, dict):
+                self.last_metadata["model_profile_enrichment"] = {"status": "success", "source": "aic"}
+                return self._with_derived_model_parameters({**config, **values})
+
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(
+                str(model_id),
+                token=os.environ.get("HF_TOKEN"),
+            ).to_dict()
+        except Exception as exc:
+            errors.append(exc)
+        else:
+            self.last_metadata["model_profile_enrichment"] = {
+                "status": "success",
+                "source": "huggingface",
+            }
+            return self._with_derived_model_parameters({**config, **values})
+
+        error = errors[-1]
+        self.last_metadata["model_profile_enrichment"] = {
+            "status": "unavailable",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        return values
+
+    @staticmethod
+    def _with_derived_model_parameters(values):
+        if values.get("model_params_b") is not None or not values.get("model_id"):
+            return values
+        profile = model_profile_from_values(str(values["model_id"]), values)
+        if profile is None or not {"layers", "hidden_size", "attention_heads"} <= profile.known_fields:
+            return values
+        return {**values, "model_params_b": profile.parameter_count / 1e9}
+
+    def _resolve_aic_dtypes(self, values):
+        requested = {
+            "weights": values.get("weight_dtype"),
+            "fmha": values.get("fmha_quant_mode")
+            or values.get("activation_dtype")
+            or values.get("weight_dtype"),
+            "kv_cache": values.get("kvcache_quant_mode") or values.get("kvcache_dtype"),
+        }
+        compatibility = self.last_metadata.setdefault("compatibility", {})
+        for component, dtype in requested.items():
+            if dtype is None or canonicalize_dtype(dtype) == "auto":
+                continue
+            compatibility[f"{component}_dtype"] = resolve_dtype(
+                dtype,
+                backend="aic",
+                component=component,
+                available=_AIC_DTYPES if component == "weights" else frozenset({"bf16"}),
+            ).to_dict()
+
+    def _resolved_aic_dtype(self, name):
+        resolution = (self.last_metadata.get("compatibility") or {}).get(name) or {}
+        return resolution.get("backend_value") if resolution.get("supported", True) else None
+
+    def _requested_aic_dtype(self, name):
+        resolution = (self.last_metadata.get("compatibility") or {}).get(name) or {}
+        canonical = resolution.get("canonical")
+        if canonical == "fp16":
+            canonical = "bf16"
+        return backend_dtype_name(canonical, "aic") if canonical else None
 
     def _resolve_aic_num_gpu_blocks(self, engine_args, memory_x_values):
         """Run AIC's memory fit/KV-capacity estimator before DynoSim replay."""
@@ -658,10 +1003,10 @@ class SurrogatePrediction:
                 # attention_dp_size=int(memory_x_values.get("aic_attention_dp_size") or 1),
                 moe_ep_size=engine_args.get("aic_moe_ep_size"),
                 # Not Koi X today; AIC infers these from the model config or defaults.
-                # gemm_quant_mode=memory_x_values.get("gemm_quant_mode"),
+                gemm_quant_mode=self._requested_aic_dtype("weights_dtype"),
                 # moe_quant_mode=memory_x_values.get("moe_quant_mode"),
-                # kvcache_quant_mode=memory_x_values.get("kvcache_quant_mode"),
-                # fmha_quant_mode=memory_x_values.get("fmha_quant_mode"),
+                kvcache_quant_mode=self._requested_aic_dtype("kv_cache_dtype"),
+                fmha_quant_mode=self._requested_aic_dtype("fmha_dtype"),
                 # comm_quant_mode=memory_x_values.get("comm_quant_mode"),
                 gpu_memory_capacity_bytes_override=self._gpu_memory_capacity_bytes(memory_x_values),
                 allow_naive_fallback=False,
@@ -669,7 +1014,9 @@ class SurrogatePrediction:
             )
         except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig, SurrogateExecutionError):
             raise
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
             raise self._memory_preflight_error(exc) from exc
         if int(blocks) <= 0:
             raise SurrogateMemoryNoFit(f"AIC memory preflight no-fit: num_gpu_blocks={blocks}")
@@ -725,13 +1072,102 @@ class SurrogatePrediction:
         # Run the surrogate model.
         # Inputs: SurrogateInput, Method=List[DynoSim, LLMSimulator, etc], accumulate_logic: average,llm decides
         # Outputs: y_hat, v_hat
-        if len(method) == 1 and method[0] == "AIC_DynoSim":
-            # dont accumulate, just run the surrogate model
-            if surrogate_input.get("aic_only"):
+        if len(method) == 1 and method[0] in {"AIC_Direct", "AIC_DynoSim"}:
+            dtype_resolutions = [
+                resolution
+                for name, resolution in (self.last_metadata.get("compatibility") or {}).items()
+                if name.endswith("_dtype")
+            ]
+            if any(resolution.get("kind") == "unsupported" for resolution in dtype_resolutions):
+                raise SurrogateUnsupportedConfig("AIC has no compatible dtype for this candidate")
+            requires_direct_dtype = any(
+                resolution.get("kind") == "nearest"
+                or resolution.get("resolved") not in {None, "bf16"}
+                for resolution in dtype_resolutions
+            )
+            if method[0] == "AIC_Direct" or surrogate_input.get("aic_only"):
+                return self.run_aic_only(surrogate_input)
+            if surrogate_input.get("aic_profile_matches"):
+                return self.run_aic_dynosim(surrogate_input)
+            if requires_direct_dtype:
                 return self.run_aic_only(surrogate_input)
             return self.run_aic_dynosim(surrogate_input)
 
     def run_aic_only(self, surrogate_input):
+        matches = tuple(surrogate_input.get("aic_profile_matches") or ())
+        if not matches:
+            return self._run_aic_modes(surrogate_input, ("SILICON", *_AIC_FALLBACK_MODES))
+
+        failures = []
+        base_engine_args = surrogate_input["engine_args"]
+        for match in matches:
+            attempt = {
+                **surrogate_input,
+                "engine_args": self._engine_args_for_profile(base_engine_args, match),
+            }
+            self.last_metadata["aic_profile_match"] = dict(match)
+            try:
+                result = self._run_aic_modes(attempt, ("SILICON", *_AIC_FALLBACK_MODES))
+            except SurrogateMemoryNoFit as exc:
+                if (
+                    match.get("model_id") == surrogate_input.get("requested_model_id")
+                    and match.get("aic_system") == surrogate_input.get("requested_aic_system")
+                ):
+                    raise
+                failures.append(
+                    {
+                        "profile_id": match.get("profile_id"),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            except SurrogateUnsupportedConfig as exc:
+                if not self._is_retryable_profile_failure(exc):
+                    raise
+                failures.append(
+                    {
+                        "profile_id": match.get("profile_id"),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            if failures:
+                self.last_metadata["aic_profile_attempts"] = failures
+            return result
+
+        self.last_metadata["aic_profile_attempts"] = failures
+        details = "; ".join(attempt["error"] for attempt in failures)
+        raise SurrogateUnsupportedConfig(f"AIC has no usable estimate for ranked profiles: {details}")
+
+    def _run_aic_modes(self, surrogate_input, modes, fallback_reason=None):
+        failures = []
+        mapped_failures = []
+        for database_mode in modes:
+            try:
+                result = self._run_aic_mode(surrogate_input, database_mode)
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                    raise
+                mapped = self._aic_only_error(exc)
+                if isinstance(mapped, SurrogateMemoryNoFit):
+                    raise mapped from exc
+                mapped_failures.append(mapped)
+                failures.append(f"{database_mode}: {type(exc).__name__}: {exc}")
+                continue
+            self.last_metadata["aic_database_mode"] = database_mode
+            if database_mode != "SILICON":
+                self.last_metadata["aic_fallback"] = {
+                    "reason": fallback_reason or "silicon_estimate_unavailable",
+                    "attempts": failures,
+                    "selected_database_mode": database_mode,
+                }
+            return result
+        message = "AIC has no usable silicon, empirical, or SOL estimate: " + "; ".join(failures)
+        if any(isinstance(failure, SurrogateExecutionError) for failure in mapped_failures):
+            raise SurrogateExecutionError(message)
+        raise SurrogateUnsupportedConfig(message)
+
+    def _run_aic_mode(self, surrogate_input, database_mode):
         engine_args = surrogate_input["engine_args"]
         replay_args = surrogate_input["replay_args"]
         aic_args = surrogate_input.get("aic_args") or {}
@@ -745,36 +1181,64 @@ class SurrogatePrediction:
         )
         num_workers = int(replay_args.get("num_workers") or 1)
 
-        try:
-            estimate = self._aic_estimate(
-                model_path=engine_args["aic_model_path"],
-                system_name=engine_args["aic_system"],
-                mode="agg",
-                backend_name=engine_args["aic_backend"],
-                backend_version=engine_args.get("aic_backend_version"),
-                isl=input_tokens,
-                osl=output_tokens,
-                batch_size=self._aic_batch_size(engine_args, replay_args),
-                ctx_tokens=int(engine_args.get("max_num_batched_tokens") or input_tokens),
-                tp_size=int(engine_args.get("aic_tp_size") or 1),
-                pp_size=int(aic_args.get("pp_size") or 1),
-                moe_ep_size=engine_args.get("aic_moe_ep_size"),
-            )
-        except Exception as exc:
-            raise self._aic_only_error(exc) from exc
-
+        estimate = self._aic_estimate(
+            model_path=engine_args["aic_model_path"],
+            system_name=engine_args["aic_system"],
+            mode="agg",
+            backend_name=engine_args["aic_backend"],
+            backend_version=engine_args.get("aic_backend_version"),
+            database_mode=database_mode,
+            isl=input_tokens,
+            osl=output_tokens,
+            batch_size=self._aic_batch_size(engine_args, replay_args),
+            ctx_tokens=int(engine_args.get("max_num_batched_tokens") or input_tokens),
+            tp_size=int(engine_args.get("aic_tp_size") or 1),
+            pp_size=int(aic_args.get("pp_size") or 1),
+            moe_ep_size=engine_args.get("aic_moe_ep_size"),
+            gemm_quant_mode=aic_args.get("gemm_quant_mode"),
+            fmha_quant_mode=aic_args.get("fmha_quant_mode"),
+            kvcache_quant_mode=aic_args.get("kvcache_quant_mode"),
+        )
         raw = estimate.raw or {}
-        throughput = float(raw.get("tokens/s") or 0.0) * num_workers
+        throughput = float(raw.get("tokens/s") or getattr(estimate, "tokens_per_second", 0.0))
+        throughput *= num_workers
+        prefill_speed, decode_speed = self._phase_compatibility_scales()
+        baseline_duration = float(estimate.ttft) + float(estimate.tpot) * output_tokens
+        scaled_duration = float(estimate.ttft) / prefill_speed + (
+            float(estimate.tpot) * output_tokens / decode_speed
+        )
+        throughput_speed = baseline_duration / max(
+            scaled_duration,
+            1e-12,
+        )
         raw_report = {
             "completed_requests": expected_requests,
             "total_input_tokens": input_tokens * expected_requests,
             "total_output_tokens": output_tokens * expected_requests,
-            "p99_ttft_ms": estimate.ttft,
-            "p99_tpot_ms": estimate.tpot,
-            "output_throughput_tok_s": throughput,
+            "p99_ttft_ms": float(estimate.ttft) / prefill_speed,
+            "p99_tpot_ms": float(estimate.tpot) / decode_speed,
+            "output_throughput_tok_s": throughput * throughput_speed,
             "prefix_cache_reused_ratio": None,
         }
-        return self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
+        y_hat, v_hat = self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
+        return y_hat, v_hat
+
+    def _phase_compatibility_scales(self):
+        match = self.last_metadata.get("aic_profile_match") or {}
+        if match:
+            return (
+                max(float(match.get("prefill_speed_ratio") or 1.0), 1e-12),
+                max(float(match.get("decode_speed_ratio") or 1.0), 1e-12),
+            )
+        compatibility = self.last_metadata.get("compatibility") or {}
+        gpu_scale = float((compatibility.get("gpu") or {}).get("throughput_scale") or 1.0)
+        dtype_scales = [
+            float(resolution.get("throughput_scale") or 1.0)
+            for name, resolution in compatibility.items()
+            if name.endswith("_dtype")
+        ]
+        throughput_scale = gpu_scale * min(dtype_scales, default=1.0)
+        return throughput_scale, throughput_scale
 
     @staticmethod
     def _aic_batch_size(engine_args, replay_args):
@@ -799,7 +1263,14 @@ class SurrogatePrediction:
         text = str(exc).lower()
         if "oom" in text or "kv cache" in text or "kv-cache" in text or "does not fit" in text:
             return SurrogateMemoryNoFit(f"AIC-only PP no-fit: {exc}")
-        if "unsupported" in text or "not supported" in text or "no database" in text:
+        if (
+            "unsupported" in text
+            or "not supported" in text
+            or "no database" in text
+            or "perfdatanotavailableerror" in text
+            or "empiricalnotimplementederror" in text
+            or ("performance data" in text and "not available" in text)
+        ):
             return SurrogateUnsupportedConfig(f"AIC-only PP unsupported config: {exc}")
         return SurrogateExecutionError(f"AIC-only PP execution failed: {exc}")
 
@@ -807,10 +1278,17 @@ class SurrogatePrediction:
         # Run the AIC DynoSim model.
         # Inputs: SurrogateInput
         # Outputs: y_hat, v_hat
-        from dynamo.llm import MockEngineArgs
-        from dynamo.replay.api import run_synthetic_trace_replay
+        try:
+            from dynamo.llm import MockEngineArgs
+            from dynamo.replay.api import run_synthetic_trace_replay
+        except Exception as exc:
+            return self._run_aic_modes(
+                surrogate_input,
+                _AIC_FALLBACK_MODES,
+                fallback_reason=f"DynoSim unavailable: {type(exc).__name__}: {exc}",
+            )
 
-        engine_args = surrogate_input["engine_args"]
+        base_engine_args = surrogate_input["engine_args"]
         replay_args = surrogate_input["replay_args"]
 
         input_tokens = int(replay_args["input_tokens"])
@@ -845,33 +1323,188 @@ class SurrogatePrediction:
         elif replay_args.get("arrival_interval_ms") is not None:
             common_replay_args["arrival_interval_ms"] = replay_args["arrival_interval_ms"]
 
+        configured_matches = tuple(surrogate_input.get("aic_profile_matches") or ())
+        matches = tuple(
+            match
+            for match in configured_matches
+            if self._profile_failure_key(match, replay_args, base_engine_args)
+            not in self._failed_profile_slices
+        )
+        if configured_matches and not matches:
+            return self._run_aic_modes(
+                surrogate_input,
+                _AIC_FALLBACK_MODES,
+                fallback_reason="all ranked AIC profile slices previously failed",
+            )
+        attempts = matches or (None,)
+        failures = []
+        for match in attempts:
+            engine_args = self._engine_args_for_profile(base_engine_args, match)
+            try:
+                raw_report = self._run_dynosim_replay(
+                    run_synthetic_trace_replay,
+                    MockEngineArgs,
+                    engine_args,
+                    replay_args,
+                    input_tokens,
+                    output_tokens,
+                    request_count,
+                    common_replay_args,
+                    pd_enabled,
+                )
+            # PyO3 PanicException inherits BaseException directly, not Exception.
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                    raise
+                details = f"{type(exc).__name__}: {exc}"
+                failures.append(
+                    {
+                        "profile_id": (match or {}).get("profile_id"),
+                        "error": details,
+                    }
+                )
+                if match is not None and self._is_retryable_profile_failure(exc):
+                    if self._is_aic_coverage_failure(exc):
+                        self._failed_profile_slices.add(
+                            self._profile_failure_key(match, replay_args, base_engine_args)
+                        )
+                    continue
+                return self._run_aic_modes(
+                    surrogate_input,
+                    _AIC_FALLBACK_MODES,
+                    fallback_reason=details,
+                )
+            if match is not None:
+                self.last_metadata["aic_profile_match"] = dict(match)
+            if failures:
+                self.last_metadata["aic_profile_attempts"] = failures
+            if match is not None:
+                return self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
+
+            prefill_speed, decode_speed = self._phase_compatibility_scales()
+            scaled_report = dict(raw_report)
+            if scaled_report.get("p99_ttft_ms") is not None:
+                scaled_report["p99_ttft_ms"] = float(scaled_report["p99_ttft_ms"]) / prefill_speed
+            if scaled_report.get("p99_tpot_ms") is not None:
+                scaled_report["p99_tpot_ms"] = float(scaled_report["p99_tpot_ms"]) / decode_speed
+            if scaled_report.get("output_throughput_tok_s") is not None:
+                scaled_report["output_throughput_tok_s"] = (
+                    float(scaled_report["output_throughput_tok_s"]) * decode_speed
+                )
+            return self.canonicalize_aic_dynosim_output(scaled_report, expected_requests)
+
+        self.last_metadata["aic_profile_attempts"] = failures
+        details = "; ".join(attempt["error"] for attempt in failures)
+        return self._run_aic_modes(
+            surrogate_input,
+            _AIC_FALLBACK_MODES,
+            fallback_reason=details,
+        )
+
+    @staticmethod
+    def _engine_args_for_profile(base_engine_args, match):
+        engine_args = dict(base_engine_args)
+        if match is None:
+            return engine_args
+        prefill_speed = max(float(match.get("prefill_speed_ratio") or 1.0), 1e-12)
+        decode_speed = max(float(match.get("decode_speed_ratio") or 1.0), 1e-12)
+        engine_args.update(
+            {
+                "engine_type": match["engine_name"],
+                "aic_backend": match["engine_name"],
+                "aic_backend_version": match["engine_version"],
+                "aic_system": match["aic_system"],
+                "aic_model_path": match["model_id"],
+                "speedup_ratio": prefill_speed,
+                "decode_speedup_ratio": decode_speed / prefill_speed,
+            }
+        )
+        return engine_args
+
+    @staticmethod
+    def _run_dynosim_replay(
+        run_replay,
+        mock_engine_args,
+        engine_args,
+        replay_args,
+        input_tokens,
+        output_tokens,
+        request_count,
+        common_replay_args,
+        pd_enabled,
+    ):
         if pd_enabled:
             prefill_engine_args = dict(engine_args)
             decode_engine_args = dict(engine_args)
-            prefill_engine_args["worker_type"] = "prefill"
-            decode_engine_args["worker_type"] = "decode"
-
-            raw_report = run_synthetic_trace_replay(
+            prefill_engine_args.update({"worker_type": "prefill", "decode_speedup_ratio": 1.0})
+            decode_speed = float(engine_args.get("speedup_ratio") or 1.0) * float(
+                engine_args.get("decode_speedup_ratio") or 1.0
+            )
+            decode_engine_args.update(
+                {
+                    "worker_type": "decode",
+                    "speedup_ratio": decode_speed,
+                    "decode_speedup_ratio": 1.0,
+                }
+            )
+            return run_replay(
                 input_tokens,
                 output_tokens,
                 request_count,
-                prefill_engine_args=MockEngineArgs(**prefill_engine_args),
-                decode_engine_args=MockEngineArgs(**decode_engine_args),
+                prefill_engine_args=mock_engine_args(**prefill_engine_args),
+                decode_engine_args=mock_engine_args(**decode_engine_args),
                 num_prefill_workers=int(replay_args.get("prefill_worker_count", 1)),
                 num_decode_workers=int(replay_args.get("decode_worker_count", 1)),
                 **common_replay_args,
             )
-        else:
-            raw_report = run_synthetic_trace_replay(
-                input_tokens,
-                output_tokens,
-                request_count,
-                extra_engine_args=MockEngineArgs(**engine_args),
-                num_workers=int(replay_args.get("num_workers", 1)),
-                **common_replay_args,
-            )
+        return run_replay(
+            input_tokens,
+            output_tokens,
+            request_count,
+            extra_engine_args=mock_engine_args(**engine_args),
+            num_workers=int(replay_args.get("num_workers", 1)),
+            **common_replay_args,
+        )
 
-        return self.canonicalize_aic_dynosim_output(raw_report, expected_requests)
+    @staticmethod
+    def _is_aic_coverage_failure(exc):
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return (
+            "perfdatanotavailableerror" in text
+            or "no database" in text
+            or ("performance data" in text and "not available" in text)
+        )
+
+    @classmethod
+    def _is_retryable_profile_failure(cls, exc):
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return cls._is_aic_coverage_failure(exc) or "unsupported model" in text
+
+    @staticmethod
+    def _profile_failure_key(match, replay_args, engine_args):
+        return (
+            match.get("profile_id"),
+            int(replay_args.get("input_tokens") or 0),
+            int(replay_args.get("output_tokens") or 0),
+            int(replay_args.get("replay_concurrency") or engine_args.get("max_num_seqs") or 1),
+            int(engine_args.get("max_num_batched_tokens") or 0),
+            int(replay_args.get("num_workers") or 1),
+            int(engine_args.get("aic_tp_size") or 1),
+            int(engine_args.get("aic_moe_ep_size") or 1),
+            str(replay_args.get("replay_mode") or "offline"),
+            str(replay_args.get("router_mode") or "round_robin"),
+            float(replay_args.get("arrival_interval_ms") or 0.0),
+            int(replay_args.get("turns_per_session") or 1),
+            bool(replay_args.get("pd_enabled", False)),
+            int(replay_args.get("prefill_worker_count") or 1),
+            int(replay_args.get("decode_worker_count") or 1),
+            int(engine_args.get("block_size") or 0),
+            int(engine_args.get("num_gpu_blocks") or 0),
+            bool(engine_args.get("enable_prefix_caching", False)),
+            bool(engine_args.get("enable_chunked_prefill", False)),
+            str(engine_args.get("preemption_mode") or ""),
+            str(engine_args.get("aic_backend_version") or ""),
+        )
 
     def canonicalize_aic_dynosim_output(self, raw_report, expected_requests):
         # TODO - general helper, can be moved out of this file/class

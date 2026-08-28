@@ -186,6 +186,9 @@ REQUIRED_JOB_STATE = {
 KNOWN_ROLES = frozenset({"aggregate"})
 _V0_DISABLED_ROLES = frozenset({"prefill", "decode"})  # rejected until PD lands
 _ENGINE_AUTOTUNED_CONFIG_KEYS = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
+ALLOWED_SERVICE_CLASSES = frozenset(
+    {"supported", "partial", "exploratory", "idle_capacity_fallback"}
+)
 
 
 def _strip_engine_knobs(config) -> dict:
@@ -209,12 +212,70 @@ def _as_env_tuple(env) -> tuple | None:
     return (text,)
 
 
+def deployment_rank_identity(raw, *, replicas: int | None = None) -> tuple:
+    """Return the normalized physical identity used for deployment reconciliation."""
+    outer = dict(raw or {})
+    shape = dict(outer.get("shape_json") or outer)
+    config = dict(shape.get("config") or shape)
+    env = _as_env_tuple(shape.get("env") or outer.get("target_node")) or ()
+
+    def positive_int(name: str, default: int = 1, alias: str | None = None) -> int:
+        value = config.get(name)
+        if value is None and alias is not None:
+            value = config.get(alias)
+        value = default if value is None else value
+        if isinstance(value, bool):
+            raise ValueError(f"deployment {name} must be a positive integer")
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError(f"deployment {name} must be a positive integer")
+        return parsed
+
+    replica_count = _positive_replica_count(
+        replicas if replicas is not None else shape.get("n_replicas")
+    )
+    return (
+        tuple(str(part) for part in env),
+        str(config.get("instance_type") or ""),
+        positive_int("gpu_count", alias="count"),
+        positive_int("tp"),
+        positive_int("pp"),
+        positive_int("sp"),
+        positive_int("ep"),
+        positive_int("cp"),
+        positive_int("num_nodes_per_chain"),
+        replica_count,
+    )
+
+
+def deployment_ladder_identity(ranks) -> tuple:
+    """Return an order-independent physical identity for a deployment ladder."""
+    return tuple(sorted(deployment_rank_identity(rank) for rank in ranks or []))
+
+
 def env_gpu_type(env) -> str | None:
     """Return gpu_type from a canonical env label, if present."""
     env_tuple = _as_env_tuple(env)
     if env_tuple is None or len(env_tuple) <= ENV_GPU_TYPE_INDEX:
         return None
     return str(env_tuple[ENV_GPU_TYPE_INDEX])
+
+
+def _positive_replica_count(value) -> int:
+    value = 1 if value is None else value
+    if isinstance(value, bool):
+        raise ValueError("rank n_replicas must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("rank n_replicas must be a positive integer") from exc
+    try:
+        exact = float(value) == parsed
+    except (TypeError, ValueError, OverflowError):
+        exact = False
+    if parsed < 1 or not exact:
+        raise ValueError("rank n_replicas must be a positive integer")
+    return parsed
 
 
 @dataclass
@@ -284,8 +345,8 @@ class RankSpec:
                 predicted_y = inner.pop("predicted_y", None)
                 predicted_v = inner.pop("predicted_v", None)
                 prediction_lineage = inner.pop("prediction_lineage", None)
-                n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1)) or 1
-                n_rep = int(n_rep_raw)
+                n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1))
+                n_rep = _positive_replica_count(n_rep_raw)
                 return cls(
                     role=only_key,
                     env=_as_env_tuple(env),
@@ -306,11 +367,12 @@ class RankSpec:
         n_rep_raw = (
             raw.get("n_replicas") if raw.get("n_replicas") is not None else raw.get("chains", 1)
         )
+        n_replicas = _positive_replica_count(n_rep_raw)
         return cls(
             role=role,
             env=_as_env_tuple(raw.get("env")),
             config=_strip_engine_knobs(raw.get("config", {})),
-            n_replicas=int(n_rep_raw or 1),
+            n_replicas=n_replicas,
             rank_id=raw.get("rank_id"),
             mechanism_id=raw.get("mechanism_id"),
             chain_id=raw.get("chain_id"),
@@ -371,6 +433,37 @@ class PlanAction:
     budget_ref: str | None = None  # BudgetSlice reference for resource-consuming actions
     rationale: str | None = None
     predicted_y: dict | None = None  # advisory: LLM's predict_outcome result; scoring re-derives
+    admitted_tps: float | None = None
+    achieved_tps: float | None = None
+    unmet_tps: float | None = None
+    meets_target: bool | None = None
+    served_fraction: float | None = None
+    admission_mode: str | None = None
+    prediction_assessment: dict | None = None
+    point_capacity_covers_target: bool | None = None
+    base_latency_within_target: bool | None = None
+    queue_state: str | None = None
+    queue_slo_verified: bool | None = None
+    observed_slo_met: bool | None = None
+    rehabilitation_status: str | None = None
+    rehabilitation_reasons: list[str] | None = None
+    keep_baseline_sigma: float | None = None
+    swap_gain_over_keep: float | None = None
+    service_class: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.service_class is not None and self.type not in LADDER_ACTIONS:
+            raise ValueError(
+                f"job {self.job_id}: service_class is valid only for place/swap actions"
+            )
+        if self.service_class is not None and (
+            not isinstance(self.service_class, str)
+            or self.service_class not in ALLOWED_SERVICE_CLASSES
+        ):
+            raise ValueError(
+                f"job {self.job_id}: service_class must be one of "
+                f"{sorted(ALLOWED_SERVICE_CLASSES)}, got {self.service_class!r}"
+            )
 
     @classmethod
     def from_dict(cls, raw, job_id: str | None = None) -> "PlanAction":
@@ -413,7 +506,24 @@ class PlanAction:
             type=action_type,
             user_id=raw.get("user_id"),
             ladder=ladder,
+            service_class=raw.get("service_class"),
             target_tps=raw.get("target_tps"),
+            admitted_tps=raw.get("admitted_tps"),
+            achieved_tps=raw.get("achieved_tps"),
+            unmet_tps=raw.get("unmet_tps"),
+            meets_target=raw.get("meets_target"),
+            served_fraction=raw.get("served_fraction"),
+            admission_mode=raw.get("admission_mode"),
+            prediction_assessment=raw.get("prediction_assessment"),
+            point_capacity_covers_target=raw.get("point_capacity_covers_target"),
+            base_latency_within_target=raw.get("base_latency_within_target"),
+            queue_state=raw.get("queue_state"),
+            queue_slo_verified=raw.get("queue_slo_verified"),
+            observed_slo_met=raw.get("observed_slo_met"),
+            rehabilitation_status=raw.get("rehabilitation_status"),
+            rehabilitation_reasons=raw.get("rehabilitation_reasons"),
+            keep_baseline_sigma=raw.get("keep_baseline_sigma"),
+            swap_gain_over_keep=raw.get("swap_gain_over_keep"),
             target_p99_ttft_ms=raw.get("target_p99_ttft_ms"),
             target_p99_tpot_ms=raw.get("target_p99_tpot_ms"),
             mechanism_id=raw.get("mechanism_id"),
@@ -438,7 +548,7 @@ class PlanAction:
             seen.add(rank.rank_id)
 
     def to_dict(self) -> dict:
-        return {
+        raw = {
             "job_id": self.job_id,
             "type": self.type.value,
             "user_id": self.user_id,
@@ -451,6 +561,29 @@ class PlanAction:
             "budget_ref": self.budget_ref,
             "rationale": self.rationale,
         }
+        for field_name in (
+            "admitted_tps",
+            "service_class",
+            "achieved_tps",
+            "unmet_tps",
+            "meets_target",
+            "served_fraction",
+            "admission_mode",
+            "prediction_assessment",
+            "point_capacity_covers_target",
+            "base_latency_within_target",
+            "queue_state",
+            "queue_slo_verified",
+            "observed_slo_met",
+            "rehabilitation_status",
+            "rehabilitation_reasons",
+            "keep_baseline_sigma",
+            "swap_gain_over_keep",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                raw[field_name] = value
+        return raw
 
 
 @dataclass

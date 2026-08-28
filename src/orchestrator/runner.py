@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
+from pathlib import Path
 from typing import Any
 
 from src.agent.agent import KoiAgentHarness
@@ -43,6 +45,19 @@ DEFAULT_TYPICAL_RANGES = {
     "slo_margin": 1000.0,
 }
 
+PARTIAL_ONLINE_ADMISSION_MODES = ("off", "advisory")
+
+
+def _positive_int(value: str) -> int:
+    """Parse a strictly positive integer for argparse."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the runner CLI."""
@@ -69,7 +84,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout-sec", type=float, default=200.0)
     parser.add_argument("--k-p", type=int, default=1)
     parser.add_argument("--k-max", type=int, default=4)
-    parser.add_argument("--wall-clock-sec", type=float, default=520.0)
+    parser.add_argument("--wall-clock-sec", type=float, default=240.0)
     parser.add_argument("--stdout-limit", type=int, default=10000)
     parser.add_argument("--error-limit", type=int, default=30)
     parser.add_argument("--live-agent", action="store_true")
@@ -82,8 +97,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--surrogate-lower-quantile",
         type=float,
-        default=None,
-        help="Conservative fusion residual quantile; defaults to KOI_SURROGATE_LOWER_QUANTILE or 0.05",
+        default=os.getenv("KOI_SURROGATE_LOWER_QUANTILE", "0.05"),
+        help="Conservative fusion residual quantile (KOI_SURROGATE_LOWER_QUANTILE; default: 0.05)",
     )
     parser.add_argument(
         "--surrogate-peer-mode",
@@ -91,8 +106,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("KOI_SURROGATE_PEER_MODE", "shadow"),
         help="External predictor mode; requires the optional tandemn-predictors package",
     )
+    parser.add_argument(
+        "--surrogate-call-budget",
+        type=_positive_int,
+        default=os.getenv("KOI_SURROGATE_CALL_BUDGET", "100"),
+        help="Maximum distinct surrogate search calls per tick (default: 100)",
+    )
+    parser.add_argument(
+        "--partial-online-admission",
+        choices=PARTIAL_ONLINE_ADMISSION_MODES,
+        default=os.getenv("KOI_PARTIAL_ONLINE_ADMISSION", "advisory"),
+        help="Partial online admission mode (KOI_PARTIAL_ONLINE_ADMISSION; default: advisory)",
+    )
     parser.add_argument("--rust-log", default=os.getenv("RUST_LOG", "warn"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.partial_online_admission not in PARTIAL_ONLINE_ADMISSION_MODES:
+        parser.error(
+            "--partial-online-admission must be one of: "
+            + ", ".join(PARTIAL_ONLINE_ADMISSION_MODES)
+        )
+    return args
 
 
 def configure_logging(level: str, log_file=None) -> None:
@@ -115,6 +148,8 @@ def build_runner(args: argparse.Namespace):
     if not args.api_key:
         raise SystemExit("OPENAI_API_KEY or --api-key is required")
 
+    agent_tools.configure_surrogate_call_budget(args.surrogate_call_budget)
+    agent_tools.configure_partial_online_admission(args.partial_online_admission)
     os.environ["RUST_LOG"] = str(args.rust_log)
 
     client = PostgresClient()
@@ -151,6 +186,7 @@ def build_runner(args: argparse.Namespace):
         candidate_graph=candidate_graph,
         mechanism_registry=mechanism_registry,
         resource_map=resource_map,
+        partial_online_admission_mode=args.partial_online_admission,
     )
     surrogate = init_surrogate_stack(
         evidence_store=evidence_store,
@@ -254,6 +290,70 @@ def clear_tick_buffers(agent: Any, llm: Any) -> None:
         calls.clear()
 
 
+def _git_output(*args: str) -> str | None:
+    """Return bounded Git output, or None when metadata is unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _source_revision() -> str | None:
+    """Return the current Git revision when repository metadata is available."""
+    return _git_output("rev-parse", "HEAD") or None
+
+
+def _source_dirty() -> bool | None:
+    """Return whether Git sees source changes, or None when Git is unavailable."""
+    status = _git_output("status", "--porcelain", "--untracked-files=normal")
+    return None if status is None else bool(status)
+
+
+def emit_run_manifest(debug_logger: DebugLogger, args: argparse.Namespace) -> None:
+    """Persist effective non-secret runner configuration once per run."""
+    admission_status_fn = getattr(agent_tools, "get_partial_online_admission_status", None)
+    admission_status = (
+        admission_status_fn()
+        if callable(admission_status_fn)
+        else {"mode": args.partial_online_admission, "status": "unavailable"}
+    )
+    payload: dict[str, Any] = {
+        "config": {
+            "model": args.openai_model,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+            "timeout_sec": args.timeout_sec,
+            "k_p": args.k_p,
+            "k_max": args.k_max,
+            "wall_clock_sec": args.wall_clock_sec,
+            "tick_interval_sec": args.tick_interval_sec,
+            "telemetry_window_sec": args.telemetry_window_sec,
+            "trace": args.trace,
+            "surrogate_peer_mode": args.surrogate_peer_mode,
+            "surrogate_lower_quantile": args.surrogate_lower_quantile,
+            "surrogate_call_budget": args.surrogate_call_budget,
+            "partial_online_admission": args.partial_online_admission,
+        },
+        "surrogate_budget": agent_tools.get_surrogate_budget_status(),
+        "partial_online_admission": admission_status,
+    }
+    revision = _source_revision()
+    if revision is not None:
+        payload["source_revision"] = revision
+    source_dirty = _source_dirty()
+    if source_dirty is not None:
+        payload["source_dirty"] = source_dirty
+    debug_logger.write_event("run_manifest", payload)
+
+
 def run_ticks(
     *,
     evidence_store: Any,
@@ -300,6 +400,7 @@ def main(
     configure_logging(args.log_level, debug_logger.runner_log_path)
     log.info("debug logs: %s", debug_logger.run_dir)
     runner, evidence_store, agent, llm = build_runner_fn(args)
+    emit_run_manifest(debug_logger, args)
     if hasattr(runner, "trace"):
         runner.trace = debug_logger
     agent_tools.bind_tools(trace_logger=debug_logger)

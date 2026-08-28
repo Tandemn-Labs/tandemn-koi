@@ -10,18 +10,21 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from src.agent.tools import agent_tools
+
 RAW_STATE_FIELDS = {
-    "S0_ENTER_TICK": ("cluster_snapshot",),
+    "S0_ENTER_TICK": ("cluster_snapshot", "deployment_reconciliation"),
     "S1_OBSERVE": ("telemetry", "deployment_x", "telemetry_diagnostics"),
-    "S2_VALIDATE": ("evidence_rows", "mechanism_diagnostics"),
+    "S2_VALIDATE": ("evidence_rows", "mechanism_diagnostics", "active_health"),
     "S3_SLOW_UPDATE": ("new_slow_state", "confidence_diagnostics", "slow_update_diagnostics"),
     "S4_AGENTIC_PLAN": ("candidate_plan",),
     "S5_VALIDATE_PLAN": ("validated_plan", "s5_repair_count"),
     "S6_DEPLOY": ("validated_plan", "deploy_acks"),
 }
 CURATED_STATE_FIELDS = {
+    "S0_ENTER_TICK": ("deployment_reconciliation",),
     "S1_OBSERVE": ("telemetry_diagnostics",),
-    "S2_VALIDATE": ("mechanism_diagnostics",),
+    "S2_VALIDATE": ("mechanism_diagnostics", "active_health"),
     "S3_SLOW_UPDATE": ("confidence_diagnostics", "slow_update_diagnostics"),
     "S5_VALIDATE_PLAN": ("s5_repair_count",),
     "S6_DEPLOY": ("deploy_acks",),
@@ -126,6 +129,11 @@ class DebugLogger:
             "deploy_acks": getattr(ctx, "deploy_acks", []) or [],
             "error": repr(getattr(ctx, "error", None)) if getattr(ctx, "error", None) else None,
             "state_durations_ms": getattr(ctx, "state_durations_ms", {}) or {},
+            "surrogate_budget": _compact(agent_tools.get_surrogate_budget_status(), "no-llm"),
+            "deployment_reconciliation": _compact(
+                getattr(ctx, "deployment_reconciliation", []) or [], "no-llm"
+            ),
+            "active_health": _compact(getattr(ctx, "active_health", {}) or {}, "no-llm"),
         }
         if self.trace == "all":
             summary["candidate_plan"] = _compact(getattr(ctx, "candidate_plan", None), self.trace)
@@ -172,6 +180,7 @@ def _plan_summary(plan: Any) -> dict[str, Any] | None:
                 "job_id": getattr(action, "job_id", None),
                 "type": getattr(action_type, "value", action_type),
                 "rank_count": len(ladder),
+                "service_class": getattr(action, "service_class", None),
                 "rationale": getattr(action, "rationale", None),
             }
         )
@@ -188,10 +197,12 @@ def _surrogate_summary(trace: dict[str, Any]) -> dict[str, Any]:
     backends = trace.get("backends") or {}
     fusion = trace.get("fusion") or {}
     calibration = trace.get("calibration") or {}
+    compatibility = trace.get("compatibility") or {}
     failure = trace.get("failure") or None
     return {
         "schema_version": trace.get("schema_version"),
         "scenario": trace.get("scenario"),
+        "method": trace.get("method"),
         "composite_version": trace.get("composite_version"),
         "components": {
             name: {
@@ -223,6 +234,22 @@ def _surrogate_summary(trace: dict[str, Any]) -> dict[str, Any]:
             "offset_y_nodes": sorted((calibration.get("offsets_y") or {}).keys()),
             "offset_v_nodes": sorted((calibration.get("offsets_v") or {}).keys()),
         },
+        "compatibility": {
+            backend: {
+                dimension: {
+                    key: resolution.get(key)
+                    for key in ("requested", "resolved", "kind", "confidence")
+                }
+                for dimension, resolution in resolutions.items()
+            }
+            for backend, resolutions in compatibility.items()
+        },
+        "profile_match": {
+            key: (trace.get("profile_match") or {}).get(key)
+            for key in ("profile_id", "distance", "confidence")
+        }
+        if trace.get("profile_match")
+        else None,
         "failure": (
             {
                 "stage": failure.get("stage"),

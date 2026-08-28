@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import importlib
 import math
+from copy import copy
 from typing import Any
+
+from src.prediction.analytic_v import model_weight_gb
+from src.prediction.compatibility import gpu_profile_from_values, resolve_dtype, resolve_gpu
+from src.prediction.profile_search import resolve_model_reference
 
 _MODEL_KEYS = {
     "meta-llama/meta-llama-3-8b": "llama3-8b",
@@ -17,21 +22,28 @@ _MODEL_KEYS = {
     "qwen/qwen3-8b": "qwen3-8b",
     "qwen/qwen3-32b": "qwen3-32b",
 }
-_DEVICE_KEYS = {
-    "A100": "A100",
-    "A100-80GB": "A100",
-    "H100": "H100",
-    "H100-80GB": "H100",
-    "L40S": "L40S",
+_MODEL_REFERENCE_SIZES_B = {
+    "llama3-8b": 8.0,
+    "llama3-70b": 70.0,
+    "qwen3-8b": 8.0,
+    "qwen3-32b": 32.0,
+    "qwen-72b": 72.0,
+}
+_SOLVER_GPU_CHOICES = frozenset({"A10G", "A100", "H100", "L4", "L40S"})
+_SOLVER_FAMILIES = {
+    "A10G": "g5.48xlarge",
+    "L4": "g6.48xlarge",
+    "L40S": "g6e.48xlarge",
 }
 
 
 class PeerPredictorClient:
     """Call the optional external predictor package for one Koi rank."""
 
-    def __init__(self, names=("solver", "blis"), predict_fn=None):
+    def __init__(self, names=("solver", "blis"), predict_fn=None, query_cls=None):
         self.names = tuple(names)
         self._predict_fn = predict_fn
+        self._query_cls = query_cls
 
     def predict(
         self,
@@ -40,7 +52,12 @@ class PeerPredictorClient:
         *,
         scenario: str,
     ) -> dict[str, dict[str, Any]]:
-        query = self._query(job_config, job_features, scenario=scenario)
+        query = self._query(
+            job_config,
+            job_features,
+            scenario=scenario,
+            query_cls=self._query_cls,
+        )
         if query is None:
             return {}
         predict_fn = self._predict_fn
@@ -56,32 +73,174 @@ class PeerPredictorClient:
 
             predict_fn = default_predict
 
-        return {
+        results = {
             name: result.to_dict()
             for name, result in predict_fn(query, predictors=self.names).items()
         }
+        solver = results.get("solver")
+        if solver is not None and solver.get("status") in {"unsupported", "failed"}:
+            fallback = self._retry_roofline(predict_fn, query)
+            if fallback is not None:
+                results["solver"] = fallback
+        compatibility = query.context.get("compatibility") or {}
+        approximate_compatibility = {
+            name: resolution
+            for name, resolution in compatibility.items()
+            if resolution.get("kind") == "nearest"
+        }
+        input_approximations = {}
+        if approximate_compatibility:
+            input_approximations["compatibility"] = approximate_compatibility
+        if query.context.get("model_approximation"):
+            input_approximations["model"] = query.context["model_approximation"]
+        for result in results.values():
+            result["compatibility"] = compatibility
+            if input_approximations:
+                resolutions = approximate_compatibility.values()
+                scale = math.prod(
+                    float(item.get("throughput_scale") or 1.0) for item in resolutions
+                )
+                scale *= float(
+                    (input_approximations.get("model") or {}).get("throughput_scale") or 1.0
+                )
+                if result.get("status") == "success" and scale != 1.0:
+                    for node in ("total_tps", "input_tps", "output_tps"):
+                        if result.get(node) is not None:
+                            result[node] = float(result[node]) * scale
+                    for node in (
+                        "ttft_ms_p50",
+                        "ttft_ms_p99",
+                        "tpot_ms_p50",
+                        "tpot_ms_p99",
+                        "e2e_ms_p50",
+                        "e2e_ms_p99",
+                    ):
+                        if result.get(node) is not None:
+                            result[node] = float(result[node]) / scale
+                    if result.get("dollar_per_mtok") is not None:
+                        result["dollar_per_mtok"] = float(result["dollar_per_mtok"]) / scale
+                approximation = dict(result.get("approximation") or {})
+                approximation["inputs"] = input_approximations
+                result["approximation"] = approximation
+        return results
 
     @staticmethod
-    def _query(job_config: dict[str, Any], job_features: dict[str, Any], *, scenario: str):
+    def _retry_roofline(predict_fn, query) -> dict[str, Any] | None:
+        requested = {
+            "task": query.task,
+            "precision": query.precision,
+            "num_replicas": query.num_replicas,
+            "tp": query.tp,
+            "pp": query.pp,
+        }
+        variants = (
+            (query.tp, query.pp),
+            (query.tp, 1),
+            (1, 1),
+        )
+        seen = set()
+        for tp, pp in variants:
+            resolved = ("capacity", "bf16", 1, tp, pp)
+            if resolved in seen or resolved == tuple(requested.values()):
+                continue
+            seen.add(resolved)
+            candidate = copy(query)
+            candidate.task = "capacity"
+            candidate.precision = "bf16"
+            candidate.num_replicas = 1
+            candidate.tp = tp
+            candidate.pp = pp
+            try:
+                retry = predict_fn(candidate, predictors=("solver",)).get("solver")
+            except Exception:
+                continue
+            if retry is None:
+                continue
+            result = retry.to_dict()
+            if result.get("status") != "success":
+                continue
+            if requested["task"] == "online":
+                for node in (
+                    "ttft_ms_p50",
+                    "ttft_ms_p99",
+                    "tpot_ms_p50",
+                    "tpot_ms_p99",
+                    "e2e_ms_p50",
+                    "e2e_ms_p99",
+                ):
+                    result.pop(node, None)
+            replicas = max(1, int(requested["num_replicas"]))
+            for node in ("total_tps", "input_tps", "output_tps", "cost_per_hour"):
+                if result.get(node) is not None:
+                    result[node] = float(result[node]) * replicas
+            result["approximation"] = {
+                "reason": "nearest_supported_roofline_config",
+                "requested": requested,
+                "resolved": {
+                    "task": candidate.task,
+                    "precision": candidate.precision,
+                    "num_replicas": candidate.num_replicas,
+                    "tp": candidate.tp,
+                    "pp": candidate.pp,
+                },
+            }
+            return result
+        return None
+
+    @staticmethod
+    def _query(
+        job_config: dict[str, Any],
+        job_features: dict[str, Any],
+        *,
+        scenario: str,
+        query_cls=None,
+    ):
         values = {**job_features, **job_config}
         model_id = str(values.get("model_id") or "").strip()
-        model = _MODEL_KEYS.get(model_id.lower())
-        gpu = str(values.get("gpu_type") or "").replace("NVIDIA ", "").strip()
-        device = _DEVICE_KEYS.get(gpu.upper(), _DEVICE_KEYS.get(gpu))
-        if model is None or device is None:
+        model, model_approximation = resolve_model_reference(
+            model_id,
+            values,
+            _MODEL_KEYS,
+            _MODEL_REFERENCE_SIZES_B,
+        )
+        if not _requested_model_fits(values, require_proof=model_approximation is not None):
             return None
+        gpu_resolution = resolve_gpu(
+            values.get("gpu_type"),
+            backend="solver",
+            available=_SOLVER_GPU_CHOICES,
+            requested_profile=values,
+        )
+        dtype_resolution = resolve_dtype(
+            values.get("weight_dtype") or "bf16",
+            backend="solver",
+            component="weights",
+            available=frozenset({"bf16"}),
+        )
+        if (
+            model is None
+            or not gpu_resolution.supported
+            or gpu_resolution.resolved is None
+            or gpu_resolution.backend_value is None
+            or not dtype_resolution.supported
+        ):
+            return None
+        device = gpu_resolution.backend_value
+        resolved_gpu = gpu_resolution.resolved
 
         input_length = _positive_int(values.get("isl_token_avg"))
         output_length = _positive_int(values.get("osl_token_avg"))
         if input_length is None or output_length is None:
             return None
-        try:
-            Query = importlib.import_module("predictor_compare").Query
-        except ImportError as exc:
-            raise RuntimeError(
-                "peer prediction requires the optional tandemn-predictors package "
-                "from Tandemn-Labs/LLM_placement_solver"
-            ) from exc
+        Query = query_cls
+        if Query is None:
+            try:
+                Query = importlib.import_module("predictor_compare").Query
+            except ImportError as exc:
+                raise RuntimeError(
+                    "peer prediction requires the optional tandemn-predictors package "
+                    "from Tandemn-Labs/LLM_placement_solver"
+                ) from exc
         dp = max(1, int(values.get("dp") or values.get("n_replicas") or 1))
         batch = max(
             1,
@@ -124,6 +283,15 @@ class PeerPredictorClient:
         }
         context = {key: value for key, value in values.items() if key not in represented}
         context["scenario"] = scenario
+        context["compatibility"] = {
+            "gpu": gpu_resolution.to_dict(),
+            "weight_dtype": dtype_resolution.to_dict(),
+        }
+        if model_approximation:
+            context["model_approximation"] = model_approximation
+        solver_family = values.get("instance_type") or _SOLVER_FAMILIES.get(resolved_gpu)
+        if gpu_resolution.approximate:
+            solver_family = _SOLVER_FAMILIES.get(resolved_gpu)
         return Query(
             model=model,
             device=device,
@@ -139,7 +307,7 @@ class PeerPredictorClient:
                 1,
                 int(values.get("max_num_batched_tokens") or batch * (input_length + output_length)),
             ),
-            precision=str(values.get("weight_dtype") or "bf16"),
+            precision=str(dtype_resolution.backend_value),
             request_pattern=str(values.get("request_arrival_pattern") or mode or "batch"),
             task=task,
             engine_name=str(values.get("engine_name") or "vllm"),
@@ -156,7 +324,7 @@ class PeerPredictorClient:
             dynosim_model=model_id,
             blis_model=values.get("blis_model"),
             solver_config_dir=values.get("solver_config_dir"),
-            solver_instance_family=values.get("instance_type"),
+            solver_instance_family=solver_family,
         )
 
 
@@ -166,3 +334,19 @@ def _positive_int(value) -> int | None:
     except (TypeError, ValueError):
         return None
     return result if result > 0 else None
+
+
+def _requested_model_fits(values: dict[str, Any], *, require_proof: bool) -> bool:
+    weight_gb = model_weight_gb(values)
+    raw_memory = values.get("gpu_mem_gb")
+    if raw_memory is None:
+        profile = gpu_profile_from_values(str(values.get("gpu_type") or ""), values)
+        raw_memory = profile.memory_gb if profile is not None else None
+    if weight_gb is None or raw_memory is None:
+        return not require_proof
+    try:
+        shards = max(1, int(values.get("tp") or 1) * int(values.get("pp") or 1))
+        usable_memory = float(raw_memory) * float(values.get("gpu_mem_util") or 0.9)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return weight_gb / shards + 2.0 <= usable_memory

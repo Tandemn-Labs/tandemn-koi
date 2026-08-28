@@ -1,7 +1,12 @@
 import math
 
 from src.prediction.analytic_parallelism import compute_parallelism_v
-from src.prediction.analytic_v import compute_memory_v, kv_bytes_per_token, model_weight_gb
+from src.prediction.analytic_v import (
+    compute_memory_v,
+    kv_bytes_per_token,
+    model_weight_gb,
+    target_memory_fit,
+)
 from src.prediction.backends.base import Candidate
 from src.prediction.normalization import (
     architecture_signature,
@@ -79,6 +84,42 @@ def test_memory_v_quantization_tp_pp_missing_and_dp_invariance():
     assert fp16 == dp8
     assert fp16["vram_headroom_gb"] > less_sharded["vram_headroom_gb"]
     assert compute_memory_v({"tp": 2}, {"gpu_mem_gb": 80}) == {}
+
+
+def test_memory_v_uses_tp_sharding_for_moe_with_fixed_ep_one():
+    dense = compute_memory_v({**MODEL, **WORKLOAD, "tp": 8, "pp": 2, "ep": 1})
+    moe = compute_memory_v({**MODEL, **WORKLOAD, "tp": 8, "pp": 2, "ep": 1, "is_moe": True})
+    moe_tp2 = compute_memory_v({**MODEL, **WORKLOAD, "tp": 2, "pp": 1, "ep": 1, "is_moe": True})
+
+    assert dense == moe
+    assert moe["vram_headroom_gb"] > moe_tp2["vram_headroom_gb"]
+
+
+def test_mixtral_fixed_ep_one_memory_fit_changes_with_tp():
+    base = {
+        "model_params_b": 46.7,
+        "weight_quantization_bits": 16,
+        "gpu_mem_gb": 80,
+        "gpu_mem_util": 0.9,
+        "pp": 1,
+        "ep": 1,
+        "is_moe": True,
+    }
+
+    assert target_memory_fit({**base, "tp": 1})["status"] == "physical_no_fit"
+    tp2 = target_memory_fit({**base, "tp": 2})
+    tp8 = target_memory_fit({**base, "tp": 8})
+    assert tp2["status"] in {"fit", "unknown"}
+    assert tp8["status"] in {"fit", "unknown"}
+    assert float(tp8["required_gb"]) < float(tp2["required_gb"])
+
+
+def test_kvcache_auto_prefers_activation_then_weight_dtype():
+    auto_activation = {**MODEL, "kvcache_dtype": "auto", "activation_dtype": "fp8"}
+    auto_weight = {**MODEL, "kvcache_dtype": "auto"}
+
+    assert kv_bytes_per_token(auto_activation) == 2 * 80 * 8 * 128
+    assert kv_bytes_per_token(auto_weight) == 2 * 80 * 8 * 128 * 2
 
 
 def test_parallelism_v_uses_singular_aggregate_throughput_and_never_changes_y():

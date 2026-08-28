@@ -36,11 +36,26 @@ class StorePlanExecutor(Executor):
 
         actions = []
         for action in plan.actions:
+            ladder = [rank.to_dict() for rank in action.ladder] if action.ladder else None
+            if (
+                ladder
+                and action.admission_mode == "advisory"
+                and isinstance(action.served_fraction, int | float)
+                and not isinstance(action.served_fraction, bool)
+                and action.served_fraction < 1.0
+            ):
+                shares = [float(rank.get("rank_traffic_share") or 0.0) for rank in ladder]
+                total_share = sum(shares)
+                if total_share > 0:
+                    for rank, share in zip(ladder, shares, strict=True):
+                        rank["rank_traffic_share"] = share / total_share
             actions.append(
                 store_models.PlanAction(
                     job_id=action.job_id,
                     type=store_models.ActionType(action.type.value),
-                    ladder=[rank.to_dict() for rank in action.ladder] if action.ladder else None,
+                    ladder=ladder,
+                    # A point-capacity estimate is not an enforced admission rate.
+                    # Keep the workload target until the router exposes such a contract.
                     target_tps=action.target_tps,
                     target_p99_ttft_ms=action.target_p99_ttft_ms,
                     target_p99_tpot_ms=action.target_p99_tpot_ms,

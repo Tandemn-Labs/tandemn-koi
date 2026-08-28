@@ -13,13 +13,14 @@ One tick is a closed learning loop:
     S1 OBSERVE        Pull per-rank telemetry bundles for [t-1, t].
     S2 VALIDATE       Per rank: residuals -> applicable mechanisms ->
                       per-mechanism (V-CUSUM, Y-CUSUM) -> per-mechanism Q ->
-                      ICP per edge -> one EvidenceRow appended; DRO fed.
-    S3 SLOW_UPDATE    1) Beta(alpha, beta) fan-out: every decided
+                      ICP per edge -> one EvidenceRow appended.
+    S3 SLOW_UPDATE    1) Decision-band coverage, then DRO residual ingestion.
+                      2) Beta(alpha, beta) fan-out: every decided
                          (row, mechanism) pair updates that mechanism and
                          its edges via ConfidenceService.
-                      2) SlowLoop.slow_update_all: w_t, z_star_t,
+                      3) SlowLoop.slow_update_all: w_t, z_star_t,
                          lambda_swit, beta_t, B_t, epsilon_dro.
-                      3) Meta cadence: CUSUM (delta, h) recalibration every
+                      4) Meta cadence: CUSUM (delta, h) recalibration every
                          `recalibrate_every` ticks.
     S4 AGENTIC_PLAN   One KoiAgentHarness.run_agent_loop call -> plan.
                       The harness owns K_P sampling, budget-first specialist
@@ -63,24 +64,35 @@ regret / slow_loop / dro / eig / tchebecheff / switchcost; the planning
 lives in agent.py; the tools live in agent_tools.py.
 """
 
+import copy
 import logging
 import time
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 import numpy as np
+from src.config.hyperparameters import PARTIAL_DIVERGENCE_BETA
 from src.core.models import (
     SWAP_BUDGET_ACTIONS,
     ActionType,
     EvidenceRow,
     Plan,
     PlanAction,
+    deployment_ladder_identity,
+    deployment_rank_identity,
 )
 from src.infra.deployment_x import build_deployment_x_index
+from src.validation.cusum import CusumResult
 from src.validation.icp import ICPResult
 
 log = logging.getLogger("koi.fsm")
+
+_DEPLOYMENT_GRACE_TICKS = 1
+_DEPLOYMENT_RETRY_BACKOFF_TICKS = 1
+_DEPLOYMENT_MAX_ATTEMPTS = 3
 
 
 class FSMState(Enum):
@@ -120,6 +132,8 @@ class TickContext:
     candidate_plan: Any = None
     validated_plan: Any = None
     deploy_acks: list[Any] = field(default_factory=list)
+    deployment_reconciliation: list[dict[str, Any]] = field(default_factory=list)
+    active_health: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     s5_repair_count: int = 0
     max_s5_repairs: int = 1
@@ -244,6 +258,9 @@ class TickRunner:
         # Swap bookkeeping recorded in S6, consumed by next tick's S3.
         self._last_swap_count: int = 0
         self._last_active_count: int = 0
+        self._deployment_ledger: dict[str, dict[str, Any]] = {}
+        self._prediction_ledger: dict[tuple[str, str], dict[str, Any]] = {}
+        self._health_state: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Entry point
@@ -325,6 +342,7 @@ class TickRunner:
         if self.on_tick_start is not None:
             self.on_tick_start()
         ctx.cluster_snapshot = self.resource_map.snapshot_cluster_state(ctx.tick)
+        ctx.deployment_reconciliation = self._reconcile_deployments(ctx)
         return FSMState.S1_OBSERVE
 
     def S1(self, ctx: TickContext) -> FSMState:
@@ -348,8 +366,8 @@ class TickRunner:
         (committed + scope matches, restricted to bundles fully observable
         in this rank's telemetry); run V-CUSUM and Y-CUSUM per mechanism;
         classify a Q per mechanism; run ICP once per edge in the union of
-        applicable bundles; append one EvidenceRow; feed DRO's residual
-        ring.
+        applicable bundles; append one EvidenceRow. S3 evaluates the
+        immutable decision-time DRO band before feeding this row's residual.
 
         No Beta updates here - S2 writes evidence, S3 reads it. The
         separation keeps S2 idempotent for replay.
@@ -370,6 +388,8 @@ class TickRunner:
             str(job.get("job_id", job.get("id"))): dict(job.get("job_features") or {})
             for job in jobs or []
         }
+        health_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        tick_icp_details: dict[str, dict[str, Any]] = {}
 
         # if ctx.deployment_x is None:
         #     ctx.deployment_x = self._build_deployment_x_index(ctx)
@@ -389,10 +409,30 @@ class TickRunner:
             residuals_per_v = self._residuals(v_obs, v_pred)
             residuals_per_y = self._residuals(y_obs, y_pred)
             y_observed_mean = {name: float(np.mean(arr)) for name, arr in y_obs.items() if len(arr)}
+            health_sample = dict(y_observed_mean)
+            if len(v_obs.get("depth_req_q", [])):
+                health_sample["depth_req_q"] = max(float(value) for value in v_obs["depth_req_q"])
+            health_sample["telemetry_complete"] = bool(
+                getattr(rank_telem, "health_observed_replicas", 1)
+                >= getattr(rank_telem, "expected_replicas", 1)
+            )
+            health_samples[job_id].append(health_sample)
 
-            committed = self._committed_mechanism_id(rank_telem)
-            mechanism_context = {**job_features.get(job_id, {}), **x}
-            applicable = self._applicable_mechanisms(mechanism_context, committed)
+            committed = self._committed_mechanism_id(rank_telem) or (
+                self._prediction_ledger.get((job_id, rank_id), {}).get("mechanism_id")
+            )
+            mechanism_context = {
+                key: value
+                for key, value in {**job_features.get(job_id, {}), **x}.items()
+                if value is not None and value != "NA"
+            }
+            applicable = self._applicable_mechanisms(
+                mechanism_context,
+                committed,
+                diagnostics=ctx.mechanism_diagnostics,
+                job_id=job_id,
+                rank_id=rank_id,
+            )
 
             v_params = self._resolve_cusum_params(residuals_per_v, cached_v_params)
             y_params = self._resolve_cusum_params(residuals_per_y, cached_y_params)
@@ -405,43 +445,62 @@ class TickRunner:
             for mech in applicable:
                 bundle = self._bundle(mech)
                 missing = self._missing_bundle_inputs(bundle, v_obs, v_pred, y_obs, y_pred)
-                if any(missing.values()):
-                    q_per_mech[mech.mechanism_id] = None
-                    rank_diagnostics.append(
-                        {
-                            "job_id": job_id,
-                            "rank_id": rank_id,
-                            "mechanism_id": mech.mechanism_id,
-                            "status": "skipped",
-                            "missing": missing,
-                            "icp": [],
-                        }
-                    )
-                    continue
-                touched_edge_ids.update(bundle.edge_ids)
-                v_verdict, y_verdict = self.cusum.cusum_per_mechanism(
-                    mechanism=mech,
-                    candidate_graph=self.candidate_graph,
-                    v_obs_traj=v_obs,
-                    v_hat_traj=v_pred,
-                    y_obs_traj=y_obs,
-                    y_hat_traj=y_pred,
-                    v_params=v_params,
-                    y_params=y_params,
+                available_v = [
+                    name for name in bundle.bundle_v_variables if name in residuals_per_v
+                ]
+                available_y = [name for name in bundle.bundle_y_outcomes if name in residuals_per_y]
+                missing["v_unusable"] = [
+                    name for name in bundle.bundle_v_variables if name not in residuals_per_v
+                ]
+                missing["y_unusable"] = [
+                    name for name in bundle.bundle_y_outcomes if name not in residuals_per_y
+                ]
+                v_verdict = (
+                    self.cusum.cusum_per_bundle(available_v, v_obs, v_pred, v_params)
+                    if available_v
+                    else CusumResult.MATCHED
+                    if not bundle.bundle_v_variables
+                    else None
                 )
-                cusum_per_mech[mech.mechanism_id] = (v_verdict, y_verdict)
-                q_per_mech[mech.mechanism_id] = self.qv.classify_quadrant(v_verdict, y_verdict)
+                y_verdict = (
+                    self.cusum.cusum_per_bundle(available_y, y_obs, y_pred, y_params)
+                    if available_y
+                    else CusumResult.MATCHED
+                    if not bundle.bundle_y_outcomes
+                    else None
+                )
+                if v_verdict is not None or y_verdict is not None:
+                    cusum_per_mech[mech.mechanism_id] = (v_verdict, y_verdict)
+                fully_observable = not any(missing.values())
+                q_per_mech[mech.mechanism_id] = (
+                    self.qv.classify_quadrant(v_verdict, y_verdict) if fully_observable else None
+                )
+                observable_edges = self._observable_edge_ids(
+                    bundle, set(available_v), set(available_y)
+                )
+                touched_edge_ids.update(observable_edges)
+                diagnostic_status = (
+                    "evaluated"
+                    if fully_observable
+                    else "partially_evaluated"
+                    if v_verdict is not None or y_verdict is not None
+                    else "unobservable"
+                )
                 rank_diagnostics.append(
                     {
                         "job_id": job_id,
                         "rank_id": rank_id,
                         "mechanism_id": mech.mechanism_id,
-                        "status": "evaluated",
-                        "cusum": self._cusum_diagnostics(
-                            bundle, v_obs, v_pred, y_obs, y_pred, v_params, y_params
-                        ),
+                        "status": diagnostic_status,
+                        "missing": missing,
+                        "cusum": {
+                            "V": self._cusum_axis_diagnostics(available_v, v_obs, v_pred, v_params),
+                            "Y": self._cusum_axis_diagnostics(available_y, y_obs, y_pred, y_params),
+                        },
+                        "v_verdict": getattr(v_verdict, "value", v_verdict),
+                        "y_verdict": getattr(y_verdict, "value", y_verdict),
                         "q_label": q_per_mech[mech.mechanism_id],
-                        "_edge_ids": bundle.edge_ids,
+                        "_edge_ids": observable_edges,
                     }
                 )
 
@@ -451,9 +510,13 @@ class TickRunner:
                 edge = self._resolve_edge(edge_id)
                 if edge is None:
                     continue
-                details = self.icp.compute_icp_details_per_edge(
-                    edge=edge, evidence_store=self.evidence_store
-                )
+                if edge_id not in tick_icp_details:
+                    tick_icp_details[edge_id] = self.icp.compute_icp_details_per_edge(
+                        edge=edge,
+                        evidence_store=self.evidence_store,
+                        before_tick=ctx.tick,
+                    )
+                details = tick_icp_details[edge_id]
                 icp_per_edge[edge_id] = details["result"]
                 icp_diagnostics[edge_id] = details
 
@@ -499,14 +562,17 @@ class TickRunner:
             self.evidence_store.append_row(row)
             ctx.evidence_rows.append(row)
 
-            self.dro.append_residual_history(pred_y=y_pred, obs_y=y_observed_mean)
+        ctx.active_health = self._update_active_health(ctx, job_features, health_samples)
 
         return FSMState.S3_SLOW_UPDATE
 
     def S3(self, ctx: TickContext) -> FSMState:
         """Apply the learning updates, then refresh the slow-loop knobs.
 
-        Part 1 - Beta fan-out: every decided (row, mechanism) pair updates
+        Part 1 - Evaluate decision-time DRO coverage, then append every
+        current residual to DRO history.
+
+        Part 2 - Beta fan-out: every decided (row, mechanism) pair updates
         that mechanism's Beta and the Betas of ITS edges, with the edge
         delta modulated by that edge's ICP result. An edge shared by
         several applicable mechanisms receives one update per mechanism
@@ -514,20 +580,73 @@ class TickRunner:
         ConfidenceService also records env coverage and recency (single
         writer for all confidence state).
 
-        Part 2 - SlowLoop.slow_update_all with the observed swap rate
-        (recorded by last tick's S6), the observed DRO coverage (this
-        tick's rows vs their predicted bands), the R2 gradient (v0 stub),
+        Part 3 - SlowLoop.slow_update_all receives coverage, the observed
+        swap rate (recorded by last tick's S6), the R2 gradient (v0 stub),
         and annealed targets.
 
-        Part 3 - meta cadence: CUSUM (delta, h) recalibration from
+        Part 4 - meta cadence: CUSUM (delta, h) recalibration from
         accumulated residual history every recalibrate_every ticks.
         """
-        did_confidence_update = False
         ctx.confidence_diagnostics = []
         slow_before = self._slow_state_snapshot()
+        coverage = self._observed_coverage_details(ctx)
+        for row in ctx.evidence_rows:
+            self.dro.append_residual_history(
+                pred_y=row.y_predicted,
+                obs_y=row.y_observed_mean,
+            )
+
+        did_confidence_update = False
         for row in ctx.evidence_rows:
             for mid, q in row.q_label_per_mechanism.items():
                 if q is None:
+                    verdicts = row.cusum_per_mechanism.get(mid) or ()
+                    if any(
+                        getattr(verdict, "value", verdict) == "diverged" for verdict in verdicts
+                    ):
+                        try:
+                            mechanism = self.mechanism_registry.get_mechanism(mid)
+                        except KeyError:
+                            continue
+                        observable_edges = self._observable_edge_ids(
+                            self._bundle(mechanism),
+                            set(row.residuals_per_v),
+                            set(row.residuals_per_y),
+                            include_v=any(
+                                getattr(verdict, "value", verdict) == "diverged"
+                                for verdict in verdicts[:1]
+                            ),
+                            include_y=any(
+                                getattr(verdict, "value", verdict) == "diverged"
+                                for verdict in verdicts[1:2]
+                            ),
+                        )
+                        apply_partial = getattr(
+                            self.confidence_service, "apply_partial_divergence", None
+                        )
+                        if not callable(apply_partial):
+                            continue
+                        apply_partial(
+                            mid,
+                            observable_edges,
+                            PARTIAL_DIVERGENCE_BETA,
+                            icp_results=row.icp_result_per_edge,
+                            env_label=row.env_label,
+                            tick=ctx.tick,
+                        )
+                        did_confidence_update = True
+                        ctx.confidence_diagnostics.append(
+                            {
+                                "evidence_row_id": row.row_id,
+                                "job_id": row.job_id,
+                                "rank_id": row.rank_id,
+                                "mechanism_id": mid,
+                                "q_label": None,
+                                "partial_divergence": True,
+                                "observable_edges": observable_edges,
+                                "beta_delta": PARTIAL_DIVERGENCE_BETA,
+                            }
+                        )
                     continue
                 mechanism_before = self._mechanism_confidence_snapshot(mid)
                 mechanism_delta = self.confidence_service.get_delta_c_mechanism(q)
@@ -577,7 +696,6 @@ class TickRunner:
             flush_confidence()
 
         observed_swap_rate = self._observed_swap_rate(ctx)
-        coverage = self._observed_coverage_details(ctx)
         r2_gradient = self._r2_gradient(ctx)
         target_overrides = self.slow_loop.anneal_targets(ctx.tick)
         dro_before = self._dro_parameters()
@@ -692,7 +810,18 @@ class TickRunner:
         The swap count recorded here feeds next tick's observed_swap_rate,
         which drives lambda_swit.
         """
-        ctx.deploy_acks = self.executor.send_to_executor(ctx.validated_plan)
+        new_attempts = self._record_deployment_requests(ctx)
+        self._record_prediction_ledger(ctx)
+        try:
+            ctx.deploy_acks = self.executor.send_to_executor(ctx.validated_plan)
+        except Exception as exc:
+            self._record_deployment_acks(
+                new_attempts,
+                [{"status": "error", "error": str(exc)}],
+                ctx.tick,
+            )
+            raise
+        self._record_deployment_acks(new_attempts, ctx.deploy_acks, ctx.tick)
 
         self._last_swap_count = self._count_plan_swaps(ctx)
         self._last_active_count = self._active_job_count(ctx)
@@ -706,6 +835,457 @@ class TickRunner:
             except Exception:
                 log.exception("trace persist failed at tick %d", ctx.tick)
         return FSMState.S7_EXIT_TICK
+
+    def _reconcile_deployments(self, ctx: TickContext) -> list[dict[str, Any]]:
+        """Compare prior PLACE/SWAP requests with the next frozen active snapshot."""
+        snapshot = ctx.cluster_snapshot
+        active_jobs = (
+            list(snapshot.active_jobs_summary() or [])
+            if snapshot is not None and hasattr(snapshot, "active_jobs_summary")
+            else []
+        )
+        pending_jobs = (
+            list(snapshot.pending_jobs_summary() or [])
+            if snapshot is not None and hasattr(snapshot, "pending_jobs_summary")
+            else []
+        )
+        active_ranks: dict[str, set[str]] = defaultdict(set)
+        active_chains: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for job in active_jobs:
+            jid = str(job.get("job_id", job.get("id")))
+            for chain in job.get("active_chains") or job.get("current_ladder") or []:
+                rank_id = (chain.get("shape_json") or {}).get("rank_id") or chain.get("rank_id")
+                if rank_id:
+                    active_ranks[jid].add(str(rank_id))
+                    active_chains[jid][str(rank_id)].append(chain)
+        active_shapes = {
+            jid: {rank_id: self._rank_group_signature(chains) for rank_id, chains in groups.items()}
+            for jid, groups in active_chains.items()
+        }
+        pending_by_id = {str(job.get("job_id", job.get("id"))): job for job in pending_jobs}
+        active_by_id = {str(job.get("job_id", job.get("id"))): job for job in active_jobs}
+        reconciled = []
+        completed = []
+        for jid, request in self._deployment_ledger.items():
+            attempts = request.get("attempt_details") or [
+                {
+                    "attempt_number": index + 1,
+                    "request_tick": request.get("request_tick", ctx.tick),
+                    "rank_ids": rank_ids,
+                    "rank_shapes": request.get("rank_shapes") or {},
+                    "state": "submitted",
+                }
+                for index, rank_ids in enumerate(
+                    request.get("rank_id_attempts") or [request.get("rank_ids") or []]
+                )
+            ]
+            matching_attempt = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if self._deployment_attempt_active(
+                        attempt,
+                        active_ranks.get(jid, set()),
+                        active_shapes.get(jid, {}),
+                    )
+                ),
+                None,
+            )
+            latest_attempt = attempts[-1]
+            if matching_attempt is not None:
+                matching_attempt["state"] = "materialized"
+                matching_attempt["terminal_tick"] = ctx.tick
+                if (
+                    matching_attempt.get("action_type") or request.get("action_type")
+                ) == ActionType.SWAP.value:
+                    self._health_state.setdefault(jid, {})["last_swap_tick"] = ctx.tick
+                status = "active"
+                completed.append(jid)
+            else:
+                attempt_state = str(latest_attempt.get("state") or "submitted")
+                request_tick = int(latest_attempt.get("request_tick", request["request_tick"]))
+                if attempt_state in {"timed_out", "executor_rejected"}:
+                    status = "deployment_not_materialized"
+                elif ctx.tick - request_tick <= _DEPLOYMENT_GRACE_TICKS:
+                    status = "deployment_pending"
+                else:
+                    latest_attempt["state"] = "timed_out"
+                    latest_attempt["terminal_tick"] = ctx.tick
+                    latest_attempt["retry_after_tick"] = ctx.tick + _DEPLOYMENT_RETRY_BACKOFF_TICKS
+                    status = "deployment_not_materialized"
+            request["attempt_details"] = attempts
+            row = {
+                **request,
+                "job_id": jid,
+                "status": status,
+                "observed_rank_ids": sorted(active_ranks.get(jid, set())),
+            }
+            reconciled.append(row)
+            descriptor = pending_by_id.get(jid) or active_by_id.get(jid)
+            if descriptor is not None:
+                descriptor["deployment_status"] = status
+                descriptor["deployment_attempts"] = request.get("attempts", 1)
+                descriptor["deployment_action_type"] = request.get("action_type")
+                descriptor["last_requested_shapes"] = copy.deepcopy(request.get("shapes") or [])
+                if status == "deployment_not_materialized":
+                    terminal_attempts = [
+                        attempt
+                        for attempt in attempts
+                        if attempt.get("state") in {"timed_out", "executor_rejected"}
+                    ]
+                    retry_after_tick = latest_attempt.get("retry_after_tick")
+                    attempt_count = int(request.get("attempts") or len(attempts))
+                    retry_exhausted = attempt_count >= _DEPLOYMENT_MAX_ATTEMPTS
+                    descriptor["deployment_retry_after_tick"] = retry_after_tick
+                    descriptor["deployment_retry_exhausted"] = retry_exhausted
+                    descriptor["deployment_retry_allowed"] = bool(
+                        not retry_exhausted
+                        and retry_after_tick is not None
+                        and ctx.tick >= int(retry_after_tick)
+                    )
+                    descriptor["attempted_deployment_identities"] = [
+                        copy.deepcopy(attempt.get("deployment_identity"))
+                        for attempt in terminal_attempts
+                        if attempt.get("deployment_identity")
+                    ]
+                    descriptor["recent_failures"] = max(
+                        1, int(descriptor.get("recent_failures") or 0)
+                    )
+        for jid in completed:
+            self._deployment_ledger.pop(jid, None)
+        return reconciled
+
+    def _record_deployment_requests(self, ctx: TickContext) -> list[tuple[str, int]]:
+        new_attempts: list[tuple[str, int]] = []
+        for action in getattr(ctx.validated_plan, "actions", []) or []:
+            if action.type not in {ActionType.PLACE, ActionType.SWAP} or not action.ladder:
+                continue
+            shapes = [
+                {
+                    "env": list(rank.env or []),
+                    "instance_type": rank.config.get("instance_type"),
+                    "tp": rank.config.get("tp"),
+                    "pp": rank.config.get("pp"),
+                    "sp": rank.config.get("sp"),
+                    "ep": rank.config.get("ep"),
+                    "cp": rank.config.get("cp"),
+                    "num_nodes_per_chain": rank.config.get("num_nodes_per_chain"),
+                    "interconnect_type": rank.config.get("interconnect_type"),
+                    "n_replicas": rank.n_replicas,
+                }
+                for rank in action.ladder
+            ]
+            previous = self._deployment_ledger.get(action.job_id)
+            previous_record = previous or {}
+            current_rank_ids = {str(rank.rank_id) for rank in action.ladder if rank.rank_id}
+            rank_shapes = {
+                str(rank.rank_id): self._deployment_shape_signature(rank.to_dict())
+                for rank in action.ladder
+                if rank.rank_id
+            }
+            attempt_number = int(previous_record.get("attempts", 0)) + 1
+            attempt = {
+                "attempt_number": attempt_number,
+                "request_tick": ctx.tick,
+                "action_type": action.type.value,
+                "rank_ids": sorted(current_rank_ids),
+                "rank_shapes": rank_shapes,
+                "deployment_identity": deployment_ladder_identity(
+                    rank.to_dict() for rank in action.ladder
+                ),
+                "executor_ack": [],
+                "state": "submitted",
+                "terminal_tick": None,
+                "retry_after_tick": None,
+            }
+            attempt_details = [*list(previous_record.get("attempt_details") or []), attempt]
+            self._deployment_ledger[action.job_id] = {
+                "request_tick": ctx.tick,
+                "first_tick": previous_record.get("first_tick", ctx.tick),
+                "attempts": attempt_number,
+                "action_type": action.type.value,
+                "rank_ids": sorted(current_rank_ids),
+                "rank_shapes": rank_shapes,
+                "attempt_details": attempt_details,
+                "shapes": shapes,
+            }
+            new_attempts.append((action.job_id, attempt_number))
+        return new_attempts
+
+    def _record_deployment_acks(
+        self,
+        attempt_refs: list[tuple[str, int]],
+        acks: list[Any],
+        tick: int,
+    ) -> None:
+        copied_acks = copy.deepcopy(list(acks or []))
+        rejected = any(
+            str((ack or {}).get("status") or "").lower() in {"failed", "rejected", "error"}
+            for ack in copied_acks
+            if isinstance(ack, dict)
+        )
+        for job_id, attempt_number in attempt_refs:
+            request = self._deployment_ledger.get(job_id) or {}
+            attempt = next(
+                (
+                    item
+                    for item in request.get("attempt_details") or []
+                    if int(item.get("attempt_number") or 0) == attempt_number
+                ),
+                None,
+            )
+            if attempt is None:
+                continue
+            attempt["executor_ack"] = copied_acks
+            attempt["state"] = "executor_rejected" if rejected else "acknowledged"
+            if rejected:
+                attempt["terminal_tick"] = tick
+                attempt["retry_after_tick"] = tick + _DEPLOYMENT_RETRY_BACKOFF_TICKS
+
+    @staticmethod
+    def _deployment_shape_signature(raw: dict[str, Any], replicas: int | None = None) -> tuple:
+        return deployment_rank_identity(raw, replicas=replicas)
+
+    @staticmethod
+    def _deployment_attempt_active(
+        attempt: dict[str, Any],
+        observed_rank_ids: set[str],
+        observed_shapes: dict[str, tuple],
+    ) -> bool:
+        expected_ids = set(attempt.get("rank_ids") or [])
+        expected_shapes = dict(attempt.get("rank_shapes") or {})
+        ids_active = bool(expected_ids) and expected_ids <= observed_rank_ids
+        if not expected_shapes:
+            return ids_active
+        return ids_active and all(
+            observed_shapes.get(rank_id) == tuple(expected_shapes.get(rank_id) or ())
+            for rank_id in expected_ids
+        )
+
+    @classmethod
+    def _rank_group_signature(cls, chains: list[dict[str, Any]]) -> tuple:
+        signatures = {cls._deployment_shape_signature(chain, len(chains)) for chain in chains}
+        return next(iter(signatures)) if len(signatures) == 1 else ("mixed_replica_shapes",)
+
+    @staticmethod
+    def _prediction_shape_signature(raw: dict[str, Any], replicas: int | None = None) -> tuple:
+        """Identity for safely restoring predictions across Store round trips."""
+        shape = dict(raw.get("shape_json") or raw)
+        config = dict(shape.get("config") or shape)
+        return (
+            deployment_rank_identity(raw, replicas=replicas),
+            config.get("weight_dtype"),
+            config.get("activation_dtype"),
+            config.get("kvcache_dtype"),
+            config.get("weight_quantization_bits"),
+            config.get("weight_quantization_method"),
+            config.get("engine_name"),
+            config.get("engine_version"),
+            config.get("router_policy"),
+            config.get("scheduling_policy"),
+            config.get("preemption_policy"),
+            config.get("prefix_cache_enabled"),
+            config.get("chunked_prefill_enable"),
+            config.get("interconnect_type"),
+        )
+
+    @classmethod
+    def _prediction_rank_group_signature(cls, chains: list[dict[str, Any]]) -> tuple:
+        signatures = {cls._prediction_shape_signature(chain, len(chains)) for chain in chains}
+        return next(iter(signatures)) if len(signatures) == 1 else ("mixed_replica_shapes",)
+
+    def _record_prediction_ledger(self, ctx: TickContext) -> None:
+        for action in getattr(ctx.validated_plan, "actions", []) or []:
+            for rank in action.ladder or []:
+                if not rank.rank_id:
+                    continue
+                self._prediction_ledger[(action.job_id, str(rank.rank_id))] = {
+                    "predicted_y": copy.deepcopy(rank.predicted_y or {}),
+                    "predicted_v": copy.deepcopy(rank.predicted_v or {}),
+                    "prediction_lineage": copy.deepcopy(rank.prediction_lineage or {}),
+                    "mechanism_id": rank.mechanism_id or action.mechanism_id,
+                    "shape_signature": self._prediction_shape_signature(rank.to_dict()),
+                }
+
+    def _update_active_health(
+        self,
+        ctx: TickContext,
+        job_features: dict[str, dict[str, Any]],
+        samples: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, dict[str, Any]]:
+        health: dict[str, dict[str, Any]] = {}
+        active_jobs = list(ctx.cluster_snapshot.active_jobs_summary() or [])
+        incomplete_jobs = {
+            str(item.get("job_id"))
+            for item in (ctx.telemetry_diagnostics.get("missing_ranks") or [])
+            if item.get("job_id")
+        }
+        for job in active_jobs:
+            jid = str(job.get("job_id", job.get("id")))
+            rows = samples.get(jid, [])
+            features = job_features.get(jid, {})
+            observed = {
+                name: max(
+                    (float(row[name]) for row in rows if row.get(name) is not None),
+                    default=None,
+                )
+                for name in ("p99_ttft_ms", "p99_tpot_ms", "depth_req_q")
+            }
+            throughput_values = [
+                float(row["throughput_token_per_sec"])
+                for row in rows
+                if row.get("throughput_token_per_sec") is not None
+            ]
+            observed_throughput = sum(throughput_values) if throughput_values else None
+            observed["throughput_token_per_sec"] = observed_throughput
+            reasons = []
+            ttft_target = features.get("target_p99_ttft_ms")
+            tpot_target = features.get("target_p99_tpot_ms")
+            previous = self._health_state.get(jid, {})
+            previous_depth = float(previous.get("last_queue_depth") or 0.0)
+            current_depth = float(observed["depth_req_q"] or 0.0)
+            try:
+                job_type = str(
+                    features.get("type")
+                    or features.get("workload_type")
+                    or job.get("kind")
+                    or "online"
+                ).lower()
+                if job_type == "batch":
+                    deadline_hours = features.get("deadline_hours")
+                    if deadline_hours is None:
+                        deadline_hours = features.get("deadline_hrs", 24.0)
+                    required_throughput = float(features.get("total_token_budget") or 0.0) / max(
+                        1.0,
+                        float(deadline_hours) * 3600.0,
+                    )
+                else:
+                    required_throughput = (
+                        float(features.get("request_arrival_rate") or 0.0)
+                        * float(
+                            features.get("osl_token_avg")
+                            or features.get("output_len_tokens_avg")
+                            or 0.0
+                        )
+                        * float(features.get("headroom_factor") or 1.5)
+                    )
+            except (TypeError, ValueError, OverflowError):
+                required_throughput = 0.0
+            if job_type == "batch":
+                if observed_throughput is not None and observed_throughput <= 0:
+                    reasons.append("zero_throughput")
+                elif (
+                    observed_throughput is not None
+                    and required_throughput > 0
+                    and observed_throughput < required_throughput
+                ):
+                    reasons.append("throughput_shortfall")
+            else:
+                has_backlog = current_depth > 0
+                if has_backlog and observed_throughput is not None and observed_throughput <= 0:
+                    reasons.append("zero_throughput")
+                elif (
+                    has_backlog
+                    and observed_throughput is not None
+                    and required_throughput > 0
+                    and observed_throughput < 0.5 * required_throughput
+                ):
+                    reasons.append("throughput_shortfall")
+                if (
+                    ttft_target
+                    and observed["p99_ttft_ms"] is not None
+                    and observed["p99_ttft_ms"] > float(ttft_target)
+                ):
+                    reasons.append("ttft_breach")
+                if (
+                    tpot_target
+                    and observed["p99_tpot_ms"] is not None
+                    and observed["p99_tpot_ms"] > float(tpot_target)
+                ):
+                    reasons.append("tpot_breach")
+                if current_depth >= 10 and current_depth > max(10.0, previous_depth * 1.1):
+                    reasons.append("queue_growing")
+                if current_depth >= 100:
+                    reasons.append("queue_critical")
+            complete_samples = bool(rows) and all(
+                sample.get("telemetry_complete") is True for sample in rows
+            )
+            telemetry_incomplete = jid in incomplete_jobs or not complete_samples
+            critical = (
+                "zero_throughput" in reasons
+                or (
+                    observed_throughput is not None
+                    and required_throughput > 0
+                    and observed_throughput < 0.1 * required_throughput
+                    and (job_type == "batch" or current_depth > 0)
+                )
+                or (job_type != "batch" and current_depth >= 100)
+                or (
+                    job_type != "batch"
+                    and ttft_target
+                    and observed["p99_ttft_ms"] is not None
+                    and observed["p99_ttft_ms"] >= 3 * float(ttft_target)
+                )
+            )
+            if telemetry_incomplete and not critical:
+                entry = {
+                    "status": "unknown",
+                    "reasons": ["telemetry_incomplete"],
+                    "unhealthy_ticks": int(previous.get("unhealthy_ticks", 0)),
+                    "observed": observed,
+                    "observed_slo_met": None,
+                    "rehabilitation_eligible": False,
+                    "last_swap_tick": int(previous.get("last_swap_tick", -10_000)),
+                    "last_queue_depth": float(previous.get("last_queue_depth") or 0.0),
+                }
+                self._health_state[jid] = copy.deepcopy(entry)
+                job["health"] = copy.deepcopy(entry)
+                job["recent_failures"] = entry["unhealthy_ticks"]
+                health[jid] = copy.deepcopy(entry)
+                continue
+            if telemetry_incomplete:
+                reasons.append("telemetry_incomplete")
+            streak = int(previous.get("unhealthy_ticks", 0)) + 1 if reasons else 0
+            last_swap_tick = int(previous.get("last_swap_tick", -10_000))
+            status = (
+                "critical"
+                if critical
+                else "degraded"
+                if reasons
+                else "healthy"
+                if rows
+                else "unknown"
+            )
+            entry = {
+                "status": status,
+                "reasons": reasons,
+                "unhealthy_ticks": streak,
+                "observed": observed,
+                "observed_slo_met": None
+                if telemetry_incomplete
+                else bool(rows)
+                and not any(
+                    reason in reasons
+                    for reason in (
+                        "zero_throughput",
+                        "throughput_shortfall",
+                        "ttft_breach",
+                        "tpot_breach",
+                    )
+                ),
+                "rehabilitation_eligible": bool(
+                    (critical or streak >= 2) and ctx.tick - last_swap_tick >= 2
+                ),
+                "last_swap_tick": last_swap_tick,
+                "last_queue_depth": current_depth,
+            }
+            self._health_state[jid] = copy.deepcopy(entry)
+            job["health"] = copy.deepcopy(entry)
+            job["recent_failures"] = streak
+            health[jid] = copy.deepcopy(entry)
+        return health
 
     # ------------------------------------------------------------------
     # Terminal handlers
@@ -754,12 +1334,38 @@ class TickRunner:
                 model_catalogs={},
                 x_fields=x_fields,
             )
-        return build_deployment_x_index(
+        index = build_deployment_x_index(
             ctx.cluster_snapshot,
             hardware_catalog=self._hardware_catalog(),
             model_catalogs=self._model_catalogs(ctx),
             x_fields=x_fields,
         )
+        observed_shapes: dict[tuple[str, str], tuple] = {}
+        for job in ctx.cluster_snapshot.active_jobs_summary() or []:
+            jid = str(job.get("job_id", job.get("id")))
+            groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for chain in job.get("active_chains") or job.get("current_ladder") or []:
+                shape = dict(chain.get("shape_json") or chain)
+                rank_id = shape.get("rank_id")
+                if rank_id:
+                    groups[str(rank_id)].append(chain)
+            for rank_id, chains in groups.items():
+                observed_shapes[(jid, rank_id)] = self._prediction_rank_group_signature(chains)
+        for key, deployment in index.by_rank.items():
+            cached = self._prediction_ledger.get(key)
+            if not cached or cached.get("shape_signature") != observed_shapes.get(key):
+                continue
+            if not deployment.prediction_lineage:
+                deployment.prediction_lineage = cached.get("prediction_lineage")
+            deployment.y_predicted = {
+                **dict(cached.get("predicted_y") or {}),
+                **deployment.y_predicted,
+            }
+            deployment.v_predicted = {
+                **dict(cached.get("predicted_v") or {}),
+                **deployment.v_predicted,
+            }
+        return index
 
     @staticmethod
     def _has_active_chains(ctx: TickContext) -> bool:
@@ -876,24 +1482,49 @@ class TickRunner:
         self,
         context: dict[str, Any],
         committed_id: str | None,
+        *,
+        diagnostics: list[dict[str, Any]] | None = None,
+        job_id: str | None = None,
+        rank_id: str | None = None,
     ) -> list[Any]:
         """Resolve the mechanisms this rank's evidence speaks to.
 
         Active structured matches on deployed X and workload values, plus the
-        committed mechanism regardless of status - the agent's bet always
-        receives its verdict, even if the mechanism was archived
-        mid-flight.
+        committed mechanism regardless of status. Every returned mechanism has
+        all X values required by its edges, scope, and conditions.
         """
-        applicable = {
+        if self.candidate_graph is None:
+            raise ValueError("candidate graph is required for mechanism X validation")
+        candidates = {
             mechanism.mechanism_id: mechanism
             for mechanism, _ in self.mechanism_registry.find_applicable(context)
         }
-        if committed_id is not None and committed_id not in applicable:
+        if committed_id is not None and committed_id not in candidates:
             try:
-                applicable[committed_id] = self.mechanism_registry.get_mechanism(committed_id)
+                candidates[committed_id] = self.mechanism_registry.get_mechanism(committed_id)
             except KeyError:
                 log.warning("committed mechanism %s not in registry", committed_id)
-        return list(applicable.values())
+
+        applicable = []
+        for mechanism in candidates.values():
+            required_x = self.candidate_graph.required_x_for_mechanism(mechanism)
+            missing_x = [name for name in required_x if name not in context]
+            if missing_x:
+                if diagnostics is not None:
+                    diagnostics.append(
+                        {
+                            "job_id": job_id,
+                            "rank_id": rank_id,
+                            "mechanism_id": mechanism.mechanism_id,
+                            "status": "skipped",
+                            "reason": "missing_x",
+                            "missing_x": missing_x,
+                            "icp": [],
+                        }
+                    )
+                continue
+            applicable.append(mechanism)
+        return applicable
 
     def _bundle(self, mechanism) -> _MechanismBundle:
         """Cached V/Y bundle view for one mechanism."""
@@ -913,11 +1544,41 @@ class TickRunner:
     def _missing_bundle_inputs(bundle, v_obs, v_pred, y_obs, y_pred) -> dict[str, list[str]]:
         """Return missing CUSUM inputs grouped by trajectory type."""
         return {
-            "v_observed": [name for name in bundle.bundle_v_variables if name not in v_obs],
-            "v_predicted": [name for name in bundle.bundle_v_variables if name not in v_pred],
-            "y_observed": [name for name in bundle.bundle_y_outcomes if name not in y_obs],
-            "y_predicted": [name for name in bundle.bundle_y_outcomes if name not in y_pred],
+            "v_observed": [name for name in bundle.bundle_v_variables if v_obs.get(name) is None],
+            "v_predicted": [name for name in bundle.bundle_v_variables if v_pred.get(name) is None],
+            "y_observed": [name for name in bundle.bundle_y_outcomes if y_obs.get(name) is None],
+            "y_predicted": [name for name in bundle.bundle_y_outcomes if y_pred.get(name) is None],
         }
+
+    def _observable_edge_ids(
+        self,
+        bundle: _MechanismBundle,
+        available_v: set[str],
+        available_y: set[str],
+        *,
+        include_v: bool = True,
+        include_y: bool = True,
+    ) -> list[str]:
+        """Return mechanism edges whose measured endpoints can be evaluated."""
+        observable = []
+        for edge_id in bundle.edge_ids:
+            edge = self._resolve_edge(edge_id)
+            if edge is None:
+                continue
+            if (
+                include_v
+                and edge.src_type == "X"
+                and edge.dst_type == "V"
+                and edge.dst in available_v
+            ) or (
+                include_y
+                and edge.src_type == "V"
+                and edge.dst_type == "Y"
+                and edge.src in available_v
+                and edge.dst in available_y
+            ):
+                observable.append(edge_id)
+        return observable
 
     def _cusum_diagnostics(self, bundle, v_obs, v_pred, y_obs, y_pred, v_params, y_params):
         """Return the exact per-variable CUSUM calculations for one mechanism."""
@@ -1081,53 +1742,96 @@ class TickRunner:
         return 0.0
 
     def _observed_coverage_details(self, ctx: TickContext) -> dict[str, Any]:
-        """Return this tick's DRO coverage and the bands used to compute it.
+        """Evaluate outcomes against immutable DRO bands persisted at decision time.
 
-        Bands are recomputed from each row's stored y_predicted with the
-        current epsilon - one tick of epsilon drift versus the band that
-        existed at deploy time, accepted as the honest v0 approximation.
-        Returns the DRO target (no-signal) when the tick produced no rows.
+        The target coverage is the existing float API's neutral no-signal
+        value. A persisted but unusable band is measured as uncovered; only
+        a missing band or missing required observation is non-evaluable.
         """
+        target = float(getattr(self.dro, "target", 0.90))
         rows = [r for r in ctx.evidence_rows if r.y_observed_mean]
         if not rows:
             return {
-                "value": float(getattr(self.dro, "target", 0.90)),
+                "value": target,
                 "inside_rows": 0,
                 "row_count": 0,
+                "evaluable_row_count": 0,
+                "has_signal": False,
                 "reason": "no_evidence",
                 "rows": [],
             }
         inside = 0
+        evaluable = 0
         row_details = []
         for row in rows:
-            band = self.dro.compute_dro_band(row.y_predicted)
-            row_inside = self.dro._all_objectives_inside(row.y_observed_mean, band)
+            lineage = getattr(row, "prediction_lineage", None)
+            has_band = isinstance(lineage, Mapping) and "decision_dro_band" in lineage
+            band = (
+                lineage.get("decision_dro_band")
+                if isinstance(lineage, Mapping) and has_band
+                else None
+            )
+            required = (
+                lineage.get("decision_required_objectives")
+                if isinstance(lineage, Mapping) and has_band
+                else None
+            )
+            status = self.dro._coverage_status(row.y_observed_mean, band, required)
+            row_inside = status is True
+            if status is not None:
+                evaluable += 1
             if row_inside:
                 inside += 1
+            if required is None:
+                required_names = list(band) if isinstance(band, Mapping) else []
+            elif isinstance(required, (list, tuple, set, frozenset)):
+                required_names = [name for name in required if isinstance(name, str)]
+            else:
+                required_names = []
             objectives = {}
-            for name, observed in row.y_observed_mean.items():
-                objective_band = band.get(name)
-                if objective_band is None:
-                    objectives[name] = {"observed": float(observed), "band": None}
+            for name in required_names:
+                observed = row.y_observed_mean.get(name)
+                objective_band = band.get(name) if isinstance(band, Mapping) else None
+                if not isinstance(objective_band, Mapping):
+                    objectives[name] = {
+                        "observed": self._float_or_none(observed),
+                        "band": None,
+                        "inside": False,
+                    }
                     continue
                 objectives[name] = {
-                    "observed": float(observed),
-                    "point": objective_band["point"],
-                    "lower": objective_band["lower"],
-                    "upper": objective_band["upper"],
-                    "inside": objective_band["lower"] <= observed <= objective_band["upper"],
+                    "observed": self._float_or_none(observed),
+                    "point": objective_band.get("point"),
+                    "lower": objective_band.get("lower"),
+                    "upper": objective_band.get("upper"),
+                    "inside": self.dro._all_objectives_inside(
+                        {name: observed}, {name: objective_band}, [name]
+                    ),
                 }
             row_details.append(
                 {
                     "row_id": row.row_id,
                     "inside": row_inside,
+                    "evaluable": status is not None,
                     "objectives": objectives,
                 }
             )
+        if not evaluable:
+            return {
+                "value": target,
+                "inside_rows": 0,
+                "row_count": len(rows),
+                "evaluable_row_count": 0,
+                "has_signal": False,
+                "reason": "no_evaluable_decision_bands",
+                "rows": row_details,
+            }
         return {
-            "value": inside / len(rows),
+            "value": inside / evaluable,
             "inside_rows": inside,
             "row_count": len(rows),
+            "evaluable_row_count": evaluable,
+            "has_signal": True,
             "reason": "measured",
             "rows": row_details,
         }

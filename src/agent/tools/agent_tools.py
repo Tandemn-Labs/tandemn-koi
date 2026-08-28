@@ -51,7 +51,7 @@ Tool catalog:
         simulate_resource_free      counterfactual resources if a job released
         enumerate_ladder            feasible chain configs under constraints
         required_throughput_enumerator  required tokens/sec from workload + SLO
-        size_ladder                 derive n_replicas per rank from y_hat + capacity
+        size_ladder                 evaluate fixed-rank Direct point capacity
 
     mechanism / confidence:
         get_scope                   mechanisms whose scope matches job features
@@ -64,6 +64,8 @@ Tool catalog:
 
     prediction / scoring:
         predict_outcome             calibrated surrogate prediction + DRO band
+        get_surrogate_budget_status current tick search-budget accounting
+        get_partial_online_admission_status  guarded admission mode/counters
         get_z_star                  current ideal-point reference (z_star_t)
         compute_tchebycheff         augmented Tchebycheff J
         optimize_config             LLM-steered coordinate descent over candidates
@@ -86,12 +88,12 @@ import json
 import logging
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from threading import Lock
 from typing import Any
 
 from src.config.hyperparameters import GAMMA_SLO
+from src.config.policy import MODEL_MAX_TP, SUPPORTED_EP, VALID_TP_DEGREES, load_config_policy
 from src.core.models import (
     LADDER_ACTIONS,
     SWAP_BUDGET_ACTIONS,
@@ -99,10 +101,14 @@ from src.core.models import (
     Plan,
     PlanAction,
     RankSpec,
+    deployment_ladder_identity,
+    deployment_rank_identity,
     env_gpu_type,
 )
-from src.infra.deployment_x import build_rank_x
+from src.infra.deployment_x import build_rank_x, materialize_launch_config
+from src.prediction.analytic_v import target_memory_fit
 from src.prediction.composer import compact_prediction_lineage
+from src.prediction.queue_model import estimate_queue_shadow
 from src.prediction.surrogate import (
     SurrogateExecutionError,
     SurrogateMemoryNoFit,
@@ -129,7 +135,6 @@ AGENT_TUNABLE_X = frozenset(
         "pp",
         "sp",
         "dp",
-        "ep",
         "cp",
         # disaggregated prefill/decode worker split
         "prefill_worker_count",
@@ -140,6 +145,7 @@ AGENT_TUNABLE_X = frozenset(
 # Engine-AUTOTUNED batch knobs: never valid from the agent OR from workload
 # features. Stripped from BOTH config and features.
 _ENGINE_AUTOTUNED_X = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
+_INTERNAL_AGENT_CONFIG_X = frozenset({"_arrival_share_rps"})
 
 # Engine/catalog-owned CONFIG knobs the agent must NOT set (not in the allowed
 # proposal set). The engine/catalog supplies them, and the valid workload value
@@ -165,7 +171,7 @@ _ENGINE_OWNED_X = frozenset(
 
 
 def _sanitize_agent_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Strip engine-owned + engine-autotuned knobs from an agent-proposed CONFIG.
+    """Strip engine-owned, autotuned, and Koi-internal values from CONFIG.
 
     The agent may only propose the placement/topology/parallelism/PD knobs in
     AGENT_TUNABLE_X; everything else is engine/catalog-owned and is removed here
@@ -173,7 +179,7 @@ def _sanitize_agent_config(config: dict[str, Any]) -> dict[str, Any]:
     etc.) can never reach the surrogate. The catalog, workload features, and
     surrogate defaults supply the real values.
     """
-    drop = _ENGINE_AUTOTUNED_X | _ENGINE_OWNED_X
+    drop = _ENGINE_AUTOTUNED_X | _ENGINE_OWNED_X | _INTERNAL_AGENT_CONFIG_X
     return {key: value for key, value in (config or {}).items() if key not in drop}
 
 
@@ -227,6 +233,7 @@ DEFAULT_COLD_START_Z_STAR = {
 # Opportunity cost charged per WAITING job the plan leaves unserved, so a
 # feasible placement (sigma ~ J<=0 + EIG) beats defer (0). Scaled by priority.
 UNSERVED_PENALTY = 1.0
+_WORK_CONSERVING_GAIN_FLOOR = 1e-9
 # COST is a weighted OPTIMIZE objective (see compute_sigma), governed by the slow
 # loop's weight w_t["cost_per_token"] - the SAME code serves any market, only the
 # weight changes. Reserved sets it ~0 (fleet is sunk -> cost inert, a small job may
@@ -367,6 +374,13 @@ def bind_tools(**components) -> None:
     surrogate_changed = components.get("surrogate") is not None and components.get(
         "surrogate"
     ) is not getattr(_CTX, "surrogate", None)
+    specialist_changed = components.get("specialist_runner") is not None and components.get(
+        "specialist_runner"
+    ) is not getattr(_CTX, "specialist_runner", None)
+    context_changed = any(
+        value is not None and value is not getattr(_CTX, name, None)
+        for name, value in components.items()
+    )
     for name, value in components.items():
         if not hasattr(_ToolContext, name):
             raise ValueError(f"bind_tools: unknown component {name!r}")
@@ -375,10 +389,16 @@ def bind_tools(**components) -> None:
     if surrogate_changed:
         with _SURROGATE_EXECUTION_LOCK:
             _prediction_cache.clear()
+    if specialist_changed:
+        _specialist_results_cache.clear()
+    if context_changed:
+        _scored_candidates_cache.clear()
     surrogate = getattr(_CTX, "surrogate", None)
     evidence_store = getattr(_CTX, "evidence_store", None)
-    if surrogate is not None and evidence_store is not None and hasattr(
-        surrogate, "bind_evidence_store"
+    if (
+        surrogate is not None
+        and evidence_store is not None
+        and hasattr(surrogate, "bind_evidence_store")
     ):
         surrogate.bind_evidence_store(evidence_store)
 
@@ -430,43 +450,170 @@ def assert_planning_ready() -> None:
         )
 
 
-# Per-tick surrogate-call budget: a runaway BACKSTOP, not a quality limiter.
+# Per-tick surrogate SEARCH-call budget: a runaway BACKSTOP, not a quality limiter.
 # The planner may explore freely (grid / coordinate search) up to this many
 # surrogate simulations per tick; beyond it a sim raises SurrogateBudgetExceeded,
-# which size_ladder / optimize_config / the specialist eval loops catch and treat
-# as an infeasible/skipped frame - so hitting it late just means "commit the best
-# scored so far", never a crash or forced defer. Raise it for deeper search; it
-# is generous by design (a normal tick uses far fewer).
+# which candidate evaluation reports separately from physical failures, so hitting
+# it late means "commit the best scored so far", never a crash or forced defer.
+# Raise it for deeper search; it is generous by design (a normal tick uses far fewer).
 SURROGATE_CALL_BUDGET = 100
+PARTIAL_ONLINE_ADMISSION_MODE = "advisory"
+_AIC_DIRECT_METHOD = ("AIC_Direct",)
+_HARD_SIZING_FAILURES = frozenset(
+    {"invalid_config", "no_pool_capacity", "physical_no_fit", "resource_budget"}
+)
+_SOFT_PREDICTION_FAILURES = frozenset(
+    {
+        "unsupported_prediction",
+        "prediction_failed",
+        "prediction_empty",
+        "prediction_incomplete",
+        "zero_predicted_capacity",
+        "demand_unmodeled",
+    }
+)
+_DIRECT_PREDICTION_SEMANTICS = {
+    "basis": "aic_direct_point",
+    "throughput_token_per_sec": "point_capacity",
+    "p99_ttft_ms": "base_service_latency",
+    "p99_tpot_ms": "base_service_latency",
+    "slo_margin": "base_service_latency_margin",
+    "queue_model": "none",
+    "queue_slo_verified": False,
+}
+_POINT_PREDICTION_BASES = frozenset({"aic_direct_point", "composed_point_estimate"})
+
+
+def _is_exploratory_assessment(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("basis") in _POINT_PREDICTION_BASES
+        and value.get("kind") == "exploratory"
+        and value.get("status") in _SOFT_PREDICTION_FAILURES
+    )
+
+
 _surrogate_calls = 0
+_surrogate_cache_hits = 0
+_surrogate_budget_rejections = 0
+_surrogate_finalization_calls = 0
+_surrogate_stress_calls = 0
+_partial_online_searches = 0
+_partial_online_queue_aware_probes = 0
+_partial_online_safe_probes = 0
+_partial_online_admissions = 0
+_partial_online_truncated_searches = 0
+_placement_decision_sequence = 0
 # Per-tick memo of RAW surrogate output keyed on (job_config, job_features,
-# scenario). DynoSim is deterministic, so re-probing a config the LLM already
-# evaluated THIS tick returns the identical numbers - we serve them from here
-# instead of re-running the surrogate. Reads are lock-free (atomic dict.get under
-# the GIL); writes happen under _SURROGATE_EXECUTION_LOCK (see _predict_outcome_core).
+# scenario, calibration, method, accounting mode). Direct AIC is deterministic,
+# so re-probing a config the LLM already evaluated THIS tick returns identical
+# numbers. Serve them from here instead of re-running the surrogate. Access happens under
+# _SURROGATE_EXECUTION_LOCK (see _predict_outcome_core).
 # Cleared every tick by reset_tick_caches so calibration / z* / evidence updates are
 # never stale, and so a cache hit never leaks across capacity/telemetry boundaries.
 _prediction_cache: dict[str, dict[str, Any]] = {}
+_specialist_results_cache: dict[str, dict[str, dict[str, Any]]] = {}
+_scored_candidates_cache: dict[str, dict[str, Any]] = {}
 
 
 class SurrogateBudgetExceeded(RuntimeError):
-    """Raised when a tick exceeds SURROGATE_CALL_BUDGET distinct surrogate sims."""
+    """Raised when a search call would exceed the tick's surrogate budget."""
+
+
+def configure_surrogate_call_budget(limit: int) -> None:
+    """Set the per-tick search-call limit without resetting current metrics."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError("surrogate call budget must be an integer")
+    if limit < 0:
+        raise ValueError("surrogate call budget must be >= 0")
+    global SURROGATE_CALL_BUDGET
+    with _SURROGATE_EXECUTION_LOCK:
+        SURROGATE_CALL_BUDGET = limit
+    # A result truncated under the old limit is not reusable after reconfiguration.
+    _scored_candidates_cache.clear()
+
+
+def configure_partial_online_admission(mode: str) -> None:
+    """Retain the legacy admission-mode setting for compatibility and reporting."""
+    if not isinstance(mode, str):
+        raise TypeError("partial online admission mode must be a string")
+    if mode not in {"off", "advisory"}:
+        raise ValueError("partial online admission mode must be exactly 'off' or 'advisory'")
+    global PARTIAL_ONLINE_ADMISSION_MODE
+    with _SURROGATE_EXECUTION_LOCK:
+        PARTIAL_ONLINE_ADMISSION_MODE = mode
+    _scored_candidates_cache.clear()
+
+
+def get_partial_online_admission_status() -> dict[str, Any]:
+    """Return point-capacity admission accounting and legacy zeroed counters."""
+    with _SURROGATE_EXECUTION_LOCK:
+        return {
+            "mode": PARTIAL_ONLINE_ADMISSION_MODE,
+            "prediction_basis": "aic_direct_point",
+            "queue_model": "none",
+            "queue_slo_verified": False,
+            "searches": _partial_online_searches,
+            "queue_aware_probes": _partial_online_queue_aware_probes,
+            "safe_probes": _partial_online_safe_probes,
+            "admissions": _partial_online_admissions,
+            "truncated_searches": _partial_online_truncated_searches,
+        }
+
+
+def get_surrogate_budget_status() -> dict[str, int]:
+    """Return current tick search usage and non-search surrogate accounting."""
+    with _SURROGATE_EXECUTION_LOCK:
+        return {
+            "limit": SURROGATE_CALL_BUDGET,
+            "calls_executed": _surrogate_calls,
+            "cache_hits": _surrogate_cache_hits,
+            "budget_rejections": _surrogate_budget_rejections,
+            "finalization_calls": _surrogate_finalization_calls,
+            "stress_calls": _surrogate_stress_calls,
+            "remaining": max(0, SURROGATE_CALL_BUDGET - _surrogate_calls),
+        }
+
+
+def _tick_cache_key(*values: Any) -> str | None:
+    """Build a stable key for plain per-tick tool inputs."""
+    try:
+        return json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        return None
 
 
 def reset_tick_caches() -> None:
-    """Clear per-tick caches: user envelopes and the validated BudgetBook.
+    """Clear per-tick tool caches and surrogate accounting.
 
     Must run at every tick boundary (S0 wires it via the TickRunner's
     on_tick_start hook). Without this, run_job_specialists' default-book
     path could reuse a book validated against LAST tick's capacity -
     a stale-budget hole in the anti-split-brain ordering.
     """
-    global _surrogate_calls
+    global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
+    global _surrogate_finalization_calls, _surrogate_stress_calls
+    global _partial_online_admissions, _partial_online_queue_aware_probes
+    global _partial_online_safe_probes, _partial_online_searches
+    global _partial_online_truncated_searches
+    global _placement_decision_sequence
     _CTX.user_envelopes = None
     _CTX.validated_budget_book = None
     with _SURROGATE_EXECUTION_LOCK:
         _surrogate_calls = 0
+        _surrogate_cache_hits = 0
+        _surrogate_budget_rejections = 0
+        _surrogate_finalization_calls = 0
+        _surrogate_stress_calls = 0
+        _partial_online_searches = 0
+        _partial_online_queue_aware_probes = 0
+        _partial_online_safe_probes = 0
+        _partial_online_admissions = 0
+        _partial_online_truncated_searches = 0
+        _placement_decision_sequence = 0
         _prediction_cache.clear()
+    _specialist_results_cache.clear()
+    _scored_candidates_cache.clear()
 
 
 # Public module functions that are NOT LLM tools (infrastructure/boot).
@@ -475,7 +622,11 @@ _NON_TOOL_NAMES = frozenset(
         "bind_tools",
         "all_callables",
         "assert_planning_ready",
+        "compute_sigma_for_commit",
+        "configure_partial_online_admission",
+        "configure_surrogate_call_budget",
         "reset_tick_caches",
+        "stamp_plan_predictions",
     }
 )
 
@@ -596,9 +747,17 @@ def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
     return {}
 
 
-def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None = None) -> dict:
-    """Build the surrogate payload for one rank without mutating the rank."""
+def _rank_prediction_payload(
+    rank: RankSpec,
+    job_features: dict[str, Any] | None = None,
+    *,
+    arrival_rate_rps: float | None = None,
+) -> dict:
+    """Build a fixed-frame Direct payload without synthetic offered-load overrides."""
     features = _sanitize_agent_features(dict(job_features or {}))
+    # Kept in the signature for compatibility with older callers. Direct is a point
+    # estimator, so changing this value must not be used to synthesize queue behavior.
+    _ = arrival_rate_rps
     env = None
     if rank.env is not None:
         env = list(rank.env) if isinstance(rank.env, (list, tuple)) else str(rank.env).split("|")
@@ -625,22 +784,25 @@ def _rank_prediction_payload(rank: RankSpec, job_features: dict[str, Any] | None
             count = rank.gpus_per_chain()
             shape = {**config, "env": list(env), "count": count, "gpu_count": count}
             resources = resource_map.resources_summary()
+            model_catalog = resource_map.model_catalog(str(model_id))
             compiled_x = build_rank_x(
                 job_values=features,
                 shape=shape,
                 env=(str(env[0]), str(env[1]), str(env[2]), str(env[3]), str(env[4])),
                 resources=resources,
                 hardware_catalog=resource_map.hardware_catalog(),
-                model_catalog=resource_map.model_catalog(str(model_id)),
+                model_catalog=model_catalog,
                 replica_count=max(1, int(rank.n_replicas or 1)),
             )
             config.update(compiled_x)
+            config.update(materialize_launch_config(model_catalog, str(env[4])))
             allocation = _rank_allocation_summary(rank, resources)
             price = allocation.get("price_per_unit_hour")
             if price is not None:
                 config["price_per_hour"] = float(price)
         except Exception:
             log.exception("rank prediction X assembly failed; using rank config only")
+    config.pop("_arrival_share_rps", None)
     return {"job_config": config, "job_features": features}
 
 
@@ -672,9 +834,18 @@ def _slo_thresholds_for(snapshot, job_id: str) -> dict:
     """
     if snapshot is None:
         return {}
-    if hasattr(snapshot, "slo_thresholds"):
-        return dict(snapshot.slo_thresholds(job_id) or {})
-    return {}
+    thresholds = (
+        dict(snapshot.slo_thresholds(job_id) or {}) if hasattr(snapshot, "slo_thresholds") else {}
+    )
+    features = _job_features_for(snapshot, job_id)
+    for outcome, names in {
+        "p99_ttft_ms": ("target_p99_ttft_ms", "target_p99_TTFT_ms"),
+        "p99_tpot_ms": ("target_p99_tpot_ms", "target_p99_TPOT_ms"),
+    }.items():
+        value = next((features[name] for name in names if features.get(name) is not None), None)
+        if value is not None and float(value) > 0:
+            thresholds.setdefault(outcome, float(value))
+    return thresholds
 
 
 # Job-outcome composition across a (possibly heterogeneous) multi-rank ladder.
@@ -693,15 +864,24 @@ _COST_OBJS = frozenset({"cost_per_token"})
 _MARGIN_OBJS = frozenset({"slo_margin"})
 
 
-def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> dict[str, Any]:
+def _compose_job_y_hat(
+    action,
+    job_features: dict[str, Any] | None = None,
+    *,
+    method: tuple[str, ...] = _AIC_DIRECT_METHOD,
+    scenario: str = "mean",
+    finalization: bool = False,
+) -> dict[str, Any]:
     """Compose a job-level y_hat from a ladder's per-rank predictions.
 
     y_hat is predicted per rank (per config); this rolls the ranks up to the
     single job-level outcome that J and Pr_DRO are scored on. Honors the
     action's advisory predicted_y when the planner attached one (it already
     composed). A single-rank ladder returns that rank's y_hat unchanged, so
-    homogeneous ladders are unaffected.
+    homogeneous ladders are unaffected. The method input is retained for
+    compatibility; production prediction is always Direct AIC.
     """
+    method = _AIC_DIRECT_METHOD
     # TODO - I can debate this as we don't need the LLM to pass the predicted_y
     # we want it to CALL The SUrrogate ALWAYS
     # so i am, for now, removing this call.
@@ -709,32 +889,30 @@ def _compose_job_y_hat(action, job_features: dict[str, Any] | None = None) -> di
     #     return dict(action.predicted_y)
     samples: list[tuple[int, dict]] = []
     for rank in action.ladder or []:
-        # Predict each rank at ITS arrival share (recorded by size_ladder), not the
-        # whole job's rate - so a heterogeneous composite is not scored as if every
-        # rank carried the full traffic (that double-counts demand and over-loads
-        # each rank's predicted latency). Single-rank jobs carry the full share, so
-        # they are unaffected.
-        share_rps = (rank.config or {}).get("_arrival_share_rps")
-        feats = (
-            {**(job_features or {}), "request_arrival_rate": float(share_rps)}
-            if share_rps is not None
-            else job_features
-        )
         try:
-            payload = _rank_prediction_payload(rank, feats)
-            y = _predict_outcome_core(payload["job_config"], payload["job_features"]).get(
-                "y_hat", {}
-            )
-        except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
+            payload = _rank_prediction_payload(rank, job_features)
+            y = _predict_outcome_core(
+                payload["job_config"],
+                payload["job_features"],
+                scenario=scenario,
+                method=method,
+                _finalization=finalization,
+            ).get("y_hat", {})
+        except SurrogateBudgetExceeded:
+            raise
+        except SurrogateMemoryNoFit:
+            raise
+        except SurrogateUnsupportedConfig as exc:
             log.warning("rank y_hat rejected for job %s (%s)", action.job_id, exc)
             y = {}
         except SurrogateExecutionError:
             raise
         except Exception:
             log.exception("rank y_hat failed for job %s", action.job_id)
-            y = {}
-        if y:
-            samples.append((max(1, int(rank.n_replicas or 1)), y))
+            raise
+        if not y:
+            return {}
+        samples.append((max(1, int(rank.n_replicas or 1)), y))
     if not samples:
         return {}
     # Always roll up (even a single rank) so DP is applied: a lone rank with
@@ -948,17 +1126,57 @@ def get_priority() -> list[dict[str, Any]]:
         List of {"job_id", "user_id", "priority_score", "signals"}
         sorted by descending score.
     """
+
+    def field(job: dict[str, Any], features: dict[str, Any], *names: str, default=None):
+        for source in (job, features):
+            for name in names:
+                value = source.get(name)
+                if value is not None:
+                    return value
+        return default
+
+    def number(value: Any, default: float) -> float:
+        if isinstance(value, bool):
+            return default
+        try:
+            converted = float(value)
+        except (TypeError, ValueError):
+            return default
+        return converted if math.isfinite(converted) else default
+
+    priority_classes = {
+        "LOW": 0.0,
+        "STANDARD": 1.0,
+        "HIGH": 2.0,
+        "CRITICAL": 3.0,
+    }
     jobs = list(get_pending_jobs()) + list(get_active_jobs())
     scored: list[dict[str, Any]] = []
     for j in jobs:
+        job_features = j.get("job_features")
+        if not isinstance(job_features, dict):
+            job_features = {}
+
+        raw_priority_class = field(j, job_features, "priority_class", default=0.0)
+        if isinstance(raw_priority_class, str):
+            class_name = raw_priority_class.strip().upper()
+            priority_class = priority_classes.get(class_name, number(raw_priority_class, 0.0))
+        else:
+            priority_class = number(raw_priority_class, 0.0)
+
+        workload_type = field(j, job_features, "workload_type", "type")
+        if workload_type is None:
+            workload_type = j.get("kind")
+        if workload_type is None:
+            workload_type = job_features.get("kind", "online")
         signals = {
-            "user_priority": float(j.get("user_priority", 1.0)),
-            "priority_class": float(j.get("priority_class", 0)),
-            "is_online": 1.0 if j.get("type", "online") == "online" else 0.0,
-            "deadline_pressure": float(j.get("deadline_pressure", 0.0)),
-            "slo_margin_deficit": max(0.0, -float(j.get("slo_margin", 0.0))),
-            "queue_age_ticks": float(j.get("queue_age_ticks", 0)),
-            "recent_failures": float(j.get("recent_failures", 0)),
+            "user_priority": number(field(j, job_features, "user_priority"), 1.0),
+            "priority_class": priority_class,
+            "is_online": 1.0 if str(workload_type).strip().lower() == "online" else 0.0,
+            "deadline_pressure": number(field(j, job_features, "deadline_pressure"), 0.0),
+            "slo_margin_deficit": max(0.0, -number(field(j, job_features, "slo_margin"), 0.0)),
+            "queue_age_ticks": number(field(j, job_features, "queue_age_ticks"), 0.0),
+            "recent_failures": number(field(j, job_features, "recent_failures"), 0.0),
         }
         score = (
             signals["user_priority"] * 10.0
@@ -977,7 +1195,7 @@ def get_priority() -> list[dict[str, Any]]:
                 "signals": signals,
             }
         )
-    scored.sort(key=lambda x: float(x["priority_score"]), reverse=True)
+    scored.sort(key=lambda x: (-float(x["priority_score"]), str(x["job_id"] or "")))
     return scored
 
 
@@ -1050,6 +1268,15 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         features.get("workload_type") or features.get("type") or (descriptor or {}).get("kind")
     )
     mechanisms = get_scope(mechanism_context)
+    available_instances = instance_catalog()
+    hardware = sorted(
+        {
+            str(info.get("gpu_type") or str(env).split("|")[-1])
+            for env, pools in available_instances.items()
+            for info in pools.values()
+        }
+    )
+    policy_rules = load_config_policy().rules_for_model(str(model_id or ""), hardware)
 
     return {
         "job_id": job_id,
@@ -1061,7 +1288,11 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         "recent_theory_blobs": blobs,
         "similar_deployments": get_similar_deployments(features, top_k=5),
         "mechanism_candidates": mechanisms,
-        "instance_catalog": instance_catalog(),
+        "placement_policy": {
+            gpu: {"precision": rule.precision, "allowed_tp": list(rule.allowed_tp)}
+            for gpu, rule in policy_rules.items()
+        },
+        "instance_catalog": available_instances,
     }
 
 
@@ -1084,9 +1315,23 @@ def instance_catalog() -> dict[str, dict[str, dict[str, Any]]]:
             instance_type = pool.get("instance_type")
             if not instance_type:
                 continue
+            allocation_kind = str(
+                pool.get("allocation_kind") or pool.get("allocation_unit") or "instance"
+            ).lower()
+            raw_gpus_per_unit = int(pool.get("gpus_per_instance") or pool.get("gpus_per_unit") or 1)
+            free_gpus = int(pool.get("free", 0) or 0)
+            available_units = (
+                free_gpus if allocation_kind == "gpu" else int(pool.get("free_instances", 0) or 0)
+            )
             env_map[str(instance_type)] = {
-                "gpus_per_instance": int(pool.get("gpus_per_instance", 0) or 0),
-                "free_instances": int(pool.get("free_instances", 0) or 0),
+                "gpus_per_instance": (1 if allocation_kind == "gpu" else raw_gpus_per_unit),
+                "gpus_per_unit": 1 if allocation_kind == "gpu" else raw_gpus_per_unit,
+                "candidate_gpu_cap": (
+                    available_units if allocation_kind == "gpu" else raw_gpus_per_unit
+                ),
+                "free_instances": available_units,
+                "available_units": available_units,
+                "allocation_kind": allocation_kind,
                 "gpu_type": info.get("gpu_type") or str(env_key).split("|")[-1],
                 "price_per_instance_hour": pool.get("price_per_instance_hour"),
             }
@@ -1420,6 +1665,7 @@ def _budget_violations(
 
 def run_job_specialists(
     max_workers: int = 8,
+    include_active: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Run bounded per-job specialists under a validated BudgetBook.
 
@@ -1431,12 +1677,14 @@ def run_job_specialists(
 
     Args:
         max_workers: Parallel specialist calls.
+        include_active: Include running jobs in addition to waiting jobs. Defaults
+            to False because the candidate builder currently consumes waiting jobs.
 
     Returns:
         Dict job_id -> JobSpecialistResult ({"job_id", "type", "ladder",
-        "predicted_y", "predicted_sigma", "budget_utilization",
-        "fitness", "marginal_value_of_more", "unused_capacity",
-        "mechanism_ids", "new_mechanism_proposals", "reasoning"}).
+        "budget_utilization", "used_capacity", "fitness",
+        "marginal_value_of_more", "unused_capacity", "mechanism_ids",
+        "new_mechanism_proposals", "reasoning"}).
 
     Raises:
         RuntimeError: If no validated book exists or no specialist
@@ -1449,11 +1697,34 @@ def run_job_specialists(
             "run_job_specialists requires the BudgetBook most recently "
             "validated by validate_budget_book. Validate first."
         )
-    job_ids = list((book.get("job_budgets") or {}).keys())
-    results = _CTX.specialist_runner.run_many(
-        jobs=job_ids, budget_book=book, max_workers=int(max_workers)
+    cache_key = _tick_cache_key(book, int(max_workers), bool(include_active))
+    if cache_key is not None and cache_key in _specialist_results_cache:
+        return copy.deepcopy(_specialist_results_cache[cache_key])
+    pending_ids = {
+        job.get("job_id", job.get("id"))
+        for job in get_pending_jobs()
+        if job.get("job_id", job.get("id"))
+    }
+    eligible_ids = set(pending_ids)
+    if include_active:
+        eligible_ids.update(
+            job.get("job_id", job.get("id"))
+            for job in get_active_jobs()
+            if job.get("job_id", job.get("id"))
+        )
+    job_ids = [job_id for job_id in (book.get("job_budgets") or {}) if job_id in eligible_ids]
+    results = (
+        _CTX.specialist_runner.run_many(
+            jobs=job_ids, budget_book=book, max_workers=int(max_workers)
+        )
+        if job_ids
+        else []
     )
-    return {str(result.get("job_id")): result for result in results}
+    by_job = {str(result.get("job_id")): result for result in results}
+    if cache_key is not None:
+        _specialist_results_cache[cache_key] = copy.deepcopy(by_job)
+        return copy.deepcopy(_specialist_results_cache[cache_key])
+    return copy.deepcopy(by_job)
 
 
 # ----------------------------------------------------------------------
@@ -1514,7 +1785,7 @@ def required_throughput_enumerator(job_features: dict[str, Any]) -> float:
     Returns:
         Required throughput in tokens/sec.
     """
-    job_type = job_features.get("type", "online")
+    job_type = _job_mode(job_features)
     headroom = float(job_features.get("headroom_factor", 1.5))
     if job_type == "batch":
         budget = float(job_features.get("total_token_budget", 0.0))
@@ -1602,30 +1873,56 @@ def _model_num_heads(config: dict[str, Any], job_features: dict[str, Any] | None
 def config_runnable(
     config: dict[str, Any],
     job_features: dict[str, Any] | None = None,
+    gpu_type: str | None = None,
 ) -> tuple[bool, str]:
     """Deterministic physical-validity pre-check for a rank config.
 
-    Enforces the HARD constraints the model/hardware impose - tp*pp must fit the
-    engine's GPU demand, and tp must divide the model's attention-head count - in
+    Enforces the HARD constraints the model/hardware impose - gpu_count must equal
+    the tp*pp engine demand, and tp must divide the model's attention-head count - in
     CODE, so an unrunnable config (e.g. tp=8 on a 28-head model) is rejected with
     a clear reason instead of being nagged about in the prompt or crashing the
     surrogate. Checks it cannot evaluate (missing catalog arch) are skipped, not
     failed - the surrogate stays the backstop for those. Returns (ok, reason).
     """
     config = config or {}
-    try:
-        tp = int(config.get("tp") or 1)
-        pp = int(config.get("pp") or 1)
-    except (TypeError, ValueError):
-        return True, ""  # non-numeric parallelism - let the schema/validator handle it
+    raw_tp = config.get("tp", 1)
+    raw_pp = config.get("pp", 1)
+    if type(raw_tp) is not int or type(raw_pp) is not int:
+        return False, f"tp and pp must be positive integers (got tp={raw_tp!r}, pp={raw_pp!r})"
+    tp = raw_tp
+    pp = raw_pp
     if tp < 1 or pp < 1:
         return False, f"tp={tp} and pp={pp} must both be >= 1"
-    gpu_count = config.get("gpu_count")
-    if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and tp * pp > gpu_count:
-        return False, f"tp*pp={tp * pp} exceeds gpu_count={gpu_count} (need one GPU per shard)"
+    ep = config.get("ep", SUPPORTED_EP)
+    if type(ep) is not int or ep != SUPPORTED_EP:
+        return False, f"ep must be exactly {SUPPORTED_EP} in this Koi version (got {ep!r})"
+    gpu_count = config.get("gpu_count", config.get("count"))
+    if type(gpu_count) is not int or gpu_count <= 0:
+        return False, f"gpu_count must be a positive integer (got {gpu_count!r})"
+    if gpu_count != tp * pp:
+        return False, f"gpu_count must equal tp*pp={tp * pp} (got {gpu_count})"
     heads = _model_num_heads(config, job_features)
     if heads and heads % tp != 0:
         return False, f"tp={tp} does not divide the model's {heads} attention heads (cannot shard)"
+    model_id = str(config.get("model_id") or (job_features or {}).get("model_id") or "")
+    hardware = str(gpu_type or config.get("gpu_type") or (job_features or {}).get("gpu_type") or "")
+    policy = load_config_policy()
+    if model_id in MODEL_MAX_TP and tp > MODEL_MAX_TP[model_id]:
+        return False, f"{model_id} policy limits TP to {MODEL_MAX_TP[model_id]} (got TP={tp})"
+    rule = policy.rule_for(hardware, model_id) if hardware and model_id else None
+    if rule is not None:
+        if tp not in rule.allowed_tp:
+            return False, (
+                f"{model_id} policy on {hardware} allows TP {list(rule.allowed_tp)} (got TP={tp})"
+            )
+        precision_ok = policy.precision_matches(
+            rule,
+            config.get("weight_dtype") or (job_features or {}).get("weight_dtype"),
+            config.get("weight_quantization_method")
+            or (job_features or {}).get("weight_quantization_method"),
+        )
+        if precision_ok is False:
+            return False, f"{model_id} policy on {hardware} requires {rule.precision} precision"
     return True, ""
 
 
@@ -1635,32 +1932,16 @@ def size_ladder(
     target_tps: float | None = None,
     utilization_target: float | None = None,
 ) -> dict[str, Any]:
-    """Size each rank's replica count to meet ONE shared throughput target.
+    """Evaluate fixed-rank proposals with Direct point estimates.
 
-    The planner proposes rank CONFIGS (gpu, tp, pp, engine, quant), possibly
-    HETEROGENEOUS - e.g. an H100 rank and an A100 rank for the same job; this
-    derives each rank's replica/dp count instead of leaving it to a guess.
-    Ranks are filled in the order given, each covering the REMAINING target,
-    so the ladder's achieved throughput SUMS across its ranks (parallel
-    replicas, not a series). v0 is aggregate-only; the disaggregated
-    prefill->decode SERIES case (achieved = min across roles) is deferred.
+    ``n_replicas`` is part of each proposed frame and is never resized here. Direct
+    supplies point capacity and base service latency for that exact geometry; it does
+    not simulate an offered-load queue. Generated replica alternatives therefore must
+    be enumerated by the candidate builder before calling this function.
 
-        target        = required throughput (batch: budget/deadline*headroom;
-                        online: arrival_rate * output_len * headroom)
-        per rank      : SEARCH replica count (DP) d = 1,2,4,...,cap. At each d the
-                        surrogate simulates the rank at num_workers=d serving its
-                        share of the arrival rate and returns the DP-aggregate
-                        throughput + real p99 latency (queue included). Take the
-                        min d whose p99 TTFT/TPOT clear the SLO AND that keeps up
-                        with the share; the rest of the demand spills to the next
-                        rank. NO per-chain*util derate, NO linear scaling.
-        achieved_tps  = demand actually served within SLO (SUM across ranks).
-
-    Online latency GATES the replica count (queueing latency FALLS with more
-    replicas), it does not veto the rank. A rank that cannot clear the SLO even at
-    max capacity serves the partial throughput it can push (marked not-slo_ok) and
-    the shortfall spills; unmet_tps reports demand the whole ladder could not cover.
-    meets_target requires the whole demand covered AND every serving rank in SLO.
+    Physical/configuration failures reject a rank. Prediction-only failures retain the
+    physically valid rank as an exploratory candidate with zero service credit so the
+    joint selector may use otherwise-idle capacity without displacing supported work.
 
     Args:
         ranks: rank dicts (RankSpec.from_dict form) with role, env, config.
@@ -1670,103 +1951,212 @@ def size_ladder(
             target_p99_tpot_ms, total_token_budget, deadline_hours,
             headroom_factor.
         target_tps: override; default from required_throughput_enumerator.
-        utilization_target: override; default UTILIZATION_TARGET_ONLINE for
-            online, 1.0 for batch.
+        utilization_target: Deprecated compatibility input; ignored.
 
     Returns:
         {"ranks": [deployable rank dicts, n_replicas >= 1], "regime",
-         "target_tps", "achieved_tps" (summed), "unmet_tps", "meets_target",
+         "target_tps", "point_capacity_tps", "achieved_tps", "unmet_tps",
+         "meets_target", "candidate_kind",
          "per_rank": [...all ranks incl. dropped/excluded...],
          "marginal_value": {env_key: extra_gpus_to_meet_target}}.
     """
     _require("resource_map", "surrogate", "candidate_graph", "dro")
-
     job_features = _sanitize_agent_features(dict(job_features or {}))
-    regime = str(job_features.get("type", "online")).lower()
-    is_online = regime != "batch"
-    # utilization_target is accepted for backward compatibility but no longer used:
-    # the surrogate now simulates the DP queue directly (num_workers=dp), so we do
-    # NOT derate a per-chain estimate - we SEARCH the replica count against the
-    # surrogate's own p99 latency.
+    regime = _job_mode(job_features)
+    is_online = regime == "online"
     _ = utilization_target
     target = (
         float(target_tps)
         if target_tps is not None
         else float(required_throughput_enumerator(job_features))
     )
-    osl = _feature_value(job_features, "osl_token_avg", "output_len_tokens_avg") or 0.0
+    if not math.isfinite(target) or target < 0:
+        raise ValueError("target_tps must be a finite non-negative number")
     ttft_target = _feature_value(job_features, "target_p99_ttft_ms", "target_p99_TTFT_ms")
     tpot_target = _feature_value(job_features, "target_p99_tpot_ms", "target_p99_TPOT_ms")
 
-    def _slo_ok(y: dict) -> bool:
-        # Online latency gate. Batch has no per-request latency SLO -> always passes
-        # here and is sized on throughput alone.
+    def _finite_latency(y: dict, *keys: str) -> float | None:
+        for key in keys:
+            value = y.get(key)
+            if value is None:
+                continue
+            try:
+                latency = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return latency if math.isfinite(latency) and latency >= 0 else None
+        return None
+
+    def _base_latency_ok(y: dict) -> bool:
+        """Compare Direct's base latency with targets without claiming queue safety."""
         if not is_online:
             return True
         if not y:
             return False
-        ttft = _y_value(y, "p99_ttft_ms", "p99_TTFT_ms")
-        tpot = _y_value(y, "p99_tpot_ms", "p99_TPOT_ms")
-        if ttft_target is not None and ttft > ttft_target:
+        ttft = _finite_latency(y, "p99_ttft_ms", "p99_TTFT_ms")
+        tpot = _finite_latency(y, "p99_tpot_ms", "p99_TPOT_ms")
+        if ttft_target is not None and (ttft is None or ttft > ttft_target):
             return False
-        return not (tpot_target is not None and tpot > tpot_target)
+        return not (tpot_target is not None and (tpot is None or tpot > tpot_target))
 
-    def _capacity_tps(y: dict) -> float:
-        point = _y_value(y, "throughput_token_per_sec")
-        lower = y.get("_throughput_token_per_sec_lower")
-        return min(point, float(lower)) if lower is not None and float(lower) > 0 else point
+    def _slo_prediction_complete(y: dict) -> bool:
+        if not is_online:
+            return True
+        return (
+            bool(y)
+            and (
+                ttft_target is None
+                or any(y.get(key) is not None for key in ("p99_ttft_ms", "p99_TTFT_ms"))
+            )
+            and (
+                tpot_target is None
+                or any(y.get(key) is not None for key in ("p99_tpot_ms", "p99_TPOT_ms"))
+            )
+        )
 
-    def _dp_candidates(cap: int) -> list[int]:
-        ds, d = [], 1
-        while d <= cap:
-            ds.append(d)
-            d *= 2
-        if cap >= 1 and (not ds or ds[-1] != cap):
-            ds.append(cap)
-        return ds
+    def _point_capacity_tps(y: dict) -> float:
+        try:
+            point = _y_value(y, "throughput_token_per_sec")
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return point if math.isfinite(point) and point > 0 else 0.0
 
     physical_rejections: list[str] = []
+    prediction_rejections: list[dict[str, str]] = []
 
-    def _predict_at(rank: RankSpec, d: int, share_tps: float) -> dict | None:
-        # Predict this rank at DP=d workers carrying `share_tps` tokens/s of demand.
-        # For online we hand that demand in as an arrival rate (share_tps/osl); the
-        # surrogate splits it across the d workers (num_workers=dp), so more workers
-        # -> less per-worker queue -> lower p99. Returns:
-        #   dict y_hat -> the DP-aggregate prediction,
-        #   {}         -> overloaded/incomplete at this DP (try more replicas),
-        #   None       -> physical/memory no-fit (no replica count fixes it).
-        feats = dict(job_features)
-        if is_online and osl > 0:
-            feats["request_arrival_rate"] = float(share_tps) / osl
-        r = RankSpec.from_dict(rank.to_dict())
-        r.n_replicas = int(d)
-        payload = _rank_prediction_payload(r, feats)
-        if not config_runnable(dict(r.config), payload["job_features"])[0]:
-            return None
+    def _predict_fixed_rank(
+        rank: RankSpec,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, str]:
+        payload = _rank_prediction_payload(rank, job_features)
+        memory_fit = target_memory_fit({**payload["job_features"], **payload["job_config"]})
+        if memory_fit["status"] == "physical_no_fit":
+            reason = (
+                "requested model memory no-fit: "
+                f"requires {memory_fit['required_gb']:.2f} GiB per GPU, "
+                f"capacity {memory_fit['capacity_gb']:.2f} GiB"
+            )
+            log.warning(
+                "size_ladder rejected candidate before surrogate: model=%s gpu=%s "
+                "instance=%s tp=%s pp=%s dp=%d error=%s",
+                payload["job_config"].get("model_id") or payload["job_features"].get("model_id"),
+                payload["job_features"].get("gpu_type") or payload["job_config"].get("gpu_type"),
+                rank.config.get("instance_type"),
+                rank.config.get("tp"),
+                rank.config.get("pp"),
+                rank.n_replicas,
+                reason,
+            )
+            physical_rejections.append(reason)
+            return (
+                {},
+                {"kind": "hard", "status": "physical_no_fit", "reason": reason},
+                "aic_direct_point",
+            )
         try:
             prediction = _predict_outcome_core(
-                payload["job_config"], payload["job_features"], scenario="peak"
+                payload["job_config"],
+                payload["job_features"],
+                scenario="peak" if is_online else "mean",
+                method=_AIC_DIRECT_METHOD,
             )
+            semantics = prediction.get("prediction_semantics") or {}
+            prediction_basis = str(semantics.get("basis") or "aic_direct_point")
             y_hat = dict(prediction.get("y_hat", {}))
+            if not y_hat:
+                lineage = prediction.get("prediction_lineage") or {}
+                primary = (lineage.get("backends") or {}).get("primary") or {}
+                primary_status = primary.get("status")
+                metadata = primary.get("metadata") or {}
+                if primary_status == "failed":
+                    status = "prediction_failed"
+                    reason = str(metadata.get("error") or "Direct prediction failed")
+                elif primary_status == "unsupported":
+                    status = "unsupported_prediction"
+                    reason = str(metadata.get("error") or "Direct prediction is unsupported")
+                else:
+                    status = "prediction_empty"
+                    reason = "surrogate prediction returned no Y values"
+                prediction_rejections.append({"status": status, "reason": reason})
+                return {}, {"kind": "soft", "status": status, "reason": reason}, prediction_basis
+            throughput = y_hat.get("throughput_token_per_sec")
+            if throughput is None:
+                issue = {
+                    "kind": "soft",
+                    "status": "prediction_incomplete",
+                    "reason": "surrogate prediction omitted throughput_token_per_sec",
+                }
+                prediction_rejections.append({k: issue[k] for k in ("status", "reason")})
+                return y_hat, issue, prediction_basis
+            try:
+                throughput_value = float(throughput)
+            except (TypeError, ValueError, OverflowError):
+                throughput_value = math.nan
+            if not math.isfinite(throughput_value) or throughput_value <= 0:
+                issue = {
+                    "kind": "soft",
+                    "status": "zero_predicted_capacity",
+                    "reason": f"surrogate predicted unusable throughput {throughput!r}",
+                }
+                prediction_rejections.append({k: issue[k] for k in ("status", "reason")})
+                return y_hat, issue, prediction_basis
+            if not _slo_prediction_complete(y_hat):
+                issue = {
+                    "kind": "soft",
+                    "status": "prediction_incomplete",
+                    "reason": "surrogate prediction omitted a declared TTFT/TPOT value",
+                }
+                prediction_rejections.append({k: issue[k] for k in ("status", "reason")})
+                return y_hat, issue, prediction_basis
             lower = prediction.get("throughput_token_per_sec_lower")
             if lower is not None:
                 y_hat["_throughput_token_per_sec_lower"] = lower
-            return y_hat
-        except (SurrogateMemoryNoFit, SurrogateUnsupportedConfig) as exc:
-            log.warning("size_ladder: surrogate rejected rank config (%s)", exc)
+            return y_hat, None, prediction_basis
+        except SurrogateMemoryNoFit as exc:
+            log.warning(
+                "size_ladder rejected candidate: model=%s gpu=%s instance=%s "
+                "tp=%s pp=%s dp=%d error=%s",
+                payload["job_config"].get("model_id") or payload["job_features"].get("model_id"),
+                payload["job_features"].get("gpu_type") or payload["job_config"].get("gpu_type"),
+                rank.config.get("instance_type"),
+                rank.config.get("tp"),
+                rank.config.get("pp"),
+                rank.n_replicas,
+                exc,
+            )
             physical_rejections.append(str(exc))
-            return None
+            return (
+                {},
+                {"kind": "hard", "status": "physical_no_fit", "reason": str(exc)},
+                "aic_direct_point",
+            )
+        except SurrogateUnsupportedConfig as exc:
+            log.warning(
+                "size_ladder unsupported prediction: model=%s gpu=%s instance=%s "
+                "tp=%s pp=%s dp=%d error=%s",
+                payload["job_config"].get("model_id") or payload["job_features"].get("model_id"),
+                payload["job_features"].get("gpu_type") or payload["job_config"].get("gpu_type"),
+                rank.config.get("instance_type"),
+                rank.config.get("tp"),
+                rank.config.get("pp"),
+                rank.n_replicas,
+                exc,
+            )
+            issue = {
+                "kind": "soft",
+                "status": "unsupported_prediction",
+                "reason": str(exc),
+            }
+            prediction_rejections.append({k: issue[k] for k in ("status", "reason")})
+            return {}, issue, "aic_direct_point"
         except SurrogateExecutionError as exc:
-            message = str(exc)
-            if message.startswith("completed ") and message.endswith(" requests"):
-                log.warning("size_ladder: surrogate overload at dp=%d (%s)", d, exc)
-                return {}
-            raise
+            issue = {"kind": "soft", "status": "prediction_failed", "reason": str(exc)}
+            prediction_rejections.append({k: issue[k] for k in ("status", "reason")})
+            return {}, issue, "aic_direct_point"
 
     sized: list[dict[str, Any]] = []
     per_rank: list[dict[str, Any]] = []
-    marginal: dict[str, int] = {}
-    remaining = target
+    point_capacity_total = 0.0
+    prediction_bases: set[str] = set()
     remaining_by_pool: dict[tuple[str, str | None], int] = {}
     resources = (
         _CTX.resource_map.resources_summary()
@@ -1774,17 +2164,37 @@ def size_ladder(
         else None
     )
 
-    # Cover the demand rank by rank. Each rank tries to serve the REMAINING demand;
-    # size_ladder SEARCHES its replica count (DP) against the surrogate's own p99, so
-    # latency GATES the replica count instead of vetoing the rank up front (queueing
-    # latency DOES fall with more replicas). A rank that clears TTFT+TPOT+keep-up at
-    # some DP takes the whole remaining share; one that cannot even at max capacity
-    # takes the throughput it can push and the shortfall spills to the next rank
-    # (heterogeneous ladder). meets_target needs the whole demand covered AND every
-    # serving rank within SLO.
+    hard_issue: dict[str, Any] | None = None
+    soft_issue: dict[str, Any] | None = None
     for raw in ranks:
         physical_rejection_start = len(physical_rejections)
-        rank = RankSpec.from_dict(raw)
+        prediction_rejection_start = len(prediction_rejections)
+        try:
+            rank = RankSpec.from_dict(raw)
+        except (TypeError, ValueError) as exc:
+            parse_issue = {"kind": "hard", "status": "invalid_config", "reason": str(exc)}
+            hard_issue = hard_issue or parse_issue
+            per_rank.append(
+                {
+                    "role": raw.get("role") if isinstance(raw, dict) else None,
+                    "env": raw.get("env") if isinstance(raw, dict) else None,
+                    "n_replicas": 0,
+                    "requested_replicas": raw.get("n_replicas") if isinstance(raw, dict) else None,
+                    "served_tps": 0.0,
+                    "point_capacity_tps": None,
+                    "slo_ok": False,
+                    "base_latency_within_target": None,
+                    "prediction_received": False,
+                    "prediction_complete": False,
+                    "reason": parse_issue["reason"],
+                    "failure_kind": parse_issue["kind"],
+                    "failure_status": parse_issue["status"],
+                    "physical_violations": [],
+                    "prediction_failures": [],
+                }
+            )
+            continue
+        requested_replicas = int(rank.n_replicas)
         gpus_per_chain = rank.gpus_per_chain()
         gpu_type = env_gpu_type(rank.env)
         env_key = _env_key(rank.env)
@@ -1793,7 +2203,7 @@ def size_ladder(
             env_free = int(info.get("free", 0)) if info and info.get("gpu_type") == gpu_type else 0
         else:
             env_free = _CTX.resource_map.get_avail_capacity(rank.env, gpu_type) if gpu_type else 0
-        allocation_error = None
+        allocation_error: str | None = None
         try:
             allocation = _rank_allocation_summary(rank, resources)
             capacity_per_replica = int(allocation["capacity_per_replica"])
@@ -1815,68 +2225,70 @@ def size_ladder(
         runnable, validity_reason = config_runnable(
             dict(rank.config), _rank_prediction_payload(rank, job_features)["job_features"]
         )
-        share = remaining
-        n_replicas = 0
-        served = 0.0
-        slo_ok = False
+        issue: dict[str, Any] | None = None
+        point_capacity: float | None = None
+        base_latency_ok: bool | None = None
         reason: str | None = None
         y_hat: dict[str, Any] = {}
-        dp_tried = 0
+        prediction_basis = "aic_direct_point"
 
-        if not runnable:
-            reason = f"config not runnable: {validity_reason}"
+        if requested_replicas < 1:
+            issue = {
+                "kind": "hard",
+                "status": "invalid_config",
+                "reason": "n_replicas must be >= 1",
+            }
+        elif not runnable:
+            issue = {
+                "kind": "hard",
+                "status": "invalid_config",
+                "reason": f"config not runnable: {validity_reason}",
+            }
+        elif allocation_error is not None:
+            issue = {
+                "kind": "hard",
+                "status": "invalid_config",
+                "reason": f"allocation cannot be resolved: {allocation_error}",
+            }
         elif max_by_cap < 1:
-            reason = "no free capacity in pool"
-        elif share <= 0:
-            reason = "demand already covered by earlier ranks"
+            issue = {
+                "kind": "hard",
+                "status": "no_pool_capacity",
+                "reason": "no free capacity in pool",
+            }
+        elif requested_replicas > max_by_cap:
+            issue = {
+                "kind": "hard",
+                "status": "no_pool_capacity",
+                "reason": (
+                    f"requested {requested_replicas} replicas but pool capacity allows {max_by_cap}"
+                ),
+            }
         else:
-            met = False
-            for d in _dp_candidates(max_by_cap):
-                dp_tried = d
-                y = _predict_at(rank, d, share)
-                if y is None:
-                    reason = "does not fit (memory/physical)"
-                    break
-                if not y:
-                    # overloaded / requests did not all complete at this DP - add
-                    # replicas and retry (this is the queue that DP relieves).
-                    reason = "overloaded at max DP" if d == max_by_cap else reason
-                    continue
-                y_hat = y
-                tp = _capacity_tps(y)
-                keeps_up = tp >= 0.99 * share if share > 0 else tp > 0
-                if _slo_ok(y) and keeps_up:
-                    n_replicas, served, slo_ok, reason, met = d, share, True, "ok", True
-                    break
-            if not met and y_hat:
-                # No DP up to capacity cleared SLO+keep-up at the full share. Take max
-                # capacity and serve the throughput it can push; the rest spills to
-                # the next rank. slo_ok=False here keeps meets_target honest.
-                tp = _capacity_tps(y_hat)
-                partial = min(share, tp)
-                if partial > 0:
-                    n_replicas = _dp_candidates(max_by_cap)[-1]
-                    served = partial
-                    slo_ok = _slo_ok(y_hat)
-                    reason = "capacity-bound (partial share)" if slo_ok else "under-SLO at max DP"
-            elif not met and reason is None:
-                reason = "cannot meet SLO/keep-up at any replica count"
+            y_hat, issue, prediction_basis = _predict_fixed_rank(rank)
+            prediction_bases.add(prediction_basis)
+            if issue is None:
+                point_capacity = _point_capacity_tps(y_hat)
+                base_latency_ok = _base_latency_ok(y_hat)
+                reason = (
+                    "Direct point capacity with base-latency target miss; queue unmodeled"
+                    if base_latency_ok is False
+                    else "Direct point capacity; queue unmodeled"
+                )
 
-        rank.n_replicas = n_replicas
-        if n_replicas >= 1:
-            rank.rank_traffic_share = served / target if target > 0 else 1.0
-            # Record the arrival rate (req/s) this rank actually serves, so downstream
-            # scoring (compute_sigma) predicts each rank at ITS share, not the whole
-            # job's traffic - otherwise a multi-rank composite double-counts demand.
-            if osl > 0:
-                rank.config["_arrival_share_rps"] = served / osl
+        if issue is not None:
+            reason = str(issue["reason"])
+            if issue["kind"] == "hard":
+                hard_issue = hard_issue or issue
+            else:
+                soft_issue = soft_issue or issue
+        if issue is None or issue["kind"] == "soft":
+            rank.rank_traffic_share = None
+            rank.config.pop("_arrival_share_rps", None)
             sized.append(rank.to_dict())
-            remaining = max(0.0, remaining - served)
-            remaining_by_pool[pool_key] = max(0, free - n_replicas * capacity_per_replica)
-        if dp_tried > n_replicas and not slo_ok:
-            marginal[env_key] = (
-                marginal.get(env_key, 0) + max(0, dp_tried - n_replicas) * capacity_per_replica
-            )
+            remaining_by_pool[pool_key] = max(0, free - requested_replicas * capacity_per_replica)
+        if point_capacity is not None:
+            point_capacity_total += point_capacity
 
         per_rank.append(
             {
@@ -1890,30 +2302,96 @@ def size_ladder(
                 if not allocation_error
                 else None,
                 "max_replicas_by_capacity": max_by_cap,
-                "n_replicas": n_replicas,
-                "share_tps": share,
-                "served_tps": served,
-                "slo_ok": slo_ok,
+                "requested_replicas": requested_replicas,
+                "n_replicas": requested_replicas if issue is None or issue["kind"] == "soft" else 0,
+                "share_tps": None,
+                "served_tps": 0.0,
+                "point_capacity_tps": point_capacity,
+                "prediction_basis": prediction_basis,
+                "base_p99_ttft_ms": _finite_latency(y_hat, "p99_ttft_ms", "p99_TTFT_ms"),
+                "base_p99_tpot_ms": _finite_latency(y_hat, "p99_tpot_ms", "p99_TPOT_ms"),
+                "slo_ok": base_latency_ok is True,
+                "base_latency_within_target": base_latency_ok,
+                "prediction_received": bool(y_hat),
+                "prediction_complete": _slo_prediction_complete(y_hat),
+                "partial_search_attempted": False,
+                "partial_search_probes": 0,
+                "partial_search_truncated": False,
+                "partial_search_upper_tps": 0.0,
+                "partial_admission": False,
+                "admitted_tps": None,
                 "reason": reason,
+                "failure_kind": issue.get("kind") if issue else None,
+                "failure_status": issue.get("status") if issue else None,
                 "physical_violations": physical_rejections[physical_rejection_start:],
+                "prediction_failures": prediction_rejections[prediction_rejection_start:],
             }
         )
 
-    # achieved = demand actually served; meets_target needs the WHOLE demand covered
-    # AND every serving rank inside its latency SLO.
-    achieved_tps = max(0.0, target - remaining)
-    serving = [r for r in per_rank if r["n_replicas"] >= 1]
-    served_slo_ok = bool(serving) and all(r["slo_ok"] for r in serving)
-    meets_target = remaining <= max(1e-6, 1e-3 * target) and served_slo_ok
+    if target <= 0 and hard_issue is None:
+        soft_issue = soft_issue or {
+            "kind": "soft",
+            "status": "demand_unmodeled",
+            "reason": "workload has no positive token-throughput target",
+        }
+    if hard_issue is not None:
+        sized = []
+        point_capacity_total = 0.0
+    exploratory = hard_issue is None and soft_issue is not None
+    achieved_tps = 0.0 if exploratory else min(target, point_capacity_total)
+    unmet_tps = max(0.0, target - achieved_tps)
+    capacity_fraction = min(1.0, achieved_tps / target) if target > 0 else 0.0
+    serving = [rank for rank in per_rank if rank["n_replicas"] >= 1]
+    base_latency_ok = bool(serving) and all(
+        rank["base_latency_within_target"] is True for rank in serving
+    )
+    meets_target = (
+        target > 0
+        and not exploratory
+        and achieved_tps >= target - max(1e-6, 1e-3 * target)
+        and base_latency_ok
+    )
+    if not exploratory and hard_issue is None and target > 0 and point_capacity_total > 0:
+        for rank_dict, detail in zip(sized, serving, strict=False):
+            capacity = float(detail.get("point_capacity_tps") or 0.0)
+            routing_share = capacity / point_capacity_total
+            rank_dict["rank_traffic_share"] = routing_share if len(sized) > 1 else None
+            detail["share_tps"] = target * routing_share
+            detail["served_tps"] = achieved_tps * routing_share
+    failure = hard_issue or soft_issue
+    prediction_basis = (
+        "composed_point_estimate"
+        if "composed_point_estimate" in prediction_bases
+        else "aic_direct_point"
+    )
     return {
         "ranks": sized,
         "regime": regime,
         "target_tps": target,
+        "point_capacity_tps": point_capacity_total if hard_issue is None else None,
+        "capacity_fraction": capacity_fraction,
+        "base_latency_within_target": base_latency_ok if hard_issue is None else None,
         "achieved_tps": achieved_tps,
-        "unmet_tps": max(0.0, remaining),
+        "unmet_tps": unmet_tps,
         "meets_target": meets_target,
+        "candidate_kind": "rejected"
+        if hard_issue is not None
+        else "exploratory"
+        if exploratory
+        else "service",
+        "prediction_semantics": {
+            **_DIRECT_PREDICTION_SEMANTICS,
+            "basis": prediction_basis,
+        },
+        "partial_online_admission": False,
+        "admission_mode": None,
+        "partial_search_probes": 0,
+        "partial_search_truncated": False,
         "per_rank": per_rank,
-        "marginal_value": marginal,
+        "failure_kind": failure["kind"] if failure else None,
+        "failure_status": failure["status"] if failure else None,
+        "failure_reason": failure["reason"] if failure else None,
+        "marginal_value": {},
     }
 
 
@@ -2131,7 +2609,7 @@ def get_similar_deployments(
     store = _CTX.evidence_store
 
     if hasattr(store, "retrieve_similar_rows"):
-        rows = store.retrieve_similar_rows(job_features, top_k=int(top_k))
+        rows = store.retrieve_similar_rows(job_features, top_k=max(int(top_k) * 4, int(top_k)))
     else:
         current = store.current_tick()
         rows = store.get_rows_in_window((max(0, current - 50), current))
@@ -2148,6 +2626,16 @@ def get_similar_deployments(
                     or str(r.X.get("type") or r.X.get("workload_type")).lower() == wanted_type
                 )
             ]
+        rows = rows[-int(top_k) :]
+
+    wanted_type = job_features.get("workload_type") or job_features.get("type")
+    if wanted_type is not None:
+        wanted_type = str(wanted_type).lower()
+        rows = [
+            row
+            for row in rows
+            if str(row.X.get("workload_type") or row.X.get("type") or "").lower() == wanted_type
+        ]
         rows = rows[-int(top_k) :]
 
     return [
@@ -2249,6 +2737,7 @@ def predict_outcome(
     env: list[str] | tuple[str, ...] | None = None,  # TODO - Added direct env to this tool for v0
     calibrate: bool = True,
     scenario: str = "mean",
+    queue_aware: bool = False,
 ) -> dict[str, Any]:
     """Run the composed surrogate and attach its prediction lineage and DRO band.
 
@@ -2258,10 +2747,14 @@ def predict_outcome(
         mechanism: Optional mechanism context, informational only.
         env: Optional canonical [market, cloud, region, zone, gpu_type].
         calibrate: Apply the residual correction (default True).
+        queue_aware: Deprecated compatibility input. It is ignored; production
+            predictions always use Direct AIC.
 
     Returns:
         {"y_hat": calibrated dict, "y_hat_raw": surrogate dict,
-         "calibration_offsets": dict, "v_hat": dict, "dro_band": dict}.
+         "calibration_offsets": dict, "v_hat": dict, "dro_band": dict,
+         "prediction_semantics": dict}. Direct throughput is point capacity;
+         Direct latency is base service latency and does not verify queue SLOs.
     """
     if not isinstance(config, dict):
         raise ValueError(
@@ -2274,7 +2767,14 @@ def predict_outcome(
     job_config = _sanitize_agent_config(dict(config.get("job_config", config)))
     if env and len(env) == 5 and not job_config.get("gpu_type"):
         job_config["gpu_type"] = env[4]
-    return _predict_outcome_core(job_config, job_features, calibrate=calibrate, scenario=scenario)
+    _ = queue_aware
+    return _predict_outcome_core(
+        job_config,
+        job_features,
+        calibrate=calibrate,
+        scenario=scenario,
+        method=_AIC_DIRECT_METHOD,
+    )
 
 
 def _prediction_cache_key(
@@ -2282,15 +2782,18 @@ def _prediction_cache_key(
     job_features: dict[str, Any],
     scenario: str,
     calibrate: bool,
+    method: tuple[str, ...],
+    finalization: bool,
 ) -> str | None:
     """Canonical, order-stable key for the composed-prediction memo.
 
-    Calibration mode is part of the key because deployment stamping requests an
-    uncalibrated prediction while candidate scoring uses evidence calibration.
+    Direct is deterministic within one tick, so commit scoring reuses the exact
+    selection prediction. Finalization accounting is tracked separately.
     """
+    _ = finalization
     try:
         return json.dumps(
-            [job_config, job_features, scenario, bool(calibrate)],
+            [job_config, job_features, scenario, bool(calibrate), method],
             sort_keys=True,
             default=str,
         )
@@ -2303,76 +2806,108 @@ def _predict_outcome_core(
     job_features: dict[str, Any],
     calibrate: bool = True,
     scenario: str = "mean",
+    *,
+    method: str | tuple[str, ...] = _AIC_DIRECT_METHOD,
+    _finalization: bool = False,
 ) -> dict[str, Any]:
     """Run or reuse one composed prediction with trusted, sanitized inputs.
 
-    Cache misses remain serialized because the direct surrogate is not thread-safe.
+    Cache misses remain serialized because the composed surrogate is not thread-safe.
     The composer owns calibration; callers receive final values plus the raw and
-    calibration details carried in its prediction lineage.
+    calibration details carried in its prediction lineage. The method input remains
+    compatible with older callers but is canonicalized to Direct AIC.
     """
     _require("candidate_graph", "dro", "surrogate")
-    global _surrogate_calls
-    key = _prediction_cache_key(job_config, job_features, scenario, calibrate)
+    ep = job_config.get("ep", SUPPORTED_EP)
+    if type(ep) is not int or ep != SUPPORTED_EP:
+        raise SurrogateUnsupportedConfig(
+            f"ep must be exactly {SUPPORTED_EP} in this Koi version (got {ep!r})"
+        )
+    memory_fit = target_memory_fit({**job_features, **job_config})
+    if memory_fit["status"] == "physical_no_fit":
+        raise SurrogateMemoryNoFit(
+            "requested model memory no-fit: "
+            f"requires {float(memory_fit['required_gb']):.2f} GiB per GPU, "
+            f"capacity {float(memory_fit['capacity_gb']):.2f} GiB"
+        )
+    global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
+    global _surrogate_finalization_calls, _surrogate_stress_calls
+    selected_method = _AIC_DIRECT_METHOD
+    key = _prediction_cache_key(
+        job_config,
+        job_features,
+        scenario,
+        calibrate,
+        selected_method,
+        _finalization,
+    )
 
-    cached = _prediction_cache.get(key) if key is not None else None
-    if cached is None:
-        with _SURROGATE_EXECUTION_LOCK:
-            cached = _prediction_cache.get(key) if key is not None else None
-            if cached is None:
-                if scenario != "peak_all_multiturn_stress":
-                    _surrogate_calls += 1
-                    if _surrogate_calls > SURROGATE_CALL_BUDGET:
-                        raise SurrogateBudgetExceeded(
-                            f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
-                            "narrow to your best few candidate configs and reuse scored results."
-                        )
-                if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
-                    # Point-in-time cutoff prevents later evidence leaking into replayed predictions.
-                    try:
-                        y_hat, v_hat, prediction_lineage = (
-                            _CTX.surrogate.compose_prediction_with_trace(
-                                job_config=job_config,
-                                job_features=job_features,
-                                candidate_graph=_CTX.candidate_graph,
-                                method=("AIC_DynoSim",),
-                                scenario=scenario,
-                                as_of_timestamp_utc=time.time() if calibrate else None,
-                            )
-                        )
-                    except Exception:
-                        _persist_surrogate_trace(getattr(_CTX.surrogate, "last_trace", None))
-                        raise
-                    _persist_surrogate_trace(prediction_lineage)
-                else:
-                    result = _CTX.surrogate.compose_prediction(
+    with _SURROGATE_EXECUTION_LOCK:
+        cached = _prediction_cache.get(key) if key is not None else None
+        if cached is not None:
+            _surrogate_cache_hits += 1
+            if _finalization:
+                _surrogate_finalization_calls += 1
+        else:
+            is_stress = scenario == "peak_all_multiturn_stress"
+            if _finalization:
+                _surrogate_finalization_calls += 1
+            elif is_stress:
+                _surrogate_stress_calls += 1
+            else:
+                if _surrogate_calls >= SURROGATE_CALL_BUDGET:
+                    _surrogate_budget_rejections += 1
+                    raise SurrogateBudgetExceeded(
+                        f"surrogate-call budget {SURROGATE_CALL_BUDGET} reached this tick; "
+                        "narrow to your best few candidate configs and reuse scored results."
+                    )
+                _surrogate_calls += 1
+            if hasattr(_CTX.surrogate, "compose_prediction_with_trace"):
+                # Point-in-time cutoff prevents later evidence leaking into replayed predictions.
+                try:
+                    y_hat, v_hat, prediction_lineage = _CTX.surrogate.compose_prediction_with_trace(
                         job_config=job_config,
                         job_features=job_features,
                         candidate_graph=_CTX.candidate_graph,
-                        method=("AIC_DynoSim",),
+                        method=selected_method,
                         scenario=scenario,
+                        as_of_timestamp_utc=time.time() if calibrate else None,
                     )
-                    prediction_lineage = None
-                    if isinstance(result, tuple) and len(result) == 2:
-                        y_hat, v_hat = result
-                    else:
-                        y_hat = getattr(result, "y_hat", {}) or {}
-                        v_hat = getattr(result, "v_hat", {}) or {}
-                cached = {
+                except Exception:
+                    _persist_surrogate_trace(getattr(_CTX.surrogate, "last_trace", None))
+                    raise
+                _persist_surrogate_trace(prediction_lineage)
+            else:
+                result = _CTX.surrogate.compose_prediction(
+                    job_config=job_config,
+                    job_features=job_features,
+                    candidate_graph=_CTX.candidate_graph,
+                    method=selected_method,
+                    scenario=scenario,
+                )
+                prediction_lineage = None
+                if isinstance(result, tuple) and len(result) == 2:
+                    y_hat, v_hat = result
+                else:
+                    y_hat = getattr(result, "y_hat", {}) or {}
+                    v_hat = getattr(result, "v_hat", {}) or {}
+            cached = copy.deepcopy(
+                {
                     "y_hat": dict(y_hat or {}),
                     "v_hat": dict(v_hat or {}),
                     "prediction_lineage": copy.deepcopy(prediction_lineage),
                 }
-                if key is not None:
-                    _prediction_cache[key] = cached
+            )
+            if key is not None:
+                _prediction_cache[key] = copy.deepcopy(cached)
 
+    cached = copy.deepcopy(cached)
     y_hat = dict(cached["y_hat"])
     v_hat = dict(cached["v_hat"])
-    prediction_lineage = copy.deepcopy(cached.get("prediction_lineage"))
+    prediction_lineage = cached.get("prediction_lineage")
     y_hat_raw = ((prediction_lineage or {}).get("raw") or {}).get("y_hat") or dict(y_hat)
     offsets = ((prediction_lineage or {}).get("calibration") or {}).get("offsets_y") or {}
-    lower_throughput = ((prediction_lineage or {}).get("fusion") or {}).get(
-        "lower_throughput"
-    )
+    lower_throughput = ((prediction_lineage or {}).get("fusion") or {}).get("lower_throughput")
 
     dro_band = _CTX.dro.compute_dro_band(y_hat or {})
     return {
@@ -2381,6 +2916,9 @@ def _predict_outcome_core(
         "calibration_offsets": offsets,
         "v_hat": v_hat or {},
         "prediction_lineage": prediction_lineage,
+        "prediction_semantics": copy.deepcopy(
+            (prediction_lineage or {}).get("prediction_semantics") or _DIRECT_PREDICTION_SEMANTICS
+        ),
         "throughput_token_per_sec_lower": lower_throughput,
         "dro_band": dro_band,
     }
@@ -2424,6 +2962,7 @@ def _attach_peak_multiturn_stress(action: dict[str, Any], job_features: dict[str
                 payload["job_features"],
                 calibrate=False,
                 scenario="peak_all_multiturn_stress",
+                method=_AIC_DIRECT_METHOD,
             )
             y = dict(pred.get("y_hat_raw") or pred.get("y_hat") or {})
             v = dict(pred.get("v_hat") or {})
@@ -2444,6 +2983,25 @@ def _attach_peak_multiturn_stress(action: dict[str, Any], job_features: dict[str
     action.setdefault("selection_diagnostics", {})["peak_all_multiturn_stress"] = diagnostic
 
 
+def _decision_required_objectives(snapshot, action, job_features: dict[str, Any]) -> list[str]:
+    """Comparable objectives whose decision-time bands can be evaluated later."""
+    assessment = getattr(action, "prediction_assessment", None) or {}
+    required: set[str] = set()
+    if assessment.get("queue_slo_verified") is True:
+        required.update(
+            str(objective)
+            for objective, threshold in _slo_thresholds_for(snapshot, action.job_id).items()
+            if threshold is not None
+        )
+    try:
+        target_tps = action.target_tps or required_throughput_enumerator(job_features)
+        if float(target_tps or 0.0) > 0:
+            required.add(_THROUGHPUT_OBJ)
+    except (TypeError, ValueError):
+        pass
+    return sorted(required)
+
+
 def stamp_plan_predictions(plan, cluster_snapshot=None):
     """Attach raw per-rank predictions to the plan that will be deployed."""
     typed = _as_plan(plan)
@@ -2452,20 +3010,147 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
         if action.type not in LADDER_ACTIONS or not action.ladder:
             continue
         job_features = _job_features_for(snapshot, action.job_id)
+        method = _AIC_DIRECT_METHOD
+        required_objectives = _decision_required_objectives(snapshot, action, job_features)
+        partial_admission = None
+        if action.admission_mode == "advisory" and action.served_fraction is not None:
+            partial_admission = {
+                "mode": "advisory",
+                "requested_tps": action.target_tps,
+                "admitted_tps": action.admitted_tps,
+                "served_fraction": action.served_fraction,
+                "enforced": False,
+            }
+        stamped_queue_states: list[str] = []
         for rank in action.ladder:
             payload = _rank_prediction_payload(rank, job_features)
-            pred = _predict_outcome_core(
-                payload["job_config"], payload["job_features"], calibrate=False, scenario="peak"
-            )
-            rank.predicted_y = dict(pred.get("y_hat") or pred.get("y_hat_raw") or {})
+            try:
+                pred = _predict_outcome_core(
+                    payload["job_config"],
+                    payload["job_features"],
+                    calibrate=True,
+                    scenario="peak" if _job_mode(job_features) == "online" else "mean",
+                    method=method,
+                    _finalization=True,
+                )
+            except (SurrogateUnsupportedConfig, SurrogateExecutionError) as exc:
+                if not _is_exploratory_assessment(action.prediction_assessment):
+                    raise
+                pred = {
+                    "y_hat": {},
+                    "v_hat": {},
+                    "dro_band": {},
+                    "prediction_lineage": {
+                        "schema_version": 3,
+                        "method": list(_AIC_DIRECT_METHOD),
+                        "scenario": "peak",
+                        "prediction_semantics": dict(_DIRECT_PREDICTION_SEMANTICS),
+                        "backends": {
+                            "primary": {
+                                "status": "unsupported"
+                                if isinstance(exc, SurrogateUnsupportedConfig)
+                                else "failed",
+                                "metadata": {
+                                    "error_type": type(exc).__name__,
+                                    "error": str(exc),
+                                },
+                            }
+                        },
+                    },
+                }
+            rank.predicted_y = dict(pred.get("y_hat_raw") or pred.get("y_hat") or {})
             rank.predicted_v = dict(pred.get("v_hat") or {})
             lineage = compact_prediction_lineage(pred.get("prediction_lineage"))
-            if lineage:
-                lineage["deployment_id"] = (
-                    f"deploy:{typed.tick}:{action.job_id}:{rank.rank_id or 'rank'}"
-                )
-                lineage["evidence_baseline"] = "pre_calibration"
-            rank.prediction_lineage = lineage or None
+            lineage["prediction_semantics"] = copy.deepcopy(
+                pred.get("prediction_semantics")
+                or lineage.get("prediction_semantics")
+                or _DIRECT_PREDICTION_SEMANTICS
+            )
+            lineage["prediction_assessment"] = copy.deepcopy(action.prediction_assessment or {})
+            if action.service_class is not None:
+                lineage["service_class"] = action.service_class
+            if _job_mode(job_features) == "online":
+                try:
+                    lineage["queue_shadow"] = estimate_queue_shadow(
+                        arrival_rate_rps=_feature_value(job_features, "request_arrival_rate"),
+                        input_tokens_per_request=_feature_value(
+                            job_features, "isl_token_avg", "input_len_tokens_avg"
+                        ),
+                        input_tokens_per_request_max=_feature_value(
+                            job_features, "isl_token_max", "input_len_tokens_max"
+                        ),
+                        output_tokens_per_request=_feature_value(
+                            job_features, "osl_token_avg", "output_len_tokens_avg"
+                        ),
+                        output_tokens_per_request_max=_feature_value(
+                            job_features, "osl_token_max", "output_len_tokens_max"
+                        ),
+                        aggregate_capacity_tps=rank.predicted_y.get("throughput_token_per_sec"),
+                        replicas=rank.n_replicas,
+                        base_ttft_ms=rank.predicted_y.get("p99_ttft_ms"),
+                        homogeneous=len(action.ladder) == 1,
+                        scenario="peak",
+                        peak_to_mean_ratio=_feature_value(job_features, "peak_to_mean_ratio")
+                        or 1.0,
+                        affects_selection=False,
+                    )
+                    stamped_queue_states.append(
+                        str(lineage["queue_shadow"].get("status") or "unmodeled")
+                    )
+                except Exception as exc:
+                    lineage["queue_shadow"] = {
+                        "model": "erlang_c_token_work_v2",
+                        "mode": "shadow",
+                        "status": "unmodeled",
+                        "reason": f"queue shadow failed: {exc}",
+                        "affects_selection": False,
+                    }
+                    stamped_queue_states.append("unmodeled")
+            if pred.get("dro_band"):
+                lineage["decision_dro_band"] = copy.deepcopy(pred["dro_band"])
+            lineage["decision_required_objectives"] = list(required_objectives)
+            lineage["deployment_id"] = (
+                f"deploy:{typed.tick}:{action.job_id}:{rank.rank_id or 'rank'}"
+            )
+            lineage["evidence_baseline"] = "pre_calibration"
+            if partial_admission is not None:
+                lineage["partial_admission"] = copy.deepcopy(partial_admission)
+            rank.prediction_lineage = lineage
+        if "unstable" in stamped_queue_states:
+            action.queue_state = "unstable"
+        elif stamped_queue_states and all(state == "stable" for state in stamped_queue_states):
+            action.queue_state = "stable"
+        elif stamped_queue_states:
+            action.queue_state = "unmodeled"
+        action.queue_slo_verified = False
+    write_event = getattr(getattr(_CTX, "trace_logger", None), "write_event", None)
+    if callable(write_event):
+        try:
+            write_event(
+                "placement_decision_committed",
+                {
+                    "actions": [
+                        {
+                            "job_id": action.job_id,
+                            "type": action.type.value,
+                            "ranks": [
+                                {
+                                    "rank_id": rank.rank_id,
+                                    "env": list(rank.env or []),
+                                    "instance_type": rank.config.get("instance_type"),
+                                    "tp": rank.config.get("tp"),
+                                    "n_replicas": rank.n_replicas,
+                                }
+                                for rank in action.ladder or []
+                            ],
+                        }
+                        for action in typed.actions
+                    ]
+                },
+                tick=typed.tick,
+            )
+        except Exception:
+            log.exception("committed placement decision trace failed")
     return typed
 
 
@@ -2827,6 +3512,16 @@ def compute_sigma(plan) -> dict[str, Any]:
     Returns:
         {"per_job": dict, "aggregate_sigma": float, "swap_count": int}.
     """
+    return _compute_sigma(plan, finalization=False)
+
+
+def compute_sigma_for_commit(plan) -> dict[str, Any]:
+    """Score a materialized plan without consuming the search-call budget."""
+    return _compute_sigma(plan, finalization=True)
+
+
+def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
+    """Shared plan scorer with an explicit surrogate-accounting mode."""
     _require(
         "slow_loop",
         "tchebycheff_module",
@@ -2840,8 +3535,31 @@ def compute_sigma(plan) -> dict[str, Any]:
     )
     typed = _as_plan(plan)
     snapshot = _snapshot()
-    per_job: dict[str, dict[str, float]] = {}
+    per_job: dict[str, dict[str, Any]] = {}
     aggregate = 0.0
+    served_fraction_by_job: dict[str, float] = {}
+    priority_by_job = {
+        p.get("job_id"): float(p.get("priority_score", 1.0) or 1.0) for p in get_priority()
+    }
+    for action in typed.actions:
+        if action.type not in LADDER_ACTIONS or not action.ladder:
+            continue
+        if _is_exploratory_assessment(action.prediction_assessment):
+            served_fraction_by_job[action.job_id] = 0.0
+            continue
+        raw_fraction = getattr(action, "served_fraction", None)
+        if raw_fraction is None:
+            continue
+        if isinstance(raw_fraction, bool) or not isinstance(raw_fraction, int | float):
+            raise ValueError(
+                f"job {action.job_id}: served_fraction must be a finite number in [0, 1]"
+            )
+        served_fraction = float(raw_fraction)
+        if not math.isfinite(served_fraction) or not 0.0 <= served_fraction <= 1.0:
+            raise ValueError(
+                f"job {action.job_id}: served_fraction must be a finite number in [0, 1]"
+            )
+        served_fraction_by_job[action.job_id] = served_fraction
 
     # w_t (objective weights) is fetched PER JOB in the loop below - it is per-workload-
     # mode (batch favors throughput+cost, online favors latency), so it is NOT global.
@@ -2873,9 +3591,167 @@ def compute_sigma(plan) -> dict[str, Any]:
         job_mode = _job_mode(job_features)
         w_t = _CTX.slow_loop.get_sss_wt(job_type=job_mode)
         w_cost = float((w_t or {}).get("cost_per_token", 0.0) or 0.0)
-        y_hat = _compose_job_y_hat(action, job_features)
+        assessment = action.prediction_assessment
+        exploratory = _is_exploratory_assessment(assessment)
+        prediction_method = _AIC_DIRECT_METHOD
+        prediction_scenario = "peak" if job_mode == "online" else "mean"
+        try:
+            y_hat = _compose_job_y_hat(
+                action,
+                job_features,
+                method=prediction_method,
+                scenario=prediction_scenario,
+                finalization=finalization,
+            )
+        except SurrogateExecutionError as exc:
+            if not isinstance(assessment, dict):
+                raise
+            assessment.update(
+                kind="exploratory",
+                status="prediction_failed",
+                reason=str(exc),
+            )
+            exploratory = True
+            y_hat = {}
+        if y_hat and isinstance(assessment, dict):
+            throughput = y_hat.get(_THROUGHPUT_OBJ)
+            try:
+                throughput_value = float(throughput) if throughput is not None else math.nan
+            except (TypeError, ValueError, OverflowError):
+                throughput_value = math.nan
+            missing_latency = job_mode == "online" and any(
+                _feature_value(job_features, *target_names) is not None
+                and not any(y_hat.get(name) is not None for name in outcome_names)
+                for target_names, outcome_names in (
+                    (
+                        ("target_p99_ttft_ms", "target_p99_TTFT_ms"),
+                        ("p99_ttft_ms", "p99_TTFT_ms"),
+                    ),
+                    (
+                        ("target_p99_tpot_ms", "target_p99_TPOT_ms"),
+                        ("p99_tpot_ms", "p99_TPOT_ms"),
+                    ),
+                )
+            )
+            if throughput is None or missing_latency:
+                assessment.update(
+                    kind="exploratory",
+                    status="prediction_incomplete",
+                    reason="final Direct prediction omitted required point outputs",
+                )
+                exploratory = True
+            elif not math.isfinite(throughput_value) or throughput_value <= 0:
+                assessment.update(
+                    kind="exploratory",
+                    status="zero_predicted_capacity",
+                    reason=f"final Direct prediction returned capacity {throughput!r}",
+                )
+                exploratory = True
+            elif exploratory:
+                try:
+                    recovered_target = float(
+                        action.target_tps or required_throughput_enumerator(job_features)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    recovered_target = 0.0
+                if recovered_target > 0:
+                    assessment.update(
+                        kind="point",
+                        status="success",
+                        reason="Direct point prediction recovered during commit scoring",
+                    )
+                    exploratory = False
+                    if action.service_class != "idle_capacity_fallback":
+                        recovered_capacity = max(0.0, float(y_hat.get(_THROUGHPUT_OBJ) or 0.0))
+                        recovered_achieved = min(recovered_target, recovered_capacity)
+                        recovered_latency_ok = all(
+                            target is None
+                            or (
+                                y_hat.get(metric) is not None
+                                and float(y_hat[metric]) <= float(target)
+                            )
+                            for metric, target in (
+                                (
+                                    "p99_ttft_ms",
+                                    _feature_value(
+                                        job_features,
+                                        "target_p99_ttft_ms",
+                                        "target_p99_TTFT_ms",
+                                    ),
+                                ),
+                                (
+                                    "p99_tpot_ms",
+                                    _feature_value(
+                                        job_features,
+                                        "target_p99_tpot_ms",
+                                        "target_p99_TPOT_ms",
+                                    ),
+                                ),
+                            )
+                        )
+                        action.achieved_tps = recovered_achieved
+                        action.unmet_tps = max(0.0, recovered_target - recovered_achieved)
+                        action.served_fraction = min(1.0, recovered_capacity / recovered_target)
+                        action.point_capacity_covers_target = recovered_capacity >= recovered_target
+                        action.base_latency_within_target = recovered_latency_ok
+                        action.meets_target = bool(
+                            action.point_capacity_covers_target and recovered_latency_ok
+                        )
+                        action.service_class = "supported" if action.meets_target else "partial"
+        if exploratory or (not y_hat and isinstance(assessment, dict)):
+            assessment_dict = assessment if isinstance(assessment, dict) else {}
+            if not exploratory:
+                assessment_dict.update(
+                    kind="exploratory",
+                    status="prediction_incomplete",
+                    reason=assessment_dict.get("reason")
+                    or "final Direct prediction was unavailable",
+                )
+            action.admitted_tps = None
+            action.achieved_tps = None
+            action.unmet_tps = None
+            action.meets_target = None
+            action.served_fraction = None
+            action.admission_mode = None
+            if action.service_class != "idle_capacity_fallback":
+                action.service_class = "exploratory"
+            for rank in action.ladder:
+                rank.rank_traffic_share = None
+            served_fraction_by_job[job_id] = 0.0
+            sigma_i = _WORK_CONSERVING_GAIN_FLOOR
+            per_job[job_id] = {
+                "J": 0.0,
+                "eig": 0.0,
+                "switch_cost_total": 0.0,
+                "pr_slo_dro": 0.0,
+                "cost_penalty": 0.0,
+                "opt_bonus": 0.0,
+                "value_bonus": 0.0,
+                "sigma": sigma_i,
+                "prediction_available": bool(y_hat),
+                "scoring_mode": "exploration_only",
+                "prediction_status": assessment_dict.get("status"),
+            }
+            aggregate += sigma_i
+            continue
         if not y_hat:
             continue
+        if isinstance(assessment, dict) and assessment.get("basis") in _POINT_PREDICTION_BASES:
+            try:
+                declared_target = float(
+                    action.target_tps or required_throughput_enumerator(job_features)
+                )
+                predicted_capacity = float(y_hat.get(_THROUGHPUT_OBJ) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                declared_target = 0.0
+                predicted_capacity = 0.0
+            served_fraction_by_job[job_id] = (
+                min(1.0, predicted_capacity / declared_target)
+                if declared_target > 0 and predicted_capacity > 0
+                else 0.0
+            )
+        else:
+            served_fraction_by_job.setdefault(job_id, 1.0)
         # Score against the job's OWN SLO/throughput TARGET, not the absolute z*
         # ideal: meeting the target is "good enough" and earns 0 gap (no reward for
         # over-service), so the optimizer stops lavishing scarce GPUs on a job that
@@ -2980,6 +3856,30 @@ def compute_sigma(plan) -> dict[str, Any]:
         # looking worse than defer. cost and opt_bonus stay in the diagnostics.
         value_bonus = max(0.0, opt_bonus - cost_penalty)
         sigma_i = J + value_bonus + beta * eig_value - GAMMA_SLO * pr_slo - lam * switch_total
+        model_sigma = sigma_i
+        rehabilitation_credit = 0.0
+        if action.type == ActionType.SWAP:
+            severity = (
+                1.0
+                if action.rehabilitation_status == "critical"
+                else 0.5
+                if action.rehabilitation_status == "degraded"
+                else 0.0
+            )
+            rehabilitation_credit = (
+                UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * severity
+            )
+            sigma_i += rehabilitation_credit
+        selection_mode = assessment.get("selection_mode") if isinstance(assessment, dict) else None
+        if selection_mode in {"work_conserving", "emergency_recovery"}:
+            if selection_mode == "work_conserving":
+                action.service_class = "idle_capacity_fallback"
+            fraction = served_fraction_by_job.get(job_id, 0.0)
+            avoided_penalty = (
+                UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * fraction
+            )
+            if action.queue_state == "unstable" or sigma_i + avoided_penalty <= 0:
+                sigma_i = -avoided_penalty + _WORK_CONSERVING_GAIN_FLOOR
         per_job[job_id] = {
             "J": J,
             "eig": eig_value,
@@ -2988,6 +3888,10 @@ def compute_sigma(plan) -> dict[str, Any]:
             "cost_penalty": cost_penalty,
             "opt_bonus": opt_bonus,
             "value_bonus": value_bonus,
+            "rehabilitation_credit": rehabilitation_credit,
+            "keep_baseline_sigma": 0.0,
+            "swap_gain_over_keep": sigma_i,
+            "model_sigma": model_sigma,
             "sigma": sigma_i,
         }
         aggregate += sigma_i
@@ -3009,15 +3913,15 @@ def compute_sigma(plan) -> dict[str, Any]:
     # stuck on L40S, |sigma|~33) correctly stays deferred until a better frame
     # (e.g. H100) is available. Raise UNSERVED_PENALTY above 1.0 to bias harder
     # toward serving.
-    served = {a.job_id for a in typed.actions if a.type in LADDER_ACTIONS and a.ladder}
-    priority_by_job = {
-        p.get("job_id"): float(p.get("priority_score", 1.0) or 1.0) for p in get_priority()
-    }
     unserved_penalty = 0.0
     for job in get_pending_jobs():
         jid = job.get("job_id", job.get("id"))
-        if jid and jid not in served:
-            unserved_penalty += UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0))
+        if not jid:
+            continue
+        served_fraction = served_fraction_by_job.get(jid, 0.0)
+        unserved_penalty += (
+            UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0)) * (1.0 - served_fraction)
+        )
     aggregate -= unserved_penalty
 
     return {
@@ -3038,7 +3942,8 @@ def _ladder_capacity_cost(
 ) -> dict[tuple, int]:
     """Resource cost of a ladder as {capacity_key: amount}, in BOTH dimensions the
     validator enforces:
-      ('gpu', env_key)            -> GPUs used = sum(gpu_count * n_replicas)
+      ('gpu', env_key)            -> GPUs reserved, including idle GPUs in a
+                                     whole-instance allocation
       ('pool', env_key, instance) -> whole INSTANCES used
                                      = sum(n_replicas * ceil(gpu_count / gpus_per_instance))
     Per-pool instances is the constraint the old env-GPU-only check missed: eight
@@ -3061,16 +3966,21 @@ def _ladder_capacity_cost(
             reps = max(0, int(rank.get("n_replicas", 1) or 1))
         except (TypeError, ValueError):
             continue
-        cost[("gpu", env_key)] = cost.get(("gpu", env_key), 0) + gpus * reps
         instance_type = cfg.get("instance_type")
         spec = (
             (instance_specs.get(env_key) or {}).get(str(instance_type)) if instance_type else None
         )
         gpi = int(spec.get("gpus_per_instance", 0) or 0) if spec else 0
         if gpi > 0:
-            per_replica = max(1, -(-gpus // gpi))  # ceil(gpus / gpi) instances per replica
+            assert spec is not None
+            allocation_kind = str(spec.get("allocation_kind") or "instance")
+            per_replica = gpus if allocation_kind == "gpu" else max(1, -(-gpus // gpi))
+            reserved_gpus = reps * gpus if allocation_kind == "gpu" else reps * per_replica * gpi
+            cost[("gpu", env_key)] = cost.get(("gpu", env_key), 0) + reserved_gpus
             key = ("pool", env_key, str(instance_type))
             cost[key] = cost.get(key, 0) + reps * per_replica
+        else:
+            cost[("gpu", env_key)] = cost.get(("gpu", env_key), 0) + gpus * reps
     return cost
 
 
@@ -3079,14 +3989,57 @@ def _largest_pow2_divisor_leq(heads: int | None, cap: int) -> int:
     <= cap (the instance's GPU count); 1 if heads unknown. Under instance-atomic
     accounting a rank reserves the WHOLE instance, so a smaller tp would just idle
     the rest of the box - use as many of its GPUs as can shard the model. Scaling
-    THROUGHPUT past one instance comes from n_replicas and extra (heterogeneous)
-    ranks sized by size_ladder, NOT from a smaller tp inside one box."""
+    THROUGHPUT past one instance comes from explicit fixed-DP candidate variants
+    and extra heterogeneous ranks, NOT from a smaller tp inside one box."""
     if not heads or int(heads) <= 0 or cap < 1:
         return 1
     tp, power = 1, 2
     while power <= cap and int(heads) % power == 0:
         tp, power = power, power * 2
     return tp
+
+
+def _replica_options(cap: int) -> list[int]:
+    """Bounded fixed-DP alternatives, exact for common small replica pools."""
+    options = list(range(1, min(cap, 8) + 1))
+    replicas = 16
+    while replicas <= cap:
+        options.append(replicas)
+        replicas *= 2
+    if cap > 0 and (not options or options[-1] != cap):
+        options.append(cap)
+    return options
+
+
+def _generated_tp_options(
+    *,
+    heads: int | None,
+    gpu_cap: int,
+    gpu_type: str,
+    model_id: str,
+    allocation_kind: str,
+) -> list[int]:
+    """Return policy-valid TP alternatives for one generated pool frame."""
+    rule = load_config_policy().rule_for(gpu_type, model_id)
+    if rule is not None:
+        return [
+            tp for tp in rule.allowed_tp if tp <= gpu_cap and (not heads or int(heads) % tp == 0)
+        ]
+    max_tp = MODEL_MAX_TP.get(model_id)
+    if max_tp is not None:
+        return [
+            tp
+            for tp in sorted(VALID_TP_DEGREES)
+            if tp <= min(gpu_cap, max_tp) and (not heads or int(heads) % tp == 0)
+        ]
+    if allocation_kind == "gpu":
+        options = []
+        tp = 1
+        while tp <= gpu_cap and (not heads or int(heads) % tp == 0):
+            options.append(tp)
+            tp *= 2
+        return options
+    return [_largest_pow2_divisor_leq(heads, gpu_cap)]
 
 
 def _applicable_mechanism_id(rank: dict[str, Any], features: dict[str, Any]) -> str | None:
@@ -3111,10 +4064,105 @@ def _online_slo_targets(features: dict[str, Any]) -> dict[str, Any]:
     """Online latency SLO targets to carry ON the emitted action (None for batch).
     compute_sigma reads these from job_features, but the deployed action must also
     carry them - Orca/Dynamo route on them - so we copy them onto every place act."""
+    if _job_mode(features) != "online":
+        return {"target_p99_ttft_ms": None, "target_p99_tpot_ms": None}
     return {
         "target_p99_ttft_ms": _feature_value(features, "target_p99_ttft_ms", "target_p99_TTFT_ms"),
         "target_p99_tpot_ms": _feature_value(features, "target_p99_tpot_ms", "target_p99_TPOT_ms"),
     }
+
+
+def _online_sizing_rejection(
+    sized: dict[str, Any], features: dict[str, Any]
+) -> tuple[str, str] | None:
+    """Return only deterministic hard failures; prediction quality is advisory."""
+    del features
+    if sized.get("failure_kind") == "hard":
+        return str(sized.get("failure_status") or "invalid_config"), str(
+            sized.get("failure_reason") or "candidate failed deterministic sizing"
+        )
+    return None
+
+
+def _prediction_assessment(sized: dict[str, Any], features: dict[str, Any]) -> dict[str, Any]:
+    """Summarize Direct's point estimate without implying queue verification."""
+    status = str(sized.get("failure_status") or "success")
+    semantics = dict(sized.get("prediction_semantics") or _DIRECT_PREDICTION_SEMANTICS)
+    queue_state = "not_applicable" if _job_mode(features) != "online" else "unmodeled"
+    queue_utilization = None
+    queue_affects_selection = False
+    if _job_mode(features) == "online" and status == "success":
+        per_rank = [
+            rank for rank in (sized.get("per_rank") or []) if int(rank.get("n_replicas") or 0) > 0
+        ]
+        try:
+            shadow = estimate_queue_shadow(
+                arrival_rate_rps=_feature_value(features, "request_arrival_rate"),
+                input_tokens_per_request=_feature_value(
+                    features, "isl_token_avg", "input_len_tokens_avg"
+                ),
+                input_tokens_per_request_max=_feature_value(
+                    features, "isl_token_max", "input_len_tokens_max"
+                ),
+                output_tokens_per_request=_feature_value(
+                    features, "osl_token_avg", "output_len_tokens_avg"
+                ),
+                output_tokens_per_request_max=_feature_value(
+                    features, "osl_token_max", "output_len_tokens_max"
+                ),
+                aggregate_capacity_tps=sized.get("point_capacity_tps"),
+                replicas=sum(int(rank.get("n_replicas") or 0) for rank in per_rank),
+                base_ttft_ms=max(
+                    (
+                        float(rank["base_p99_ttft_ms"])
+                        for rank in per_rank
+                        if rank.get("base_p99_ttft_ms") is not None
+                    ),
+                    default=None,
+                ),
+                homogeneous=len(per_rank) == 1,
+                scenario="peak",
+                peak_to_mean_ratio=_feature_value(features, "peak_to_mean_ratio") or 1.0,
+                affects_selection=True,
+            )
+            queue_state = str(shadow.get("status") or "unmodeled")
+            queue_utilization = shadow.get("utilization")
+            queue_token_work_pressure = shadow.get("combined_token_work_pressure")
+            queue_tail_token_work_pressure = shadow.get("tail_token_work_pressure")
+            queue_affects_selection = bool(shadow.get("affects_selection"))
+        except Exception:
+            queue_state = "unmodeled"
+            queue_token_work_pressure = None
+            queue_tail_token_work_pressure = None
+    else:
+        queue_token_work_pressure = None
+        queue_tail_token_work_pressure = None
+    return {
+        **semantics,
+        "kind": "exploratory" if status in _SOFT_PREDICTION_FAILURES else "point",
+        "status": status,
+        "reason": sized.get("failure_reason"),
+        "point_capacity_tps": sized.get("point_capacity_tps"),
+        "capacity_fraction": sized.get("capacity_fraction"),
+        "base_latency_within_target": sized.get("base_latency_within_target"),
+        "queue_state": queue_state,
+        "queue_utilization": queue_utilization,
+        "queue_token_work_pressure": queue_token_work_pressure,
+        "queue_tail_token_work_pressure": queue_tail_token_work_pressure,
+        "queue_affects_selection": queue_affects_selection,
+    }
+
+
+def _sized_online_slo_risk(sized: dict[str, Any], features: dict[str, Any]) -> bool:
+    """Whether a usable Direct point has a base-latency target miss."""
+    if _job_mode(features) != "online" or sized.get("failure_kind") == "soft":
+        return False
+    serving = [
+        rank for rank in (sized.get("per_rank") or []) if int(rank.get("n_replicas") or 0) >= 1
+    ]
+    return any(
+        rank.get("prediction_complete") is True and rank.get("slo_ok") is False for rank in serving
+    )
 
 
 def _normalize_candidate_rank(raw: Any) -> dict[str, Any] | None:
@@ -3149,10 +4197,16 @@ def _normalize_candidate_rank(raw: Any) -> dict[str, Any] | None:
         ("num_nodes_per_chain", 1),
     ):
         config.setdefault(knob, default)
+    raw_replicas = raw.get("n_replicas", 1)
+    if isinstance(raw_replicas, bool):
+        return None
     try:
-        n_replicas = max(1, int(raw.get("n_replicas", 1) or 1))
-    except (TypeError, ValueError):
-        n_replicas = 1
+        n_replicas = int(raw_replicas)
+        exact = float(raw_replicas) == n_replicas
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if n_replicas < 1 or not exact:
+        return None
     return {"role": "aggregate", "env": list(env), "config": config, "n_replicas": n_replicas}
 
 
@@ -3163,13 +4217,42 @@ def _rank_shape_key(rank: dict[str, Any]) -> tuple:
         cfg.get("instance_type"),
         cfg.get("tp"),
         cfg.get("pp"),
+        cfg.get("sp", 1),
+        cfg.get("ep", SUPPORTED_EP),
+        cfg.get("cp", 1),
         cfg.get("gpu_count"),
-        cfg.get("num_nodes_per_chain"),
+        cfg.get("num_nodes_per_chain", 1),
+        cfg.get("interconnect_type"),
+        rank.get("n_replicas", 1),
+        rank.get("rank_traffic_share"),
+        rank.get("mechanism_id"),
     )
 
 
+def _deployment_shape_key(raw: dict[str, Any], replicas: int | None = None) -> tuple:
+    return deployment_rank_identity(raw, replicas=replicas)
+
+
+def _candidate_budget_errors(jid: str, action: dict[str, Any]) -> list[str]:
+    """Return BudgetSlice violations when a validated book is active."""
+    book = getattr(_CTX, "validated_budget_book", None)
+    if not isinstance(book, dict):
+        return []
+    slice_ = (book.get("job_budgets") or {}).get(jid)
+    if not isinstance(slice_, dict):
+        return ["validated BudgetBook has no slice for this job"]
+    if action.get("budget_ref") != slice_.get("slice_id"):
+        return ["candidate does not reference its validated BudgetSlice"]
+    return _budget_violations(PlanAction.from_dict(action), slice_)
+
+
 def _score_one_frame(
-    jid: str, user_id: Any, slice_id: Any, rank: dict[str, Any], features: dict[str, Any]
+    jid: str,
+    user_id: Any,
+    slice_id: Any,
+    rank: dict[str, Any],
+    features: dict[str, Any],
+    action_type: str = "place",
 ) -> dict[str, Any]:
     """The proven per-frame pipeline: runnable -> mechanism -> size_ladder ->
     feasibility -> per-job sigma. Returns {candidate|None, meets_target, diag}."""
@@ -3186,10 +4269,11 @@ def _score_one_frame(
         "achieved_tps": None,
         "target_tps": None,
         "sigma": None,
+        "slo_risk": False,
     }
-    runnable, reason = config_runnable(cfg, features)
+    runnable, reason = config_runnable(cfg, features, gpu_type=gpu_type)
     if not runnable:
-        diag.update(status="unrunnable", reason=reason)
+        diag.update(status="invalid_config", reason=reason)
         return {"candidate": None, "meets_target": False, "diag": diag}
     mid = _applicable_mechanism_id(rank, features)
     if not mid:
@@ -3197,8 +4281,25 @@ def _score_one_frame(
         return {"candidate": None, "meets_target": False, "diag": diag}
     scored_rank = dict(rank)
     scored_rank["mechanism_id"] = mid
+    budget_errors = _candidate_budget_errors(
+        jid,
+        {
+            "job_id": jid,
+            "type": action_type,
+            "user_id": user_id,
+            "ladder": [scored_rank],
+            "mechanism_id": mid,
+            "budget_ref": slice_id,
+        },
+    )
+    if budget_errors:
+        diag.update(status="resource_budget", reason="; ".join(budget_errors)[:200])
+        return {"candidate": None, "meets_target": False, "diag": diag}
     try:
         sized = size_ladder([scored_rank], features)
+    except SurrogateBudgetExceeded as exc:
+        diag.update(status="budget_exhausted", reason=str(exc))
+        return {"candidate": None, "meets_target": False, "diag": diag}
     except Exception as exc:
         diag.update(status="size_error", reason=f"size_ladder failed: {exc}")
         return {"candidate": None, "meets_target": False, "diag": diag}
@@ -3207,50 +4308,187 @@ def _score_one_frame(
     target_tps = float(sized.get("target_tps") or 0.0)
     achieved_tps = float(sized.get("achieved_tps") or 0.0)
     unmet_tps = max(0.0, target_tps - achieved_tps) if target_tps > 0 else 0.0
-    served_fraction = min(1.0, achieved_tps / target_tps) if target_tps > 0 else 1.0
+    served_fraction = min(1.0, achieved_tps / target_tps) if target_tps > 0 else 0.0
+    slo_risk = _sized_online_slo_risk(sized, features)
     diag.update(
         achieved_tps=achieved_tps,
         target_tps=target_tps,
         meets_target=meets,
         unmet_tps=unmet_tps,
         served_fraction=served_fraction,
+        slo_risk=slo_risk,
+        partial_search_probes=int(sized.get("partial_search_probes") or 0),
+        partial_search_truncated=bool(sized.get("partial_search_truncated")),
     )
+    online_rejection = _online_sizing_rejection(sized, features)
+    if online_rejection is not None:
+        status, reason = online_rejection
+        diag.update(status=status, reason=reason)
+        return {
+            "candidate": None,
+            "composite_eligible": status == "under_target",
+            "meets_target": False,
+            "diag": diag,
+        }
     if not ranks:
+        failure_status = sized.get("failure_status")
         diag.update(
-            status="no_fit",
-            reason=f"does not fit/meet SLO (achieved {sized.get('achieved_tps')} of "
-            f"{sized.get('target_tps')} tps)",
+            status=failure_status or "prediction_incomplete",
+            reason=sized.get("failure_reason")
+            or "no deployable rank produced a complete prediction",
         )
         return {"candidate": None, "meets_target": False, "diag": diag}
+    assessment = _prediction_assessment(sized, features)
+    assessment["proposal_source"] = rank.get("proposal_source", "specialist")
+    exploratory = assessment["kind"] == "exploratory"
+    if action_type == "swap" and not exploratory:
+        health = features.get("_active_health") or {}
+        observed = health.get("observed") or {}
+        reasons = set(health.get("reasons") or [])
+        per_rank = sized.get("per_rank") or []
+        predicted_ttft = max(
+            (
+                float(item["base_p99_ttft_ms"])
+                for item in per_rank
+                if item.get("base_p99_ttft_ms") is not None
+            ),
+            default=None,
+        )
+        predicted_tpot = max(
+            (
+                float(item["base_p99_tpot_ms"])
+                for item in per_rank
+                if item.get("base_p99_tpot_ms") is not None
+            ),
+            default=None,
+        )
+        predicted_capacity = float(sized.get("point_capacity_tps") or 0.0)
+        current_throughput = observed.get("throughput_token_per_sec")
+        current_ttft = observed.get("p99_ttft_ms")
+        current_tpot = observed.get("p99_tpot_ms")
+        capacity_reasons = {
+            "zero_throughput",
+            "throughput_shortfall",
+            "queue_growing",
+            "queue_critical",
+        }
+        needs_capacity_repair = bool(reasons & capacity_reasons)
+        capacity_acceptable = (
+            predicted_capacity >= target_tps
+            if target_tps > 0
+            else current_throughput is not None and predicted_capacity >= float(current_throughput)
+        )
+        baseline_available = any(
+            value is not None for value in (current_throughput, current_ttft, current_tpot)
+        )
+        not_worse = (
+            capacity_acceptable
+            and (
+                current_ttft is None
+                or (predicted_ttft is not None and predicted_ttft <= float(current_ttft))
+            )
+            and (
+                current_tpot is None
+                or (predicted_tpot is not None and predicted_tpot <= float(current_tpot))
+            )
+        )
+        improves = (
+            (
+                "ttft_breach" in reasons
+                and predicted_ttft is not None
+                and current_ttft is not None
+                and predicted_ttft < 0.9 * float(current_ttft)
+            )
+            or (
+                "tpot_breach" in reasons
+                and predicted_tpot is not None
+                and current_tpot is not None
+                and predicted_tpot < 0.9 * float(current_tpot)
+            )
+            or (needs_capacity_repair and capacity_acceptable)
+        )
+        if reasons and (not baseline_available or not improves or not not_worse):
+            diag.update(
+                status="no_rehabilitation_gain",
+                reason="SWAP is not Pareto-better than the unhealthy KEEP baseline",
+                prediction_assessment=assessment,
+            )
+            return {"candidate": None, "meets_target": False, "diag": diag}
+    if exploratory:
+        service_label = f"exploratory ({assessment['status']})"
+    elif slo_risk:
+        service_label = "base-latency target missed; queue behavior unmodeled"
+    elif meets:
+        service_label = "point capacity covers target; queue behavior unmodeled"
+    else:
+        service_label = "point capacity below target; queue behavior unmodeled"
     act = {
         "job_id": jid,
-        "type": "place",
+        "type": action_type,
         "user_id": user_id,
         "ladder": ranks,
         "target_tps": target_tps,
-        "achieved_tps": achieved_tps,
-        "unmet_tps": unmet_tps,
-        "meets_target": meets,
-        "served_fraction": served_fraction,
         "mechanism_id": mid,
         "budget_ref": slice_id,
+        "prediction_assessment": assessment,
+        "point_capacity_covers_target": bool(target_tps > 0 and achieved_tps >= target_tps),
+        "base_latency_within_target": sized.get("base_latency_within_target"),
+        "queue_state": assessment.get("queue_state"),
+        "queue_slo_verified": False,
+        "service_class": (
+            "exploratory"
+            if exploratory
+            else "supported"
+            if meets and not slo_risk and assessment.get("queue_state") != "unstable"
+            else "partial"
+        ),
         **_online_slo_targets(features),
-        "rationale": f"Deterministic {gpu_type} candidate "
-        f"({'full-service' if meets else 'under-target'}).",
+        "rationale": f"Deterministic {gpu_type} candidate ({service_label}).",
     }
+    if action_type == "swap":
+        act["swap_reason"] = "replace"
+        health = features.get("_active_health") or {}
+        act["rehabilitation_status"] = health.get("status")
+        act["rehabilitation_reasons"] = list(health.get("reasons") or [])
+    if not exploratory and target_tps > 0:
+        act.update(
+            achieved_tps=achieved_tps,
+            unmet_tps=unmet_tps,
+            meets_target=meets,
+            served_fraction=served_fraction,
+        )
     one = {"tick_rationale": "candidate scoring", "actions": [act]}
     try:
+        budget_errors = _candidate_budget_errors(jid, act)
+        if budget_errors:
+            diag.update(status="resource_budget", reason="; ".join(budget_errors)[:200])
+            return {"candidate": None, "meets_target": meets, "diag": diag}
+        if exploratory:
+            score = {
+                "sigma": 0.0,
+                "scoring_mode": "exploration_only",
+                "prediction_available": False,
+            }
+        else:
+            score = compute_sigma(one)["per_job"][jid]
+        act["sigma"] = score["sigma"]
+        if action_type == "swap":
+            act["keep_baseline_sigma"] = score.get("keep_baseline_sigma")
+            act["swap_gain_over_keep"] = score.get("swap_gain_over_keep")
         feas = check_feasibility(one)
         if not feas.get("feasible"):
             diag.update(status="infeasible", reason="; ".join(feas.get("violations", []))[:200])
             return {"candidate": None, "meets_target": meets, "diag": diag}
-        score = compute_sigma(one)["per_job"][jid]
-        act["sigma"] = score["sigma"]
+    except SurrogateBudgetExceeded as exc:
+        diag.update(status="budget_exhausted", reason=str(exc))
+        return {"candidate": None, "meets_target": meets, "diag": diag}
     except Exception as exc:
         diag.update(status="score_error", reason=f"scoring failed: {exc}")
         return {"candidate": None, "meets_target": meets, "diag": diag}
-    _attach_peak_multiturn_stress(act, features)
-    diag.update(status="ok", **score)
+    diag.update(status=assessment["status"] if exploratory else "ok", **score)
+    diag["prediction_assessment"] = assessment
+    if slo_risk:
+        diag["reason"] = "Direct base-latency target missed; queue behavior is unmodeled"
     return {"candidate": act, "meets_target": meets, "diag": diag}
 
 
@@ -3259,11 +4497,10 @@ def _score_composite(
 ) -> dict[str, Any]:
     """Score ONE heterogeneous, data-parallel multi-rank ladder for a job.
 
-    size_ladder fills the given ranks in order, each covering the REMAINING
-    throughput target and capped by its own pool's free capacity, so achieved SUMS
-    across pools - the way a big job reaches a target NO single pool can (e.g. all
+    size_ladder evaluates every supplied fixed-DP rank and sums point capacities
+    across pools. This is how a big job can exceed one pool's capacity (for example,
     H100 across p5.48xlarge + p5.4xlarge, or an H100 rank plus an A100 rank). The
-    caller orders the ranks best-pool-first. ALWAYS returns a {candidate,
+    caller orders ranks by preference. ALWAYS returns a {candidate,
     meets_target, diag} dict (same shape as _score_one_frame); candidate is None -
     with a diagnostic status/reason - when the ladder can't be built or scored, so
     the attempt is always visible in diagnostics (never a silent drop)."""
@@ -3277,10 +4514,13 @@ def _score_composite(
         "achieved_tps": None,
         "target_tps": None,
         "sigma": None,
+        "slo_risk": False,
     }
     scored_ranks: list[dict[str, Any]] = []
     for rank in ranks:
-        runnable, _ = config_runnable(dict(rank.get("config") or {}), features)
+        runnable, _ = config_runnable(
+            dict(rank.get("config") or {}), features, gpu_type=env_gpu_type(rank.get("env"))
+        )
         if not runnable:
             continue
         mid = _applicable_mechanism_id(rank, features)
@@ -3294,8 +4534,25 @@ def _score_composite(
             status="no_composite", reason=f"only {len(scored_ranks)} runnable rank(s) to combine"
         )
         return {"candidate": None, "meets_target": False, "diag": diag}
+    budget_errors = _candidate_budget_errors(
+        jid,
+        {
+            "job_id": jid,
+            "type": "place",
+            "user_id": user_id,
+            "ladder": scored_ranks,
+            "mechanism_id": scored_ranks[0].get("mechanism_id"),
+            "budget_ref": slice_id,
+        },
+    )
+    if budget_errors:
+        diag.update(status="resource_budget", reason="; ".join(budget_errors)[:200])
+        return {"candidate": None, "meets_target": False, "diag": diag}
     try:
         sized = size_ladder(scored_ranks, features)
+    except SurrogateBudgetExceeded as exc:
+        diag.update(status="budget_exhausted", reason=str(exc))
+        return {"candidate": None, "meets_target": False, "diag": diag}
     except Exception as exc:
         diag.update(status="size_error", reason=f"size_ladder failed: {exc}")
         return {"candidate": None, "meets_target": False, "diag": diag}
@@ -3304,7 +4561,8 @@ def _score_composite(
     target_tps = float(sized.get("target_tps") or 0.0)
     achieved_tps = float(sized.get("achieved_tps") or 0.0)
     unmet_tps = max(0.0, target_tps - achieved_tps) if target_tps > 0 else 0.0
-    served_fraction = min(1.0, achieved_tps / target_tps) if target_tps > 0 else 1.0
+    served_fraction = min(1.0, achieved_tps / target_tps) if target_tps > 0 else 0.0
+    slo_risk = _sized_online_slo_risk(sized, features)
     label = "+".join(str((r.get("config") or {}).get("instance_type")) for r in sized_ranks) or None
     diag.update(
         instance_type=label,
@@ -3313,7 +4571,35 @@ def _score_composite(
         target_tps=target_tps,
         unmet_tps=unmet_tps,
         served_fraction=served_fraction,
+        slo_risk=slo_risk,
+        partial_search_probes=int(sized.get("partial_search_probes") or 0),
+        partial_search_truncated=bool(sized.get("partial_search_truncated")),
     )
+    online_rejection = _online_sizing_rejection(sized, features)
+    if online_rejection is not None:
+        status, reason = online_rejection
+        diag.update(status=status, reason=reason)
+        return {"candidate": None, "meets_target": False, "diag": diag}
+    if not sized_ranks:
+        diag.update(
+            status=sized.get("failure_status") or "prediction_incomplete",
+            reason=sized.get("failure_reason")
+            or "no composite rank produced a complete prediction",
+        )
+        return {"candidate": None, "meets_target": False, "diag": diag}
+    assessment = _prediction_assessment(sized, features)
+    assessment["proposal_source"] = "composite"
+    exploratory = assessment["kind"] == "exploratory"
+    if exploratory:
+        diag.update(
+            status=assessment["status"],
+            reason=(
+                "prediction-uncertain composite has no defensible traffic split; "
+                "retain its physically valid single-rank alternatives"
+            ),
+            prediction_assessment=assessment,
+        )
+        return {"candidate": None, "meets_target": False, "diag": diag}
     if len(sized_ranks) < 2:
         # size_ladder covered the target (or ran out) on ONE rank - no composite;
         # the single-frame candidate already represents it.
@@ -3322,36 +4608,109 @@ def _score_composite(
             reason=f"size_ladder used {len(sized_ranks)} rank(s) of {len(scored_ranks)}",
         )
         return {"candidate": None, "meets_target": meets, "diag": diag}
+    if exploratory:
+        service_state = f"exploratory ({assessment['status']})"
+    elif slo_risk:
+        service_state = "base-latency target missed; queue behavior unmodeled"
+    elif meets:
+        service_state = "point capacity covers target; queue behavior unmodeled"
+    else:
+        service_state = "point capacity below target; queue behavior unmodeled"
     act = {
         "job_id": jid,
         "type": "place",
         "user_id": user_id,
         "ladder": sized_ranks,
         "target_tps": target_tps,
-        "achieved_tps": achieved_tps,
-        "unmet_tps": unmet_tps,
-        "meets_target": meets,
-        "served_fraction": served_fraction,
         "mechanism_id": sized_ranks[0].get("mechanism_id"),
         "budget_ref": slice_id,
+        "prediction_assessment": assessment,
+        "point_capacity_covers_target": bool(target_tps > 0 and achieved_tps >= target_tps),
+        "base_latency_within_target": sized.get("base_latency_within_target"),
+        "queue_state": assessment.get("queue_state"),
+        "queue_slo_verified": False,
+        "service_class": "supported" if meets and not slo_risk else "partial",
         **_online_slo_targets(features),
-        "rationale": f"Deterministic composite candidate ({label}) "
-        f"({'full-service' if meets else 'under-target'}).",
+        "rationale": f"Deterministic composite candidate ({label}) ({service_state}).",
     }
+    if not exploratory and target_tps > 0:
+        act.update(
+            achieved_tps=achieved_tps,
+            unmet_tps=unmet_tps,
+            meets_target=meets,
+            served_fraction=served_fraction,
+        )
     one = {"tick_rationale": "candidate scoring", "actions": [act]}
     try:
+        budget_errors = _candidate_budget_errors(jid, act)
+        if budget_errors:
+            diag.update(status="resource_budget", reason="; ".join(budget_errors)[:200])
+            return {"candidate": None, "meets_target": meets, "diag": diag}
         feas = check_feasibility(one)
         if not feas.get("feasible"):
             diag.update(status="infeasible", reason="; ".join(feas.get("violations", []))[:200])
             return {"candidate": None, "meets_target": meets, "diag": diag}
-        score = compute_sigma(one)["per_job"][jid]
+        if exploratory:
+            score = {
+                "sigma": 0.0,
+                "scoring_mode": "exploration_only",
+                "prediction_available": False,
+            }
+        else:
+            score = compute_sigma(one)["per_job"][jid]
         act["sigma"] = score["sigma"]
+    except SurrogateBudgetExceeded as exc:
+        diag.update(status="budget_exhausted", reason=str(exc))
+        return {"candidate": None, "meets_target": meets, "diag": diag}
     except Exception as exc:
         diag.update(status="score_error", reason=f"scoring failed: {exc}")
         return {"candidate": None, "meets_target": meets, "diag": diag}
-    _attach_peak_multiturn_stress(act, features)
-    diag.update(status="ok", **score)
+    diag.update(status=assessment["status"] if exploratory else "ok", **score)
+    diag["prediction_assessment"] = assessment
+    if slo_risk:
+        diag["reason"] = "Direct base-latency target missed; queue behavior is unmodeled"
     return {"candidate": act, "meets_target": meets, "diag": diag}
+
+
+def _budget_skipped_frame(rank: dict[str, Any]) -> dict[str, Any]:
+    """Diagnostic placeholder for a frame not attempted after cap exhaustion."""
+    env = rank.get("env")
+    cfg = rank.get("config") or {}
+    return {
+        "candidate": None,
+        "meets_target": False,
+        "diag": {
+            "env": env_gpu_type(env) if env else None,
+            "instance_type": cfg.get("instance_type"),
+            "tp": cfg.get("tp"),
+            "status": "budget_skipped",
+            "reason": "not attempted after surrogate search budget exhaustion",
+            "meets_target": False,
+            "achieved_tps": None,
+            "target_tps": None,
+            "sigma": None,
+        },
+    }
+
+
+def _empty_frame_result(status: str, reason: str, **details: Any) -> dict[str, Any]:
+    """Return a typed diagnostic for a job intentionally given no frames."""
+    return {
+        "candidate": None,
+        "meets_target": False,
+        "diag": {
+            "env": None,
+            "instance_type": None,
+            "tp": None,
+            "status": status,
+            "reason": reason,
+            "meets_target": False,
+            "achieved_tps": None,
+            "target_tps": None,
+            "sigma": None,
+            **details,
+        },
+    }
 
 
 def build_scored_candidates(
@@ -3359,12 +4718,10 @@ def build_scored_candidates(
     specialist_results: Any = None,
 ) -> dict[str, Any]:
     """Deterministic candidate pipeline for all waiting jobs: normalize specialist
-    ladders (HINTS), then generate the right-sized menu - for every (gpu_type,
-    instance_type) with free capacity, ONE frame at fill-tp (the largest power of 2
-    that shards the model's heads and fits the instance's GPUs). Resource accounting
-    is instance-atomic (a rank reserves the whole instance), so a partial tp would
-    just idle the box - fill it, and scale throughput with n_replicas, not smaller
-    tp. Size and score each via the proven chain (config_runnable ->
+    ladders (HINTS), then generate fixed-DP alternatives for each available pool at
+    fill-tp (the largest power of 2 that shards the model's heads and fits the
+    instance's GPUs). Resource accounting is instance-atomic. Size and score each
+    exact frame via the proven chain (config_runnable ->
     get_applicable_mechanisms -> size_ladder -> check_feasibility -> compute_sigma).
     Frames the model can't fit fall out when the surrogate rejects them.
 
@@ -3376,27 +4733,32 @@ def build_scored_candidates(
     part of a job to A100 so another job keeps the H100) when that is the best
     cluster outcome.
 
-    EVERY physically-runnable, feasible frame is returned as a candidate - INCLUDING
-    under-target ones - because placing a job beats deferring it; the joint solver
-    decides serve-vs-defer from the scored sigma, not a hard meets_target gate here.
-    A job appears in `exhausted` only when it has NO runnable, feasible frame at all.
+    EVERY physically-runnable, feasible batch frame is returned as a candidate.
+    Direct results are point-capacity/base-latency estimates, not queue simulations.
+    Prediction-only failures remain exploratory candidates; only deterministic hard
+    failures remove a frame. A job appears in `exhausted` only when it has no
+    physically valid candidate; budget-truncated jobs are reported separately.
 
     Returns {"candidates": [...for jointly_select_placements],
              "exhausted": {job_id: reason},
+             "budget_limited": {job_id: reason},
              "diagnostics": {job_id: [per-frame diag incl. meets_target/achieved_tps]}}.
     """
     _require("resource_map", "surrogate")
+    cache_key = _tick_cache_key(budget_book, specialist_results)
+    if cache_key is not None and cache_key in _scored_candidates_cache:
+        return copy.deepcopy(_scored_candidates_cache[cache_key])
     snapshot = _snapshot()
     specs = instance_catalog()
-    gpu_type_env: dict[str, list[str]] = {}
-    for env_key, info in get_resource_map().items():
+    free_envs: list[tuple[str, list[str]]] = []
+    for raw_env_key, info in sorted(get_resource_map().items(), key=lambda item: _env_key(item[0])):
         try:
             if int(info.get("free", 0) or 0) <= 0:
                 continue
         except (TypeError, ValueError):
             continue
-        gpu_type = info.get("gpu_type") or str(env_key).split("|")[-1]
-        gpu_type_env.setdefault(str(gpu_type), str(env_key).split("|"))
+        env_key = _env_key(raw_env_key)
+        free_envs.append((env_key, env_key.split("|")))
 
     spec_by_job: dict[str, dict[str, Any]] = {}
     if isinstance(specialist_results, dict):
@@ -3418,75 +4780,226 @@ def build_scored_candidates(
     # small-tp frames (right for small models), big instances give the tp ladder
     # (tp2*DP4 .. tp8*DP1) for big ones; the solver picks the best-sigma survivor.
     frames_by_job: dict[str, list[dict[str, Any]]] = {}
-    ctx_by_job: dict[str, tuple[Any, Any, dict[str, Any]]] = {}
-    for job in get_pending_jobs():
+    ctx_by_job: dict[str, tuple[Any, Any, dict[str, Any], str]] = {}
+    blocked_by_job: dict[str, dict[str, Any]] = {}
+    attempted_identities_by_job: dict[str, list[Any]] = {}
+    pending_jobs = sorted(
+        get_pending_jobs(), key=lambda job: str(job.get("job_id", job.get("id", "")))
+    )
+    active_rehabilitation = sorted(
+        [
+            job
+            for job in get_active_jobs()
+            if (job.get("health") or {}).get("rehabilitation_eligible") is True
+        ],
+        key=lambda job: str(job.get("job_id", job.get("id", ""))),
+    )
+    pending_ids = {str(job.get("job_id", job.get("id"))) for job in pending_jobs}
+    for job in [*pending_jobs, *active_rehabilitation]:
         jid = job.get("job_id", job.get("id"))
         if not jid:
             continue
         features = _job_features_for(snapshot, jid) or dict(job.get("job_features") or {})
+        if str(jid) not in pending_ids:
+            features["_active_health"] = copy.deepcopy(job.get("health") or {})
         model_id = features.get("model_id") or job.get("model_id")
         user_id = job.get("user_id") or features.get("user_id")
-        slice_id = (budgets.get(jid) or {}).get("slice_id", jid)
+        slice_ = budgets.get(jid) or {}
+        slice_id = slice_.get("slice_id", jid)
         heads = _model_num_heads({"model_id": model_id}, features)
 
         frames: list[dict[str, Any]] = []
         seen: set = set()
+        is_pending = str(jid) in pending_ids
+        deployment_status = job.get("deployment_status")
+        retry_action_type = "place" if is_pending else "swap"
+        attempt_gate_applies = is_pending or job.get("deployment_action_type") == "swap"
+        if attempt_gate_applies and deployment_status == "deployment_pending":
+            frames_by_job[jid] = []
+            ctx_by_job[jid] = (user_id, slice_id, features, retry_action_type)
+            blocked_by_job[jid] = _empty_frame_result(
+                "deployment_pending",
+                "prior placement is still inside the materialization grace period",
+                deployment_attempts=int(job.get("deployment_attempts") or 1),
+            )
+            continue
+        if attempt_gate_applies and deployment_status == "deployment_not_materialized":
+            attempts = int(job.get("deployment_attempts") or 1)
+            retry_after = job.get("deployment_retry_after_tick")
+            if job.get("deployment_retry_exhausted") is True:
+                frames_by_job[jid] = []
+                ctx_by_job[jid] = (user_id, slice_id, features, retry_action_type)
+                blocked_by_job[jid] = _empty_frame_result(
+                    "deployment_retry_exhausted",
+                    "deployment retry limit reached",
+                    deployment_attempts=attempts,
+                    retry_after_tick=retry_after,
+                )
+                continue
+            if job.get("deployment_retry_allowed") is not True:
+                frames_by_job[jid] = []
+                ctx_by_job[jid] = (user_id, slice_id, features, retry_action_type)
+                blocked_by_job[jid] = _empty_frame_result(
+                    "deployment_retry_backoff",
+                    "prior placement timed out; waiting for retry backoff",
+                    deployment_attempts=attempts,
+                    retry_after_tick=retry_after,
+                )
+                continue
         for raw in (spec_by_job.get(jid) or {}).get("ladder") or []:
             rank = _normalize_candidate_rank(raw)
             if rank is not None and _rank_shape_key(rank) not in seen:
+                rank["proposal_source"] = "specialist"
                 seen.add(_rank_shape_key(rank))
                 frames.append(rank)
-        # For EVERY (gpu_type, instance_type) with free capacity, one fill-tp frame:
+        # For every pool, enumerate bounded fixed-DP alternatives. Direct evaluates
+        # each exact frame; size_ladder never mutates a specialist's replica count.
         # a 1-GPU box -> tp=1 (right for small models), an 8-GPU box -> tp=8 (right
         # for big ones). Accounting is instance-atomic, so a partial tp just idles
-        # the box - fill it; size_ladder scales n_replicas across instances for
-        # throughput, and Phase 2.5 spans pools when one is not enough. Specialist
-        # ladders above stay as hints (deduped by shape).
-        for _gpu_type, env in gpu_type_env.items():
-            for instance_type, spec in (specs.get(_env_key(env)) or {}).items():
+        # the box - fill it. Explicit fixed-DP variants scale across instances, and
+        # Phase 2.5 spans pools when one is not enough. Specialist ladders above stay
+        # as exact-capacity proposals (deduped by shape).
+        for env_key, env in free_envs:
+            for instance_type, spec in sorted((specs.get(env_key) or {}).items()):
+                if slice_ and env_key not in (slice_.get("env_budget") or {}):
+                    continue
+                if slice_ and instance_type not in (
+                    (slice_.get("pool_budget") or {}).get(env_key) or {}
+                ):
+                    continue
                 gpi = int(spec.get("gpus_per_instance", 0) or 0)
                 if gpi <= 0 or int(spec.get("free_instances", 0) or 0) <= 0:
                     continue
-                tp = _largest_pow2_divisor_leq(heads, gpi)
-                rank = _normalize_candidate_rank(
-                    {
-                        "role": "aggregate",
-                        "env": list(env),
-                        "config": {
-                            "instance_type": instance_type,
-                            "gpu_count": tp,
-                            "tp": tp,
-                            "pp": 1,
-                        },
-                        "n_replicas": 1,
-                    }
+                allocation_kind = spec.get("allocation_kind")
+                gpu_cap = (
+                    int(spec.get("candidate_gpu_cap", 0) or 0) if allocation_kind == "gpu" else gpi
                 )
-                if rank is not None and _rank_shape_key(rank) not in seen:
-                    seen.add(_rank_shape_key(rank))
-                    frames.append(rank)
+                tp_options = _generated_tp_options(
+                    heads=heads,
+                    gpu_cap=gpu_cap,
+                    gpu_type=str(env[4]),
+                    model_id=str(model_id or ""),
+                    allocation_kind=str(allocation_kind or "instance"),
+                )
+                for tp in tp_options:
+                    max_replicas = int(spec.get("free_instances", 0) or 0)
+                    capacity_per_replica = tp if allocation_kind == "gpu" else gpi
+                    if allocation_kind == "gpu":
+                        max_replicas //= max(1, tp)
+                    env_budget = (slice_.get("env_budget") or {}).get(env_key)
+                    if env_budget is not None:
+                        max_replicas = min(
+                            max_replicas,
+                            int(env_budget) // capacity_per_replica,
+                        )
+                    pool_budget = ((slice_.get("pool_budget") or {}).get(env_key) or {}).get(
+                        instance_type
+                    )
+                    if pool_budget is not None:
+                        allowed_units = int(pool_budget)
+                        if allocation_kind == "gpu":
+                            allowed_units //= max(1, tp)
+                        max_replicas = min(max_replicas, allowed_units)
+                    replica_options = _replica_options(max_replicas) if slice_ else [1]
+                    for replicas in replica_options:
+                        rank = _normalize_candidate_rank(
+                            {
+                                "role": "aggregate",
+                                "env": list(env),
+                                "config": {
+                                    "instance_type": instance_type,
+                                    "gpu_count": tp,
+                                    "tp": tp,
+                                    "pp": 1,
+                                },
+                                "n_replicas": replicas,
+                            }
+                        )
+                        if rank is not None and _rank_shape_key(rank) not in seen:
+                            rank["proposal_source"] = "generated"
+                            seen.add(_rank_shape_key(rank))
+                            frames.append(rank)
+        if not is_pending:
+            current_groups: dict[str, list[dict[str, Any]]] = {}
+            for index, chain in enumerate(
+                job.get("current_ladder") or job.get("active_chains") or []
+            ):
+                shape = dict(chain.get("shape_json") or chain)
+                rank_id = str(shape.get("rank_id") or f"chain-{index}")
+                current_groups.setdefault(rank_id, []).append(chain)
+            current_shapes = {
+                _deployment_shape_key(chains[0], replicas=len(chains))
+                for chains in current_groups.values()
+            }
+            frames = [rank for rank in frames if _deployment_shape_key(rank) not in current_shapes]
+        if attempt_gate_applies and deployment_status == "deployment_not_materialized":
+            attempted = list(job.get("attempted_deployment_identities") or [])
+            attempted_identities_by_job[jid] = attempted
+            before_retry_filter = len(frames)
+            frames = [
+                rank
+                for rank in frames
+                if not any(deployment_ladder_identity([rank]) == identity for identity in attempted)
+            ]
+            if before_retry_filter > 0 and not frames:
+                blocked_by_job[jid] = _empty_frame_result(
+                    "deployment_shape_already_attempted",
+                    "all generated deployment shapes have already timed out",
+                    deployment_attempts=int(job.get("deployment_attempts") or 1),
+                    retry_after_tick=job.get("deployment_retry_after_tick"),
+                )
+        if not frames and jid not in blocked_by_job:
+            blocked_by_job[jid] = _empty_frame_result(
+                "no_pool_capacity",
+                "no policy-valid candidate frame has free pool capacity",
+            )
         frames_by_job[jid] = frames
-        ctx_by_job[jid] = (user_id, slice_id, features)
+        ctx_by_job[jid] = (
+            user_id,
+            slice_id,
+            features,
+            "place" if str(jid) in pending_ids else "swap",
+        )
 
-    # Phase 2 (surrogate-heavy): score EVERY frame across all jobs CONCURRENTLY.
-    # Each _score_one_frame runs size_ladder + check_feasibility + compute_sigma -
-    # tens of seconds of surrogate each - so scoring them serially blew the tick
-    # (~7 min). Fan the leaf scorings out on a thread pool: the surrogate runs its
-    # own worker pool and concurrent tool calls are already used safely in the REPL.
-    tasks = [
-        (jid, ctx_by_job[jid][0], ctx_by_job[jid][1], rank, ctx_by_job[jid][2])
-        for jid, frames in frames_by_job.items()
-        for rank in frames
-    ]
-    scored_by_job: dict[str, list[dict[str, Any]]] = {jid: [] for jid in frames_by_job}
-    if tasks:
+    # Phase 2 (surrogate-heavy): deterministic round-robin over jobs. The surrogate
+    # is globally serialized, so threads add no throughput and obscure which jobs
+    # received the final calls. Specialist frame 0 leads for every job before any
+    # job receives frame 1.
+    scored_by_job: dict[str, list[dict[str, Any]]] = {
+        jid: [blocked_by_job[jid]] if jid in blocked_by_job else [] for jid in frames_by_job
+    }
+    budget_exhausted = False
+    max_frames = max((len(frames) for frames in frames_by_job.values()), default=0)
+    for frame_index in range(max_frames):
+        for jid, frames in frames_by_job.items():
+            if frame_index >= len(frames):
+                continue
+            user_id, slice_id, features, action_type = ctx_by_job[jid]
+            scored = (
+                _score_one_frame(jid, user_id, slice_id, frames[frame_index], features)
+                if action_type == "place"
+                else _score_one_frame(
+                    jid,
+                    user_id,
+                    slice_id,
+                    frames[frame_index],
+                    features,
+                    action_type="swap",
+                )
+            )
+            scored_by_job[jid].append(scored)
+            if scored.get("diag", {}).get("status") == "budget_exhausted":
+                budget_exhausted = True
+                break
+        if budget_exhausted:
+            break
 
-        def _run(task: tuple) -> tuple:
-            jid, user_id, slice_id, rank, features = task
-            return jid, _score_one_frame(jid, user_id, slice_id, rank, features)
-
-        with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
-            for jid, scored in pool.map(_run, tasks):
-                scored_by_job[jid].append(scored)
+    if budget_exhausted:
+        for jid, frames in frames_by_job.items():
+            results = scored_by_job[jid]
+            scored_frame_count = 0 if jid in blocked_by_job else len(results)
+            for rank in frames[scored_frame_count:]:
+                results.append(_budget_skipped_frame(rank))
 
     # Phase 2.5 (heterogeneous composites). Two motivations:
     #  - CAPACITY: if NO single pool meets the target, span pools (fill the
@@ -3496,70 +5009,177 @@ def build_scored_candidates(
     #    (cheap pool + top-up) can beat the single-pool winner on cost. In reserved
     #    (w_cost=0) the fleet is sunk - a "cheaper" mix saves nothing - so we only do
     #    the capacity fallback.
-    # size_ladder fills each ordering and sums achieved; the joint solver ranks EVERY
+    # size_ladder evaluates each ordering and sums point capacity; the joint solver ranks every
     # candidate by sigma (which includes the bounded cost term), so if no mix is both
     # cheaper AND SLO-meeting, the single pool still wins. A cheapest-first ordering
     # whose cheapest pool already meets alone collapses to <2 ranks -> no composite.
-    # scored_by_job[jid] aligns with frames_by_job[jid] (thread pool preserves order).
+    # scored_by_job[jid] aligns with frames_by_job[jid].
     try:
         w_cost = float((_CTX.slow_loop.get_sss_wt() or {}).get("cost_per_token", 0.0) or 0.0)
     except Exception:
         w_cost = 0.0
-    for jid, frames in frames_by_job.items():
-        results = scored_by_job.get(jid) or []
-        runnable = [
-            (f, r) for f, r in zip(frames, results, strict=False) if r.get("candidate") is not None
-        ]
-        if not runnable:
-            continue
-        user_id, slice_id, features = ctx_by_job[jid]
-        single_meets = any(r.get("meets_target") for _, r in runnable)
-        orders: list[list[dict[str, Any]]] = []
-        if not single_meets:
-            orders.append(
-                [
-                    f
-                    for f, _ in sorted(
-                        runnable,
-                        key=lambda fr: fr[1]["diag"].get("achieved_tps") or 0.0,
-                        reverse=True,
+    if not budget_exhausted:
+        for jid, frames in frames_by_job.items():
+            results = scored_by_job.get(jid) or []
+            composable = [
+                (f, r)
+                for f, r in zip(frames, results, strict=False)
+                if r.get("composite_eligible")
+                or (
+                    r.get("candidate") is not None
+                    and not _is_exploratory_assessment(
+                        (r.get("candidate") or {}).get("prediction_assessment")
                     )
-                ]
-            )
-        if w_cost > 0:
-            orders.append(
-                [
-                    f
-                    for f, _ in sorted(
-                        runnable, key=lambda fr: fr[1]["diag"].get("cost_penalty") or 0.0
-                    )
-                ]
-            )
-        for order in orders:
-            composite = _score_composite(jid, user_id, slice_id, order, features)
-            if composite is not None:
+                )
+            ]
+            if not composable:
+                continue
+            # Fixed-DP generation emits several replica counts per pool. A composite
+            # may use at most one of them; otherwise it double-books the same pool as
+            # separate ranks. Keep the best scored frame for each pool.
+            best_by_pool: dict[tuple[str, str | None], tuple[dict[str, Any], dict[str, Any]]] = {}
+            for frame, result in composable:
+                cfg = frame.get("config") or {}
+                key = (_env_key(frame.get("env")), cfg.get("instance_type"))
+                current = best_by_pool.get(key)
+                rank_key = (
+                    bool(result.get("meets_target")),
+                    float((result.get("candidate") or {}).get("sigma", float("-inf"))),
+                    float(result.get("diag", {}).get("achieved_tps") or 0.0),
+                )
+                if current is None:
+                    best_by_pool[key] = (frame, result)
+                    continue
+                current_key = (
+                    bool(current[1].get("meets_target")),
+                    float((current[1].get("candidate") or {}).get("sigma", float("-inf"))),
+                    float(current[1].get("diag", {}).get("achieved_tps") or 0.0),
+                )
+                if rank_key > current_key:
+                    best_by_pool[key] = (frame, result)
+            composable = list(best_by_pool.values())
+            user_id, slice_id, features, action_type = ctx_by_job[jid]
+            if action_type == "swap":
+                continue
+            single_meets = any(r.get("meets_target") for _, r in composable)
+            orders: list[list[dict[str, Any]]] = []
+            if not single_meets:
+                orders.append(
+                    [
+                        f
+                        for f, _ in sorted(
+                            composable,
+                            key=lambda fr: fr[1]["diag"].get("achieved_tps") or 0.0,
+                            reverse=True,
+                        )
+                    ]
+                )
+            if w_cost > 0:
+                orders.append(
+                    [
+                        f
+                        for f, _ in sorted(
+                            composable, key=lambda fr: fr[1]["diag"].get("cost_penalty") or 0.0
+                        )
+                    ]
+                )
+            for order in orders:
+                if any(
+                    deployment_ladder_identity(order) == identity
+                    for identity in attempted_identities_by_job.get(jid, [])
+                ):
+                    continue
+                composite = _score_composite(jid, user_id, slice_id, order, features)
                 scored_by_job[jid].append(composite)
+                if composite.get("diag", {}).get("status") == "budget_exhausted":
+                    budget_exhausted = True
+                    break
+            if budget_exhausted:
+                break
 
-    # Phase 3 (cheap): group into candidates / exhausted / diagnostics. Every
-    # feasible frame is a candidate - INCLUDING under-target ones (placing beats
-    # deferring; the joint solver decides serve-vs-defer from sigma). `exhausted` =
-    # a job with NO runnable, feasible frame at all, not merely "under target".
+    if budget_exhausted:
+        for _jid, scored_list in scored_by_job.items():
+            composable_results = [
+                item
+                for item in scored_list
+                if item.get("candidate") is not None or item.get("composite_eligible")
+            ]
+            single_meets = any(item.get("meets_target") for item in composable_results)
+            composite_was_relevant = len(composable_results) >= 2 and (
+                not single_meets or w_cost > 0
+            )
+            has_composite_result = any(
+                item.get("diag", {}).get("env") == "composite" for item in scored_list
+            )
+            has_budget_status = any(
+                item.get("diag", {}).get("status") in {"budget_exhausted", "budget_skipped"}
+                for item in scored_list
+            )
+            if composite_was_relevant and not has_composite_result and not has_budget_status:
+                scored_list.append(
+                    {
+                        "candidate": None,
+                        "meets_target": False,
+                        "diag": {
+                            "env": "composite",
+                            "instance_type": None,
+                            "tp": None,
+                            "status": "budget_skipped",
+                            "reason": (
+                                "composite not attempted after surrogate search budget exhaustion"
+                            ),
+                            "meets_target": False,
+                            "achieved_tps": None,
+                            "target_tps": None,
+                            "sigma": None,
+                        },
+                    }
+                )
+
+    # Phase 3 (cheap): group into candidates / exhausted / diagnostics. Batch may
+    # retain under-target frames; online partials pass only through the advisory
+    # safety gate above. Budget-truncated jobs never become exhausted.
     candidates: list[dict[str, Any]] = []
     exhausted: dict[str, str] = {}
+    budget_limited: dict[str, str] = {}
     diagnostics: dict[str, list[dict[str, Any]]] = {}
     for jid, scored_list in scored_by_job.items():
         job_diag = [s["diag"] for s in scored_list]
         job_candidates = [s["candidate"] for s in scored_list if s["candidate"] is not None]
         diagnostics[jid] = job_diag
+        limited = [
+            diag
+            for diag in job_diag
+            if diag.get("status") in {"budget_exhausted", "budget_skipped"}
+        ]
+        if limited:
+            reasons = [diag["reason"] for diag in limited if diag.get("reason")]
+            budget_limited[jid] = (
+                "; ".join(dict.fromkeys(reasons))
+                if reasons
+                else "surrogate search budget exhausted"
+            )
         if job_candidates:
             candidates.extend(job_candidates)
-        else:
+        elif not limited and not any(
+            diagnostic.get("status") in {"deployment_pending", "deployment_retry_backoff"}
+            for diagnostic in job_diag
+        ):
             reasons = [d["reason"] for d in job_diag if d.get("reason")]
             exhausted[jid] = (
                 "; ".join(dict.fromkeys(reasons)) if reasons else "no runnable, feasible frame"
             )
 
-    return {"candidates": candidates, "exhausted": exhausted, "diagnostics": diagnostics}
+    result = {
+        "candidates": candidates,
+        "exhausted": exhausted,
+        "budget_limited": budget_limited,
+        "diagnostics": diagnostics,
+    }
+    if cache_key is not None:
+        _scored_candidates_cache[cache_key] = copy.deepcopy(result)
+        return copy.deepcopy(_scored_candidates_cache[cache_key])
+    return copy.deepcopy(result)
 
 
 def jointly_select_placements(
@@ -3571,12 +5191,15 @@ def jointly_select_placements(
     Chooses at most one candidate frame per job (or defers it) to MAXIMIZE the
     cluster objective - the sum of placed per-job sigma plus avoided unserved
     demand, credited by served_fraction for under-target frames - subject to
-    per-env free-GPU capacity. This is the joint decision the greedy per-job loop cannot make: it
-    weighs every job's GPU options together, so a scarce type (e.g. H100) goes to
-    whichever job it helps most instead of being pre-split blindly. It ARBITRATES
-    the frames you pass; it does NOT invent them. Proposing the right GPU types
-    (an L40S frame and an H100 frame for a big model) is the planner's
-    domain-knowledge job - this tool just picks the joint optimum among them.
+    per-env free-GPU capacity. Advisory positive-throughput frames receive a tiny
+    positive gain only when their normal gain is non-positive, making otherwise
+    idle capacity work-conserving without displacing normally valuable work. This
+    is the joint decision the greedy per-job loop cannot make: it weighs every
+    job's GPU options together, so a scarce type (e.g. H100) goes to whichever job
+    it helps most instead of being pre-split blindly. It ARBITRATES the frames you
+    pass; it does NOT invent them. Proposing the right GPU types (an L40S frame and
+    an H100 frame for a big model) is the planner's domain-knowledge job - this
+    tool just picks the joint optimum among them.
 
     Capacity is enforced in TWO dimensions - env GPU totals AND per-pool whole-
     INSTANCE limits (validator C5) - so the returned assignment actually fits the
@@ -3606,9 +5229,119 @@ def jointly_select_placements(
     (cap_key is 'gpu:<env>' or 'pool:<env>:<instance_type>')
     """
     _require("resource_map")
+    global _placement_decision_sequence
+    _placement_decision_sequence += 1
+    decision_index = _placement_decision_sequence
     reserve_map = {_env_key(env): int(n) for env, n in (reserves or {}).items()}
     resources = get_resource_map()
     specs = instance_catalog()
+    original_candidates = list(candidates or [])
+
+    def selection_score(candidate: dict[str, Any]) -> float:
+        field = (
+            "swap_gain_over_keep" if str(candidate.get("type") or "").lower() == "swap" else "sigma"
+        )
+        raw_value = candidate.get(field)
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+            return float("-inf")
+        value = float(raw_value)
+        return value if math.isfinite(value) else float("-inf")
+
+    def emergency_recovery(candidate: dict[str, Any]) -> bool:
+        return (
+            str(candidate.get("type") or "").lower() == "swap"
+            and candidate.get("rehabilitation_status") == "critical"
+            and bool(
+                set(candidate.get("rehabilitation_reasons") or [])
+                & {"zero_throughput", "queue_critical"}
+            )
+        )
+
+    eligible_candidates = []
+    for candidate in original_candidates:
+        is_swap = str(candidate.get("type") or "").lower() == "swap"
+        if is_swap and (
+            selection_score(candidate) <= 0
+            or (candidate.get("queue_state") == "unstable" and not emergency_recovery(candidate))
+        ):
+            continue
+        eligible_candidates.append(candidate)
+
+    def footprint(candidate: dict[str, Any]) -> int:
+        return sum(_ladder_capacity_cost(candidate.get("ladder") or [], specs).values())
+
+    def dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        left_cost = _ladder_capacity_cost(left.get("ladder") or [], specs)
+        right_cost = _ladder_capacity_cost(right.get("ladder") or [], specs)
+        keys = set(left_cost) | set(right_cost)
+        no_more_resource = all(left_cost.get(key, 0) <= right_cost.get(key, 0) for key in keys)
+        no_less_capacity = float(left.get("achieved_tps") or 0.0) >= float(
+            right.get("achieved_tps") or 0.0
+        )
+        no_worse_score = selection_score(left) >= selection_score(right)
+        queue_quality = {"stable": 2, "unmodeled": 1, "not_applicable": 1, "unstable": 0}
+        no_worse_queue = queue_quality.get(str(left.get("queue_state")), 1) >= queue_quality.get(
+            str(right.get("queue_state")), 1
+        )
+        strictly_better = (
+            any(left_cost.get(key, 0) < right_cost.get(key, 0) for key in keys)
+            or float(left.get("achieved_tps") or 0.0) > float(right.get("achieved_tps") or 0.0)
+            or selection_score(left) > selection_score(right)
+        )
+        return (
+            no_more_resource
+            and no_less_capacity
+            and no_worse_score
+            and no_worse_queue
+            and strictly_better
+        )
+
+    grouped: dict[tuple[str, str, str | None], list[dict[str, Any]]] = {}
+    for candidate in eligible_candidates:
+        ladder = candidate.get("ladder") or []
+        first = ladder[0] if ladder else {}
+        cfg = first.get("config") or {}
+        key = (
+            str(candidate.get("job_id") or ""),
+            _env_key(first.get("env")),
+            cfg.get("instance_type"),
+        )
+        grouped.setdefault(key, []).append(candidate)
+
+    pruned_candidates: list[dict[str, Any]] = []
+    for entries in grouped.values():
+        if len(entries) <= 4:
+            pruned_candidates.extend(entries)
+            continue
+        specialists: list[dict[str, Any]] = [
+            entry
+            for entry in entries
+            if (entry.get("prediction_assessment") or {}).get("proposal_source") == "specialist"
+        ]
+        service = [
+            entry
+            for entry in entries
+            if not _is_exploratory_assessment(entry.get("prediction_assessment"))
+        ]
+        explorers = [
+            entry
+            for entry in entries
+            if _is_exploratory_assessment(entry.get("prediction_assessment"))
+        ]
+        retained = [
+            entry
+            for entry in service
+            if not any(other is not entry and dominates(other, entry) for other in service)
+        ]
+        retained.extend(specialists)
+        if explorers:
+            retained.append(min(explorers, key=footprint))
+        seen_ids: set[int] = set()
+        for entry in retained:
+            if id(entry) not in seen_ids:
+                seen_ids.add(id(entry))
+                pruned_candidates.append(entry)
+    candidates = pruned_candidates
     # Capacity is two-dimensional: env GPU totals AND per-pool whole-instance
     # limits. The pool dimension is what the old env-GPU-only check missed.
     capacity: dict[tuple, int] = {}
@@ -3623,9 +5356,74 @@ def jointly_select_placements(
     priority_by_job = {
         p.get("job_id"): float(p.get("priority_score", 1.0) or 1.0) for p in get_priority()
     }
+    pending_job_order = [str(job.get("job_id", job.get("id"))) for job in get_pending_jobs()]
+    pending_job_ids = set(pending_job_order)
+    slow_loop = getattr(_CTX, "slow_loop", None)
+    swap_budget = (
+        int(slow_loop.get_sss_swap_budget_t())
+        if slow_loop is not None and hasattr(slow_loop, "get_sss_swap_budget_t")
+        else 0
+    )
 
     def penalty(jid: str) -> float:
         return UNSERVED_PENALTY * max(1.0, priority_by_job.get(jid, 1.0))
+
+    def finite_number(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
+
+    def candidate_served_fraction(cand: dict[str, Any]) -> float | None:
+        assessment = cand.get("prediction_assessment") or {}
+        exploratory = (
+            assessment.get("basis") in _POINT_PREDICTION_BASES
+            and assessment.get("kind") == "exploratory"
+            and assessment.get("status") in _SOFT_PREDICTION_FAILURES
+        )
+        if exploratory:
+            if cand.get("admitted_tps") is not None or cand.get("admission_mode") is not None:
+                return None
+            return 0.0
+        accounting_fields = {
+            "target_tps",
+            "admitted_tps",
+            "achieved_tps",
+            "unmet_tps",
+            "meets_target",
+            "served_fraction",
+            "admission_mode",
+        }
+        if not any(field in cand for field in accounting_fields):
+            return None
+        if not all(field in cand for field in ("target_tps", "achieved_tps", "served_fraction")):
+            return None
+
+        target = finite_number(cand["target_tps"])
+        achieved = finite_number(cand["achieved_tps"])
+        fraction = finite_number(cand["served_fraction"])
+        if target is None or target <= 0.0 or achieved is None or achieved <= 0.0:
+            return None
+        if fraction is None or fraction <= 0.0 or fraction > 1.0:
+            return None
+        if achieved > target and not math.isclose(
+            achieved,
+            target,
+            rel_tol=1e-3,
+            abs_tol=1e-6,
+        ):
+            return None
+        derived = min(1.0, achieved / target)
+        if not math.isclose(fraction, derived, rel_tol=1e-3, abs_tol=1e-6):
+            return None
+
+        if "admitted_tps" in cand:
+            admitted = finite_number(cand["admitted_tps"])
+            if admitted is None or admitted <= 0.0:
+                return None
+            if not math.isclose(admitted, achieved, rel_tol=1e-3, abs_tol=1e-6):
+                return None
+        return fraction
 
     # Group scored candidates by job, attaching each frame's per-env GPU cost and
     # its GAIN over deferring that job. Under-target frames only avoid the defer
@@ -3633,44 +5431,141 @@ def jointly_select_placements(
     # same as a full-service placement.
     by_job: dict[str, list[dict[str, Any]]] = {}
     for cand in candidates or []:
+        cand.pop("work_conserving_floor", None)
         jid = cand.get("job_id")
         if not jid:
             continue
         cost = _ladder_capacity_cost(cand.get("ladder") or [], specs)
         if not cost:
             continue  # no real GPU footprint -> not a placeable frame
-        try:
-            served_fraction = float(cand.get("served_fraction", 1.0) or 0.0)
-        except (TypeError, ValueError):
-            served_fraction = 1.0
-        served_fraction = max(0.0, min(1.0, served_fraction))
-        served_credit = penalty(jid) * served_fraction
-        gain = float(cand.get("sigma", 0.0)) + served_credit
-        if gain <= 0:
+        served_fraction = candidate_served_fraction(cand)
+        if served_fraction is None:
             continue
-        cand["served_fraction"] = served_fraction
+        served_credit = penalty(jid) * served_fraction if str(jid) in pending_job_ids else 0.0
+        gain = float(cand.get("sigma", 0.0)) + served_credit
+        assessment = cand.get("prediction_assessment") or {}
+        exploratory = (
+            assessment.get("basis") in _POINT_PREDICTION_BASES
+            and assessment.get("kind") == "exploratory"
+            and assessment.get("status") in _SOFT_PREDICTION_FAILURES
+        )
+        achieved_tps = finite_number(cand.get("achieved_tps"))
+        point_capacity_candidate = (
+            achieved_tps is not None
+            and achieved_tps > 0
+            and (
+                assessment.get("basis") in _POINT_PREDICTION_BASES
+                or cand.get("admission_mode") == "advisory"
+                or (
+                    PARTIAL_ONLINE_ADMISSION_MODE == "advisory"
+                    and any(
+                        cand.get(field) is not None
+                        for field in ("target_p99_ttft_ms", "target_p99_tpot_ms")
+                    )
+                )
+            )
+        )
+        queue_unstable = (
+            cand.get("queue_state") == "unstable" or assessment.get("queue_state") == "unstable"
+        )
+        is_swap = str(cand.get("type") or "").lower() == "swap"
+        swap_gain_over_keep = finite_number(cand.get("swap_gain_over_keep"))
+        is_emergency_recovery = emergency_recovery(cand)
+        if is_swap and (
+            (queue_unstable and not is_emergency_recovery)
+            or swap_gain_over_keep is None
+            or swap_gain_over_keep <= 0
+        ):
+            continue
+        if is_swap:
+            assert swap_gain_over_keep is not None
+            gain = swap_gain_over_keep
+        if queue_unstable:
+            gain = _WORK_CONSERVING_GAIN_FLOOR
+            cand["work_conserving_floor"] = True
+            cand["service_class"] = "partial" if is_emergency_recovery else "idle_capacity_fallback"
+            if isinstance(assessment, dict):
+                assessment["selection_mode"] = (
+                    "emergency_recovery" if is_emergency_recovery else "work_conserving"
+                )
+        elif gain <= 0:
+            if not exploratory and not point_capacity_candidate:
+                continue
+            gain = _WORK_CONSERVING_GAIN_FLOOR
+            cand["work_conserving_floor"] = True
+            cand["service_class"] = "idle_capacity_fallback"
+            if isinstance(assessment, dict):
+                assessment["selection_mode"] = "work_conserving"
+        if not exploratory:
+            cand["served_fraction"] = served_fraction
         cand["served_credit"] = served_credit
         cand["solver_gain"] = gain
-        by_job.setdefault(jid, []).append({"cand": cand, "cost": cost, "gain": gain})
+        floor_tier = (
+            2
+            if cand.get("work_conserving_floor") and (exploratory or queue_unstable)
+            else 1
+            if cand.get("work_conserving_floor")
+            else 0
+        )
+        cand["solver_tier"] = floor_tier
+        by_job.setdefault(jid, []).append(
+            {
+                "cand": cand,
+                "cost": cost,
+                "gain": gain,
+                "normal_gain": 0.0 if cand.get("work_conserving_floor") else gain,
+                "stable_floor_value": penalty(jid) if floor_tier == 1 else 0.0,
+                "exploratory_floor_value": penalty(jid) if floor_tier == 2 else 0.0,
+                "swap_count": 1 if is_swap else 0,
+            }
+        )
     jobs = [jid for jid in by_job if by_job[jid]]
 
-    best: dict[str, Any] = {"objective": 0.0, "chosen": []}  # all-defer baseline == 0 gain
+    best: dict[str, Any] = {
+        "normal_objective": 0.0,
+        "stable_floor_objective": 0.0,
+        "exploratory_floor_objective": 0.0,
+        "chosen": [],
+    }
 
     space = 1
     for jid in jobs:
         space *= 1 + len(by_job[jid])
 
-    if space <= 200_000:
+    solver_mode = "exact" if space <= 200_000 else "greedy"
+    if solver_mode == "exact":
         # Exact branch-and-bound: every node is a capacity-feasible assignment
         # (deferring the remaining jobs), so its accumulated gain is a valid
         # objective; keep the best. Place-branches that overflow a pool are pruned.
-        def dfs(i: int, used: dict[str, int], gain: float, chosen: list[dict[str, Any]]) -> None:
-            if gain > best["objective"]:
-                best["objective"] = gain
+        def dfs(
+            i: int,
+            used: dict[str, int],
+            normal_gain: float,
+            stable_floor_value: float,
+            exploratory_floor_value: float,
+            swaps_used: int,
+            chosen: list[dict[str, Any]],
+        ) -> None:
+            if (normal_gain, stable_floor_value, exploratory_floor_value) > (
+                best["normal_objective"],
+                best["stable_floor_objective"],
+                best["exploratory_floor_objective"],
+            ):
+                best["normal_objective"] = normal_gain
+                best["stable_floor_objective"] = stable_floor_value
+                best["exploratory_floor_objective"] = exploratory_floor_value
                 best["chosen"] = list(chosen)
             if i >= len(jobs):
                 return
-            dfs(i + 1, used, gain, chosen)  # defer job i
+            dfs(
+                i + 1,
+                used,
+                normal_gain,
+                stable_floor_value,
+                exploratory_floor_value,
+                swaps_used,
+                chosen,
+            )  # defer job i
             for entry in by_job[jobs[i]]:
                 new_used = dict(used)
                 over = False
@@ -3681,11 +5576,21 @@ def jointly_select_placements(
                         break
                 if over:
                     continue
+                if swaps_used + entry["swap_count"] > swap_budget:
+                    continue
                 chosen.append(entry["cand"])
-                dfs(i + 1, new_used, gain + entry["gain"], chosen)
+                dfs(
+                    i + 1,
+                    new_used,
+                    normal_gain + entry["normal_gain"],
+                    stable_floor_value + entry["stable_floor_value"],
+                    exploratory_floor_value + entry["exploratory_floor_value"],
+                    swaps_used + entry["swap_count"],
+                    chosen,
+                )
                 chosen.pop()
 
-        dfs(0, {}, 0.0, [])
+        dfs(0, {}, 0.0, 0.0, 0.0, 0, [])
     else:
         # Greedy fallback for a large choice space: best-gain frame per job in
         # priority order, taking each only if it still fits. Bounded, never over
@@ -3694,39 +5599,117 @@ def jointly_select_placements(
         used: dict[str, int] = {}
         chosen: list[dict[str, Any]] = []
         total = 0.0
-        for jid in sorted(jobs, key=lambda j: priority_by_job.get(j, 1.0), reverse=True):
-            for entry in sorted(by_job[jid], key=lambda e: e["gain"], reverse=True):
-                trial = dict(used)
-                over = False
-                for key, need in entry["cost"].items():
-                    trial[key] = trial.get(key, 0) + need
-                    if trial[key] > capacity.get(key, 0):
-                        over = True
+        swaps_used = 0
+        placed_greedy: set[str] = set()
+        ordered_jobs = sorted(jobs, key=lambda j: priority_by_job.get(j, 1.0), reverse=True)
+        for tier in (0, 1, 2):
+            for jid in ordered_jobs:
+                if jid in placed_greedy:
+                    continue
+                entries = [
+                    entry
+                    for entry in by_job[jid]
+                    if int(entry["cand"].get("solver_tier") or 0) == tier
+                ]
+                for entry in sorted(entries, key=lambda item: item["gain"], reverse=True):
+                    trial = dict(used)
+                    over = False
+                    for key, need in entry["cost"].items():
+                        trial[key] = trial.get(key, 0) + need
+                        if trial[key] > capacity.get(key, 0):
+                            over = True
+                            break
+                    if not over:
+                        if swaps_used + entry["swap_count"] > swap_budget:
+                            continue
+                        used, total = trial, total + entry["gain"]
+                        swaps_used += entry["swap_count"]
+                        chosen.append(entry["cand"])
+                        placed_greedy.add(jid)
                         break
-                if not over:
-                    used, total = trial, total + entry["gain"]
-                    chosen.append(entry["cand"])
-                    break
-        best = {"objective": total, "chosen": chosen}
+        best = {
+            "normal_objective": sum(
+                float(candidate.get("solver_gain", 0.0))
+                for candidate in chosen
+                if not candidate.get("work_conserving_floor")
+            ),
+            "stable_floor_objective": sum(
+                penalty(str(candidate.get("job_id")))
+                for candidate in chosen
+                if candidate.get("solver_tier") == 1
+            ),
+            "exploratory_floor_objective": sum(
+                penalty(str(candidate.get("job_id")))
+                for candidate in chosen
+                if candidate.get("solver_tier") == 2
+            ),
+            "chosen": chosen,
+        }
 
     chosen = best["chosen"]
+    objective = sum(float(candidate.get("solver_gain", 0.0)) for candidate in chosen)
     placed_ids = {c.get("job_id") for c in chosen}
     used_final: dict[str, int] = {}
     for c in chosen:
         for key, need in _ladder_capacity_cost(c.get("ladder") or [], specs).items():
             used_final[_cap_key_str(key)] = used_final.get(_cap_key_str(key), 0) + need
-    deferred = [
-        jid
-        for jid in (j.get("job_id", j.get("id")) for j in get_pending_jobs())
-        if jid and jid not in placed_ids
-    ]
-    return {
+    deferred = [jid for jid in pending_job_order if jid and jid not in placed_ids]
+    result = {
         "chosen": chosen,
         "deferred": deferred,
-        "objective": best["objective"],
+        "objective": objective,
         "used": used_final,
         "capacity": {_cap_key_str(k): v for k, v in capacity.items()},
+        "solver_mode": solver_mode,
+        "candidate_count_before_pruning": len(original_candidates),
+        "candidate_count_after_pruning": len(candidates),
+        "combination_count": space,
+        "decision_index": decision_index,
+        "swap_budget": swap_budget,
+        "swap_count": sum(1 for candidate in chosen if candidate.get("type") == "swap"),
     }
+    write_event = getattr(getattr(_CTX, "trace_logger", None), "write_event", None)
+    if callable(write_event):
+        try:
+            write_event(
+                "placement_decision",
+                {
+                    "solver_mode": solver_mode,
+                    "decision_index": decision_index,
+                    "objective": objective,
+                    "candidate_count_before_pruning": len(original_candidates),
+                    "candidate_count_after_pruning": len(candidates),
+                    "combination_count": space,
+                    "surrogate_budget": get_surrogate_budget_status(),
+                    "chosen": [
+                        {
+                            "job_id": candidate.get("job_id"),
+                            "solver_gain": candidate.get("solver_gain"),
+                            "queue_state": candidate.get("queue_state"),
+                            "prediction_status": (candidate.get("prediction_assessment") or {}).get(
+                                "status"
+                            ),
+                            "ladder": [
+                                {
+                                    "env": rank.get("env"),
+                                    "instance_type": (rank.get("config") or {}).get(
+                                        "instance_type"
+                                    ),
+                                    "tp": (rank.get("config") or {}).get("tp"),
+                                    "n_replicas": rank.get("n_replicas"),
+                                }
+                                for rank in candidate.get("ladder") or []
+                            ],
+                        }
+                        for candidate in chosen
+                    ],
+                    "deferred": deferred,
+                },
+                tick=getattr(getattr(_CTX, "cluster_snapshot", None), "tick", None),
+            )
+        except Exception:
+            log.exception("placement decision trace failed")
+    return result
 
 
 def check_feasibility(plan) -> dict[str, Any]:
@@ -3773,6 +5756,7 @@ def check_feasibility(plan) -> dict[str, Any]:
                 ok_cfg, reason = config_runnable(
                     dict(getattr(rank, "config", {}) or {}),
                     _job_features_for(snapshot, action.job_id),
+                    gpu_type=env_gpu_type(getattr(rank, "env", None)),
                 )
                 if not ok_cfg:
                     feasible = False
@@ -3788,15 +5772,11 @@ def check_feasibility(plan) -> dict[str, Any]:
 
 
 def plan_tick() -> dict[str, Any]:
-    """Run the FULL deterministic tick pipeline and return a ready-to-commit plan.
+    """Run the full deterministic pipeline as a one-call planning recommendation.
 
-    The root's entire job is ``FINAL_VAR(plan_tick())``. This closes the weak-root
-    failure mode observed in the wild: the LLM re-runs the pipeline itself, sees the
-    (perfectly normal) negative sigmas, panics, and commits an all-defer plan even
-    though ``jointly_select_placements`` already PLACED every job feasibly. plan_tick
-    makes the serve-vs-defer call non-negotiable - the returned plan IS the joint
-    solver's decision, built straight from ``chosen``. Negative sigma is expected and
-    is NOT a defer reason; do not rebuild this plan, add defers, or re-judge sigma.
+    The root may commit this result directly or make a reasoned, feasible adjustment.
+    This shortcut must not be combined with a second execution of the same pipeline in
+    one tick. Negative sigma is expected and is not, by itself, a reason to defer.
 
     Sequence is byte-for-byte the documented MANDATORY ORDER:
       build_user_envelopes -> get_priority -> allocate_budget_book ->
@@ -3824,12 +5804,14 @@ def plan_tick() -> dict[str, Any]:
     chosen = list(joint.get("chosen", []) or [])
     deferred = list(joint.get("deferred", []) or [])
     exhausted = scored.get("exhausted", {}) or {}
+    budget_limited = scored.get("budget_limited", {}) or {}
     plan: dict[str, Any] = {
         "tick_rationale": (
             f"plan_tick: joint solver placed {len(chosen)} job(s) "
             f"(objective={joint.get('objective')}); deferred={deferred}; "
-            f"exhausted={list(exhausted.keys())}. Committed AS-IS from "
-            "jointly_select_placements - negative sigma is normal, NOT a defer reason."
+            f"candidate_exhausted={list(exhausted.keys())}; "
+            f"budget_limited={list(budget_limited.keys())}. Recommended by "
+            "jointly_select_placements; negative sigma is normal, NOT a defer reason."
         ),
         "actions": chosen,
     }

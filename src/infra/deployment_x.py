@@ -58,6 +58,10 @@ _GPU_FIELDS = (
     "pcie_bandwidth_gbps",
     "gpu_watts",
 )
+_GPU_NAME_ALIASES = {
+    "MI300": "MI300X",
+    "MI300-X": "MI300X",
+}
 _ALIASES = {
     "deadline_hrs": ("deadline_hrs", "deadline_hours"),
     "isl_token_avg": ("isl_token_avg", "input_len_tokens_avg"),
@@ -69,6 +73,8 @@ _ALIASES = {
 }
 _USER_JOB_X = {
     "model_id",
+    "type",
+    "workload_type",
     "isl_token_avg",
     "isl_token_min",
     "isl_token_max",
@@ -234,13 +240,25 @@ def _rank_deployment(
         total_replicas=total_replicas,
     )
 
+    projected_x = _project_x(x, x_fields)
+    workload_type = job_values.get("workload_type") or job_values.get("type") or job.get("kind")
+    if workload_type is not None:
+        projected_x["workload_type"] = str(workload_type).lower()
     return RankDeployment(
         job_id=job_id,
         rank_id=rank_id,
         env_label=env,
-        x=_project_x(x, x_fields),
-        v_predicted=dict(shape.get("predicted_v") or {}),
-        y_predicted=dict(shape.get("predicted_y") or {}),
+        x=projected_x,
+        v_predicted={
+            name: value
+            for name, value in dict(shape.get("predicted_v") or {}).items()
+            if value is not None
+        },
+        y_predicted={
+            name: value
+            for name, value in dict(shape.get("predicted_y") or {}).items()
+            if value is not None
+        },
         prediction_lineage=dict(shape.get("prediction_lineage") or {}) or None,
     )
 
@@ -258,9 +276,9 @@ def _rank_x(
 ) -> dict[str, Any]:
     catalog_x = _model_catalog_x(model_catalog, env[4])
     x: dict[str, Any] = {
-        **catalog_x,
-        **job_values,
-        **{key: value for key, value in shape.items() if key not in _X_SKIP},
+        **_available_x(catalog_x),
+        **_available_x(job_values),
+        **_available_x({key: value for key, value in shape.items() if key not in _X_SKIP}),
     }
     x["market"] = env[0]
     x["cloud"] = env[1]
@@ -325,7 +343,7 @@ def materialize_launch_config(catalog: dict[str, Any], gpu_type: str) -> dict[st
     return {
         key: value
         for key, value in resolved.items()
-        if key in _LAUNCH_CONFIG_FIELDS and value is not None
+        if key in _LAUNCH_CONFIG_FIELDS and not _is_missing_x_value(value)
     }
 
 
@@ -387,10 +405,12 @@ def _catalog_by_instance(catalog: dict[str, Any]) -> dict[tuple[str, str, str], 
 def _hardware_x(hardware: dict[str, Any], gpu_type: str) -> dict[str, object]:
     """Return required hardware X from one catalog instance entry."""
     gpu = _gpu(hardware, gpu_type)
-    out = {key: gpu[key] for key in _GPU_FIELDS}
+    out = {key: gpu[key] for key in _GPU_FIELDS if key in gpu and not _is_missing_x_value(gpu[key])}
     out["gpu_mem_gb"] = float(gpu["memory_mib_each"]) / 1024.0
     out["gpu_per_node"] = gpu["count"]
-    out["internode_bandwidth_gbps"] = _network_bandwidth(hardware)
+    network_bandwidth = _network_bandwidth(hardware)
+    if network_bandwidth is not None:
+        out["internode_bandwidth_gbps"] = network_bandwidth
     return out
 
 
@@ -409,12 +429,16 @@ def _gpu(hardware: dict[str, Any], gpu_type: str) -> dict[str, Any]:
 
 def _gpu_name(value: object) -> str:
     """Normalize Store and catalog GPU labels before matching them."""
-    return str(value or "").upper().replace("_", "-")
+    normalized = str(value or "").upper().replace("_", "-")
+    return _GPU_NAME_ALIASES.get(normalized, normalized)
 
 
-def _network_bandwidth(hardware: dict[str, Any]) -> float:
-    """Return required peak network bandwidth for inter-node X."""
-    return max(float(card["peak_bandwidth_gbps"]) for card in hardware["network"]["network_cards"])
+def _network_bandwidth(hardware: dict[str, Any]) -> float | None:
+    """Return peak network bandwidth when the catalog provides network cards."""
+    cards = hardware.get("network", {}).get("network_cards", [])
+    if not cards:
+        return None
+    return max(float(card["peak_bandwidth_gbps"]) for card in cards)
 
 
 def _derive_x(x: dict[str, Any]) -> None:
@@ -428,11 +452,15 @@ def _derive_x(x: dict[str, Any]) -> None:
 
 def _set_ratio(x: dict[str, Any], out: str, numerator: str, denominator: str) -> None:
     """Set a derived ratio only when both source fields are present."""
-    if numerator in x and denominator in x:
-        bottom = float(x[denominator])
-        if bottom == 0.0:
-            raise ValueError(f"cannot derive {out}: {denominator} is zero")
-        x[out] = float(x[numerator]) / bottom
+    top = x.get(numerator)
+    bottom = x.get(denominator)
+    if _is_missing_x_value(top) or _is_missing_x_value(bottom):
+        return
+    assert top is not None and bottom is not None
+    bottom = float(bottom)
+    if bottom == 0.0:
+        raise ValueError(f"cannot derive {out}: {denominator} is zero")
+    x[out] = float(top) / bottom
 
 
 def _allocate_load_x(
@@ -453,23 +481,48 @@ def _allocate_load_x(
     """
     share = _rank_traffic_share(shape, replica_count, total_replicas)
     for field in _LOAD_FIELDS:
-        if field in job_values:
-            x[field] = float(job_values[field]) * share
+        value = job_values.get(field)
+        if not _is_missing_x_value(value):
+            assert value is not None
+            x[field] = float(value) * share
 
 
 def _rank_traffic_share(shape: dict[str, Any], replica_count: int, total_replicas: int) -> float:
-    """Return rank traffic share; multi-rank jobs must declare it."""
-    if total_replicas == replica_count:
+    """Return a valid explicit rank share, or the single-rank default."""
+    lineage = shape.get("prediction_lineage")
+    partial_admission = lineage.get("partial_admission") if isinstance(lineage, dict) else None
+    if (
+        total_replicas == replica_count
+        and isinstance(partial_admission, dict)
+        and partial_admission.get("mode") == "advisory"
+        and partial_admission.get("enforced") is False
+    ):
         return 1.0
     for key in ("rank_traffic_share", "traffic_share"):
-        if key in shape:
-            return float(shape[key])
+        value = shape.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be finite and in (0, 1]")
+        share = float(value)
+        if not math.isfinite(share) or share <= 0.0 or share > 1.0:
+            raise ValueError(f"{key} must be finite and in (0, 1]")
+        return share
+    if total_replicas == replica_count:
+        return 1.0
     raise ValueError("multi-rank jobs require rank_traffic_share per rank")
 
 
 def _project_x(x: dict[str, Any], x_fields: list[str] | tuple[str, ...]) -> dict[str, object]:
-    """Keep only candidate-graph X fields with non-missing source values."""
-    missing = [key for key in x_fields if key not in x or x[key] in (None, "NA")]
-    if missing:
-        raise ValueError(f"missing deployment X fields: {missing}")
-    return {key: x[key] for key in x_fields}
+    """Keep available values from the candidate graph's X vocabulary."""
+    return {key: x[key] for key in x_fields if key in x and not _is_missing_x_value(x[key])}
+
+
+def _available_x(values: dict[str, Any]) -> dict[str, Any]:
+    """Return source values that are known rather than absent sentinels."""
+    return {key: value for key, value in values.items() if not _is_missing_x_value(value)}
+
+
+def _is_missing_x_value(value: object) -> bool:
+    """Return whether a source value represents unknown deployment X."""
+    return value is None or value == "NA"
