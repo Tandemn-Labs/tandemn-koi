@@ -1,3 +1,5 @@
+import copy
+import json
 import logging
 import math
 import os
@@ -30,6 +32,62 @@ ONLINE_MIN_REQUESTS = 20
 _AIC_FALLBACK_MODES = ("HYBRID", "EMPIRICAL", "SOL")
 _AIC_PROFILE_BACKENDS = (("vllm", "0.22.0"), ("sglang", "0.5.14"))
 _A10G_PROFILE_FALLBACK_SYSTEMS = ("l40s", "a100_sxm", "h100_sxm", "h200_sxm")
+
+# Run-lifetime memos for inputs that do not change within a run: raw AIC
+# estimates (deterministic and pre-calibration) and per-model catalog config
+# (a network fetch when AIC does not know the model).
+_AIC_ESTIMATE_CACHE: dict[str, object] = {}
+_MODEL_CONFIG_CACHE: dict[str, tuple[dict | None, str | None]] = {}
+
+
+def _stable_cache_key(value) -> str | None:
+    """Order-stable key for cache inputs, or None when they are not encodable."""
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        return None
+
+
+def _model_catalog_config(model_id: str) -> tuple[dict | None, str | None]:
+    """Return one model's architecture config and where it came from.
+
+    AIC first, then HuggingFace. A model's config is fixed for the run, so this
+    is memoized for the process - the HuggingFace path is a network fetch and was
+    otherwise repeated for every candidate of every job on every tick. Failures
+    are memoized too, so an unknown model costs one lookup rather than thousands.
+    """
+    cached = _MODEL_CONFIG_CACHE.get(model_id)
+    if cached is not None:
+        return cached
+    error: str | None = None
+    try:
+        from aiconfigurator.sdk.utils import (  # type: ignore[import-untyped]
+            get_model_config_from_model_path,
+        )
+
+        config = get_model_config_from_model_path(model_id)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    else:
+        if isinstance(config, dict):
+            _MODEL_CONFIG_CACHE[model_id] = (config, "aic")
+            return _MODEL_CONFIG_CACHE[model_id]
+
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(
+            model_id,
+            token=os.environ.get("HF_TOKEN"),
+        ).to_dict()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    else:
+        _MODEL_CONFIG_CACHE[model_id] = (config, "huggingface")
+        return _MODEL_CONFIG_CACHE[model_id]
+
+    _MODEL_CONFIG_CACHE[model_id] = (None, error)
+    return _MODEL_CONFIG_CACHE[model_id]
 _AGGREGATE_PROFILE_OVERRIDES = {
     "moonshotai/Kimi-K2-Instruct": ("moonshotai/Kimi-K2.5", "sglang", "0.5.14", "h100_sxm"),
     "deepseek-ai/DeepSeek-V3": ("deepseek-ai/DeepSeek-V3", "sglang", "0.5.14", "h200_sxm"),
@@ -900,41 +958,16 @@ class SurrogatePrediction:
         model_id = values.get("model_id")
         if not model_id:
             return values
-        errors = []
-        try:
-            from aiconfigurator.sdk.utils import (  # type: ignore[import-untyped]
-                get_model_config_from_model_path,
-            )
-
-            config = get_model_config_from_model_path(str(model_id))
-        except Exception as exc:
-            errors.append(exc)
-        else:
-            if isinstance(config, dict):
-                self.last_metadata["model_profile_enrichment"] = {"status": "success", "source": "aic"}
-                return self._with_derived_model_parameters({**config, **values})
-
-        try:
-            from transformers import AutoConfig
-
-            config = AutoConfig.from_pretrained(
-                str(model_id),
-                token=os.environ.get("HF_TOKEN"),
-            ).to_dict()
-        except Exception as exc:
-            errors.append(exc)
-        else:
+        config, source = _model_catalog_config(str(model_id))
+        if config is not None:
             self.last_metadata["model_profile_enrichment"] = {
                 "status": "success",
-                "source": "huggingface",
+                "source": source,
             }
             return self._with_derived_model_parameters({**config, **values})
-
-        error = errors[-1]
         self.last_metadata["model_profile_enrichment"] = {
             "status": "unavailable",
-            "error_type": type(error).__name__,
-            "error": str(error),
+            "error": source,
         }
         return values
 
@@ -1256,7 +1289,27 @@ class SurrogatePrediction:
     def _aic_estimate(**kwargs):
         from aiconfigurator.cli.api import cli_estimate  # type: ignore[import-untyped]
 
-        return cli_estimate(**kwargs)
+        # Direct AIC is deterministic and PRE-calibration - the composer applies
+        # calibration downstream - so an identical estimate stays valid for the
+        # whole run, unlike the per-tick prediction memo. Without this every tick
+        # re-pays the same perf-database loads, including the ones that miss.
+        key = _stable_cache_key(kwargs)
+        if key is not None:
+            cached = _AIC_ESTIMATE_CACHE.get(key)
+            if cached is not None:
+                try:
+                    return copy.deepcopy(cached)
+                except Exception:
+                    _AIC_ESTIMATE_CACHE.pop(key, None)
+        result = cli_estimate(**kwargs)
+        if key is not None:
+            # Only memoize a result we can hand out as an independent copy, so a
+            # caller mutating one estimate can never corrupt a later one.
+            try:
+                _AIC_ESTIMATE_CACHE[key] = copy.deepcopy(result)
+            except Exception:
+                pass
+        return result
 
     @staticmethod
     def _aic_only_error(exc):

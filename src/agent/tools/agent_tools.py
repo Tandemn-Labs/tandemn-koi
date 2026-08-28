@@ -4172,10 +4172,47 @@ def _applicable_mechanism_id(rank: dict[str, Any], features: dict[str, Any]) -> 
             return mid
         vals = apps.get("mechanisms") or apps.get("applicable") or []
         if vals:
-            return vals[0] if isinstance(vals[0], str) else vals[0].get("mechanism_id")
+            return _best_mechanism_id(vals)
     elif isinstance(apps, (list, tuple)) and apps:
-        return apps[0] if isinstance(apps[0], str) else apps[0].get("mechanism_id")
+        return _best_mechanism_id(apps)
     return None
+
+
+def _best_mechanism_id(briefs) -> str | None:
+    """Pick the most trustworthy applicable mechanism, not merely the first.
+
+    Registry order carries no meaning, so taking briefs[0] pinned every rank to
+    whichever mechanism happened to be registered first. That made the committed
+    mechanism constant across a run, which in turn kept EIG at zero on every
+    accepted candidate and left the exploration term in sigma inert. Rank on the
+    signals the brief already carries: exact scope match first, then confidence,
+    then visits as a tie-break so a well-evidenced mechanism outranks a fresh one.
+    """
+    def number(value: Any) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return parsed if math.isfinite(parsed) else 0.0
+
+    best_id: str | None = None
+    best_score: tuple[int, float, int] | None = None
+    for brief in briefs:
+        if isinstance(brief, str):
+            mechanism_id, quality, confidence, visits = brief, "", 0.0, 0
+        elif isinstance(brief, dict):
+            mechanism_id = brief.get("mechanism_id")
+            quality = str(brief.get("match_quality") or "")
+            confidence = number(brief.get("c"))
+            visits = int(number(brief.get("visit_count")))
+        else:
+            continue
+        if not mechanism_id:
+            continue
+        score = (1 if quality == "exact" else 0, float(confidence), visits)
+        if best_score is None or score > best_score:
+            best_id, best_score = str(mechanism_id), score
+    return best_id
 
 
 def _online_slo_targets(features: dict[str, Any]) -> dict[str, Any]:
