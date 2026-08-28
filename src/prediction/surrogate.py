@@ -36,8 +36,35 @@ _A10G_PROFILE_FALLBACK_SYSTEMS = ("l40s", "a100_sxm", "h100_sxm", "h200_sxm")
 # Run-lifetime memos for inputs that do not change within a run: raw AIC
 # estimates (deterministic and pre-calibration) and per-model catalog config
 # (a network fetch when AIC does not know the model).
+#
+# The estimate memo is BOUNDED. Its keys carry workload-derived values (isl, osl,
+# batch size), so distinct keys keep accruing over a long run, and one entry's
+# size depends on what the AIC result object carries. Reuse is concentrated
+# within a tick and across adjacent ticks - a hit from tick 2 at tick 40 is rare
+# because the candidate set has moved with capacity - so a few thousand entries
+# covers the working set while capping worst-case memory.
+# Escape hatches, both read once at import:
+#   KOI_AIC_ESTIMATE_CACHE=0        disable the estimate memo entirely
+#   KOI_AIC_ESTIMATE_CACHE_LIMIT=N  change the entry cap
+# The model-config memo is deliberately unbounded: it is keyed by model id, so it
+# cannot exceed the number of models the scenario references.
 _AIC_ESTIMATE_CACHE: dict[str, object] = {}
 _MODEL_CONFIG_CACHE: dict[str, tuple[dict | None, str | None]] = {}
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a non-negative integer setting, ignoring an unusable value."""
+    try:
+        parsed = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+_AIC_ESTIMATE_CACHE_LIMIT = _env_int("KOI_AIC_ESTIMATE_CACHE_LIMIT", 2048)
+_AIC_ESTIMATE_CACHE_ENABLED = str(
+    os.getenv("KOI_AIC_ESTIMATE_CACHE", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _stable_cache_key(value) -> str | None:
@@ -1293,7 +1320,8 @@ class SurrogatePrediction:
         # calibration downstream - so an identical estimate stays valid for the
         # whole run, unlike the per-tick prediction memo. Without this every tick
         # re-pays the same perf-database loads, including the ones that miss.
-        key = _stable_cache_key(kwargs)
+        caching = _AIC_ESTIMATE_CACHE_ENABLED and _AIC_ESTIMATE_CACHE_LIMIT > 0
+        key = _stable_cache_key(kwargs) if caching else None
         if key is not None:
             cached = _AIC_ESTIMATE_CACHE.get(key)
             if cached is not None:
@@ -1309,6 +1337,11 @@ class SurrogatePrediction:
                 _AIC_ESTIMATE_CACHE[key] = copy.deepcopy(result)
             except Exception:
                 pass
+            else:
+                # Oldest-first eviction: dicts preserve insertion order, so the
+                # first key is the oldest entry.
+                while len(_AIC_ESTIMATE_CACHE) > _AIC_ESTIMATE_CACHE_LIMIT:
+                    _AIC_ESTIMATE_CACHE.pop(next(iter(_AIC_ESTIMATE_CACHE)), None)
         return result
 
     @staticmethod
