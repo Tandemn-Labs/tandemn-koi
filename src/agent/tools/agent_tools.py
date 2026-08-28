@@ -4969,16 +4969,11 @@ def build_scored_candidates(
         if attempt_gate_applies and deployment_status == "deployment_not_materialized":
             attempts = int(job.get("deployment_attempts") or 1)
             retry_after = job.get("deployment_retry_after_tick")
-            if job.get("deployment_retry_exhausted") is True:
-                frames_by_job[jid] = []
-                ctx_by_job[jid] = (user_id, slice_id, features, retry_action_type)
-                blocked_by_job[jid] = _empty_frame_result(
-                    "deployment_retry_exhausted",
-                    "deployment retry limit reached",
-                    deployment_attempts=attempts,
-                    retry_after_tick=retry_after,
-                )
-                continue
+            # A repeatedly-failing placement retires the SHAPE, not the job: the
+            # descriptor carries attempted_deployment_identities and
+            # recent_rank_failures so a retry can pick different hardware. Emptying
+            # the frame list here removed the job from planning permanently, which
+            # left jobs unserved while the cluster still had free capacity.
             if job.get("deployment_retry_allowed") is not True:
                 frames_by_job[jid] = []
                 ctx_by_job[jid] = (user_id, slice_id, features, retry_action_type)
@@ -5644,7 +5639,12 @@ def jointly_select_placements(
             assert swap_gain_over_keep is not None
             gain = swap_gain_over_keep
         if queue_unstable:
-            gain = _WORK_CONSERVING_GAIN_FLOOR
+            # An emergency rescue keeps its real swap_gain_over_keep: floor_tier
+            # already ranks it below every stable candidate, and flattening the
+            # gain here made every rescue tie with every speculative idle fill,
+            # so the solver could not tell a good rescue from a bad one.
+            if not is_emergency_recovery:
+                gain = _WORK_CONSERVING_GAIN_FLOOR
             cand["work_conserving_floor"] = True
             cand["service_class"] = "partial" if is_emergency_recovery else "idle_capacity_fallback"
             if isinstance(assessment, dict):

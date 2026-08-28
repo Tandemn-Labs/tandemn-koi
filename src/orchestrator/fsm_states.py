@@ -959,10 +959,13 @@ class TickRunner:
                     retry_exhausted = attempt_count >= _DEPLOYMENT_MAX_ATTEMPTS
                     descriptor["deployment_retry_after_tick"] = retry_after_tick
                     descriptor["deployment_retry_exhausted"] = retry_exhausted
+                    # Exhaustion reports how many attempts a shape series has cost;
+                    # it does NOT retire the job. Retrying is paced by the backoff
+                    # alone, so a job whose placements keep failing stays plannable
+                    # against untried hardware instead of being stranded for the
+                    # rest of the run while capacity sits idle.
                     descriptor["deployment_retry_allowed"] = bool(
-                        not retry_exhausted
-                        and retry_after_tick is not None
-                        and ctx.tick >= int(retry_after_tick)
+                        retry_after_tick is not None and ctx.tick >= int(retry_after_tick)
                     )
                     descriptor["attempted_deployment_identities"] = [
                         copy.deepcopy(attempt.get("deployment_identity"))
