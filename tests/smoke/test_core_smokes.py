@@ -5,7 +5,7 @@ import numpy as np
 from sqlalchemy import text
 from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
-from src.core.evidence_service import EvidenceService
+from src.core.evidence_service import EvidenceService, inclusive_lookback_bounds
 from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import (
     Edge,
@@ -16,6 +16,8 @@ from src.core.models import (
     Node,
     Plan,
     RankSpec,
+    deployment_ladder_identity,
+    deployment_rank_identity,
 )
 from src.prediction.calibration import build_prediction_context, calibrate_prediction
 from src.validation.icp import ICPResult
@@ -62,6 +64,43 @@ def make_row(
         evidence_available_timestamp_utc=float(tick) + 0.5,
         prediction_lineage={"schema_version": 3, "composite_version": "test-v1"},
     )
+
+
+def test_deployment_identity_normalizes_store_enrichment():
+    requested = {
+        "env": ["reserved", "aws", "r1", "z1", "H100"],
+        "config": {"instance_type": "p5", "gpu_count": 8, "tp": 8, "pp": 1},
+        "n_replicas": 2,
+        "mechanism_id": "M_requested",
+    }
+    observed = {
+        "shape_json": {
+            "env": requested["env"],
+            "instance_type": "p5",
+            "count": 8,
+            "tp": 8,
+            "pp": 1,
+            "model_id": "model",
+            "engine_name": "vllm",
+            "engine_version": "newer",
+            "mechanism_id": "M_observed",
+        }
+    }
+
+    assert deployment_rank_identity(requested) == deployment_rank_identity(observed, replicas=2)
+    assert deployment_rank_identity(requested) != deployment_rank_identity(
+        {**requested, "config": {**requested["config"], "tp": 4}}
+    )
+    assert deployment_rank_identity(requested) != deployment_rank_identity(
+        {**requested, "config": {**requested["config"], "num_nodes_per_chain": 2}}
+    )
+    assert deployment_ladder_identity([requested, observed]) == deployment_ladder_identity(
+        [observed, requested]
+    )
+
+
+def test_evidence_window_counts_prior_ticks_plus_current():
+    assert inclusive_lookback_bounds(10, 5) == (5, 10)
 
 
 class CoreSmokeTests(unittest.TestCase):
@@ -142,6 +181,74 @@ class CoreSmokeTests(unittest.TestCase):
             {"actions": [{"job_id": "job_legacy", "type": "defer"}]}, tick=1
         ).actions[0]
         self.assertNotIn("admitted_tps", legacy.to_dict())
+
+    def test_plan_action_round_trips_allowed_service_classes(self):
+        for service_class in (
+            "supported",
+            "partial",
+            "exploratory",
+            "idle_capacity_fallback",
+        ):
+            with self.subTest(service_class=service_class):
+                action = Plan.from_raw(
+                    {
+                        "actions": [
+                            {
+                                "job_id": "job_service",
+                                "type": "place",
+                                "service_class": service_class,
+                            }
+                        ]
+                    },
+                    tick=1,
+                ).actions[0]
+
+                self.assertEqual(action.service_class, service_class)
+                self.assertEqual(action.to_dict()["service_class"], service_class)
+
+    def test_plan_action_rejects_unknown_service_class(self):
+        for service_class in ("best_effort", [], 1):
+            with (
+                self.subTest(service_class=service_class),
+                self.assertRaisesRegex(ValueError, "service_class must be one of"),
+            ):
+                Plan.from_raw(
+                    {
+                        "actions": [
+                            {
+                                "job_id": "job_service",
+                                "type": "place",
+                                "service_class": service_class,
+                            }
+                        ]
+                    },
+                    tick=1,
+                )
+
+    def test_keep_and_defer_do_not_require_service_class(self):
+        for action_type in ("keep", "defer"):
+            with self.subTest(action_type=action_type):
+                action = Plan.from_raw(
+                    {"actions": [{"job_id": "job_legacy", "type": action_type}]}, tick=1
+                ).actions[0]
+
+                self.assertIsNone(action.service_class)
+                self.assertNotIn("service_class", action.to_dict())
+
+    def test_non_deploying_action_rejects_service_class(self):
+        with self.assertRaisesRegex(ValueError, "valid only for place/swap"):
+            Plan.from_raw(
+                {
+                    "actions": [
+                        {
+                            "job_id": "job_keep",
+                            "type": "keep",
+                            "service_class": "supported",
+                        }
+                    ]
+                },
+                tick=1,
+            )
 
     def test_rank_rejects_nonpositive_replica_count(self):
         for replicas in (0, -1, False, 1.5):
@@ -600,6 +707,13 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertTrue(service.apply_delta_c_mechanism(mechanism_id, Quadrant.Q4)[1])
         self.assertEqual(service.get_mechanism_visit_count(mechanism_id), 1)
         self.assertEqual(service.get_mechanism_q_histogram(mechanism_id)["Q4"], 1)
+
+        service.apply_partial_divergence(mechanism_id, [edge_id], 0.5)
+        self.assertEqual(service.get_mechanism_visit_count(mechanism_id), 2)
+        self.assertAlmostEqual(registry.mechanism_metadata_table[mechanism_id].beta, 3.0)
+        self.assertEqual(service.get_mechanism_q_histogram(mechanism_id)["Q4"], 1)
+        self.assertEqual(service.get_edge_visit_count(edge_id), 2)
+        self.assertEqual(service.get_edge_q_histogram(edge_id)["Q1"], 1)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,13 @@ def _valid_place():
 
 
 class SpecialistSchemaSmokeTests(unittest.TestCase):
+    def test_prompt_defines_single_rank_specialist_contract(self):
+        prompt = SpecialistRunner._default_prompt("job_1", _slice(), {"job_id": "job_1"})
+
+        self.assertIn("Ladder ranks are simultaneous deployment components", prompt)
+        self.assertIn("return exactly one ladder rank", prompt)
+        self.assertIn("deterministic candidate builder owns alternatives and composites", prompt)
+
     def test_fallback_preserves_rejected_specialist_proposal(self):
         class LLM:
             def __init__(self, response):
@@ -195,6 +202,21 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
 
     def test_valid_canonical_place_passes(self):
         self.assertEqual(SpecialistRunner._validate(_valid_place(), "job_1", _slice()), [])
+
+    def test_place_and_swap_reject_multiple_simultaneous_ranks(self):
+        for action_type in ("place", "swap"):
+            with self.subTest(action_type=action_type):
+                result = _valid_place()
+                result["type"] = action_type
+                result["ladder"].append({**result["ladder"][0], "n_replicas": 1})
+
+                violations = SpecialistRunner._validate(result, "job_1", _slice())
+
+                self.assertIn(
+                    f"{action_type} must return exactly one ladder rank; "
+                    "ladder ranks are simultaneous deployment components",
+                    violations,
+                )
 
     def test_shorthand_ladder_fails(self):
         result = _valid_place()

@@ -50,6 +50,7 @@ MECHANISM_BETA_UPDATE = {
     "Q3": (0.00, 1.00),
     "Q4": (0.00, 1.50),
 }
+PARTIAL_DIVERGENCE_BETA = 0.5
 
 # DRO
 EPSILON_DRO_INIT = 0.15  # epsilon_DRO^(0), range [0.05, 0.30]
@@ -73,8 +74,8 @@ B_MIN = 1  # B_min
 B_MAX = 10  # B_max
 
 # Regret
-W_REGRET = 20  # W_regret, regret window (ticks)
-W_Q1 = 20  # W_q1, Q1 rate window (ticks)
+W_REGRET = 20  # Prior ticks plus the current tick (21 total after warmup).
+W_Q1 = 20  # Prior ticks plus the current tick (21 total after warmup).
 DEFAULT_Q1_STAR: float = 1.0  # default Q1 star value
 
 

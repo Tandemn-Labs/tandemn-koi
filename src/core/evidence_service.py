@@ -28,6 +28,11 @@ from tandemn_system_data.models import (  # type: ignore[import-untyped]
 DEFAULT_ROW_READ_LIMIT = 200
 
 
+def inclusive_lookback_bounds(upper_tick: int, prior_ticks: int) -> tuple[int, int]:
+    """Return the current tick plus the requested number of prior ticks."""
+    return max(0, int(upper_tick) - int(prior_ticks)), int(upper_tick)
+
+
 def _coerce_enum(value: Any, enum_cls):
     """Best-effort enum round-trip for values serialized through JSON."""
     if value is None or isinstance(value, enum_cls):
@@ -135,7 +140,9 @@ class EvidenceService:
             return rows[-int(limit) :] if int(limit) > 0 else []
         return rows
 
-    def get_rows_available_before(self, timestamp_utc: float, limit: int = 1000) -> list[EvidenceRow]:
+    def get_rows_available_before(
+        self, timestamp_utc: float, limit: int = 1000
+    ) -> list[EvidenceRow]:
         """Return bounded evidence that was available before a replay cutoff."""
         return self._convert_many(
             self._store.latest_before(
@@ -178,8 +185,8 @@ class EvidenceService:
         )
 
     def get_recently_decided(self, window: int) -> list[EvidenceRow]:
-        """Return rows in the last window ticks, regardless of Q decision state."""
-        return self._convert_many(self._store.recently_decided(self.user_id, window))
+        """Return rows from the current tick and ``window`` prior ticks."""
+        return self.get_rows_in_window(inclusive_lookback_bounds(self.current_tick(), window))
 
     def count_visits_per_edge(self, edge_id: str) -> int:
         """Return row count indexed to one edge."""
@@ -210,10 +217,10 @@ class EvidenceService:
         return self._residual_history(y_name, window, "residuals_per_y")
 
     def _residual_history(self, name: str, window: int, field: str) -> np.ndarray:
-        """Concatenate residual arrays from recent rows for one variable."""
-        cutoff = max(0, self.current_tick() - int(window))
+        """Concatenate residuals from the current tick and ``window`` prior ticks."""
+        cutoff, upper = inclusive_lookback_bounds(self.current_tick(), window)
         chunks = []
-        for row in self.get_rows_in_window((cutoff, self.current_tick())):
+        for row in self.get_rows_in_window((cutoff, upper)):
             arr = getattr(row, field, {}).get(name)
             if arr is not None and len(arr) > 0:
                 chunks.append(np.asarray(arr, dtype=float))
@@ -262,13 +269,13 @@ class EvidenceService:
     def iter_decided_per_mechanism(
         self, window: int, tick: int | None = None
     ) -> Iterator[tuple[EvidenceRow, str, object]]:
-        """Yield decided (row, mechanism_id, q_label) triples in a window.
+        """Yield decisions from the current tick and ``window`` prior ticks.
 
         A single EvidenceRow can contribute multiple triples because S2 fans
         one rank's telemetry out to every applicable mechanism.
         """
         upper = self.current_tick() if tick is None else int(tick)
-        cutoff = max(0, upper - window)
+        cutoff, upper = inclusive_lookback_bounds(upper, window)
         for row in self.get_rows_in_window((cutoff, upper)):
             for mid, q in row.q_label_per_mechanism.items():
                 if q is not None:

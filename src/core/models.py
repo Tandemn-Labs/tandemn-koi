@@ -186,6 +186,9 @@ REQUIRED_JOB_STATE = {
 KNOWN_ROLES = frozenset({"aggregate"})
 _V0_DISABLED_ROLES = frozenset({"prefill", "decode"})  # rejected until PD lands
 _ENGINE_AUTOTUNED_CONFIG_KEYS = frozenset({"max_num_seq", "max_num_batched_tokens", "block_size"})
+ALLOWED_SERVICE_CLASSES = frozenset(
+    {"supported", "partial", "exploratory", "idle_capacity_fallback"}
+)
 
 
 def _strip_engine_knobs(config) -> dict:
@@ -207,6 +210,47 @@ def _as_env_tuple(env) -> tuple | None:
     if "|" in text:
         return tuple(text.split("|"))
     return (text,)
+
+
+def deployment_rank_identity(raw, *, replicas: int | None = None) -> tuple:
+    """Return the normalized physical identity used for deployment reconciliation."""
+    outer = dict(raw or {})
+    shape = dict(outer.get("shape_json") or outer)
+    config = dict(shape.get("config") or shape)
+    env = _as_env_tuple(shape.get("env") or outer.get("target_node")) or ()
+
+    def positive_int(name: str, default: int = 1, alias: str | None = None) -> int:
+        value = config.get(name)
+        if value is None and alias is not None:
+            value = config.get(alias)
+        value = default if value is None else value
+        if isinstance(value, bool):
+            raise ValueError(f"deployment {name} must be a positive integer")
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError(f"deployment {name} must be a positive integer")
+        return parsed
+
+    replica_count = _positive_replica_count(
+        replicas if replicas is not None else shape.get("n_replicas")
+    )
+    return (
+        tuple(str(part) for part in env),
+        str(config.get("instance_type") or ""),
+        positive_int("gpu_count", alias="count"),
+        positive_int("tp"),
+        positive_int("pp"),
+        positive_int("sp"),
+        positive_int("ep"),
+        positive_int("cp"),
+        positive_int("num_nodes_per_chain"),
+        replica_count,
+    )
+
+
+def deployment_ladder_identity(ranks) -> tuple:
+    """Return an order-independent physical identity for a deployment ladder."""
+    return tuple(sorted(deployment_rank_identity(rank) for rank in ranks or []))
 
 
 def env_gpu_type(env) -> str | None:
@@ -405,6 +449,21 @@ class PlanAction:
     rehabilitation_reasons: list[str] | None = None
     keep_baseline_sigma: float | None = None
     swap_gain_over_keep: float | None = None
+    service_class: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.service_class is not None and self.type not in LADDER_ACTIONS:
+            raise ValueError(
+                f"job {self.job_id}: service_class is valid only for place/swap actions"
+            )
+        if self.service_class is not None and (
+            not isinstance(self.service_class, str)
+            or self.service_class not in ALLOWED_SERVICE_CLASSES
+        ):
+            raise ValueError(
+                f"job {self.job_id}: service_class must be one of "
+                f"{sorted(ALLOWED_SERVICE_CLASSES)}, got {self.service_class!r}"
+            )
 
     @classmethod
     def from_dict(cls, raw, job_id: str | None = None) -> "PlanAction":
@@ -447,6 +506,7 @@ class PlanAction:
             type=action_type,
             user_id=raw.get("user_id"),
             ladder=ladder,
+            service_class=raw.get("service_class"),
             target_tps=raw.get("target_tps"),
             admitted_tps=raw.get("admitted_tps"),
             achieved_tps=raw.get("achieved_tps"),
@@ -503,6 +563,7 @@ class PlanAction:
         }
         for field_name in (
             "admitted_tps",
+            "service_class",
             "achieved_tps",
             "unmet_tps",
             "meets_target",

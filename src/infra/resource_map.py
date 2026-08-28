@@ -342,6 +342,17 @@ class ResourceMapManager:
                 if aggregate is None:
                     pool["total_instances"] = total_instances
                     pool["total"] = total
+                    pool["merged_pool_count"] = 1
+                    pool["merged_pool_sources"] = [
+                        {
+                            "pool_id": pool.get("pool_id"),
+                            "fabric_id": pool.get("fabric_id", pool.get("fabric")),
+                            "fabric_type": pool.get("fabric_type"),
+                            "price_per_instance_hour": pool.get("price_per_instance_hour"),
+                            "total_instances": total_instances,
+                            "total": total,
+                        }
+                    ]
                     pools_by_instance[instance_type] = pool
                     pool_shapes[instance_type] = (kind, gpus_per_instance)
                     continue
@@ -360,6 +371,17 @@ class ResourceMapManager:
                     )
                 aggregate["total_instances"] += total_instances
                 aggregate["total"] += total
+                aggregate["merged_pool_count"] += 1
+                aggregate["merged_pool_sources"].append(
+                    {
+                        "pool_id": pool.get("pool_id"),
+                        "fabric_id": pool.get("fabric_id", pool.get("fabric")),
+                        "fabric_type": pool.get("fabric_type"),
+                        "price_per_instance_hour": pool.get("price_per_instance_hour"),
+                        "total_instances": total_instances,
+                        "total": total,
+                    }
+                )
 
             pools = []
             for instance_type, pool in pools_by_instance.items():

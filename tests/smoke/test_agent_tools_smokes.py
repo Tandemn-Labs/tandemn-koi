@@ -1557,6 +1557,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                         {
                             "job_id": "job_1",
                             "type": "place",
+                            "service_class": "supported",
                             "ladder": [
                                 {
                                     "role": "aggregate",
@@ -1575,6 +1576,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
             self.assertEqual(rank.predicted_y["p99_ttft_ms"], 10.0)
             self.assertEqual(rank.predicted_v, {"kv_cache_util": 0.4})
             self.assertEqual(rank.prediction_lineage["schema_version"], 3)
+            self.assertEqual(rank.prediction_lineage["service_class"], "supported")
             self.assertTrue(rank.prediction_lineage["deployment_id"].startswith("deploy:"))
         finally:
             for name, value in saved.items():

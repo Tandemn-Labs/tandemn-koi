@@ -79,3 +79,25 @@ def test_queue_shadow_uses_peak_arrival_rate():
     assert result["arrival_rate_rps"] == 12.0
     assert result["utilization"] == 1.2
     assert result["status"] == "unstable"
+
+
+def test_queue_shadow_reports_decode_and_tail_token_work_pressure():
+    result = estimate_queue_shadow(
+        arrival_rate_rps=2.0,
+        input_tokens_per_request=200.0,
+        input_tokens_per_request_max=800.0,
+        output_tokens_per_request=100.0,
+        output_tokens_per_request_max=300.0,
+        aggregate_capacity_tps=1000.0,
+        replicas=2,
+        affects_selection=True,
+    )
+
+    assert result["utilization"] == 0.2
+    assert result["decode_utilization"] == 0.2
+    assert result["combined_tokens_per_request"] == 300.0
+    assert result["combined_token_work_pressure"] == 0.6
+    assert result["tail_tokens_per_request"] == 1100.0
+    assert result["tail_token_work_pressure"] == 2.2
+    assert result["status"] == "stable"
+    assert result["affects_selection"] is True
