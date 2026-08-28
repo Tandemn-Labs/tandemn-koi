@@ -224,11 +224,14 @@ class StoreTelemetry:
                 if self._chain_value("throughput_token_per_sec", rows) is not None
             }
             required_health_metrics = {"throughput_token_per_sec"}
-            if rank.job_features.get("target_p99_ttft_ms") is not None:
-                required_health_metrics.add("p99_ttft_ms")
-            if rank.job_features.get("target_p99_tpot_ms") is not None:
-                required_health_metrics.add("p99_tpot_ms")
-            if str(rank.job_features.get("type") or "online").lower() == "online":
+            job_type = str(
+                rank.job_features.get("type") or rank.job_features.get("workload_type") or "online"
+            ).lower()
+            if job_type == "online":
+                if rank.job_features.get("target_p99_ttft_ms") is not None:
+                    required_health_metrics.add("p99_ttft_ms")
+                if rank.job_features.get("target_p99_tpot_ms") is not None:
+                    required_health_metrics.add("p99_tpot_ms")
                 required_health_metrics.add("depth_req_q")
             health_chain_ids = {
                 chain_id
@@ -267,6 +270,7 @@ class StoreTelemetry:
         for job in self._active_jobs(snapshot):
             job_id = str(job["job_id"])
             job_features = dict(job.get("job_features") or {})
+            job_features.setdefault("type", job.get("kind"))
             for chain in job.get("active_chains") or job.get("current_ladder") or []:
                 chain_id = chain.get("chain_id")
                 shape = dict(chain.get("shape_json") or {})

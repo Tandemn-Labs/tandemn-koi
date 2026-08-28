@@ -30,7 +30,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.config.policy import MODEL_MAX_TP, load_config_policy
+from src.config.policy import MODEL_MAX_TP, SUPPORTED_EP, load_config_policy
 from src.core.models import (
     LADDER_ACTIONS,
     REQUIRED_JOB_STATE,
@@ -383,8 +383,21 @@ class Validator:
                         f"C6 physics: job {action.job_id} rank {i} {error}" for error in rank_errors
                     )
                     continue
-                model_id = model_by_job.get(action.job_id, "")
                 tp = int(cfg["tp"])
+                pp = int(cfg["pp"])
+                assert isinstance(gpu_count, int)
+                if gpu_count != tp * pp:
+                    violations.append(
+                        f"C6 physics: job {action.job_id} rank {i} gpu_count must equal "
+                        f"tp*pp={tp * pp}, got {gpu_count}"
+                    )
+                ep = cfg.get("ep", SUPPORTED_EP)
+                if type(ep) is not int or ep != SUPPORTED_EP:
+                    violations.append(
+                        f"C6 physics: job {action.job_id} rank {i} ep must be exactly "
+                        f"{SUPPORTED_EP}, got {ep!r}"
+                    )
+                model_id = model_by_job.get(action.job_id, "")
                 gpu_type = str(rank.env[4])
                 max_tp = MODEL_MAX_TP.get(model_id)
                 if max_tp is not None and tp > max_tp:

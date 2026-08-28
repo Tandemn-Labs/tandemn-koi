@@ -55,6 +55,8 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
         self.assertIn("Ladder ranks are simultaneous deployment components", prompt)
         self.assertIn("return exactly one ladder rank", prompt)
         self.assertIn("deterministic candidate builder owns alternatives and composites", prompt)
+        self.assertIn("gpu_count must equal tp*pp exactly", prompt)
+        self.assertIn("EP is unsupported in this version; omit it", prompt)
 
     def test_fallback_preserves_rejected_specialist_proposal(self):
         class LLM:
@@ -202,6 +204,21 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
 
     def test_valid_canonical_place_passes(self):
         self.assertEqual(SpecialistRunner._validate(_valid_place(), "job_1", _slice()), [])
+
+    def test_rank_schema_rejects_engine_footprint_and_ep_mismatch(self):
+        oversized = _valid_place()
+        oversized["ladder"][0]["config"].update(gpu_count=8, tp=2, pp=1)
+        self.assertIn(
+            "ladder[0].config.gpu_count must equal tp*pp=2",
+            SpecialistRunner._validate(oversized, "job_1", _slice()),
+        )
+
+        expert_parallel = _valid_place()
+        expert_parallel["ladder"][0]["config"]["ep"] = 2
+        self.assertIn(
+            "ladder[0].config.ep must be exactly 1",
+            SpecialistRunner._validate(expert_parallel, "job_1", _slice()),
+        )
 
     def test_place_and_swap_reject_multiple_simultaneous_ranks(self):
         for action_type in ("place", "swap"):

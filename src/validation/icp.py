@@ -44,6 +44,7 @@ class ICP:
         n_b: int = 15,
         test: str = "f_test",
         n_permutations: int = 1000,
+        before_tick: int | None = None,
     ) -> ICPResult:
         """
         Definition: Test whether the surrogate's residual for edge.dst is
@@ -78,6 +79,7 @@ class ICP:
             n_b=n_b,
             test=test,
             n_permutations=n_permutations,
+            before_tick=before_tick,
         )["result"]
 
     def compute_icp_details_per_edge(
@@ -89,9 +91,12 @@ class ICP:
         n_b: int = 15,
         test: str = "f_test",
         n_permutations: int = 1000,
+        before_tick: int | None = None,
     ) -> dict:
         """Return an ICP result with the statistics needed to interpret it."""
         rows = evidence_store.get_rows_for_edge(edge.edge_id, limit=None)
+        if before_tick is not None:
+            rows = [row for row in rows if int(row.tick) < int(before_tick)]
         details = {
             "edge_id": edge.edge_id,
             "result": ICPResult.UNDECIDED,

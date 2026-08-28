@@ -298,6 +298,13 @@ class ValidationSmokeTests(unittest.TestCase):
         self.assertEqual(icp.compute_icp_per_edge(v_edge, store), ICPResult.ACCEPT)
         self.assertEqual(icp.compute_icp_per_edge(y_edge, store), ICPResult.REJECT)
 
+        rows = store.rows_by_edge[v_edge.edge_id]
+        rows[0].tick = 1
+        rows[1].tick = 2
+        rows[2].tick = 3
+        details = icp.compute_icp_details_per_edge(v_edge, store, before_tick=3)
+        self.assertEqual(details["source_row_count"], 2)
+
     def test_validator_requires_launch_critical_rank_config(self):
         result = Validator().val_plan(
             _raw_place_plan({"instance_type": "p5.48xlarge", "gpu_count": 1, "tp": 1, "pp": 1})
@@ -318,6 +325,32 @@ class ValidationSmokeTests(unittest.TestCase):
                 result = Validator().val_plan(_raw_place_plan(config))
                 self.assertFalse(result.feasible)
                 self.assertTrue(any(expected in violation for violation in result.violations))
+
+        mismatched = Validator().val_plan(
+            _raw_place_plan({"instance_type": "p5.48xlarge", "gpu_count": 8, "tp": 2, "pp": 1})
+        )
+        self.assertFalse(mismatched.feasible)
+        self.assertTrue(
+            any("gpu_count must equal tp*pp=2" in v for v in mismatched.violations),
+            mismatched.violations,
+        )
+
+        expert_parallel = Validator().val_plan(
+            _raw_place_plan(
+                {
+                    "instance_type": "p5.48xlarge",
+                    "gpu_count": 2,
+                    "tp": 2,
+                    "pp": 1,
+                    "ep": 2,
+                }
+            )
+        )
+        self.assertFalse(expert_parallel.feasible)
+        self.assertTrue(
+            any("ep must be exactly 1" in v for v in expert_parallel.violations),
+            expert_parallel.violations,
+        )
 
     def test_validator_accepts_consistent_partial_admission_without_predictions(self):
         result = Validator().val_plan(_raw_partial_plan())

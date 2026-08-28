@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from functools import cache
 
+SUPPORTED_EP = 1
+
 _POLICY_TEXT = """\
 A100-40GB:
 - BAAI/bge-reranker-v2-m3 -> fp16 TP: 1

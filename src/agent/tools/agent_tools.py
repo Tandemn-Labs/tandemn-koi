@@ -93,7 +93,7 @@ from threading import Lock
 from typing import Any
 
 from src.config.hyperparameters import GAMMA_SLO
-from src.config.policy import MODEL_MAX_TP, VALID_TP_DEGREES, load_config_policy
+from src.config.policy import MODEL_MAX_TP, SUPPORTED_EP, VALID_TP_DEGREES, load_config_policy
 from src.core.models import (
     LADDER_ACTIONS,
     SWAP_BUDGET_ACTIONS,
@@ -105,7 +105,8 @@ from src.core.models import (
     deployment_rank_identity,
     env_gpu_type,
 )
-from src.infra.deployment_x import build_rank_x
+from src.infra.deployment_x import build_rank_x, materialize_launch_config
+from src.prediction.analytic_v import target_memory_fit
 from src.prediction.composer import compact_prediction_lineage
 from src.prediction.queue_model import estimate_queue_shadow
 from src.prediction.surrogate import (
@@ -134,7 +135,6 @@ AGENT_TUNABLE_X = frozenset(
         "pp",
         "sp",
         "dp",
-        "ep",
         "cp",
         # disaggregated prefill/decode worker split
         "prefill_worker_count",
@@ -784,16 +784,18 @@ def _rank_prediction_payload(
             count = rank.gpus_per_chain()
             shape = {**config, "env": list(env), "count": count, "gpu_count": count}
             resources = resource_map.resources_summary()
+            model_catalog = resource_map.model_catalog(str(model_id))
             compiled_x = build_rank_x(
                 job_values=features,
                 shape=shape,
                 env=(str(env[0]), str(env[1]), str(env[2]), str(env[3]), str(env[4])),
                 resources=resources,
                 hardware_catalog=resource_map.hardware_catalog(),
-                model_catalog=resource_map.model_catalog(str(model_id)),
+                model_catalog=model_catalog,
                 replica_count=max(1, int(rank.n_replicas or 1)),
             )
             config.update(compiled_x)
+            config.update(materialize_launch_config(model_catalog, str(env[4])))
             allocation = _rank_allocation_summary(rank, resources)
             price = allocation.get("price_per_unit_hour")
             if price is not None:
@@ -1875,39 +1877,35 @@ def config_runnable(
 ) -> tuple[bool, str]:
     """Deterministic physical-validity pre-check for a rank config.
 
-    Enforces the HARD constraints the model/hardware impose - tp*pp must fit the
-    engine's GPU demand, and tp must divide the model's attention-head count - in
+    Enforces the HARD constraints the model/hardware impose - gpu_count must equal
+    the tp*pp engine demand, and tp must divide the model's attention-head count - in
     CODE, so an unrunnable config (e.g. tp=8 on a 28-head model) is rejected with
     a clear reason instead of being nagged about in the prompt or crashing the
     surrogate. Checks it cannot evaluate (missing catalog arch) are skipped, not
     failed - the surrogate stays the backstop for those. Returns (ok, reason).
     """
     config = config or {}
-    try:
-        tp = int(config.get("tp") or 1)
-        pp = int(config.get("pp") or 1)
-        ep = int(config.get("ep") or 1)
-    except (TypeError, ValueError):
-        return True, ""  # non-numeric parallelism - let the schema/validator handle it
-    if tp < 1 or pp < 1 or ep < 1:
-        return False, f"tp={tp}, pp={pp}, and ep={ep} must all be >= 1"
-    gpu_count = config.get("gpu_count")
-    if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and tp * pp > gpu_count:
-        return False, f"tp*pp={tp * pp} exceeds gpu_count={gpu_count} (need one GPU per shard)"
+    raw_tp = config.get("tp", 1)
+    raw_pp = config.get("pp", 1)
+    if type(raw_tp) is not int or type(raw_pp) is not int:
+        return False, f"tp and pp must be positive integers (got tp={raw_tp!r}, pp={raw_pp!r})"
+    tp = raw_tp
+    pp = raw_pp
+    if tp < 1 or pp < 1:
+        return False, f"tp={tp} and pp={pp} must both be >= 1"
+    ep = config.get("ep", SUPPORTED_EP)
+    if type(ep) is not int or ep != SUPPORTED_EP:
+        return False, f"ep must be exactly {SUPPORTED_EP} in this Koi version (got {ep!r})"
+    gpu_count = config.get("gpu_count", config.get("count"))
+    if type(gpu_count) is not int or gpu_count <= 0:
+        return False, f"gpu_count must be a positive integer (got {gpu_count!r})"
+    if gpu_count != tp * pp:
+        return False, f"gpu_count must equal tp*pp={tp * pp} (got {gpu_count})"
     heads = _model_num_heads(config, job_features)
     if heads and heads % tp != 0:
         return False, f"tp={tp} does not divide the model's {heads} attention heads (cannot shard)"
     model_id = str(config.get("model_id") or (job_features or {}).get("model_id") or "")
     hardware = str(gpu_type or config.get("gpu_type") or (job_features or {}).get("gpu_type") or "")
-    values = {**(job_features or {}), **config}
-    is_moe = bool(values.get("is_moe"))
-    if is_moe and ep > tp:
-        return False, f"MoE ep={ep} exceeds tp={tp} without a separate expert-parallel group"
-    if is_moe and tp % ep != 0:
-        return False, f"MoE ep={ep} must divide tp={tp} without a separate expert-parallel group"
-    expert_count = values.get("num_routed_experts") or values.get("num_experts")
-    if is_moe and expert_count is not None and int(expert_count) % ep != 0:
-        return False, f"MoE ep={ep} does not divide the model's {int(expert_count)} experts"
     policy = load_config_policy()
     if model_id in MODEL_MAX_TP and tp > MODEL_MAX_TP[model_id]:
         return False, f"{model_id} policy limits TP to {MODEL_MAX_TP[model_id]} (got TP={tp})"
@@ -2030,6 +2028,30 @@ def size_ladder(
         rank: RankSpec,
     ) -> tuple[dict[str, Any], dict[str, Any] | None, str]:
         payload = _rank_prediction_payload(rank, job_features)
+        memory_fit = target_memory_fit({**payload["job_features"], **payload["job_config"]})
+        if memory_fit["status"] == "physical_no_fit":
+            reason = (
+                "requested model memory no-fit: "
+                f"requires {memory_fit['required_gb']:.2f} GiB per GPU, "
+                f"capacity {memory_fit['capacity_gb']:.2f} GiB"
+            )
+            log.warning(
+                "size_ladder rejected candidate before surrogate: model=%s gpu=%s "
+                "instance=%s tp=%s pp=%s dp=%d error=%s",
+                payload["job_config"].get("model_id") or payload["job_features"].get("model_id"),
+                payload["job_features"].get("gpu_type") or payload["job_config"].get("gpu_type"),
+                rank.config.get("instance_type"),
+                rank.config.get("tp"),
+                rank.config.get("pp"),
+                rank.n_replicas,
+                reason,
+            )
+            physical_rejections.append(reason)
+            return (
+                {},
+                {"kind": "hard", "status": "physical_no_fit", "reason": reason},
+                "aic_direct_point",
+            )
         try:
             prediction = _predict_outcome_core(
                 payload["job_config"],
@@ -2796,6 +2818,18 @@ def _predict_outcome_core(
     compatible with older callers but is canonicalized to Direct AIC.
     """
     _require("candidate_graph", "dro", "surrogate")
+    ep = job_config.get("ep", SUPPORTED_EP)
+    if type(ep) is not int or ep != SUPPORTED_EP:
+        raise SurrogateUnsupportedConfig(
+            f"ep must be exactly {SUPPORTED_EP} in this Koi version (got {ep!r})"
+        )
+    memory_fit = target_memory_fit({**job_features, **job_config})
+    if memory_fit["status"] == "physical_no_fit":
+        raise SurrogateMemoryNoFit(
+            "requested model memory no-fit: "
+            f"requires {float(memory_fit['required_gb']):.2f} GiB per GPU, "
+            f"capacity {float(memory_fit['capacity_gb']):.2f} GiB"
+        )
     global _surrogate_budget_rejections, _surrogate_cache_hits, _surrogate_calls
     global _surrogate_finalization_calls, _surrogate_stress_calls
     selected_method = _AIC_DIRECT_METHOD
@@ -3836,8 +3870,10 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
                 UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * severity
             )
             sigma_i += rehabilitation_credit
-        if isinstance(assessment, dict) and assessment.get("selection_mode") == "work_conserving":
-            action.service_class = "idle_capacity_fallback"
+        selection_mode = assessment.get("selection_mode") if isinstance(assessment, dict) else None
+        if selection_mode in {"work_conserving", "emergency_recovery"}:
+            if selection_mode == "work_conserving":
+                action.service_class = "idle_capacity_fallback"
             fraction = served_fraction_by_job.get(job_id, 0.0)
             avoided_penalty = (
                 UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * fraction
@@ -4181,11 +4217,11 @@ def _rank_shape_key(rank: dict[str, Any]) -> tuple:
         cfg.get("instance_type"),
         cfg.get("tp"),
         cfg.get("pp"),
-        cfg.get("sp"),
-        cfg.get("ep"),
-        cfg.get("cp"),
+        cfg.get("sp", 1),
+        cfg.get("ep", SUPPORTED_EP),
+        cfg.get("cp", 1),
         cfg.get("gpu_count"),
-        cfg.get("num_nodes_per_chain"),
+        cfg.get("num_nodes_per_chain", 1),
         cfg.get("interconnect_type"),
         rank.get("n_replicas", 1),
         rank.get("rank_traffic_share"),
@@ -4330,7 +4366,12 @@ def _score_one_frame(
         current_throughput = observed.get("throughput_token_per_sec")
         current_ttft = observed.get("p99_ttft_ms")
         current_tpot = observed.get("p99_tpot_ms")
-        capacity_reasons = {"zero_throughput", "throughput_shortfall", "queue_growing"}
+        capacity_reasons = {
+            "zero_throughput",
+            "throughput_shortfall",
+            "queue_growing",
+            "queue_critical",
+        }
         needs_capacity_repair = bool(reasons & capacity_reasons)
         capacity_acceptable = (
             predicted_capacity >= target_tps
@@ -5206,10 +5247,22 @@ def jointly_select_placements(
         value = float(raw_value)
         return value if math.isfinite(value) else float("-inf")
 
+    def emergency_recovery(candidate: dict[str, Any]) -> bool:
+        return (
+            str(candidate.get("type") or "").lower() == "swap"
+            and candidate.get("rehabilitation_status") == "critical"
+            and bool(
+                set(candidate.get("rehabilitation_reasons") or [])
+                & {"zero_throughput", "queue_critical"}
+            )
+        )
+
     eligible_candidates = []
     for candidate in original_candidates:
-        if str(candidate.get("type") or "").lower() == "swap" and (
-            candidate.get("queue_state") == "unstable" or selection_score(candidate) <= 0
+        is_swap = str(candidate.get("type") or "").lower() == "swap"
+        if is_swap and (
+            selection_score(candidate) <= 0
+            or (candidate.get("queue_state") == "unstable" and not emergency_recovery(candidate))
         ):
             continue
         eligible_candidates.append(candidate)
@@ -5417,7 +5470,12 @@ def jointly_select_placements(
         )
         is_swap = str(cand.get("type") or "").lower() == "swap"
         swap_gain_over_keep = finite_number(cand.get("swap_gain_over_keep"))
-        if is_swap and (queue_unstable or swap_gain_over_keep is None or swap_gain_over_keep <= 0):
+        is_emergency_recovery = emergency_recovery(cand)
+        if is_swap and (
+            (queue_unstable and not is_emergency_recovery)
+            or swap_gain_over_keep is None
+            or swap_gain_over_keep <= 0
+        ):
             continue
         if is_swap:
             assert swap_gain_over_keep is not None
@@ -5425,9 +5483,11 @@ def jointly_select_placements(
         if queue_unstable:
             gain = _WORK_CONSERVING_GAIN_FLOOR
             cand["work_conserving_floor"] = True
-            cand["service_class"] = "idle_capacity_fallback"
+            cand["service_class"] = "partial" if is_emergency_recovery else "idle_capacity_fallback"
             if isinstance(assessment, dict):
-                assessment["selection_mode"] = "work_conserving"
+                assessment["selection_mode"] = (
+                    "emergency_recovery" if is_emergency_recovery else "work_conserving"
+                )
         elif gain <= 0:
             if not exploratory and not point_capacity_candidate:
                 continue

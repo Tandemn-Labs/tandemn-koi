@@ -337,7 +337,8 @@ def build_operation_signature(
     dtype_bytes = _dtype_bytes(model.weight_dtype)
     nonexpert_parameters, expert_parameters = _parameter_components(model)
     dense_shards = max(1, topology.tp * topology.pp)
-    expert_shards = max(1, topology.ep * topology.pp)
+    expert_parallel_width = topology.ep if topology.ep > 1 else topology.tp
+    expert_shards = max(1, expert_parallel_width * topology.pp)
     weight_parameters_per_gpu = nonexpert_parameters / dense_shards
     weight_parameters_per_gpu += expert_parameters / expert_shards
     active_expert_parameters = expert_parameters
@@ -415,8 +416,10 @@ def rank_profiles(
         requested_signature = build_operation_signature(
             completed_model, requested.workload, requested.topology
         )
-        if require_weight_fit and requested.gpu.memory_gb is not None and requested_signature.weight_bytes_per_gpu > (
-            requested.gpu.memory_gb * (1 << 30)
+        if (
+            require_weight_fit
+            and requested.gpu.memory_gb is not None
+            and requested_signature.weight_bytes_per_gpu > (requested.gpu.memory_gb * (1 << 30))
         ):
             continue
         proxy_signature = build_operation_signature(

@@ -428,6 +428,47 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         materialize.assert_called_once()
         self.assertEqual(plan.actions[0].type, ActionType.PLACE)
 
+    def test_placement_floor_restores_unexplained_active_swap(self):
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        harness._current_tick = 8
+        plan = Plan(
+            tick=8,
+            actions=[PlanAction(job_id="job_1", type=ActionType.KEEP)],
+        )
+        swap = {
+            "job_id": "job_1",
+            "type": "swap",
+            "ladder": [
+                {
+                    "role": "aggregate",
+                    "env": ["reserved", "aws", "r1", "z1", "H100"],
+                    "config": {
+                        "instance_type": "p5",
+                        "gpu_count": 1,
+                        "tp": 1,
+                        "pp": 1,
+                    },
+                    "n_replicas": 1,
+                    "mechanism_id": "M_test",
+                }
+            ],
+        }
+        recommendation = {"chosen": [swap]}
+
+        with (
+            patch.object(harness, "_materialize_launch_configs"),
+            patch.object(harness, "_validate_ladder") as validate,
+        ):
+            harness._apply_placement_floor(
+                plan,
+                {"job_1": "running"},
+                recommendation,
+                object(),
+            )
+
+        self.assertEqual(plan.actions[0].type, ActionType.SWAP)
+        self.assertEqual(validate.call_args.kwargs["trusted_candidate"], swap)
+
     def test_cli_defaults_environment_validation_and_build_wiring(self):
         with patch.dict(os.environ, {}, clear=True):
             defaults = runner.parse_args([])
@@ -537,7 +578,7 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertIn("idle_capacity_fallback", prompt)
         self.assertIn("Do not add service_class to keep/defer", prompt)
         self.assertIn("Optional point-estimate accounting", prompt)
-        self.assertIn("include an explicit DEFER action", prompt)
+        self.assertIn("include an explicit DEFER (for PLACE) or KEEP (for SWAP)", prompt)
         self.assertNotIn("solver owns the pick", prompt)
         self.assertNotIn("FINAL_VAR(plan_tick())", prompt)
         self.assertNotIn("fairness, churn", prompt)
@@ -550,6 +591,9 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         self.assertNotIn("predicted_y", specialist_prompt)
         self.assertNotIn("predicted_sigma", specialist_prompt)
         self.assertIn("placement_policy is a hard baseline constraint", specialist_prompt)
+        self.assertIn("gpu_count must equal tp*pp exactly", specialist_prompt)
+        self.assertIn("EP is unsupported in this version; omit it", specialist_prompt)
+        self.assertIn("gpu_count MUST equal tp*pp", prompt)
         for field in (
             "achieved_tps",
             "unmet_tps",
