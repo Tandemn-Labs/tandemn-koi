@@ -152,11 +152,18 @@ def _weight_bytes_per_param(values: dict) -> float | None:
 
 def _kv_bytes_per_elem(values: dict) -> float | None:
     dtype = _get(values, "kvcache_dtype", "kvcache_quantization")
+    if dtype is not None and str(dtype).lower() == "auto":
+        dtype = _get(values, "activation_dtype", "weight_dtype")
     return _DTYPE_BYTES.get(str(dtype).lower()) if dtype is not None else None
 
 
 def _weight_shards(values: dict) -> int:
-    return max(1, int(_get(values, "tp") or 1) * int(_get(values, "pp") or 1))
+    tp = int(_get(values, "tp") or 1)
+    pp = int(_get(values, "pp") or 1)
+    if values.get("is_moe") is True:
+        ep = int(_get(values, "ep") or 1)
+        return max(1, min(tp, ep) * pp)
+    return max(1, tp * pp)
 
 
 def _kv_shards(values: dict) -> int | None:

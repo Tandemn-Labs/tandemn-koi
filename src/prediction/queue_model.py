@@ -10,18 +10,22 @@ def estimate_queue_shadow(
     output_tokens_per_request: Any,
     aggregate_capacity_tps: Any,
     replicas: Any,
+    input_tokens_per_request: Any = 0.0,
+    input_tokens_per_request_max: Any = None,
+    output_tokens_per_request_max: Any = None,
     base_ttft_ms: Any = None,
     homogeneous: bool = True,
     scenario: str = "mean",
     peak_to_mean_ratio: Any = 1.0,
+    affects_selection: bool = False,
 ) -> dict[str, Any]:
-    """Return an uncalibrated Erlang-C estimate without making admission decisions."""
+    """Return an uncalibrated Erlang-C estimate with conservative token-work pressure."""
     result: dict[str, Any] = {
-        "model": "erlang_c_v1",
+        "model": "erlang_c_token_work_v2",
         "mode": "shadow",
         "status": "unmodeled",
         "confidence": "uncalibrated",
-        "affects_selection": False,
+        "affects_selection": bool(affects_selection),
         "scenario": scenario,
     }
     if scenario not in {"mean", "peak"}:
@@ -32,7 +36,18 @@ def estimate_queue_shadow(
         return result
     try:
         arrival = float(arrival_rate_rps)
+        input_tokens = float(input_tokens_per_request or 0.0)
         output_tokens = float(output_tokens_per_request)
+        input_tokens_max = (
+            input_tokens
+            if input_tokens_per_request_max is None
+            else float(input_tokens_per_request_max)
+        )
+        output_tokens_max = (
+            output_tokens
+            if output_tokens_per_request_max is None
+            else float(output_tokens_per_request_max)
+        )
         capacity_tps = float(aggregate_capacity_tps)
         if isinstance(replicas, bool):
             raise ValueError
@@ -45,9 +60,22 @@ def estimate_queue_shadow(
         result["reason"] = "arrival rate, output length, capacity, and replicas are required"
         return result
     if (
-        not all(math.isfinite(value) for value in (arrival, output_tokens, capacity_tps))
+        not all(
+            math.isfinite(value)
+            for value in (
+                arrival,
+                input_tokens,
+                output_tokens,
+                input_tokens_max,
+                output_tokens_max,
+                capacity_tps,
+            )
+        )
         or arrival < 0
+        or input_tokens < 0
         or output_tokens <= 0
+        or input_tokens_max < 0
+        or output_tokens_max <= 0
         or capacity_tps <= 0
         or servers < 1
         or servers > 4096
@@ -63,22 +91,40 @@ def estimate_queue_shadow(
         result["reason"] = "scenario-adjusted arrival rate is not finite"
         return result
     total_service_rps = capacity_tps / output_tokens
+    combined_tokens = input_tokens + output_tokens
+    tail_tokens = max(input_tokens, input_tokens_max) + max(output_tokens, output_tokens_max)
+    combined_service_rate_rps = capacity_tps / combined_tokens
     service_rate_per_replica = total_service_rps / servers
     if not all(
         math.isfinite(value) and value > 0
-        for value in (total_service_rps, service_rate_per_replica)
+        for value in (total_service_rps, combined_service_rate_rps, service_rate_per_replica)
     ):
         result["reason"] = "derived service rate is not finite and positive"
         return result
-    utilization = arrival / total_service_rps
-    if not math.isfinite(utilization):
-        result["reason"] = "derived utilization is not finite"
+    decode_utilization = arrival / total_service_rps
+    combined_token_work_pressure = arrival * combined_tokens / capacity_tps
+    tail_token_work_pressure = arrival * tail_tokens / capacity_tps
+    if not all(
+        math.isfinite(value)
+        for value in (
+            decode_utilization,
+            combined_token_work_pressure,
+            tail_token_work_pressure,
+        )
+    ):
+        result["reason"] = "derived utilization or token-work pressure is not finite"
         return result
     result.update(
         arrival_rate_rps=arrival,
         service_rate_rps=total_service_rps,
+        combined_service_rate_rps=combined_service_rate_rps,
         replicas=servers,
-        utilization=utilization,
+        utilization=decode_utilization,
+        decode_utilization=decode_utilization,
+        combined_tokens_per_request=combined_tokens,
+        combined_token_work_pressure=combined_token_work_pressure,
+        tail_tokens_per_request=tail_tokens,
+        tail_token_work_pressure=tail_token_work_pressure,
     )
     if arrival == 0:
         try:
@@ -94,7 +140,7 @@ def estimate_queue_shadow(
             ),
         )
         return result
-    if utilization >= 1.0:
+    if decode_utilization >= 1.0:
         result.update(
             status="unstable",
             queue_wait_p99_ms=None,
@@ -107,7 +153,7 @@ def estimate_queue_shadow(
     erlang_b = 1.0
     for n in range(1, servers + 1):
         erlang_b = offered_load * erlang_b / (n + offered_load * erlang_b)
-    probability_wait = erlang_b / (1.0 - utilization + utilization * erlang_b)
+    probability_wait = erlang_b / (1.0 - decode_utilization + decode_utilization * erlang_b)
     queue_wait_p99_s = (
         math.log(probability_wait / 0.01) / (total_service_rps - arrival)
         if probability_wait > 0.01

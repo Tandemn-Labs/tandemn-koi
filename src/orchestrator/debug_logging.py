@@ -180,6 +180,7 @@ def _plan_summary(plan: Any) -> dict[str, Any] | None:
                 "job_id": getattr(action, "job_id", None),
                 "type": getattr(action_type, "value", action_type),
                 "rank_count": len(ladder),
+                "service_class": getattr(action, "service_class", None),
                 "rationale": getattr(action, "rationale", None),
             }
         )

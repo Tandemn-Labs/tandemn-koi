@@ -101,6 +101,8 @@ from src.core.models import (
     Plan,
     PlanAction,
     RankSpec,
+    deployment_ladder_identity,
+    deployment_rank_identity,
     env_gpu_type,
 )
 from src.infra.deployment_x import build_rank_x
@@ -1884,10 +1886,11 @@ def config_runnable(
     try:
         tp = int(config.get("tp") or 1)
         pp = int(config.get("pp") or 1)
+        ep = int(config.get("ep") or 1)
     except (TypeError, ValueError):
         return True, ""  # non-numeric parallelism - let the schema/validator handle it
-    if tp < 1 or pp < 1:
-        return False, f"tp={tp} and pp={pp} must both be >= 1"
+    if tp < 1 or pp < 1 or ep < 1:
+        return False, f"tp={tp}, pp={pp}, and ep={ep} must all be >= 1"
     gpu_count = config.get("gpu_count")
     if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and tp * pp > gpu_count:
         return False, f"tp*pp={tp * pp} exceeds gpu_count={gpu_count} (need one GPU per shard)"
@@ -1896,6 +1899,15 @@ def config_runnable(
         return False, f"tp={tp} does not divide the model's {heads} attention heads (cannot shard)"
     model_id = str(config.get("model_id") or (job_features or {}).get("model_id") or "")
     hardware = str(gpu_type or config.get("gpu_type") or (job_features or {}).get("gpu_type") or "")
+    values = {**(job_features or {}), **config}
+    is_moe = bool(values.get("is_moe"))
+    if is_moe and ep > tp:
+        return False, f"MoE ep={ep} exceeds tp={tp} without a separate expert-parallel group"
+    if is_moe and tp % ep != 0:
+        return False, f"MoE ep={ep} must divide tp={tp} without a separate expert-parallel group"
+    expert_count = values.get("num_routed_experts") or values.get("num_experts")
+    if is_moe and expert_count is not None and int(expert_count) % ep != 0:
+        return False, f"MoE ep={ep} does not divide the model's {int(expert_count)} experts"
     policy = load_config_policy()
     if model_id in MODEL_MAX_TP and tp > MODEL_MAX_TP[model_id]:
         return False, f"{model_id} policy limits TP to {MODEL_MAX_TP[model_id]} (got TP={tp})"
@@ -2575,7 +2587,7 @@ def get_similar_deployments(
     store = _CTX.evidence_store
 
     if hasattr(store, "retrieve_similar_rows"):
-        rows = store.retrieve_similar_rows(job_features, top_k=int(top_k))
+        rows = store.retrieve_similar_rows(job_features, top_k=max(int(top_k) * 4, int(top_k)))
     else:
         current = store.current_tick()
         rows = store.get_rows_in_window((max(0, current - 50), current))
@@ -2592,6 +2604,16 @@ def get_similar_deployments(
                     or str(r.X.get("type") or r.X.get("workload_type")).lower() == wanted_type
                 )
             ]
+        rows = rows[-int(top_k) :]
+
+    wanted_type = job_features.get("workload_type") or job_features.get("type")
+    if wanted_type is not None:
+        wanted_type = str(wanted_type).lower()
+        rows = [
+            row
+            for row in rows
+            if str(row.X.get("workload_type") or row.X.get("type") or "").lower() == wanted_type
+        ]
         rows = rows[-int(top_k) :]
 
     return [
@@ -3011,12 +3033,23 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
                 or _DIRECT_PREDICTION_SEMANTICS
             )
             lineage["prediction_assessment"] = copy.deepcopy(action.prediction_assessment or {})
+            if action.service_class is not None:
+                lineage["service_class"] = action.service_class
             if _job_mode(job_features) == "online":
                 try:
                     lineage["queue_shadow"] = estimate_queue_shadow(
                         arrival_rate_rps=_feature_value(job_features, "request_arrival_rate"),
+                        input_tokens_per_request=_feature_value(
+                            job_features, "isl_token_avg", "input_len_tokens_avg"
+                        ),
+                        input_tokens_per_request_max=_feature_value(
+                            job_features, "isl_token_max", "input_len_tokens_max"
+                        ),
                         output_tokens_per_request=_feature_value(
                             job_features, "osl_token_avg", "output_len_tokens_avg"
+                        ),
+                        output_tokens_per_request_max=_feature_value(
+                            job_features, "osl_token_max", "output_len_tokens_max"
                         ),
                         aggregate_capacity_tps=rank.predicted_y.get("throughput_token_per_sec"),
                         replicas=rank.n_replicas,
@@ -3025,13 +3058,14 @@ def stamp_plan_predictions(plan, cluster_snapshot=None):
                         scenario="peak",
                         peak_to_mean_ratio=_feature_value(job_features, "peak_to_mean_ratio")
                         or 1.0,
+                        affects_selection=False,
                     )
                     stamped_queue_states.append(
                         str(lineage["queue_shadow"].get("status") or "unmodeled")
                     )
                 except Exception as exc:
                     lineage["queue_shadow"] = {
-                        "model": "erlang_c_v1",
+                        "model": "erlang_c_token_work_v2",
                         "mode": "shadow",
                         "status": "unmodeled",
                         "reason": f"queue shadow failed: {exc}",
@@ -3593,6 +3627,43 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
                         reason="Direct point prediction recovered during commit scoring",
                     )
                     exploratory = False
+                    if action.service_class != "idle_capacity_fallback":
+                        recovered_capacity = max(0.0, float(y_hat.get(_THROUGHPUT_OBJ) or 0.0))
+                        recovered_achieved = min(recovered_target, recovered_capacity)
+                        recovered_latency_ok = all(
+                            target is None
+                            or (
+                                y_hat.get(metric) is not None
+                                and float(y_hat[metric]) <= float(target)
+                            )
+                            for metric, target in (
+                                (
+                                    "p99_ttft_ms",
+                                    _feature_value(
+                                        job_features,
+                                        "target_p99_ttft_ms",
+                                        "target_p99_TTFT_ms",
+                                    ),
+                                ),
+                                (
+                                    "p99_tpot_ms",
+                                    _feature_value(
+                                        job_features,
+                                        "target_p99_tpot_ms",
+                                        "target_p99_TPOT_ms",
+                                    ),
+                                ),
+                            )
+                        )
+                        action.achieved_tps = recovered_achieved
+                        action.unmet_tps = max(0.0, recovered_target - recovered_achieved)
+                        action.served_fraction = min(1.0, recovered_capacity / recovered_target)
+                        action.point_capacity_covers_target = recovered_capacity >= recovered_target
+                        action.base_latency_within_target = recovered_latency_ok
+                        action.meets_target = bool(
+                            action.point_capacity_covers_target and recovered_latency_ok
+                        )
+                        action.service_class = "supported" if action.meets_target else "partial"
         if exploratory or (not y_hat and isinstance(assessment, dict)):
             assessment_dict = assessment if isinstance(assessment, dict) else {}
             if not exploratory:
@@ -3608,6 +3679,8 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
             action.meets_target = None
             action.served_fraction = None
             action.admission_mode = None
+            if action.service_class != "idle_capacity_fallback":
+                action.service_class = "exploratory"
             for rank in action.ladder:
                 rank.rank_traffic_share = None
             served_fraction_by_job[job_id] = 0.0
@@ -3764,6 +3837,7 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
             )
             sigma_i += rehabilitation_credit
         if isinstance(assessment, dict) and assessment.get("selection_mode") == "work_conserving":
+            action.service_class = "idle_capacity_fallback"
             fraction = served_fraction_by_job.get(job_id, 0.0)
             avoided_penalty = (
                 UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * fraction
@@ -3779,8 +3853,8 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
             "opt_bonus": opt_bonus,
             "value_bonus": value_bonus,
             "rehabilitation_credit": rehabilitation_credit,
-            "keep_baseline_sigma": -rehabilitation_credit,
-            "swap_gain_over_keep": model_sigma + rehabilitation_credit,
+            "keep_baseline_sigma": 0.0,
+            "swap_gain_over_keep": sigma_i,
             "model_sigma": model_sigma,
             "sigma": sigma_i,
         }
@@ -3980,6 +4054,7 @@ def _prediction_assessment(sized: dict[str, Any], features: dict[str, Any]) -> d
     semantics = dict(sized.get("prediction_semantics") or _DIRECT_PREDICTION_SEMANTICS)
     queue_state = "not_applicable" if _job_mode(features) != "online" else "unmodeled"
     queue_utilization = None
+    queue_affects_selection = False
     if _job_mode(features) == "online" and status == "success":
         per_rank = [
             rank for rank in (sized.get("per_rank") or []) if int(rank.get("n_replicas") or 0) > 0
@@ -3987,8 +4062,17 @@ def _prediction_assessment(sized: dict[str, Any], features: dict[str, Any]) -> d
         try:
             shadow = estimate_queue_shadow(
                 arrival_rate_rps=_feature_value(features, "request_arrival_rate"),
+                input_tokens_per_request=_feature_value(
+                    features, "isl_token_avg", "input_len_tokens_avg"
+                ),
+                input_tokens_per_request_max=_feature_value(
+                    features, "isl_token_max", "input_len_tokens_max"
+                ),
                 output_tokens_per_request=_feature_value(
                     features, "osl_token_avg", "output_len_tokens_avg"
+                ),
+                output_tokens_per_request_max=_feature_value(
+                    features, "osl_token_max", "output_len_tokens_max"
                 ),
                 aggregate_capacity_tps=sized.get("point_capacity_tps"),
                 replicas=sum(int(rank.get("n_replicas") or 0) for rank in per_rank),
@@ -4003,11 +4087,20 @@ def _prediction_assessment(sized: dict[str, Any], features: dict[str, Any]) -> d
                 homogeneous=len(per_rank) == 1,
                 scenario="peak",
                 peak_to_mean_ratio=_feature_value(features, "peak_to_mean_ratio") or 1.0,
+                affects_selection=True,
             )
             queue_state = str(shadow.get("status") or "unmodeled")
             queue_utilization = shadow.get("utilization")
+            queue_token_work_pressure = shadow.get("combined_token_work_pressure")
+            queue_tail_token_work_pressure = shadow.get("tail_token_work_pressure")
+            queue_affects_selection = bool(shadow.get("affects_selection"))
         except Exception:
             queue_state = "unmodeled"
+            queue_token_work_pressure = None
+            queue_tail_token_work_pressure = None
+    else:
+        queue_token_work_pressure = None
+        queue_tail_token_work_pressure = None
     return {
         **semantics,
         "kind": "exploratory" if status in _SOFT_PREDICTION_FAILURES else "point",
@@ -4018,6 +4111,9 @@ def _prediction_assessment(sized: dict[str, Any], features: dict[str, Any]) -> d
         "base_latency_within_target": sized.get("base_latency_within_target"),
         "queue_state": queue_state,
         "queue_utilization": queue_utilization,
+        "queue_token_work_pressure": queue_token_work_pressure,
+        "queue_tail_token_work_pressure": queue_tail_token_work_pressure,
+        "queue_affects_selection": queue_affects_selection,
     }
 
 
@@ -4098,19 +4194,7 @@ def _rank_shape_key(rank: dict[str, Any]) -> tuple:
 
 
 def _deployment_shape_key(raw: dict[str, Any], replicas: int | None = None) -> tuple:
-    shape = dict(raw.get("shape_json") or raw)
-    cfg = dict(shape.get("config") or shape)
-    return (
-        tuple(shape.get("env") or []),
-        cfg.get("instance_type"),
-        cfg.get("tp"),
-        cfg.get("pp"),
-        cfg.get("sp"),
-        cfg.get("ep"),
-        cfg.get("cp"),
-        cfg.get("num_nodes_per_chain"),
-        int(replicas if replicas is not None else shape.get("n_replicas") or 1),
-    )
+    return deployment_rank_identity(raw, replicas=replicas)
 
 
 def _candidate_budget_errors(jid: str, action: dict[str, Any]) -> list[str]:
@@ -4243,14 +4327,21 @@ def _score_one_frame(
             default=None,
         )
         predicted_capacity = float(sized.get("point_capacity_tps") or 0.0)
-        current_capacity = observed.get("current_point_capacity_tps")
-        current_ttft = observed.get("current_base_p99_ttft_ms")
-        current_tpot = observed.get("current_base_p99_tpot_ms")
+        current_throughput = observed.get("throughput_token_per_sec")
+        current_ttft = observed.get("p99_ttft_ms")
+        current_tpot = observed.get("p99_tpot_ms")
+        capacity_reasons = {"zero_throughput", "throughput_shortfall", "queue_growing"}
+        needs_capacity_repair = bool(reasons & capacity_reasons)
+        capacity_acceptable = (
+            predicted_capacity >= target_tps
+            if target_tps > 0
+            else current_throughput is not None and predicted_capacity >= float(current_throughput)
+        )
         baseline_available = any(
-            value is not None for value in (current_capacity, current_ttft, current_tpot)
+            value is not None for value in (current_throughput, current_ttft, current_tpot)
         )
         not_worse = (
-            (current_capacity is None or predicted_capacity >= float(current_capacity))
+            capacity_acceptable
             and (
                 current_ttft is None
                 or (predicted_ttft is not None and predicted_ttft <= float(current_ttft))
@@ -4273,11 +4364,7 @@ def _score_one_frame(
                 and current_tpot is not None
                 and predicted_tpot < 0.9 * float(current_tpot)
             )
-            or (
-                bool(reasons & {"zero_throughput", "throughput_shortfall", "queue_growing"})
-                and current_capacity is not None
-                and predicted_capacity > float(current_capacity) * 1.1
-            )
+            or (needs_capacity_repair and capacity_acceptable)
         )
         if reasons and (not baseline_available or not improves or not not_worse):
             diag.update(
@@ -4307,6 +4394,13 @@ def _score_one_frame(
         "base_latency_within_target": sized.get("base_latency_within_target"),
         "queue_state": assessment.get("queue_state"),
         "queue_slo_verified": False,
+        "service_class": (
+            "exploratory"
+            if exploratory
+            else "supported"
+            if meets and not slo_risk and assessment.get("queue_state") != "unstable"
+            else "partial"
+        ),
         **_online_slo_targets(features),
         "rationale": f"Deterministic {gpu_type} candidate ({service_label}).",
     }
@@ -4328,10 +4422,6 @@ def _score_one_frame(
         if budget_errors:
             diag.update(status="resource_budget", reason="; ".join(budget_errors)[:200])
             return {"candidate": None, "meets_target": meets, "diag": diag}
-        feas = check_feasibility(one)
-        if not feas.get("feasible"):
-            diag.update(status="infeasible", reason="; ".join(feas.get("violations", []))[:200])
-            return {"candidate": None, "meets_target": meets, "diag": diag}
         if exploratory:
             score = {
                 "sigma": 0.0,
@@ -4344,6 +4434,10 @@ def _score_one_frame(
         if action_type == "swap":
             act["keep_baseline_sigma"] = score.get("keep_baseline_sigma")
             act["swap_gain_over_keep"] = score.get("swap_gain_over_keep")
+        feas = check_feasibility(one)
+        if not feas.get("feasible"):
+            diag.update(status="infeasible", reason="; ".join(feas.get("violations", []))[:200])
+            return {"candidate": None, "meets_target": meets, "diag": diag}
     except SurrogateBudgetExceeded as exc:
         diag.update(status="budget_exhausted", reason=str(exc))
         return {"candidate": None, "meets_target": meets, "diag": diag}
@@ -4494,6 +4588,7 @@ def _score_composite(
         "base_latency_within_target": sized.get("base_latency_within_target"),
         "queue_state": assessment.get("queue_state"),
         "queue_slo_verified": False,
+        "service_class": "supported" if meets and not slo_risk else "partial",
         **_online_slo_targets(features),
         "rationale": f"Deterministic composite candidate ({label}) ({service_state}).",
     }
@@ -4553,6 +4648,26 @@ def _budget_skipped_frame(rank: dict[str, Any]) -> dict[str, Any]:
             "achieved_tps": None,
             "target_tps": None,
             "sigma": None,
+        },
+    }
+
+
+def _empty_frame_result(status: str, reason: str, **details: Any) -> dict[str, Any]:
+    """Return a typed diagnostic for a job intentionally given no frames."""
+    return {
+        "candidate": None,
+        "meets_target": False,
+        "diag": {
+            "env": None,
+            "instance_type": None,
+            "tp": None,
+            "status": status,
+            "reason": reason,
+            "meets_target": False,
+            "achieved_tps": None,
+            "target_tps": None,
+            "sigma": None,
+            **details,
         },
     }
 
@@ -4625,6 +4740,8 @@ def build_scored_candidates(
     # (tp2*DP4 .. tp8*DP1) for big ones; the solver picks the best-sigma survivor.
     frames_by_job: dict[str, list[dict[str, Any]]] = {}
     ctx_by_job: dict[str, tuple[Any, Any, dict[str, Any], str]] = {}
+    blocked_by_job: dict[str, dict[str, Any]] = {}
+    attempted_identities_by_job: dict[str, list[Any]] = {}
     pending_jobs = sorted(
         get_pending_jobs(), key=lambda job: str(job.get("job_id", job.get("id", "")))
     )
@@ -4652,13 +4769,42 @@ def build_scored_candidates(
 
         frames: list[dict[str, Any]] = []
         seen: set = set()
-        if job.get("deployment_status") in {
-            "deployment_pending",
-            "deployment_not_materialized",
-        }:
+        is_pending = str(jid) in pending_ids
+        deployment_status = job.get("deployment_status")
+        retry_action_type = "place" if is_pending else "swap"
+        attempt_gate_applies = is_pending or job.get("deployment_action_type") == "swap"
+        if attempt_gate_applies and deployment_status == "deployment_pending":
             frames_by_job[jid] = []
-            ctx_by_job[jid] = (user_id, slice_id, features, "place")
+            ctx_by_job[jid] = (user_id, slice_id, features, retry_action_type)
+            blocked_by_job[jid] = _empty_frame_result(
+                "deployment_pending",
+                "prior placement is still inside the materialization grace period",
+                deployment_attempts=int(job.get("deployment_attempts") or 1),
+            )
             continue
+        if attempt_gate_applies and deployment_status == "deployment_not_materialized":
+            attempts = int(job.get("deployment_attempts") or 1)
+            retry_after = job.get("deployment_retry_after_tick")
+            if job.get("deployment_retry_exhausted") is True:
+                frames_by_job[jid] = []
+                ctx_by_job[jid] = (user_id, slice_id, features, retry_action_type)
+                blocked_by_job[jid] = _empty_frame_result(
+                    "deployment_retry_exhausted",
+                    "deployment retry limit reached",
+                    deployment_attempts=attempts,
+                    retry_after_tick=retry_after,
+                )
+                continue
+            if job.get("deployment_retry_allowed") is not True:
+                frames_by_job[jid] = []
+                ctx_by_job[jid] = (user_id, slice_id, features, retry_action_type)
+                blocked_by_job[jid] = _empty_frame_result(
+                    "deployment_retry_backoff",
+                    "prior placement timed out; waiting for retry backoff",
+                    deployment_attempts=attempts,
+                    retry_after_tick=retry_after,
+                )
+                continue
         for raw in (spec_by_job.get(jid) or {}).get("ladder") or []:
             rank = _normalize_candidate_rank(raw)
             if rank is not None and _rank_shape_key(rank) not in seen:
@@ -4732,7 +4878,7 @@ def build_scored_candidates(
                             rank["proposal_source"] = "generated"
                             seen.add(_rank_shape_key(rank))
                             frames.append(rank)
-        if str(jid) not in pending_ids:
+        if not is_pending:
             current_groups: dict[str, list[dict[str, Any]]] = {}
             for index, chain in enumerate(
                 job.get("current_ladder") or job.get("active_chains") or []
@@ -4745,6 +4891,27 @@ def build_scored_candidates(
                 for chains in current_groups.values()
             }
             frames = [rank for rank in frames if _deployment_shape_key(rank) not in current_shapes]
+        if attempt_gate_applies and deployment_status == "deployment_not_materialized":
+            attempted = list(job.get("attempted_deployment_identities") or [])
+            attempted_identities_by_job[jid] = attempted
+            before_retry_filter = len(frames)
+            frames = [
+                rank
+                for rank in frames
+                if not any(deployment_ladder_identity([rank]) == identity for identity in attempted)
+            ]
+            if before_retry_filter > 0 and not frames:
+                blocked_by_job[jid] = _empty_frame_result(
+                    "deployment_shape_already_attempted",
+                    "all generated deployment shapes have already timed out",
+                    deployment_attempts=int(job.get("deployment_attempts") or 1),
+                    retry_after_tick=job.get("deployment_retry_after_tick"),
+                )
+        if not frames and jid not in blocked_by_job:
+            blocked_by_job[jid] = _empty_frame_result(
+                "no_pool_capacity",
+                "no policy-valid candidate frame has free pool capacity",
+            )
         frames_by_job[jid] = frames
         ctx_by_job[jid] = (
             user_id,
@@ -4757,7 +4924,9 @@ def build_scored_candidates(
     # is globally serialized, so threads add no throughput and obscure which jobs
     # received the final calls. Specialist frame 0 leads for every job before any
     # job receives frame 1.
-    scored_by_job: dict[str, list[dict[str, Any]]] = {jid: [] for jid in frames_by_job}
+    scored_by_job: dict[str, list[dict[str, Any]]] = {
+        jid: [blocked_by_job[jid]] if jid in blocked_by_job else [] for jid in frames_by_job
+    }
     budget_exhausted = False
     max_frames = max((len(frames) for frames in frames_by_job.values()), default=0)
     for frame_index in range(max_frames):
@@ -4787,7 +4956,8 @@ def build_scored_candidates(
     if budget_exhausted:
         for jid, frames in frames_by_job.items():
             results = scored_by_job[jid]
-            for rank in frames[len(results) :]:
+            scored_frame_count = 0 if jid in blocked_by_job else len(results)
+            for rank in frames[scored_frame_count:]:
                 results.append(_budget_skipped_frame(rank))
 
     # Phase 2.5 (heterogeneous composites). Two motivations:
@@ -4873,6 +5043,11 @@ def build_scored_candidates(
                     ]
                 )
             for order in orders:
+                if any(
+                    deployment_ladder_identity(order) == identity
+                    for identity in attempted_identities_by_job.get(jid, [])
+                ):
+                    continue
                 composite = _score_composite(jid, user_id, slice_id, order, features)
                 scored_by_job[jid].append(composite)
                 if composite.get("diag", {}).get("status") == "budget_exhausted":
@@ -4945,7 +5120,10 @@ def build_scored_candidates(
             )
         if job_candidates:
             candidates.extend(job_candidates)
-        elif not limited:
+        elif not limited and not any(
+            diagnostic.get("status") in {"deployment_pending", "deployment_retry_backoff"}
+            for diagnostic in job_diag
+        ):
             reasons = [d["reason"] for d in job_diag if d.get("reason")]
             exhausted[jid] = (
                 "; ".join(dict.fromkeys(reasons)) if reasons else "no runnable, feasible frame"
@@ -5018,6 +5196,24 @@ def jointly_select_placements(
     specs = instance_catalog()
     original_candidates = list(candidates or [])
 
+    def selection_score(candidate: dict[str, Any]) -> float:
+        field = (
+            "swap_gain_over_keep" if str(candidate.get("type") or "").lower() == "swap" else "sigma"
+        )
+        raw_value = candidate.get(field)
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+            return float("-inf")
+        value = float(raw_value)
+        return value if math.isfinite(value) else float("-inf")
+
+    eligible_candidates = []
+    for candidate in original_candidates:
+        if str(candidate.get("type") or "").lower() == "swap" and (
+            candidate.get("queue_state") == "unstable" or selection_score(candidate) <= 0
+        ):
+            continue
+        eligible_candidates.append(candidate)
+
     def footprint(candidate: dict[str, Any]) -> int:
         return sum(_ladder_capacity_cost(candidate.get("ladder") or [], specs).values())
 
@@ -5029,7 +5225,7 @@ def jointly_select_placements(
         no_less_capacity = float(left.get("achieved_tps") or 0.0) >= float(
             right.get("achieved_tps") or 0.0
         )
-        no_worse_score = float(left.get("sigma") or 0.0) >= float(right.get("sigma") or 0.0)
+        no_worse_score = selection_score(left) >= selection_score(right)
         queue_quality = {"stable": 2, "unmodeled": 1, "not_applicable": 1, "unstable": 0}
         no_worse_queue = queue_quality.get(str(left.get("queue_state")), 1) >= queue_quality.get(
             str(right.get("queue_state")), 1
@@ -5037,7 +5233,7 @@ def jointly_select_placements(
         strictly_better = (
             any(left_cost.get(key, 0) < right_cost.get(key, 0) for key in keys)
             or float(left.get("achieved_tps") or 0.0) > float(right.get("achieved_tps") or 0.0)
-            or float(left.get("sigma") or 0.0) > float(right.get("sigma") or 0.0)
+            or selection_score(left) > selection_score(right)
         )
         return (
             no_more_resource
@@ -5048,7 +5244,7 @@ def jointly_select_placements(
         )
 
     grouped: dict[tuple[str, str, str | None], list[dict[str, Any]]] = {}
-    for candidate in original_candidates:
+    for candidate in eligible_candidates:
         ladder = candidate.get("ladder") or []
         first = ladder[0] if ladder else {}
         cfg = first.get("config") or {}
@@ -5223,9 +5419,13 @@ def jointly_select_placements(
         swap_gain_over_keep = finite_number(cand.get("swap_gain_over_keep"))
         if is_swap and (queue_unstable or swap_gain_over_keep is None or swap_gain_over_keep <= 0):
             continue
+        if is_swap:
+            assert swap_gain_over_keep is not None
+            gain = swap_gain_over_keep
         if queue_unstable:
             gain = _WORK_CONSERVING_GAIN_FLOOR
             cand["work_conserving_floor"] = True
+            cand["service_class"] = "idle_capacity_fallback"
             if isinstance(assessment, dict):
                 assessment["selection_mode"] = "work_conserving"
         elif gain <= 0:
@@ -5233,6 +5433,7 @@ def jointly_select_placements(
                 continue
             gain = _WORK_CONSERVING_GAIN_FLOOR
             cand["work_conserving_floor"] = True
+            cand["service_class"] = "idle_capacity_fallback"
             if isinstance(assessment, dict):
                 assessment["selection_mode"] = "work_conserving"
         if not exploratory:

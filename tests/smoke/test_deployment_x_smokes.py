@@ -11,7 +11,7 @@ from src.cost.dro import DRO
 from src.infra.deployment_x import _gpu, build_deployment_x_index, materialize_launch_config
 from src.infra.resource_map import ClusterResourceSnapshot, ResourceMapManager
 from src.orchestrator.fsm_states import TickContext, TickRunner
-from src.validation.cusum import Cusum
+from src.validation.cusum import Cusum, CusumResult
 from src.validation.icp import ICP, ICPResult
 from src.validation.quadrants import Quadrant, QuadrantValidator
 
@@ -523,6 +523,7 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(row.rank_id, "rank_a")
         self.assertEqual(row.env_label, ENV_LABEL)
         self.assertEqual(row.X["request_arrival_rate"], 100)
+        self.assertEqual(row.X["workload_type"], "online")
         self.assertEqual(row.X["gpu_generation"], "Hopper")
         self.assertEqual(row.y_predicted, {"p99_ttft_ms": 90.0})
         self.assertEqual(row.V_predicted_trajectory, {"kv_cache_util": 0.1})
@@ -531,7 +532,56 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(mechanism_registry.context["type"], "online")
         self.assertEqual(mechanism_registry.context["request_arrival_rate"], 100)
 
-    def test_s2_applicability_uses_values_and_preserves_committed(self):
+    def test_prediction_ledger_restores_lineage_after_store_enrichment(self):
+        snapshot = _snapshot()
+        chains = snapshot.active_jobs[0]["active_chains"]
+        for chain in chains:
+            chain["shape_json"].pop("prediction_lineage")
+            chain["shape_json"]["engine_version"] = "store-enriched"
+        runner = TickRunner(
+            evidence_store=_EvidenceStore(),
+            telemetry=_Telemetry(),
+            cusum=_Cusum(),
+            icp=object(),
+            quadrant_validator=object(),
+            confidence_service=SimpleNamespace(candidate_graph=_candidate_graph()),
+            slow_loop=_SlowLoop(),
+            dro=_Dro(),
+            mechanism_registry=_MechanismRegistry(),
+            resource_map=_ResourceMap(),
+            agent=object(),
+            plan_validator=object(),
+            executor=object(),
+            candidate_graph=_candidate_graph(),
+        )
+        signature = runner._prediction_shape_signature(
+            {
+                "env": list(ENV_LABEL),
+                "config": {
+                    "instance_type": "p5.48xlarge",
+                    "gpu_count": 8,
+                    "tp": 8,
+                    "pp": 1,
+                    "engine_version": "store-enriched",
+                },
+                "n_replicas": 2,
+            }
+        )
+        runner._prediction_ledger[("job_1", "rank_a")] = {
+            "predicted_y": {"p99_ttft_ms": 90.0},
+            "predicted_v": {"kv_cache_util": 0.1},
+            "prediction_lineage": {"schema_version": 3, "deployment_id": "deploy-a"},
+            "mechanism_id": "M_committed",
+            "shape_signature": signature,
+        }
+        ctx = TickContext(tick=1, cluster_snapshot=snapshot)
+
+        index = runner._build_deployment_x_index(ctx)
+
+        deployment = index.resolve("job_1", "rank_a")
+        self.assertEqual(deployment.prediction_lineage["deployment_id"], "deploy-a")
+
+    def test_s2_applicability_requires_x_values_and_preserves_committed(self):
         registry = MechanismRegistry()
         exact_id = registry.add_mechanism(
             Mechanism(
@@ -571,13 +621,38 @@ class DeploymentXSmokeTests(unittest.TestCase):
         )
         runner = TickRunner.__new__(TickRunner)
         runner.mechanism_registry = registry
+        runner.candidate_graph = CandidateGraph(
+            node_table={
+                "tp": Node("tp", "X"),
+                "comm_overhead_pct": Node("comm_overhead_pct", "V"),
+                "peak_to_mean_ratio": Node("peak_to_mean_ratio", "X"),
+                "depth_req_q": Node("depth_req_q", "V"),
+            },
+            edge_table={
+                "tp->comm_overhead_pct": Edge(
+                    "tp->comm_overhead_pct", "tp", "comm_overhead_pct", "X", "V"
+                ),
+                "peak_to_mean_ratio->depth_req_q": Edge(
+                    "peak_to_mean_ratio->depth_req_q",
+                    "peak_to_mean_ratio",
+                    "depth_req_q",
+                    "X",
+                    "V",
+                ),
+            },
+            edge_metadata_table={
+                "tp->comm_overhead_pct": EdgeMetadata("tp->comm_overhead_pct"),
+                "peak_to_mean_ratio->depth_req_q": EdgeMetadata("peak_to_mean_ratio->depth_req_q"),
+            },
+        )
         context = {"type": "online", "tp": 2, "peak_to_mean_ratio": 2}
 
         matched = {m.mechanism_id for m in runner._applicable_mechanisms(context, None)}
         committed = {m.mechanism_id for m in runner._applicable_mechanisms(context, false_id)}
 
-        self.assertEqual(matched, {exact_id, partial_id})
-        self.assertEqual(committed, {exact_id, partial_id, false_id})
+        self.assertEqual(matched, {exact_id})
+        self.assertEqual(committed, {exact_id, false_id})
+        self.assertNotIn(partial_id, matched)
 
     def test_s2_records_mechanism_cusum_and_icp_diagnostics(self):
         graph, mechanism = _diagnostic_graph()
@@ -612,6 +687,43 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertTrue(diagnostic["cusum"]["V"][0]["fired"])
         self.assertEqual(diagnostic["icp"][0]["result"].value, "undecided")
         self.assertEqual(diagnostic["icp"][0]["reason"], "no_evidence")
+
+    def test_s2_partially_evaluates_bundle_without_rewarding_missing_axis(self):
+        graph, mechanism = _diagnostic_graph()
+        evidence_store = _EvidenceStore()
+        runner = TickRunner(
+            evidence_store=evidence_store,
+            telemetry=_Telemetry(),
+            cusum=Cusum(),
+            icp=ICP(),
+            quadrant_validator=QuadrantValidator(),
+            confidence_service=SimpleNamespace(candidate_graph=graph),
+            slow_loop=_SlowLoop(),
+            dro=_Dro(),
+            mechanism_registry=_MechanismRegistry([mechanism]),
+            resource_map=_ResourceMap(),
+            agent=object(),
+            plan_validator=object(),
+            executor=object(),
+            candidate_graph=graph,
+        )
+        ctx = TickContext(tick=1, cluster_snapshot=_snapshot())
+
+        runner.S1(ctx)
+        deployment = next(iter(ctx.deployment_x.by_rank.values()))
+        deployment.v_predicted = {}
+        runner.S2(ctx)
+
+        diagnostic = ctx.mechanism_diagnostics[0]
+        row = evidence_store.rows[0]
+        self.assertEqual(diagnostic["status"], "partially_evaluated")
+        self.assertIsNone(diagnostic["v_verdict"])
+        self.assertEqual(diagnostic["y_verdict"], "diverged")
+        self.assertIsNone(row.q_label_per_mechanism[mechanism.mechanism_id])
+        self.assertEqual(
+            row.cusum_per_mechanism[mechanism.mechanism_id][1].value,
+            "diverged",
+        )
 
     def test_s3_records_confidence_and_slow_dro_diagnostics(self):
         graph, mechanism = _diagnostic_graph()
@@ -682,6 +794,61 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(slow_change["dro"]["coverage"]["inside_rows"], 1)
         self.assertAlmostEqual(slow_change["dro"]["before"]["epsilon"], 0.15)
         self.assertAlmostEqual(slow_change["dro"]["after"]["epsilon"], 0.1425)
+
+    def test_s3_penalizes_partial_divergence_without_claiming_q4(self):
+        graph, mechanism = _diagnostic_graph()
+        registry = MechanismRegistry(
+            mechanism_table={mechanism.mechanism_id: mechanism},
+            mechanism_metadata_table={
+                mechanism.mechanism_id: MechanismMetadata(mechanism.mechanism_id)
+            },
+        )
+        confidence = ConfidenceService(graph, registry)
+        dro = DRO()
+        runner = TickRunner(
+            evidence_store=object(),
+            telemetry=object(),
+            cusum=object(),
+            icp=object(),
+            quadrant_validator=object(),
+            confidence_service=confidence,
+            slow_loop=_S3SlowLoop(dro),
+            dro=dro,
+            mechanism_registry=registry,
+            resource_map=object(),
+            agent=object(),
+            plan_validator=object(),
+            executor=object(),
+            candidate_graph=graph,
+            recalibrate_every=0,
+        )
+        ctx = TickContext(
+            tick=1,
+            evidence_rows=[
+                SimpleNamespace(
+                    row_id="1_job_1_rank_a",
+                    job_id="job_1",
+                    rank_id="rank_a",
+                    env_label=ENV_LABEL,
+                    q_label_per_mechanism={mechanism.mechanism_id: None},
+                    cusum_per_mechanism={mechanism.mechanism_id: (None, CusumResult.DIVERGED)},
+                    residuals_per_v={"kv_cache_util": np.array([0.1])},
+                    residuals_per_y={"p99_ttft_ms": np.array([10.0])},
+                    icp_result_per_edge={},
+                    y_observed_mean={"p99_ttft_ms": 110.0},
+                    y_predicted={"p99_ttft_ms": 100.0},
+                    prediction_lineage=None,
+                )
+            ],
+        )
+
+        runner.S3(ctx)
+
+        metadata = registry.mechanism_metadata_table[mechanism.mechanism_id]
+        self.assertEqual(metadata.alpha, 1.0)
+        self.assertEqual(metadata.beta, 1.5)
+        self.assertEqual(metadata.q_histogram["Q4"], 0)
+        self.assertTrue(ctx.confidence_diagnostics[0]["partial_divergence"])
 
 
 class _Telemetry:

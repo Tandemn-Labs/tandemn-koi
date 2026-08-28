@@ -73,6 +73,8 @@ _ALIASES = {
 }
 _USER_JOB_X = {
     "model_id",
+    "type",
+    "workload_type",
     "isl_token_avg",
     "isl_token_min",
     "isl_token_max",
@@ -238,11 +240,15 @@ def _rank_deployment(
         total_replicas=total_replicas,
     )
 
+    projected_x = _project_x(x, x_fields)
+    workload_type = job_values.get("workload_type") or job_values.get("type") or job.get("kind")
+    if workload_type is not None:
+        projected_x["workload_type"] = str(workload_type).lower()
     return RankDeployment(
         job_id=job_id,
         rank_id=rank_id,
         env_label=env,
-        x=_project_x(x, x_fields),
+        x=projected_x,
         v_predicted={
             name: value
             for name, value in dict(shape.get("predicted_v") or {}).items()

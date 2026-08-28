@@ -142,6 +142,28 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         for name, value in self.saved_context.items():
             setattr(agent_tools._CTX, name, value)
 
+    def test_sizing_queue_assessment_reports_selection_usage_and_token_pressure(self):
+        assessment = agent_tools._prediction_assessment(
+            {
+                "point_capacity_tps": 1000.0,
+                "per_rank": [{"n_replicas": 2, "base_p99_ttft_ms": 20.0}],
+            },
+            {
+                "type": "online",
+                "request_arrival_rate": 2.0,
+                "isl_token_avg": 200.0,
+                "isl_token_max": 800.0,
+                "osl_token_avg": 100.0,
+                "osl_token_max": 300.0,
+            },
+        )
+
+        self.assertEqual(assessment["queue_utilization"], 0.2)
+        self.assertEqual(assessment["queue_token_work_pressure"], 0.6)
+        self.assertEqual(assessment["queue_tail_token_work_pressure"], 2.2)
+        self.assertEqual(assessment["queue_state"], "stable")
+        self.assertTrue(assessment["queue_affects_selection"])
+
     def _bind_prediction_fakes(self, surrogate=None):
         surrogate = surrogate or _RecordingSurrogate()
         agent_tools._CTX.candidate_graph = object()
@@ -451,6 +473,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertNotIn("scoring_mode", score)
         self.assertEqual(plan.actions[0].prediction_assessment["kind"], "point")
         self.assertEqual(plan.actions[0].prediction_assessment["status"], "success")
+        self.assertEqual(plan.actions[0].service_class, "supported")
         self.assertEqual(result["unserved_penalty"], 0.0)
         self.assertEqual(len(surrogate.calls), 1)
 
@@ -477,6 +500,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         )
         self.assertIsNone(plan.actions[0].served_fraction)
         self.assertIsNone(plan.actions[0].achieved_tps)
+        self.assertEqual(plan.actions[0].service_class, "exploratory")
 
     def test_final_score_never_downgrades_physical_no_fit_to_exploration(self):
         self._bind_prediction_fakes()
@@ -952,6 +976,74 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertNotIn("admission_mode", candidate)
         self.assertIn("base-latency target missed", result["diag"]["reason"])
 
+    def test_swap_scores_gain_before_feasibility_and_uses_observed_baseline(self):
+        env = "reserved|aws|r1|z1|H100"
+        rank = _rank(env, "p5")
+        features = {
+            "type": "online",
+            "request_arrival_rate": 0.01,
+            "osl_token_avg": 10,
+            "target_p99_ttft_ms": 100.0,
+            "target_p99_tpot_ms": 10.0,
+            "_active_health": {
+                "status": "degraded",
+                "reasons": ["ttft_breach", "throughput_shortfall"],
+                "observed": {
+                    "throughput_token_per_sec": 10.0,
+                    "p99_ttft_ms": 200.0,
+                    "p99_tpot_ms": 5.0,
+                },
+            },
+        }
+        sized = {
+            "ranks": [rank],
+            "meets_target": False,
+            "target_tps": 100.0,
+            "achieved_tps": 100.0,
+            "point_capacity_tps": 100.0,
+            "base_latency_within_target": False,
+            "per_rank": [
+                {
+                    "n_replicas": 1,
+                    "prediction_received": True,
+                    "prediction_complete": True,
+                    "base_p99_ttft_ms": 150.0,
+                    "base_p99_tpot_ms": 5.0,
+                    "slo_ok": False,
+                }
+            ],
+        }
+
+        def feasibility(plan):
+            action = plan["actions"][0]
+            self.assertEqual(action["swap_gain_over_keep"], 2.0)
+            return {"feasible": True}
+
+        with (
+            patch.object(agent_tools, "_applicable_mechanism_id", return_value="M_test"),
+            patch.object(agent_tools, "size_ladder", return_value=sized),
+            patch.object(agent_tools, "check_feasibility", side_effect=feasibility),
+            patch.object(
+                agent_tools,
+                "compute_sigma",
+                return_value={
+                    "per_job": {
+                        "job": {
+                            "sigma": 1.0,
+                            "keep_baseline_sigma": -1.0,
+                            "swap_gain_over_keep": 2.0,
+                        }
+                    }
+                },
+            ),
+        ):
+            result = agent_tools._score_one_frame(
+                "job", "user", "slice", rank, features, action_type="swap"
+            )
+
+        self.assertIsNotNone(result["candidate"])
+        self.assertEqual(result["candidate"]["swap_gain_over_keep"], 2.0)
+
     def test_point_capacity_partial_frame_and_composite_are_candidates(self):
         env = "reserved|aws|r1|z1|H100"
         ranks = [_rank(env, "p5-a"), _rank(env, "p5-b")]
@@ -1348,6 +1440,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         specs = {env: {"new-pool": {"gpus_per_instance": 1, "free_instances": 1}}}
         active = {
             "job_id": "active-job",
+            "deployment_status": "deployment_not_materialized",
             "health": {"rehabilitation_eligible": True},
             "current_ladder": [
                 {
@@ -1383,6 +1476,133 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
 
         self.assertEqual(action_types, ["swap"])
         self.assertEqual(result["candidates"][0]["type"], "swap")
+
+    def test_failed_swap_respects_retry_backoff(self):
+        env = "reserved|aws|r1|a|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"new-pool": {"gpus_per_instance": 1, "free_instances": 1}}}
+        active = {
+            "job_id": "active-job",
+            "deployment_status": "deployment_not_materialized",
+            "deployment_action_type": "swap",
+            "deployment_retry_allowed": False,
+            "deployment_retry_after_tick": 5,
+            "health": {"rehabilitation_eligible": True},
+        }
+
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        with (
+            self._candidate_patches(resources, specs, [], lambda *_args: self.fail()),
+            patch.object(agent_tools, "get_active_jobs", return_value=[active]),
+        ):
+            result = agent_tools.build_scored_candidates({}, {})
+
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(
+            result["diagnostics"]["active-job"][0]["status"],
+            "deployment_retry_backoff",
+        )
+        self.assertNotIn("active-job", result["exhausted"])
+
+    def test_failed_swap_retry_filters_previously_attempted_shape(self):
+        env = "reserved|aws|r1|a|H100"
+        rank = _rank(env, "new-pool")
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"new-pool": {"gpus_per_instance": 1, "free_instances": 1}}}
+        active = {
+            "job_id": "active-job",
+            "deployment_status": "deployment_not_materialized",
+            "deployment_action_type": "swap",
+            "deployment_retry_allowed": True,
+            "attempted_deployment_identities": [agent_tools.deployment_ladder_identity([rank])],
+            "health": {"rehabilitation_eligible": True},
+            "current_ladder": [],
+        }
+
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        with (
+            self._candidate_patches(resources, specs, [], lambda *_args: self.fail()),
+            patch.object(agent_tools, "get_active_jobs", return_value=[active]),
+        ):
+            result = agent_tools.build_scored_candidates({}, {})
+
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(
+            result["diagnostics"]["active-job"][0]["status"],
+            "deployment_shape_already_attempted",
+        )
+
+    def test_deployment_retry_backoff_has_typed_diagnostic(self):
+        env = "reserved|aws|r1|a|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 1}}}
+        pending = [
+            {
+                "job_id": "job-1",
+                "deployment_status": "deployment_not_materialized",
+                "deployment_attempts": 1,
+                "deployment_retry_after_tick": 4,
+                "deployment_retry_allowed": False,
+            }
+        ]
+
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        with (
+            self._candidate_patches(
+                resources,
+                specs,
+                pending,
+                lambda *_args, **_kwargs: self.fail("retry backoff must not score frames"),
+            ),
+            patch.object(agent_tools, "get_active_jobs", return_value=[]),
+        ):
+            result = agent_tools.build_scored_candidates({}, {})
+
+        self.assertEqual(
+            result["diagnostics"]["job-1"][0]["status"],
+            "deployment_retry_backoff",
+        )
+        self.assertEqual(result["diagnostics"]["job-1"][0]["retry_after_tick"], 4)
+
+    def test_deployment_retry_filters_previously_attempted_shape(self):
+        env = "reserved|aws|r1|a|H100"
+        rank = _rank(env, "p5")
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 1}}}
+        pending = [
+            {
+                "job_id": "job-1",
+                "deployment_status": "deployment_not_materialized",
+                "deployment_attempts": 1,
+                "deployment_retry_allowed": True,
+                "attempted_deployment_identities": [agent_tools.deployment_ladder_identity([rank])],
+            }
+        ]
+
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        with (
+            self._candidate_patches(
+                resources,
+                specs,
+                pending,
+                lambda *_args, **_kwargs: self.fail("attempted shape must not be scored"),
+            ),
+            patch.object(agent_tools, "get_active_jobs", return_value=[]),
+        ):
+            result = agent_tools.build_scored_candidates({}, {})
+
+        self.assertEqual(
+            result["diagnostics"]["job-1"][0]["status"],
+            "deployment_shape_already_attempted",
+        )
 
     def test_under_target_online_frames_remain_available_to_composites(self):
         env = "reserved|aws|r1|a|H100"
@@ -1750,6 +1970,7 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual([candidate["job_id"] for candidate in idle["chosen"]], ["explore"])
         self.assertEqual(idle["chosen"][0]["served_credit"], 0.0)
         self.assertTrue(idle["chosen"][0]["work_conserving_floor"])
+        self.assertEqual(idle["chosen"][0]["service_class"], "idle_capacity_fallback")
         self.assertEqual(
             idle["chosen"][0]["prediction_assessment"]["selection_mode"],
             "work_conserving",
@@ -1762,6 +1983,10 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual(
             point_floor["chosen"][0]["prediction_assessment"]["selection_mode"],
             "work_conserving",
+        )
+        self.assertEqual(
+            point_floor["chosen"][0]["service_class"],
+            "idle_capacity_fallback",
         )
 
     def test_solver_charges_whole_instance_gpu_footprint(self):
@@ -1911,6 +2136,42 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual(result["swap_budget"], 1)
         self.assertEqual(result["swap_count"], 1)
         self.assertEqual(len(result["chosen"]), 1)
+
+    def test_joint_solver_orders_swaps_by_gain_over_keep(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 1}}}
+        base = {
+            "job_id": "active",
+            "type": "swap",
+            "ladder": [_rank(env, "p5")],
+            "target_tps": 100.0,
+            "achieved_tps": 100.0,
+            "served_fraction": 1.0,
+            "prediction_assessment": {
+                "basis": "aic_direct_point",
+                "kind": "point",
+                "status": "success",
+                "queue_slo_verified": False,
+            },
+        }
+        candidates = [
+            {**base, "sigma": 100.0, "swap_gain_over_keep": 1.0, "marker": "absolute"},
+            {**base, "sigma": 1.0, "swap_gain_over_keep": 3.0, "marker": "gain"},
+        ]
+        slow_loop = type("SlowLoop", (), {"get_sss_swap_budget_t": lambda self: 1})()
+
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools._CTX, "slow_loop", slow_loop),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(agent_tools, "get_pending_jobs", return_value=[]),
+            patch.object(agent_tools, "get_priority", return_value=[]),
+        ):
+            result = agent_tools.jointly_select_placements(candidates)
+
+        self.assertEqual(result["chosen"][0]["marker"], "gain")
 
     def test_finalization_preserves_soft_failure_for_exploratory_action(self):
         plan = self._sigma_plan("p5")

@@ -185,9 +185,9 @@ class RegretCalculator:
     ) -> float:
         """Compute the slow-loop operational signal.
 
-        Average of recent instantaneous regrets over the last `window`
-        ticks. Small means converged; large means still learning. Despite
-        the name, this is an average of recent regrets, not a
+        Average of instantaneous regrets for the current tick and `window`
+        prior ticks. Small means converged; large means still learning.
+        Despite the name, this is an average of recent regrets, not a
         time-derivative.
 
         Args:
@@ -199,7 +199,7 @@ class RegretCalculator:
         Returns:
             Non-negative slope.
         """
-        start = max(0, tick - window + 1)
+        start = max(0, tick - window)
         gaps = [
             self.compute_inst_regret(t, evidence_store, window, q1_star)
             for t in range(start, tick + 1)

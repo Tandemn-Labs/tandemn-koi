@@ -267,6 +267,11 @@ class EigResourceSmokeTests(unittest.TestCase):
         self.assertEqual(resources[env]["free"], 24)
         self.assertEqual(pool["price_per_instance_hour"], 98.32)
         self.assertEqual(pool["fabric"], "first-fabric")
+        self.assertEqual(pool["merged_pool_count"], 2)
+        self.assertEqual(
+            [source["price_per_instance_hour"] for source in pool["merged_pool_sources"]],
+            [98.32, 99.0],
+        )
 
         capacity = manager.pool_capacity(resources)[(env, "p5.48xlarge")]
         self.assertEqual(capacity["available_units"], 3)
@@ -315,6 +320,7 @@ class EigResourceSmokeTests(unittest.TestCase):
         self.assertEqual(pools["Standard_NC24ads_A100_v4"]["total"], 4)
         self.assertEqual(pools["Standard_NC24ads_A100_v4"]["free_instances"], 4)
         self.assertEqual(pools["Standard_NC24ads_A100_v4"]["free"], 4)
+        self.assertEqual(pools["Standard_NC24ads_A100_v4"]["merged_pool_count"], 2)
         self.assertEqual(pools["Standard_ND96amsr_A100_v4"]["total_instances"], 6)
         self.assertEqual(pools["Standard_ND96amsr_A100_v4"]["total"], 48)
         self.assertEqual(pools["Standard_ND96amsr_A100_v4"]["free_instances"], 6)

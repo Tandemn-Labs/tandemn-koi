@@ -58,6 +58,7 @@ from src.core.models import (
     ActionType,
     Plan,
     PlanAction,
+    deployment_ladder_identity,
     env_gpu_type,
 )
 from src.infra.deployment_x import materialize_launch_config
@@ -249,6 +250,9 @@ class SpecialistRunner:
             "{'role':'aggregate','env':[...],'config':{'instance_type':str,"
             "'gpu_count':int,'tp':int,'pp':int,'sp':int,'ep':int,'cp':int},"
             "'n_replicas':int,'mechanism_id':'M_...'}. Do not use shorthand ranks.\n"
+            "- Ladder ranks are simultaneous deployment components, not alternatives. "
+            "For place or swap, return exactly one ladder rank; the deterministic "
+            "candidate builder owns alternatives and composites.\n"
             "- gpu_count, tp, pp, and n_replicas are positive integers. Match tp*pp "
             "to the instance_catalog; gpu_count must fit gpus_per_instance unless "
             "num_nodes_per_chain spans multiple instances. pool_budget counts whole "
@@ -478,6 +482,11 @@ class SpecialistRunner:
             if not isinstance(ladder, list) or not ladder:
                 violations.append(f"{action_name} requires non-empty canonical ladder")
             else:
+                if len(ladder) != 1:
+                    violations.append(
+                        f"{action_name} must return exactly one ladder rank; "
+                        "ladder ranks are simultaneous deployment components"
+                    )
                 for i, rank in enumerate(ladder):
                     violations.extend(
                         SpecialistRunner._validate_rank_schema(
@@ -1122,10 +1131,21 @@ class KoiAgentHarness:
                     f"job {jid}: prior placement is still deployment_pending"
                 )
             if deployment_status == "deployment_not_materialized":
-                raise PlanMaterializationError(
-                    f"job {jid}: prior placement has no terminal executor result; diagnose it "
-                    "before another PLACE"
+                if descriptor.get("deployment_retry_allowed") is not True:
+                    reason = (
+                        "deployment retry limit reached"
+                        if descriptor.get("deployment_retry_exhausted") is True
+                        else "deployment retry backoff has not elapsed"
+                    )
+                    raise PlanMaterializationError(f"job {jid}: {reason}")
+                submitted_identity = deployment_ladder_identity(
+                    rank.to_dict() for rank in action.ladder
                 )
+                attempted = descriptor.get("attempted_deployment_identities") or []
+                if any(submitted_identity == identity for identity in attempted):
+                    raise PlanMaterializationError(
+                        f"job {jid}: retry must use a different deployment shape"
+                    )
         if action.type == ActionType.SWAP:
             health = (descriptor or {}).get("health") or {}
             if health.get("rehabilitation_eligible") is not True:
@@ -1146,8 +1166,32 @@ class KoiAgentHarness:
                 raise PlanMaterializationError(
                     f"job {jid}: SWAP must match a jointly selected rehabilitation candidate"
                 )
+            if (descriptor or {}).get("deployment_action_type") == "swap" and (
+                descriptor or {}
+            ).get("deployment_status") in {
+                "deployment_pending",
+                "deployment_not_materialized",
+            }:
+                if (descriptor or {}).get("deployment_retry_allowed") is not True:
+                    raise PlanMaterializationError(
+                        f"job {jid}: prior SWAP is pending, in backoff, or exhausted"
+                    )
+                submitted_identity = deployment_ladder_identity(
+                    rank.to_dict() for rank in action.ladder
+                )
+                attempted = (descriptor or {}).get("attempted_deployment_identities") or []
+                if any(submitted_identity == identity for identity in attempted):
+                    raise PlanMaterializationError(
+                        f"job {jid}: SWAP retry must use a different deployment shape"
+                    )
             action.rehabilitation_status = health.get("status")
             action.rehabilitation_reasons = list(health.get("reasons") or [])
+
+        trusted_service_class = (trusted_candidate or {}).get("service_class")
+        if trusted_service_class is not None and action.service_class != trusted_service_class:
+            raise PlanMaterializationError(
+                f"job {jid}: service_class must match the jointly selected candidate"
+            )
 
         assessment = action.prediction_assessment
         if assessment is not None:
@@ -1208,6 +1252,7 @@ class KoiAgentHarness:
                     "queue_slo_verified",
                     "keep_baseline_sigma",
                     "swap_gain_over_keep",
+                    "service_class",
                     "mechanism_id",
                     "budget_ref",
                 )
@@ -1619,6 +1664,12 @@ class KoiAgentHarness:
             f"{online_admission_contract}"
             "Any allowed batch partial candidate "
             "carries meets_target and served_fraction so you can reason about its shortfall. "
+            "You classify each final place/swap action's service_class: supported when a "
+            "supported prediction meets the target, partial when supported service covers "
+            "only part of the target, exploratory when prediction support is unavailable, "
+            "or idle_capacity_fallback when a non-positive or queue-unstable candidate is "
+            "selected only for capacity that would otherwise remain idle. Do not add "
+            "service_class to keep/defer. "
             "A specialist defer/blocked result is only a local hint. A job in exhausted has "
             "no physically valid candidate; inspect diagnostics for the typed reason. "
             "budget_limited identifies work skipped at the "
@@ -1700,6 +1751,8 @@ class KoiAgentHarness:
             "Action dict:\n"
             "  {'job_id': str, 'type': <action>, 'user_id': str,\n"
             "   'ladder': [<rank>, ...],            # only for place/swap\n"
+            "   'service_class': 'supported|partial|exploratory|idle_capacity_fallback',\n"
+            "                                            # optional; place/swap only\n"
             "   'target_tps': float,                # required throughput for place/swap\n"
             "   # Optional point-estimate accounting: preserve it as a unit from a candidate.\n"
             "   'achieved_tps': float,              # target covered by point capacity\n"

@@ -81,6 +81,26 @@ def test_memory_v_quantization_tp_pp_missing_and_dp_invariance():
     assert compute_memory_v({"tp": 2}, {"gpu_mem_gb": 80}) == {}
 
 
+def test_memory_v_uses_conservative_moe_weight_shards():
+    dense = compute_memory_v({**MODEL, **WORKLOAD, "tp": 8, "pp": 2, "ep": 2})
+    moe = compute_memory_v({**MODEL, **WORKLOAD, "tp": 8, "pp": 2, "ep": 2, "is_moe": True})
+
+    assert dense["vram_headroom_gb"] > moe["vram_headroom_gb"]
+    expected_weight_difference = model_weight_gb(MODEL) * (1 / 4 - 1 / 16)
+    assert math.isclose(
+        dense["vram_headroom_gb"] - moe["vram_headroom_gb"],
+        expected_weight_difference,
+    )
+
+
+def test_kvcache_auto_prefers_activation_then_weight_dtype():
+    auto_activation = {**MODEL, "kvcache_dtype": "auto", "activation_dtype": "fp8"}
+    auto_weight = {**MODEL, "kvcache_dtype": "auto"}
+
+    assert kv_bytes_per_token(auto_activation) == 2 * 80 * 8 * 128
+    assert kv_bytes_per_token(auto_weight) == 2 * 80 * 8 * 128 * 2
+
+
 def test_parallelism_v_uses_singular_aggregate_throughput_and_never_changes_y():
     base = {
         "activation_dtype": "bf16",
