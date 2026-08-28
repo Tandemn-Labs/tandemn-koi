@@ -83,26 +83,29 @@ def test_policy_precision_is_checked_when_catalog_launch_config_supplies_it():
     assert "requires bf16 precision" in quantized_reason
 
 
-def test_moe_expert_parallelism_must_fit_tp_and_expert_count():
-    too_wide, too_wide_reason = config_runnable(
-        {"tp": 4, "pp": 1, "ep": 8, "gpu_count": 8},
+def test_expert_parallelism_is_fixed_to_one():
+    valid, _ = config_runnable(
+        {"tp": 4, "pp": 1, "ep": 1, "gpu_count": 4},
         {"is_moe": True, "num_routed_experts": 64},
-    )
-    non_divisible, non_divisible_reason = config_runnable(
-        {"tp": 6, "pp": 1, "ep": 3, "gpu_count": 6},
-        {"is_moe": True, "num_routed_experts": 64},
-    )
-    non_integral_group, non_integral_group_reason = config_runnable(
-        {"tp": 8, "pp": 1, "ep": 3, "gpu_count": 8},
-        {"is_moe": True, "num_routed_experts": 60},
     )
 
-    assert not too_wide
-    assert "exceeds tp" in too_wide_reason
-    assert not non_divisible
-    assert "does not divide" in non_divisible_reason
-    assert not non_integral_group
-    assert "must divide tp" in non_integral_group_reason
+    assert valid
+    for ep in (2, 8, "1", 1.5, True):
+        with_ep, reason = config_runnable(
+            {"tp": 4, "pp": 1, "ep": ep, "gpu_count": 4},
+            {"is_moe": True, "num_routed_experts": 64},
+        )
+        assert not with_ep
+        assert "ep must be exactly 1" in reason
+
+
+def test_gpu_count_must_equal_engine_parallelism():
+    valid, _ = config_runnable({"tp": 2, "pp": 1, "gpu_count": 2})
+    oversized, reason = config_runnable({"tp": 2, "pp": 1, "gpu_count": 8})
+
+    assert valid
+    assert not oversized
+    assert "gpu_count must equal tp*pp=2" in reason
 
 
 def test_validator_rejects_phi_tp8_from_snapshot_model_identity():

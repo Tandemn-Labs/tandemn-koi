@@ -2062,6 +2062,47 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertEqual([candidate["job_id"] for candidate in result["chosen"]], ["stable"])
         self.assertEqual(result["solver_mode"], "exact")
 
+    def test_critical_zero_throughput_swap_uses_emergency_recovery_tier(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 1}}}
+        candidate = {
+            "job_id": "dead-active",
+            "type": "swap",
+            "ladder": [_rank(env, "p5")],
+            "target_tps": 100.0,
+            "achieved_tps": 50.0,
+            "served_fraction": 0.5,
+            "sigma": 10.0,
+            "swap_gain_over_keep": 10.0,
+            "queue_state": "unstable",
+            "rehabilitation_status": "critical",
+            "rehabilitation_reasons": ["zero_throughput", "queue_critical"],
+            "prediction_assessment": {
+                "basis": "aic_direct_point",
+                "kind": "point",
+                "status": "success",
+                "queue_slo_verified": False,
+            },
+        }
+        slow_loop = type("SlowLoop", (), {"get_sss_swap_budget_t": lambda self: 1})()
+
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools._CTX, "slow_loop", slow_loop),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(agent_tools, "get_pending_jobs", return_value=[]),
+            patch.object(agent_tools, "get_priority", return_value=[]),
+        ):
+            result = agent_tools.jointly_select_placements([candidate])
+
+        self.assertEqual([item["job_id"] for item in result["chosen"]], ["dead-active"])
+        chosen = result["chosen"][0]
+        self.assertEqual(chosen["prediction_assessment"]["selection_mode"], "emergency_recovery")
+        self.assertEqual(chosen["service_class"], "partial")
+        self.assertTrue(chosen["work_conserving_floor"])
+
     def test_candidate_pruning_reports_before_and_after_counts(self):
         env = "reserved|aws|r1|z1|H100"
         resources = {env: {"free": 8, "gpu_type": "H100"}}

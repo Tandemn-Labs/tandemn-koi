@@ -259,6 +259,47 @@ def test_created_ack_is_recorded_without_claiming_materialization():
     assert attempt["terminal_tick"] is None
 
 
+def test_swap_cooldown_starts_when_swap_materializes():
+    runner = _runner()
+    action = PlanAction.from_dict(
+        {
+            "job_id": "job-1",
+            "type": "swap",
+            "ladder": [
+                {
+                    "role": "aggregate",
+                    "env": ["reserved", "aws", "r1", "z1", "H100"],
+                    "config": {"instance_type": "p5", "gpu_count": 2, "tp": 2, "pp": 1},
+                    "n_replicas": 1,
+                }
+            ],
+        }
+    )
+    runner._record_deployment_requests(
+        TickContext(tick=1, validated_plan=Plan(tick=1, actions=[action]))
+    )
+    assert runner._health_state.get("job-1", {}).get("last_swap_tick") is None
+
+    rank = action.ladder[0]
+    active = {
+        "job_id": "job-1",
+        "active_chains": [
+            {
+                "shape_json": {
+                    **rank.config,
+                    "env": list(rank.env),
+                    "rank_id": rank.rank_id,
+                }
+            }
+        ],
+    }
+    runner._reconcile_deployments(
+        TickContext(tick=2, cluster_snapshot=ClusterResourceSnapshot(2, {}, [active], []))
+    )
+
+    assert runner._health_state["job-1"]["last_swap_tick"] == 2
+
+
 def test_prediction_identity_retains_runtime_configuration():
     runner = _runner()
     base = {
@@ -315,6 +356,7 @@ def test_active_health_requires_repeat_or_critical_signal_for_rehabilitation():
     assert first["job-1"]["rehabilitation_eligible"] is False
     assert second["job-1"]["rehabilitation_eligible"] is True
     assert job["health"]["status"] == "degraded"
+    assert second["job-1"] is not runner._health_state["job-1"]
 
 
 def test_sparse_telemetry_does_not_trigger_rehabilitation():
@@ -411,3 +453,73 @@ def test_incomplete_telemetry_with_deep_queue_is_critical():
     assert health["status"] == "critical"
     assert health["rehabilitation_eligible"] is True
     assert "telemetry_incomplete" in health["reasons"]
+
+
+def test_online_empty_queue_does_not_treat_low_throughput_as_capacity_failure():
+    runner = _runner()
+    job = {
+        "job_id": "job-1",
+        "job_features": {
+            "type": "online",
+            "request_arrival_rate": 10.0,
+            "osl_token_avg": 100,
+            "target_p99_ttft_ms": 100.0,
+            "target_p99_tpot_ms": 20.0,
+        },
+    }
+    snapshot = ClusterResourceSnapshot(1, {}, [job], [])
+
+    result = runner._update_active_health(
+        TickContext(tick=1, cluster_snapshot=snapshot),
+        {"job-1": job["job_features"]},
+        {
+            "job-1": [
+                {
+                    "throughput_token_per_sec": 0.0,
+                    "p99_ttft_ms": 50.0,
+                    "p99_tpot_ms": 10.0,
+                    "depth_req_q": 0.0,
+                    "telemetry_complete": True,
+                }
+            ]
+        },
+    )
+
+    assert result["job-1"]["status"] == "healthy"
+    assert result["job-1"]["rehabilitation_eligible"] is False
+
+
+def test_batch_health_uses_deadline_pace_and_ignores_latency_queue():
+    runner = _runner()
+    job = {
+        "job_id": "job-1",
+        "kind": "batch",
+        "job_features": {
+            "type": "batch",
+            "total_token_budget": 1000,
+            "deadline_hrs": 1,
+            "target_p99_ttft_ms": 1.0,
+            "target_p99_tpot_ms": 1.0,
+        },
+    }
+    snapshot = ClusterResourceSnapshot(1, {}, [job], [])
+
+    result = runner._update_active_health(
+        TickContext(tick=1, cluster_snapshot=snapshot),
+        {"job-1": job["job_features"]},
+        {
+            "job-1": [
+                {
+                    "throughput_token_per_sec": 0.2,
+                    "p99_ttft_ms": 10_000.0,
+                    "p99_tpot_ms": 100.0,
+                    "depth_req_q": 1000.0,
+                    "telemetry_complete": True,
+                }
+            ]
+        },
+    )
+
+    health = result["job-1"]
+    assert health["status"] == "degraded"
+    assert health["reasons"] == ["throughput_shortfall"]

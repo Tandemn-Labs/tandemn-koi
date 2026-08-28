@@ -389,6 +389,7 @@ class TickRunner:
             for job in jobs or []
         }
         health_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        tick_icp_details: dict[str, dict[str, Any]] = {}
 
         # if ctx.deployment_x is None:
         #     ctx.deployment_x = self._build_deployment_x_index(ctx)
@@ -509,9 +510,13 @@ class TickRunner:
                 edge = self._resolve_edge(edge_id)
                 if edge is None:
                     continue
-                details = self.icp.compute_icp_details_per_edge(
-                    edge=edge, evidence_store=self.evidence_store
-                )
+                if edge_id not in tick_icp_details:
+                    tick_icp_details[edge_id] = self.icp.compute_icp_details_per_edge(
+                        edge=edge,
+                        evidence_store=self.evidence_store,
+                        before_tick=ctx.tick,
+                    )
+                details = tick_icp_details[edge_id]
                 icp_per_edge[edge_id] = details["result"]
                 icp_diagnostics[edge_id] = details
 
@@ -892,6 +897,10 @@ class TickRunner:
             if matching_attempt is not None:
                 matching_attempt["state"] = "materialized"
                 matching_attempt["terminal_tick"] = ctx.tick
+                if (
+                    matching_attempt.get("action_type") or request.get("action_type")
+                ) == ActionType.SWAP.value:
+                    self._health_state.setdefault(jid, {})["last_swap_tick"] = ctx.tick
                 status = "active"
                 completed.append(jid)
             else:
@@ -1003,8 +1012,6 @@ class TickRunner:
                 "shapes": shapes,
             }
             new_attempts.append((action.job_id, attempt_number))
-            if action.type == ActionType.SWAP:
-                self._health_state.setdefault(action.job_id, {})["last_swap_tick"] = ctx.tick
         return new_attempts
 
     def _record_deployment_acks(
@@ -1136,6 +1143,9 @@ class TickRunner:
             reasons = []
             ttft_target = features.get("target_p99_ttft_ms")
             tpot_target = features.get("target_p99_tpot_ms")
+            previous = self._health_state.get(jid, {})
+            previous_depth = float(previous.get("last_queue_depth") or 0.0)
+            current_depth = float(observed["depth_req_q"] or 0.0)
             try:
                 job_type = str(
                     features.get("type")
@@ -1147,13 +1157,9 @@ class TickRunner:
                     deadline_hours = features.get("deadline_hours")
                     if deadline_hours is None:
                         deadline_hours = features.get("deadline_hrs", 24.0)
-                    required_throughput = (
-                        float(features.get("total_token_budget") or 0.0)
-                        / max(
-                            1.0,
-                            float(deadline_hours) * 3600.0,
-                        )
-                        * float(features.get("headroom_factor") or 1.5)
+                    required_throughput = float(features.get("total_token_budget") or 0.0) / max(
+                        1.0,
+                        float(deadline_hours) * 3600.0,
                     )
                 else:
                     required_throughput = (
@@ -1167,45 +1173,58 @@ class TickRunner:
                     )
             except (TypeError, ValueError, OverflowError):
                 required_throughput = 0.0
-            if observed_throughput is not None and observed_throughput <= 0:
-                reasons.append("zero_throughput")
-            elif (
-                observed_throughput is not None
-                and required_throughput > 0
-                and observed_throughput < 0.5 * required_throughput
-            ):
-                reasons.append("throughput_shortfall")
-            if (
-                ttft_target
-                and observed["p99_ttft_ms"] is not None
-                and observed["p99_ttft_ms"] > float(ttft_target)
-            ):
-                reasons.append("ttft_breach")
-            if (
-                tpot_target
-                and observed["p99_tpot_ms"] is not None
-                and observed["p99_tpot_ms"] > float(tpot_target)
-            ):
-                reasons.append("tpot_breach")
-            previous = self._health_state.get(jid, {})
+            if job_type == "batch":
+                if observed_throughput is not None and observed_throughput <= 0:
+                    reasons.append("zero_throughput")
+                elif (
+                    observed_throughput is not None
+                    and required_throughput > 0
+                    and observed_throughput < required_throughput
+                ):
+                    reasons.append("throughput_shortfall")
+            else:
+                has_backlog = current_depth > 0
+                if has_backlog and observed_throughput is not None and observed_throughput <= 0:
+                    reasons.append("zero_throughput")
+                elif (
+                    has_backlog
+                    and observed_throughput is not None
+                    and required_throughput > 0
+                    and observed_throughput < 0.5 * required_throughput
+                ):
+                    reasons.append("throughput_shortfall")
+                if (
+                    ttft_target
+                    and observed["p99_ttft_ms"] is not None
+                    and observed["p99_ttft_ms"] > float(ttft_target)
+                ):
+                    reasons.append("ttft_breach")
+                if (
+                    tpot_target
+                    and observed["p99_tpot_ms"] is not None
+                    and observed["p99_tpot_ms"] > float(tpot_target)
+                ):
+                    reasons.append("tpot_breach")
+                if current_depth >= 10 and current_depth > max(10.0, previous_depth * 1.1):
+                    reasons.append("queue_growing")
+                if current_depth >= 100:
+                    reasons.append("queue_critical")
             complete_samples = bool(rows) and all(
                 sample.get("telemetry_complete") is True for sample in rows
             )
             telemetry_incomplete = jid in incomplete_jobs or not complete_samples
-            previous_depth = float(previous.get("last_queue_depth") or 0.0)
-            current_depth = float(observed["depth_req_q"] or 0.0)
-            if current_depth >= 10 and current_depth > max(10.0, previous_depth * 1.1):
-                reasons.append("queue_growing")
             critical = (
                 "zero_throughput" in reasons
                 or (
                     observed_throughput is not None
                     and required_throughput > 0
                     and observed_throughput < 0.1 * required_throughput
+                    and (job_type == "batch" or current_depth > 0)
                 )
-                or current_depth >= 100
+                or (job_type != "batch" and current_depth >= 100)
                 or (
-                    ttft_target
+                    job_type != "batch"
+                    and ttft_target
                     and observed["p99_ttft_ms"] is not None
                     and observed["p99_ttft_ms"] >= 3 * float(ttft_target)
                 )
@@ -1221,10 +1240,10 @@ class TickRunner:
                     "last_swap_tick": int(previous.get("last_swap_tick", -10_000)),
                     "last_queue_depth": float(previous.get("last_queue_depth") or 0.0),
                 }
-                self._health_state[jid] = entry
+                self._health_state[jid] = copy.deepcopy(entry)
                 job["health"] = copy.deepcopy(entry)
                 job["recent_failures"] = entry["unhealthy_ticks"]
-                health[jid] = entry
+                health[jid] = copy.deepcopy(entry)
                 continue
             if telemetry_incomplete:
                 reasons.append("telemetry_incomplete")
@@ -1262,10 +1281,10 @@ class TickRunner:
                 "last_swap_tick": last_swap_tick,
                 "last_queue_depth": current_depth,
             }
-            self._health_state[jid] = entry
+            self._health_state[jid] = copy.deepcopy(entry)
             job["health"] = copy.deepcopy(entry)
             job["recent_failures"] = streak
-            health[jid] = entry
+            health[jid] = copy.deepcopy(entry)
         return health
 
     # ------------------------------------------------------------------

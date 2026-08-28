@@ -725,6 +725,72 @@ class DeploymentXSmokeTests(unittest.TestCase):
             "diverged",
         )
 
+    def test_s2_computes_icp_once_per_unique_edge_per_tick(self):
+        graph, mechanism = _diagnostic_graph()
+        snapshot = _snapshot()
+        chains = snapshot.active_jobs[0]["active_chains"]
+        for chain in chains:
+            chain["shape_json"]["rank_traffic_share"] = 0.5
+        second = {
+            **chains[0],
+            "chain_id": "chain_b",
+            "shape_json": {
+                **chains[0]["shape_json"],
+                "rank_id": "rank_b",
+                "rank_traffic_share": 0.5,
+            },
+        }
+        chains.append(second)
+
+        class TwoRankTelemetry(_Telemetry):
+            def iter_per_rank(self, bundle):
+                for rank_id in ("rank_a", "rank_b"):
+                    yield SimpleNamespace(
+                        job_id="job_1",
+                        rank_id=rank_id,
+                        v_observed={"kv_cache_util": np.array([0.2, 0.3])},
+                        y_observed={"p99_ttft_ms": np.array([100.0, 110.0])},
+                    )
+
+        class CountingICP:
+            def __init__(self):
+                self.calls = []
+
+            def compute_icp_details_per_edge(self, edge, evidence_store, before_tick=None):
+                self.calls.append((edge.edge_id, before_tick))
+                return {
+                    "edge_id": edge.edge_id,
+                    "result": ICPResult.UNDECIDED,
+                    "reason": "no_evidence",
+                }
+
+        icp = CountingICP()
+        runner = TickRunner(
+            evidence_store=_EvidenceStore(),
+            telemetry=TwoRankTelemetry(),
+            cusum=Cusum(),
+            icp=icp,
+            quadrant_validator=QuadrantValidator(),
+            confidence_service=SimpleNamespace(candidate_graph=graph),
+            slow_loop=_SlowLoop(),
+            dro=_Dro(),
+            mechanism_registry=_MechanismRegistry([mechanism]),
+            resource_map=_ResourceMap(),
+            agent=object(),
+            plan_validator=object(),
+            executor=object(),
+            candidate_graph=graph,
+        )
+        ctx = TickContext(tick=3, cluster_snapshot=snapshot)
+
+        runner.S1(ctx)
+        runner.S2(ctx)
+
+        self.assertEqual(
+            sorted(icp.calls),
+            sorted((edge_id, 3) for edge_id in mechanism.edge_ids),
+        )
+
     def test_s3_records_confidence_and_slow_dro_diagnostics(self):
         graph, mechanism = _diagnostic_graph()
         registry = MechanismRegistry(

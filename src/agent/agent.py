@@ -52,6 +52,7 @@ from typing import Any
 
 import src.agent.tools.agent_tools as agent_tools
 from src.config.hyperparameters import K_MAX, K_P
+from src.config.policy import SUPPORTED_EP
 from src.core.models import (
     LADDER_ACTIONS,
     REQUIRED_JOB_STATE,
@@ -248,13 +249,15 @@ class SpecialistRunner:
             "mechanism_ids list.\n"
             "- Every env is [market,cloud,region,zone,gpu_type]. Every ladder rank is "
             "{'role':'aggregate','env':[...],'config':{'instance_type':str,"
-            "'gpu_count':int,'tp':int,'pp':int,'sp':int,'ep':int,'cp':int},"
+            "'gpu_count':int,'tp':int,'pp':int,'sp':int,'cp':int},"
             "'n_replicas':int,'mechanism_id':'M_...'}. Do not use shorthand ranks.\n"
             "- Ladder ranks are simultaneous deployment components, not alternatives. "
             "For place or swap, return exactly one ladder rank; the deterministic "
             "candidate builder owns alternatives and composites.\n"
-            "- gpu_count, tp, pp, and n_replicas are positive integers. Match tp*pp "
-            "to the instance_catalog; gpu_count must fit gpus_per_instance unless "
+            "- gpu_count, tp, pp, and n_replicas are positive integers. gpu_count must "
+            "equal tp*pp exactly. EP is unsupported in this version; omit it and Koi "
+            "will fix it to 1. "
+            "The engine demand must fit gpus_per_instance unless "
             "num_nodes_per_chain spans multiple instances. pool_budget counts whole "
             "instances, not GPUs.\n"
             "- Set only instance_type, parallelism, optional num_nodes_per_chain/"
@@ -577,6 +580,25 @@ class SpecialistRunner:
             value = config.get(key)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 violations.append(f"{prefix}.config.{key} must be a positive int")
+        ep = config.get("ep", SUPPORTED_EP)
+        if type(ep) is not int or ep != SUPPORTED_EP:
+            violations.append(f"{prefix}.config.ep must be exactly {SUPPORTED_EP}")
+        gpu_count = config.get("gpu_count")
+        tp = config.get("tp")
+        pp = config.get("pp")
+        if (
+            isinstance(gpu_count, int)
+            and not isinstance(gpu_count, bool)
+            and isinstance(tp, int)
+            and not isinstance(tp, bool)
+            and isinstance(pp, int)
+            and not isinstance(pp, bool)
+        ):
+            expected_gpu_count = tp * pp
+            if gpu_count != expected_gpu_count:
+                violations.append(
+                    f"{prefix}.config.gpu_count must equal tp*pp={expected_gpu_count}"
+                )
 
         replicas = rank.get("n_replicas")
         if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas <= 0:
@@ -1223,7 +1245,7 @@ class KoiAgentHarness:
                 raise PlanMaterializationError(
                     f"job {jid}: Direct prediction cannot claim queue SLO verification"
                 )
-            if assessment.get("selection_mode") == "work_conserving":
+            if assessment.get("selection_mode") in {"work_conserving", "emergency_recovery"}:
                 trusted_assessment = (trusted_candidate or {}).get("prediction_assessment") or {}
                 trusted_ladder = (trusted_candidate or {}).get("ladder") or []
                 submitted_shapes = [
@@ -1266,7 +1288,7 @@ class KoiAgentHarness:
                     )
                 ):
                     raise PlanMaterializationError(
-                        f"job {jid}: work-conserving status must come from the joint solver"
+                        f"job {jid}: fallback status must come from the joint solver"
                     )
 
         try:
@@ -1346,17 +1368,15 @@ class KoiAgentHarness:
     def _apply_placement_floor(
         self, plan: Plan, states: dict[str, str], joint_recommendation, cluster_snapshot
     ) -> None:
-        """Never silently discard a placement in the root's joint recommendation.
+        """Never silently discard a PLACE or SWAP in the joint recommendation.
 
-        The floor: a waiting job the plan defers WITHOUT a rationale is treated as a
-        fumbled commit. Such a job is back-filled from ``joint_recommendation`` - the
-        root's own last jointly_select_placements result this trajectory. This does
-        not cap root agency:
+        A waiting DEFER or running KEEP without rationale is treated as a fumbled
+        commit when the joint solver selected a corresponding PLACE or SWAP. This
+        does not cap root agency:
 
-          - A DEFER that carries an explicit rationale is an intentional
-            root decision and is left untouched.
+          - A DEFER/KEEP carrying an explicit rationale is intentional and remains.
           - The root may otherwise accept or adjust the recommendation; the floor
-            only repairs an unexplained defer.
+            only repairs an unexplained no-op.
           - No recompute and no _CTX mutation - we reuse the result the LLM already
             produced, so there are no pipeline side effects at commit time.
         """
@@ -1366,8 +1386,10 @@ class KoiAgentHarness:
         unexplained_ids = {
             a.job_id
             for a in plan.actions
-            if a.type == ActionType.DEFER
-            and states.get(a.job_id) == "waiting"
+            if (
+                (a.type == ActionType.DEFER and states.get(a.job_id) == "waiting")
+                or (a.type == ActionType.KEEP and states.get(a.job_id) == "running")
+            )
             and not str(getattr(a, "rationale", "") or "").strip()
         }
         if not unexplained_ids:
@@ -1375,6 +1397,11 @@ class KoiAgentHarness:
         recommended_plan = Plan.from_raw(chosen, tick=self._current_tick)
         self._materialize_launch_configs(recommended_plan, cluster_snapshot)
         book = agent_tools._CTX.validated_budget_book
+        raw_by_job = {
+            str(candidate.get("job_id")): candidate
+            for candidate in chosen
+            if isinstance(candidate, dict) and candidate.get("job_id")
+        }
         recommended_by_job = {
             a.job_id: a
             for a in recommended_plan.actions
@@ -1385,12 +1412,26 @@ class KoiAgentHarness:
         patched: list = []
         filled: list = []
         for a in plan.actions:
-            repl = recommended_by_job.get(a.job_id) if a.type == ActionType.DEFER else None
+            candidate = recommended_by_job.get(a.job_id)
+            repl = (
+                candidate
+                if candidate is not None
+                and (
+                    (a.type == ActionType.DEFER and candidate.type == ActionType.PLACE)
+                    or (a.type == ActionType.KEEP and candidate.type == ActionType.SWAP)
+                )
+                else None
+            )
             if repl is None:
                 patched.append(a)
                 continue
             try:
-                self._validate_ladder(repl, book, cluster_snapshot)
+                self._validate_ladder(
+                    repl,
+                    book,
+                    cluster_snapshot,
+                    trusted_candidate=raw_by_job.get(a.job_id),
+                )
             except PlanMaterializationError as exc:
                 # The recommended placement no longer validates (rare) - keep the defer.
                 log.warning(
@@ -1407,8 +1448,8 @@ class KoiAgentHarness:
             return
         plan.actions = patched
         note = (
-            f"[placement-floor] {len(filled)} job(s) deferred with no rationale but "
-            f"present in the joint recommendation; restored: "
+            f"[placement-floor] {len(filled)} unexplained no-op action(s) present in "
+            f"the joint recommendation; restored: "
             f"{', '.join(filled)}."
         )
         plan.tick_rationale = ((plan.tick_rationale or "") + " " + note).strip()
@@ -1634,9 +1675,10 @@ class KoiAgentHarness:
             "`scored['budget_limited']`, and `scored['diagnostics']` are troubleshooting aids "
             "for an empty or suspicious recommendation, not a mandatory extra turn. "
             "You still own whether to accept or reasonedly adjust the recommendation. "
-            "To override a job in joint['chosen'], include an explicit DEFER action with a "
-            "non-empty rationale; omission is not an override. The deterministic placement "
-            "floor restores an omitted or unexplained defer from the recommendation. Resolve "
+            "To override a job in joint['chosen'], include an explicit DEFER (for PLACE) or "
+            "KEEP (for SWAP) with a non-empty rationale; omission is not an override. The "
+            "deterministic placement floor restores an omitted or unexplained no-op from the "
+            "recommendation. Resolve "
             "any feasibility violations without rerunning the pipeline.\n\n"
             "SHORTCUT/FALLBACK. As an alternative to the primary workflow, you may call "
             "plan_tick() exactly once and inspect its returned plan before accepting it or "
@@ -1774,7 +1816,7 @@ class KoiAgentHarness:
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
             "   'rank_id': 'rank_<ULID>', # omit rank_id; Koi generates a Store-compatible ID\n"
             "   'env': [market, cloud, region, zone, gpu_type],   # REQUIRED - launch target + ICP key\n"
-            "   'config': {instance_type, gpu_count, tp, pp, sp, ep, cp,\n"
+            "   'config': {instance_type, gpu_count, tp, pp, sp, cp,\n"
             "              num_nodes_per_chain, interconnect_type},  # the ONLY config knobs you set\n"
             "   # Koi/the engine own everything else - do NOT set engine_name,\n"
             "   # engine_version, router_policy, scheduling_policy, preemption_policy,\n"
@@ -1801,8 +1843,9 @@ class KoiAgentHarness:
             "Every ladder rank MUST carry a unique rank_id (or let Koi auto-fill one), "
             "MUST carry a 5-element env, and MUST resolve a "
             "mechanism_id, either on the rank or inherited from the action. "
-            "config.instance_type, gpu_count, tp, and pp are required; sp/ep/cp "
-            "default to 1 when omitted. For cloud instance pools, "
+            "config.instance_type, gpu_count, tp, and pp are required; sp/cp default "
+            "to 1 when omitted and EP is fixed to 1. gpu_count MUST equal tp*pp. "
+            "For cloud instance pools, "
             "config.instance_type is required when the env has multiple pools. "
             "gpu_count is engine GPU demand, not "
             "reserved capacity; Koi reserves and charges one full instance per "

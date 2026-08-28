@@ -711,6 +711,61 @@ class AgentToolsSmokeTests(unittest.TestCase):
             "physical_no_fit",
         )
 
+    def test_size_ladder_rejects_known_memory_no_fit_before_surrogate_call(self):
+        saved_context = {
+            name: getattr(agent_tools._CTX, name)
+            for name in ("resource_map", "surrogate", "candidate_graph", "dro")
+        }
+        saved_payload = agent_tools._rank_prediction_payload
+        saved_predict = agent_tools._predict_outcome_core
+        calls = []
+        try:
+            agent_tools.bind_tools(
+                resource_map=_ResourceMap(),
+                surrogate=object(),
+                candidate_graph=object(),
+                dro=_DRO(),
+            )
+            agent_tools._rank_prediction_payload = lambda rank, features, **_kwargs: {
+                "job_config": {
+                    "model_id": "too-large",
+                    "model_params_b": 100,
+                    "weight_quantization_bits": 16,
+                    "gpu_type": "H100",
+                    "gpu_mem_gb": 80,
+                    "gpu_mem_util": 0.9,
+                    "tp": 1,
+                    "pp": 1,
+                },
+                "job_features": dict(features),
+            }
+            agent_tools._predict_outcome_core = lambda *_args, **_kwargs: calls.append(True)
+
+            result = agent_tools.size_ladder(
+                [
+                    {
+                        "role": "aggregate",
+                        "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
+                        "config": {
+                            "instance_type": "p5.48xlarge",
+                            "gpu_count": 1,
+                            "tp": 1,
+                            "pp": 1,
+                        },
+                    }
+                ],
+                {"type": "batch"},
+                target_tps=100,
+            )
+        finally:
+            agent_tools._rank_prediction_payload = saved_payload
+            agent_tools._predict_outcome_core = saved_predict
+            for name, value in saved_context.items():
+                setattr(agent_tools._CTX, name, value)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["failure_status"], "physical_no_fit")
+
     def test_size_ladder_keeps_unsupported_prediction_out_of_physical_failures(self):
         class UnsupportedSurrogate:
             @staticmethod
@@ -796,7 +851,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
 
         self.assertIsNone(result["candidate"])
         self.assertEqual(result["diag"]["status"], "invalid_config")
-        self.assertIn("tp*pp=2 exceeds gpu_count=1", result["diag"]["reason"])
+        self.assertIn("gpu_count must equal tp*pp=2", result["diag"]["reason"])
 
     def test_size_ladder_reports_no_pool_capacity_without_prediction(self):
         class EmptyResourceMap(_ResourceMap):
@@ -1202,6 +1257,7 @@ class AgentToolsSmokeTests(unittest.TestCase):
                         "env": ["reserved", "aws", "us-east-1", "use1-az1", "H100"],
                         "config": {
                             "instance_type": "p5.48xlarge",
+                            "gpu_count": 1,
                             "tp": 1,
                             "pp": 1,
                             "max_num_seq": 1,

@@ -160,9 +160,6 @@ def _kv_bytes_per_elem(values: dict) -> float | None:
 def _weight_shards(values: dict) -> int:
     tp = int(_get(values, "tp") or 1)
     pp = int(_get(values, "pp") or 1)
-    if values.get("is_moe") is True:
-        ep = int(_get(values, "ep") or 1)
-        return max(1, min(tp, ep) * pp)
     return max(1, tp * pp)
 
 
