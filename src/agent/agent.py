@@ -1188,6 +1188,8 @@ class KoiAgentHarness:
                 raise PlanMaterializationError(
                     f"job {jid}: SWAP must match a jointly selected rehabilitation candidate"
                 )
+            action.keep_baseline_sigma = (trusted_candidate or {}).get("keep_baseline_sigma")
+            action.swap_gain_over_keep = (trusted_candidate or {}).get("swap_gain_over_keep")
             if (descriptor or {}).get("deployment_action_type") == "swap" and (
                 descriptor or {}
             ).get("deployment_status") in {
@@ -1594,10 +1596,10 @@ class KoiAgentHarness:
             "reserved market exists this version - never plan spot or "
             "on-demand capacity.\n\n"
             # ---------- THE OBJECTIVE, EXACTLY ----------
-            "THE OBJECTIVE, EXACTLY. Only PLACE and SWAP actions add a per-job "
-            "sigma_i; keep / defer / terminate / diagnose add nothing. Aggregate "
-            "sigma = (sum over your place/swap actions of "
-            "sigma_i = J + beta*EIG - gamma*Pr_DRO - lambda*SwitchCost) MINUS an "
+            "THE OBJECTIVE, EXACTLY. PLACE contributes sigma_i; SWAP contributes "
+            "swap_gain_over_keep = sigma_i - keep_baseline_sigma; keep / defer / "
+            "terminate / diagnose add nothing. Aggregate sigma is the sum of those "
+            "action gains MINUS an "
             "unserved-demand penalty for every WAITING job you leave unplaced. So "
             "deferring a serveable job LOWERS aggregate sigma - it is NOT free.\n"
             "  - J (augmented Tchebycheff, higher is better): how close the "

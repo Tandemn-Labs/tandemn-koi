@@ -502,6 +502,77 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         self.assertIsNone(plan.actions[0].achieved_tps)
         self.assertEqual(plan.actions[0].service_class, "exploratory")
 
+    def test_emergency_recovery_commit_score_keeps_work_conserving_floor(self):
+        self._bind_prediction_fakes()
+        plan = self._sigma_plan("p5")
+        action = plan.actions[0]
+        action.type = agent_tools.ActionType.SWAP
+        action.queue_state = "unstable"
+        action.rehabilitation_status = "critical"
+        action.rehabilitation_reasons = ["zero_throughput", "queue_critical"]
+        action.service_class = "partial"
+        action.prediction_assessment = {
+            "basis": "aic_direct_point",
+            "kind": "point",
+            "status": "success",
+            "queue_slo_verified": False,
+            "selection_mode": "emergency_recovery",
+        }
+
+        with self._sigma_patches():
+            result = agent_tools.compute_sigma_for_commit(plan)
+
+        self.assertEqual(result["per_job"]["job-final"]["sigma"], 1e-9)
+        self.assertEqual(action.swap_gain_over_keep, 1e-9)
+        self.assertEqual(action.service_class, "partial")
+
+    def test_swap_score_uses_observed_keep_baseline(self):
+        self._bind_prediction_fakes()
+        plan = self._sigma_plan("p5")
+        action = plan.actions[0]
+        action.type = agent_tools.ActionType.SWAP
+        action.rehabilitation_status = "degraded"
+        action.rehabilitation_reasons = ["throughput_shortfall"]
+
+        class ThroughputScore:
+            @staticmethod
+            def compute_tchebycheff(**kwargs):
+                return float(kwargs["y_hat"]["throughput_token_per_sec"]) - 1.0
+
+        snapshot = type(
+            "Snapshot",
+            (),
+            {
+                "active_jobs_summary": lambda self: [
+                    {
+                        "job_id": "job-final",
+                        "job_features": {
+                            "type": "batch",
+                            "total_token_budget": 3600.0,
+                            "deadline_hours": 1.0,
+                            "headroom_factor": 1.0,
+                        },
+                        "health": {
+                            "observed": {"throughput_token_per_sec": 0.25},
+                        },
+                    }
+                ],
+                "pending_jobs_summary": lambda self: [],
+            },
+        )()
+
+        with (
+            self._sigma_patches(),
+            patch.object(agent_tools, "_snapshot", return_value=snapshot),
+            patch.object(agent_tools._CTX, "tchebycheff_module", ThroughputScore()),
+        ):
+            result = agent_tools.compute_sigma_for_commit(plan)
+
+        score = result["per_job"]["job-final"]
+        self.assertEqual(score["keep_baseline_sigma"], -0.75)
+        self.assertEqual(score["swap_gain_over_keep"], score["sigma"] + 0.75)
+        self.assertEqual(result["aggregate_sigma"], score["swap_gain_over_keep"])
+
     def test_final_score_never_downgrades_physical_no_fit_to_exploration(self):
         self._bind_prediction_fakes()
         plan = self._sigma_plan("p5")
@@ -1258,18 +1329,117 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
 
         with (
             patch.object(agent_tools, "get_pending_jobs", return_value=[{"job_id": "job-1"}]),
-            patch.object(agent_tools, "get_active_jobs", return_value=[{"job_id": "job-2"}]),
+            patch.object(
+                agent_tools,
+                "get_active_jobs",
+                return_value=[{"job_id": "job-2", "health": {"rehabilitation_eligible": True}}],
+            ),
         ):
-            first = agent_tools.run_job_specialists()
+            first = agent_tools.run_job_specialists(include_active=False)
             first["job-1"]["reasoning"] = "mutated"
-            second = agent_tools.run_job_specialists()
-            with_active = agent_tools.run_job_specialists(include_active=True)
+            second = agent_tools.run_job_specialists(include_active=False)
+            with_active = agent_tools.run_job_specialists()
             with_active["job-2"]["reasoning"] = "mutated"
-            with_active_again = agent_tools.run_job_specialists(include_active=True)
+            with_active_again = agent_tools.run_job_specialists()
 
         self.assertEqual(runner.calls, [["job-1"], ["job-1", "job-2"]])
         self.assertEqual(second["job-1"]["reasoning"], "original")
         self.assertEqual(with_active_again["job-2"]["reasoning"], "original")
+
+    def test_specialists_skip_deployment_blocked_jobs(self):
+        class Runner:
+            def __init__(self):
+                self.jobs = []
+
+            def run_many(self, jobs, budget_book, max_workers):
+                self.jobs = list(jobs)
+                return [{"job_id": job_id, "ladder": []} for job_id in jobs]
+
+        runner = Runner()
+        agent_tools._CTX.specialist_runner = runner
+        job_ids = ["fresh", "pending", "exhausted", "retry-ready", "active-ready"]
+        agent_tools._CTX.validated_budget_book = {
+            "job_budgets": {job_id: {"slice_id": job_id} for job_id in job_ids}
+        }
+        pending = [
+            {"job_id": "fresh"},
+            {"job_id": "pending", "deployment_status": "deployment_pending"},
+            {
+                "job_id": "exhausted",
+                "deployment_status": "deployment_not_materialized",
+                "deployment_retry_exhausted": True,
+            },
+            {
+                "job_id": "retry-ready",
+                "deployment_status": "deployment_not_materialized",
+                "deployment_retry_allowed": True,
+            },
+        ]
+        active = [
+            {
+                "job_id": "active-ready",
+                "health": {"rehabilitation_eligible": True},
+            }
+        ]
+
+        with (
+            patch.object(agent_tools, "get_pending_jobs", return_value=pending),
+            patch.object(agent_tools, "get_active_jobs", return_value=active),
+        ):
+            agent_tools.run_job_specialists()
+
+        self.assertEqual(runner.jobs, ["fresh", "retry-ready", "active-ready"])
+
+    def test_specialist_mechanism_survives_normalization_and_applicability(self):
+        raw = {
+            **_rank("reserved|aws|r1|a|H100", "p5"),
+            "mechanism_id": "M_specialist",
+        }
+
+        normalized = agent_tools._normalize_candidate_rank(raw)
+        with patch.object(
+            agent_tools,
+            "get_applicable_mechanisms",
+            return_value=[
+                {"mechanism_id": "M_default"},
+                {"mechanism_id": "M_specialist"},
+            ],
+        ):
+            selected = agent_tools._applicable_mechanism_id(normalized, {})
+
+        self.assertEqual(normalized["mechanism_id"], "M_specialist")
+        self.assertEqual(selected, "M_specialist")
+
+    def test_specialist_shape_suppresses_duplicate_generated_frame(self):
+        env = "reserved|aws|r1|a|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 1}}}
+        specialist_rank = {
+            **_rank(env, "p5"),
+            "mechanism_id": "M_specialist",
+        }
+        frames = []
+
+        def score(jid, _user_id, _slice_id, rank, _features):
+            frames.append(rank)
+            return {
+                "candidate": {"job_id": jid},
+                "meets_target": True,
+                "diag": {"status": "ok", "reason": None},
+            }
+
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        with self._candidate_patches(resources, specs, [{"job_id": "job-1"}], score):
+            agent_tools.build_scored_candidates(
+                {},
+                {"job-1": {"ladder": [specialist_rank]}},
+            )
+
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["mechanism_id"], "M_specialist")
+        self.assertEqual(frames[0]["proposal_source"], "specialist")
 
     def _candidate_patches(self, resources, specs, pending, scorer, *, job_type="batch"):
         def job_features(_snapshot, jid):
@@ -1363,6 +1533,45 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             ["ok", "budget_exhausted", "budget_skipped"],
         )
 
+    def test_candidate_round_robin_starts_with_highest_priority_job(self):
+        env = "reserved|aws|r1|a|H100"
+        resources = {env: {"free": 1, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 1}}}
+        pending = [{"job_id": "job-low"}, {"job_id": "job-high"}]
+        calls = []
+
+        def score(jid, _user_id, _slice_id, _rank, _features):
+            calls.append(jid)
+            return {
+                "candidate": {"job_id": jid},
+                "meets_target": True,
+                "diag": {"status": "ok", "reason": None},
+            }
+
+        budget = {
+            "job_budgets": {
+                "job-low": {
+                    "slice_id": "low",
+                    "priority_score": 1.0,
+                    "env_budget": {env: 1},
+                    "pool_budget": {env: {"p5": 1}},
+                },
+                "job-high": {
+                    "slice_id": "high",
+                    "priority_score": 100.0,
+                    "env_budget": {env: 1},
+                    "pool_budget": {env: {"p5": 1}},
+                },
+            }
+        }
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        with self._candidate_patches(resources, specs, pending, score):
+            agent_tools.build_scored_candidates(budget, {})
+
+        self.assertEqual(calls, ["job-high", "job-low"])
+
     def test_all_same_gpu_environments_are_stable_and_candidate_results_are_cached(self):
         env_a = "reserved|aws|r1|a|H100"
         env_b = "reserved|aws|r1|b|H100"
@@ -1433,6 +1642,113 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
             agent_tools.build_scored_candidates(budget, {})
 
         self.assertEqual(replicas, [1, 2, 3])
+
+    def test_generated_frames_cover_each_pool_before_replica_expansion(self):
+        env_a = "reserved|aws|r1|a|H100"
+        env_b = "ondemand|azure|r2|b|MI300X"
+        resources = {
+            env_a: {"free": 4, "gpu_type": "H100"},
+            env_b: {"free": 1, "gpu_type": "MI300X"},
+        }
+        specs = {
+            env_a: {"p5": {"gpus_per_instance": 1, "free_instances": 4}},
+            env_b: {"nd-mi300": {"gpus_per_instance": 1, "free_instances": 1}},
+        }
+        frames = []
+
+        def score(jid, _user_id, _slice_id, rank, _features):
+            marker = (rank["config"]["instance_type"], rank["n_replicas"])
+            frames.append(marker)
+            return {
+                "candidate": {"job_id": jid, "marker": marker},
+                "meets_target": True,
+                "diag": {"status": "ok", "reason": None},
+            }
+
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        budget = {
+            "job_budgets": {
+                "job-1": {
+                    "slice_id": "slice-1",
+                    "env_budget": {env_a: 4, env_b: 1},
+                    "pool_budget": {env_a: {"p5": 4}, env_b: {"nd-mi300": 1}},
+                }
+            }
+        }
+        with self._candidate_patches(resources, specs, [{"job_id": "job-1"}], score):
+            agent_tools.build_scored_candidates(budget, {})
+
+        self.assertEqual(set(frames[:2]), {("p5", 1), ("nd-mi300", 1)})
+        self.assertEqual(frames[2], ("p5", 2))
+
+    def test_pending_deployment_capacity_reserves_whole_instances(self):
+        env = "reserved|aws|r1|a|H100"
+        specs = {
+            env: {"p5": {"gpus_per_instance": 8, "free_instances": 4}},
+        }
+        pending = {
+            "job_id": "active-job",
+            "deployment_status": "deployment_pending",
+            "last_requested_shapes": [
+                {
+                    "env": env.split("|"),
+                    "instance_type": "p5",
+                    "gpu_count": 4,
+                    "tp": 4,
+                    "pp": 1,
+                    "n_replicas": 2,
+                }
+            ],
+        }
+
+        with (
+            patch.object(agent_tools, "get_pending_jobs", return_value=[]),
+            patch.object(agent_tools, "get_active_jobs", return_value=[pending]),
+        ):
+            reserved = agent_tools._pending_deployment_capacity(specs)
+
+        self.assertEqual(reserved[("gpu", env)], 16)
+        self.assertEqual(reserved[("pool", env, "p5")], 2)
+
+    def test_pending_deployment_capacity_removes_unmaterialized_pool_from_search(self):
+        env = "reserved|aws|r1|a|H100"
+        resources = {env: {"free": 8, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 8, "free_instances": 1}}}
+        pending_job = {"job_id": "new-job"}
+        active_job = {
+            "job_id": "active-job",
+            "deployment_status": "deployment_pending",
+            "deployment_action_type": "swap",
+            "last_requested_shapes": [
+                {
+                    "env": env.split("|"),
+                    "instance_type": "p5",
+                    "gpu_count": 4,
+                    "tp": 4,
+                    "pp": 1,
+                    "n_replicas": 1,
+                }
+            ],
+        }
+        calls = []
+
+        def score(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("reserved pool must not reach candidate scoring")
+
+        agent_tools._CTX.resource_map = object()
+        agent_tools._CTX.surrogate = object()
+        agent_tools._CTX.slow_loop = _SlowLoop()
+        with (
+            self._candidate_patches(resources, specs, [pending_job], score),
+            patch.object(agent_tools, "get_active_jobs", return_value=[active_job]),
+        ):
+            result = agent_tools.build_scored_candidates({}, {})
+
+        self.assertEqual(calls, [])
+        self.assertIn("no policy-valid candidate frame", result["exhausted"]["new-job"])
 
     def test_unhealthy_active_job_generates_swap_candidates(self):
         env = "reserved|aws|r1|a|H100"

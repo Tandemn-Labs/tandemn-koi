@@ -747,6 +747,16 @@ def _job_features_for(snapshot, job_id: str) -> dict[str, Any]:
     return {}
 
 
+def _active_health_for(snapshot, job_id: str) -> dict[str, Any]:
+    """Return deterministic health evidence for an active job, when available."""
+    if snapshot is None or not hasattr(snapshot, "active_jobs_summary"):
+        return {}
+    for job in snapshot.active_jobs_summary() or []:
+        if job.get("job_id", job.get("id")) == job_id:
+            return dict(job.get("health") or {})
+    return {}
+
+
 def _rank_prediction_payload(
     rank: RankSpec,
     job_features: dict[str, Any] | None = None,
@@ -1665,7 +1675,7 @@ def _budget_violations(
 
 def run_job_specialists(
     max_workers: int = 8,
-    include_active: bool = False,
+    include_active: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Run bounded per-job specialists under a validated BudgetBook.
 
@@ -1677,8 +1687,8 @@ def run_job_specialists(
 
     Args:
         max_workers: Parallel specialist calls.
-        include_active: Include running jobs in addition to waiting jobs. Defaults
-            to False because the candidate builder currently consumes waiting jobs.
+        include_active: Include rehabilitation-eligible running jobs in addition to
+            waiting jobs. Enabled by default because the candidate builder scores SWAPs.
 
     Returns:
         Dict job_id -> JobSpecialistResult ({"job_id", "type", "ladder",
@@ -1700,10 +1710,19 @@ def run_job_specialists(
     cache_key = _tick_cache_key(book, int(max_workers), bool(include_active))
     if cache_key is not None and cache_key in _specialist_results_cache:
         return copy.deepcopy(_specialist_results_cache[cache_key])
+
+    def retry_actionable(job: dict[str, Any]) -> bool:
+        status = job.get("deployment_status")
+        if status == "deployment_pending":
+            return False
+        if status == "deployment_not_materialized":
+            return job.get("deployment_retry_allowed") is True
+        return True
+
     pending_ids = {
         job.get("job_id", job.get("id"))
         for job in get_pending_jobs()
-        if job.get("job_id", job.get("id"))
+        if job.get("job_id", job.get("id")) and retry_actionable(job)
     }
     eligible_ids = set(pending_ids)
     if include_active:
@@ -1711,6 +1730,8 @@ def run_job_specialists(
             job.get("job_id", job.get("id"))
             for job in get_active_jobs()
             if job.get("job_id", job.get("id"))
+            and (job.get("health") or {}).get("rehabilitation_eligible") is True
+            and (job.get("deployment_action_type") != "swap" or retry_actionable(job))
         )
     job_ids = [job_id for job_id in (book.get("job_budgets") or {}) if job_id in eligible_ids]
     results = (
@@ -3465,6 +3486,40 @@ def _clamp_to_reference(y_hat: dict[str, Any], reference: dict[str, float]) -> d
     return out
 
 
+def _keep_baseline_sigma(
+    snapshot,
+    job_id: str,
+    job_features: dict[str, Any],
+    weights: dict[str, float],
+    ranges: dict[str, float],
+) -> float:
+    """Score the active deployment from observed service outcomes."""
+    observed = dict(_active_health_for(snapshot, job_id).get("observed") or {})
+    if _job_mode(job_features) == "online" and float(observed.get("depth_req_q") or 0.0) <= 0:
+        # At an empty queue, achieved throughput is offered load rather than capacity.
+        observed.pop(_THROUGHPUT_OBJ, None)
+    target_ref = _target_reference(job_features)
+    if target_ref:
+        reference = target_ref
+        current = _clamp_to_reference(observed, target_ref)
+        normalization = {name: abs(value) for name, value in target_ref.items() if value}
+    else:
+        reference = _seeded_z_star(get_z_star(job_features))
+        current = observed
+        normalization = ranges
+    scoreable = _scoreable_y_hat(current, weights, reference, normalization)
+    if not scoreable:
+        return 0.0
+    return float(
+        _CTX.tchebycheff_module.compute_tchebycheff(
+            y_hat=scoreable,
+            w_t=weights,
+            z_star_t=reference,
+            normalization_range=normalization,
+        )
+    )
+
+
 # Per-mode OPTIMIZE axis: which objective Koi pushes PAST its target once the target
 # is met. Batch maximizes aggregate throughput; online minimizes latency (online
 # throughput is pinned to demand, so there is nothing to maximize there). Cost is
@@ -3499,8 +3554,9 @@ def _axis_headroom(y_value: float, target: float, axis: str) -> float:
 def compute_sigma(plan) -> dict[str, Any]:
     """Score a plan: per-job sigma and the cluster aggregate.
 
-    sigma = J + beta_t * eig - gamma * Pr_DRO - lambda_swit * switch_cost,
-    over every ladder-bearing action (place/swap). The
+    sigma = J + beta_t * eig - gamma * Pr_DRO - lambda_swit * switch_cost.
+    PLACE contributes sigma; SWAP contributes sigma minus the observed KEEP
+    baseline. The
     scoring inputs are DERIVED, not trusted from the LLM: prev_ladder and
     slo_thresholds come from the snapshot, y_hat from the action's
     advisory predicted_y or a fresh surrogate call. Non-ladder actions
@@ -3874,12 +3930,28 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
         if selection_mode in {"work_conserving", "emergency_recovery"}:
             if selection_mode == "work_conserving":
                 action.service_class = "idle_capacity_fallback"
-            fraction = served_fraction_by_job.get(job_id, 0.0)
-            avoided_penalty = (
-                UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * fraction
+            if selection_mode == "emergency_recovery":
+                sigma_i = _WORK_CONSERVING_GAIN_FLOOR
+            else:
+                fraction = served_fraction_by_job.get(job_id, 0.0)
+                avoided_penalty = (
+                    UNSERVED_PENALTY * max(1.0, priority_by_job.get(job_id, 1.0)) * fraction
+                )
+                if action.queue_state == "unstable" or sigma_i + avoided_penalty <= 0:
+                    sigma_i = -avoided_penalty + _WORK_CONSERVING_GAIN_FLOOR
+        keep_baseline_sigma = 0.0
+        swap_gain_over_keep = sigma_i
+        if action.type == ActionType.SWAP:
+            keep_baseline_sigma = _keep_baseline_sigma(
+                snapshot,
+                job_id,
+                job_features,
+                w_t,
+                ranges,
             )
-            if action.queue_state == "unstable" or sigma_i + avoided_penalty <= 0:
-                sigma_i = -avoided_penalty + _WORK_CONSERVING_GAIN_FLOOR
+            swap_gain_over_keep = sigma_i - keep_baseline_sigma
+            action.keep_baseline_sigma = keep_baseline_sigma
+            action.swap_gain_over_keep = swap_gain_over_keep
         per_job[job_id] = {
             "J": J,
             "eig": eig_value,
@@ -3889,12 +3961,12 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
             "opt_bonus": opt_bonus,
             "value_bonus": value_bonus,
             "rehabilitation_credit": rehabilitation_credit,
-            "keep_baseline_sigma": 0.0,
-            "swap_gain_over_keep": sigma_i,
+            "keep_baseline_sigma": keep_baseline_sigma,
+            "swap_gain_over_keep": swap_gain_over_keep,
             "model_sigma": model_sigma,
             "sigma": sigma_i,
         }
-        aggregate += sigma_i
+        aggregate += swap_gain_over_keep if action.type == ActionType.SWAP else sigma_i
 
     # Serve-value: leaving a waiting job unserved is NOT free. Charge an
     # opportunity cost per pending job the plan does not place, over snapshot
@@ -3984,6 +4056,43 @@ def _ladder_capacity_cost(
     return cost
 
 
+def _pending_deployment_capacity(specs: dict[str, Any]) -> dict[tuple, int]:
+    """Capacity reserved by acknowledged requests that have not materialized yet."""
+    reserved: dict[tuple, int] = {}
+    try:
+        active_jobs = get_active_jobs()
+    except (AttributeError, RuntimeError):
+        active_jobs = []
+    jobs = {
+        str(job.get("job_id")): job
+        for job in [*get_pending_jobs(), *active_jobs]
+        if job.get("job_id") is not None
+    }
+    for job in jobs.values():
+        if job.get("deployment_status") != "deployment_pending":
+            continue
+        ranks = []
+        for shape in job.get("last_requested_shapes") or []:
+            tp = int(shape.get("tp") or 1)
+            pp = int(shape.get("pp") or 1)
+            env = shape.get("env") or []
+            ranks.append(
+                {
+                    "env": env.split("|") if isinstance(env, str) else list(env),
+                    "config": {
+                        "instance_type": shape.get("instance_type"),
+                        "gpu_count": int(shape.get("gpu_count") or tp * pp),
+                        "tp": tp,
+                        "pp": pp,
+                    },
+                    "n_replicas": int(shape.get("n_replicas") or 1),
+                }
+            )
+        for key, amount in _ladder_capacity_cost(ranks, specs).items():
+            reserved[key] = reserved.get(key, 0) + int(amount)
+    return reserved
+
+
 def _largest_pow2_divisor_leq(heads: int | None, cap: int) -> int:
     """Fill-tp for ONE instance: the largest power of 2 that divides `heads` and is
     <= cap (the instance's GPU count); 1 if heads unknown. Under instance-atomic
@@ -4048,6 +4157,15 @@ def _applicable_mechanism_id(rank: dict[str, Any], features: dict[str, Any]) -> 
         apps = get_applicable_mechanisms(rank, features)
     except Exception:
         return None
+    preferred = rank.get("mechanism_id")
+    if preferred and isinstance(apps, (list, tuple)):
+        applicable_ids = {
+            item if isinstance(item, str) else item.get("mechanism_id")
+            for item in apps
+            if isinstance(item, str | dict)
+        }
+        if preferred in applicable_ids:
+            return str(preferred)
     if isinstance(apps, dict):
         mid = apps.get("exact") or apps.get("mechanism_id")
         if mid:
@@ -4207,7 +4325,15 @@ def _normalize_candidate_rank(raw: Any) -> dict[str, Any] | None:
         return None
     if n_replicas < 1 or not exact:
         return None
-    return {"role": "aggregate", "env": list(env), "config": config, "n_replicas": n_replicas}
+    normalized = {
+        "role": "aggregate",
+        "env": list(env),
+        "config": config,
+        "n_replicas": n_replicas,
+    }
+    if isinstance(raw.get("mechanism_id"), str) and raw["mechanism_id"]:
+        normalized["mechanism_id"] = raw["mechanism_id"]
+    return normalized
 
 
 def _rank_shape_key(rank: dict[str, Any]) -> tuple:
@@ -4749,9 +4875,20 @@ def build_scored_candidates(
     if cache_key is not None and cache_key in _scored_candidates_cache:
         return copy.deepcopy(_scored_candidates_cache[cache_key])
     snapshot = _snapshot()
-    specs = instance_catalog()
+    resources = copy.deepcopy(get_resource_map())
+    specs = copy.deepcopy(instance_catalog())
+    pending_reserved = _pending_deployment_capacity(specs)
+    for env_key, info in resources.items():
+        info["free"] = max(
+            0,
+            int(info.get("free", 0) or 0) - pending_reserved.get(("gpu", _env_key(env_key)), 0),
+        )
+    for env_key, pools in specs.items():
+        for instance_type, spec in pools.items():
+            pending_units = pending_reserved.get(("pool", _env_key(env_key), str(instance_type)), 0)
+            spec["free_instances"] = max(0, int(spec.get("free_instances", 0) or 0) - pending_units)
     free_envs: list[tuple[str, list[str]]] = []
-    for raw_env_key, info in sorted(get_resource_map().items(), key=lambda item: _env_key(item[0])):
+    for raw_env_key, info in sorted(resources.items(), key=lambda item: _env_key(item[0])):
         try:
             if int(info.get("free", 0) or 0) <= 0:
                 continue
@@ -4783,19 +4920,25 @@ def build_scored_candidates(
     ctx_by_job: dict[str, tuple[Any, Any, dict[str, Any], str]] = {}
     blocked_by_job: dict[str, dict[str, Any]] = {}
     attempted_identities_by_job: dict[str, list[Any]] = {}
-    pending_jobs = sorted(
-        get_pending_jobs(), key=lambda job: str(job.get("job_id", job.get("id", "")))
-    )
-    active_rehabilitation = sorted(
-        [
-            job
-            for job in get_active_jobs()
-            if (job.get("health") or {}).get("rehabilitation_eligible") is True
-        ],
-        key=lambda job: str(job.get("job_id", job.get("id", ""))),
-    )
+    pending_jobs = list(get_pending_jobs())
+    active_rehabilitation = [
+        job
+        for job in get_active_jobs()
+        if (job.get("health") or {}).get("rehabilitation_eligible") is True
+    ]
     pending_ids = {str(job.get("job_id", job.get("id"))) for job in pending_jobs}
-    for job in [*pending_jobs, *active_rehabilitation]:
+
+    def job_order(job: dict[str, Any]) -> tuple[float, str]:
+        job_id = str(job.get("job_id", job.get("id", "")))
+        raw_priority = (budgets.get(job_id) or {}).get("priority_score", 0.0)
+        try:
+            priority = float(raw_priority)
+        except (TypeError, ValueError):
+            priority = 0.0
+        return -priority, job_id
+
+    candidate_jobs = sorted([*pending_jobs, *active_rehabilitation], key=job_order)
+    for job in candidate_jobs:
         jid = job.get("job_id", job.get("id"))
         if not jid:
             continue
@@ -4848,9 +4991,9 @@ def build_scored_candidates(
                 continue
         for raw in (spec_by_job.get(jid) or {}).get("ladder") or []:
             rank = _normalize_candidate_rank(raw)
-            if rank is not None and _rank_shape_key(rank) not in seen:
+            if rank is not None and _deployment_shape_key(rank) not in seen:
                 rank["proposal_source"] = "specialist"
-                seen.add(_rank_shape_key(rank))
+                seen.add(_deployment_shape_key(rank))
                 frames.append(rank)
         # For every pool, enumerate bounded fixed-DP alternatives. Direct evaluates
         # each exact frame; size_ladder never mutates a specialist's replica count.
@@ -4859,6 +5002,8 @@ def build_scored_candidates(
         # the box - fill it. Explicit fixed-DP variants scale across instances, and
         # Phase 2.5 spans pools when one is not enough. Specialist ladders above stay
         # as exact-capacity proposals (deduped by shape).
+        generated_groups: list[list[dict[str, Any]]] = []
+        generated_seen = set(seen)
         for env_key, env in free_envs:
             for instance_type, spec in sorted((specs.get(env_key) or {}).items()):
                 if slice_ and env_key not in (slice_.get("env_budget") or {}):
@@ -4882,6 +5027,7 @@ def build_scored_candidates(
                     allocation_kind=str(allocation_kind or "instance"),
                 )
                 for tp in tp_options:
+                    replica_frames: list[dict[str, Any]] = []
                     max_replicas = int(spec.get("free_instances", 0) or 0)
                     capacity_per_replica = tp if allocation_kind == "gpu" else gpi
                     if allocation_kind == "gpu":
@@ -4915,10 +5061,19 @@ def build_scored_candidates(
                                 "n_replicas": replicas,
                             }
                         )
-                        if rank is not None and _rank_shape_key(rank) not in seen:
+                        if rank is not None and _deployment_shape_key(rank) not in generated_seen:
                             rank["proposal_source"] = "generated"
-                            seen.add(_rank_shape_key(rank))
-                            frames.append(rank)
+                            generated_seen.add(_deployment_shape_key(rank))
+                            replica_frames.append(rank)
+                    if replica_frames:
+                        generated_groups.append(replica_frames)
+        max_generated_variants = max((len(group) for group in generated_groups), default=0)
+        for variant_index in range(max_generated_variants):
+            for group in generated_groups:
+                if variant_index < len(group):
+                    rank = group[variant_index]
+                    seen.add(_deployment_shape_key(rank))
+                    frames.append(rank)
         if not is_pending:
             current_groups: dict[str, list[dict[str, Any]]] = {}
             for index, chain in enumerate(
@@ -5235,6 +5390,7 @@ def jointly_select_placements(
     reserve_map = {_env_key(env): int(n) for env, n in (reserves or {}).items()}
     resources = get_resource_map()
     specs = instance_catalog()
+    pending_reserved = _pending_deployment_capacity(specs)
     original_candidates = list(candidates or [])
 
     def selection_score(candidate: dict[str, Any]) -> float:
@@ -5347,11 +5503,18 @@ def jointly_select_placements(
     capacity: dict[tuple, int] = {}
     for env, info in resources.items():
         env_key = _env_key(env)
-        capacity[("gpu", env_key)] = max(0, int(info.get("free", 0)) - reserve_map.get(env_key, 0))
+        capacity[("gpu", env_key)] = max(
+            0,
+            int(info.get("free", 0))
+            - reserve_map.get(env_key, 0)
+            - pending_reserved.get(("gpu", env_key), 0),
+        )
     for env_key, pools in specs.items():
         for instance_type, spec in pools.items():
-            capacity[("pool", env_key, str(instance_type))] = int(
-                spec.get("free_instances", 0) or 0
+            capacity[("pool", env_key, str(instance_type))] = max(
+                0,
+                int(spec.get("free_instances", 0) or 0)
+                - pending_reserved.get(("pool", env_key, str(instance_type)), 0),
             )
     priority_by_job = {
         p.get("job_id"): float(p.get("priority_score", 1.0) or 1.0) for p in get_priority()

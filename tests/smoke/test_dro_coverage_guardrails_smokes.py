@@ -51,6 +51,7 @@ def _row(*, band=None, observed=11.0, predicted=10.0, required=None, q_labels=No
         env_label=("reserved", "aws", "region", "zone", "H100"),
         q_label_per_mechanism=q_labels or {},
         icp_result_per_edge={},
+        residuals_per_y={"latency": np.array([observed - predicted])},
         y_predicted={"latency": predicted},
         y_observed_mean={"latency": observed},
         prediction_lineage=lineage,

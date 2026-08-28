@@ -791,6 +791,61 @@ class DeploymentXSmokeTests(unittest.TestCase):
             sorted((edge_id, 3) for edge_id in mechanism.edge_ids),
         )
 
+    def test_s2_only_learns_semantically_comparable_online_outcomes(self):
+        def evidence_for_depth(depth):
+            snapshot = _snapshot()
+            for chain in snapshot.active_jobs[0]["active_chains"]:
+                chain["shape_json"]["predicted_y"].update(
+                    throughput_token_per_sec=100.0,
+                    p99_tpot_ms=5.0,
+                )
+
+            class SemanticTelemetry(_Telemetry):
+                def iter_per_rank(self, bundle):
+                    yield SimpleNamespace(
+                        job_id="job_1",
+                        rank_id="rank_a",
+                        v_observed={"depth_req_q": np.array([depth])},
+                        y_observed={
+                            "throughput_token_per_sec": np.array([1.0]),
+                            "p99_ttft_ms": np.array([50.0]),
+                            "p99_tpot_ms": np.array([10.0]),
+                        },
+                    )
+
+            graph = _candidate_graph()
+            graph.node_table["throughput_token_per_sec"] = Node("throughput_token_per_sec", "Y")
+            graph.node_table["p99_tpot_ms"] = Node("p99_tpot_ms", "Y")
+            runner = TickRunner(
+                evidence_store=_EvidenceStore(),
+                telemetry=SemanticTelemetry(),
+                cusum=Cusum(),
+                icp=ICP(),
+                quadrant_validator=QuadrantValidator(),
+                confidence_service=SimpleNamespace(candidate_graph=graph),
+                slow_loop=_SlowLoop(),
+                dro=_Dro(),
+                mechanism_registry=_MechanismRegistry(),
+                resource_map=_ResourceMap(),
+                agent=object(),
+                plan_validator=object(),
+                executor=object(),
+                candidate_graph=graph,
+            )
+            ctx = TickContext(tick=1, cluster_snapshot=snapshot)
+            runner.S1(ctx)
+            runner.S2(ctx)
+            return ctx.evidence_rows[0]
+
+        idle = evidence_for_depth(0.0)
+        queued = evidence_for_depth(100.0)
+
+        self.assertNotIn("throughput_token_per_sec", idle.residuals_per_y)
+        self.assertIn("p99_ttft_ms", idle.residuals_per_y)
+        self.assertIn("throughput_token_per_sec", queued.residuals_per_y)
+        self.assertNotIn("p99_ttft_ms", queued.residuals_per_y)
+        self.assertNotIn("p99_tpot_ms", queued.residuals_per_y)
+
     def test_s3_records_confidence_and_slow_dro_diagnostics(self):
         graph, mechanism = _diagnostic_graph()
         registry = MechanismRegistry(
@@ -829,6 +884,7 @@ class DeploymentXSmokeTests(unittest.TestCase):
                     env_label=ENV_LABEL,
                     q_label_per_mechanism={mechanism.mechanism_id: Quadrant.Q4},
                     icp_result_per_edge=dict.fromkeys(mechanism.edge_ids, ICPResult.UNDECIDED),
+                    residuals_per_y={"p99_ttft_ms": np.array([0.0])},
                     y_observed_mean={"p99_ttft_ms": 100.0},
                     y_predicted={"p99_ttft_ms": 100.0},
                     prediction_lineage={

@@ -407,7 +407,19 @@ class TickRunner:
             y_pred = dict(deployment.y_predicted)
 
             residuals_per_v = self._residuals(v_obs, v_pred)
-            residuals_per_y = self._residuals(y_obs, y_pred)
+            comparable_y_obs = dict(y_obs)
+            mode = str(job_features.get(job_id, {}).get("type") or "online").lower()
+            queue_depth = max(
+                (float(value) for value in v_obs.get("depth_req_q", [])),
+                default=0.0,
+            )
+            if mode == "online":
+                if queue_depth <= 0:
+                    comparable_y_obs.pop("throughput_token_per_sec", None)
+                else:
+                    comparable_y_obs.pop("p99_ttft_ms", None)
+                    comparable_y_obs.pop("p99_tpot_ms", None)
+            residuals_per_y = self._residuals(comparable_y_obs, y_pred)
             y_observed_mean = {name: float(np.mean(arr)) for name, arr in y_obs.items() if len(arr)}
             health_sample = dict(y_observed_mean)
             if len(v_obs.get("depth_req_q", [])):
@@ -591,9 +603,16 @@ class TickRunner:
         slow_before = self._slow_state_snapshot()
         coverage = self._observed_coverage_details(ctx)
         for row in ctx.evidence_rows:
+            comparable_y = set(row.residuals_per_y)
             self.dro.append_residual_history(
-                pred_y=row.y_predicted,
-                obs_y=row.y_observed_mean,
+                pred_y={
+                    name: value for name, value in row.y_predicted.items() if name in comparable_y
+                },
+                obs_y={
+                    name: value
+                    for name, value in row.y_observed_mean.items()
+                    if name in comparable_y
+                },
             )
 
         did_confidence_update = False
@@ -966,6 +985,7 @@ class TickRunner:
                 {
                     "env": list(rank.env or []),
                     "instance_type": rank.config.get("instance_type"),
+                    "gpu_count": rank.config.get("gpu_count", rank.config.get("count")),
                     "tp": rank.config.get("tp"),
                     "pp": rank.config.get("pp"),
                     "sp": rank.config.get("sp"),
@@ -1776,18 +1796,29 @@ class TickRunner:
                 if isinstance(lineage, Mapping) and has_band
                 else None
             )
-            status = self.dro._coverage_status(row.y_observed_mean, band, required)
+            comparable_names = set(row.residuals_per_y)
+            if required is None:
+                requested_names = list(band) if isinstance(band, Mapping) else []
+            elif isinstance(required, (list, tuple, set, frozenset)):
+                requested_names = [name for name in required if isinstance(name, str)]
+            else:
+                requested_names = []
+            required_names = [name for name in requested_names if name in comparable_names]
+            comparable_observed = {
+                name: value
+                for name, value in row.y_observed_mean.items()
+                if name in comparable_names
+            }
+            status = (
+                self.dro._coverage_status(comparable_observed, band, required_names)
+                if required_names
+                else None
+            )
             row_inside = status is True
             if status is not None:
                 evaluable += 1
             if row_inside:
                 inside += 1
-            if required is None:
-                required_names = list(band) if isinstance(band, Mapping) else []
-            elif isinstance(required, (list, tuple, set, frozenset)):
-                required_names = [name for name in required if isinstance(name, str)]
-            else:
-                required_names = []
             objectives = {}
             for name in required_names:
                 observed = row.y_observed_mean.get(name)

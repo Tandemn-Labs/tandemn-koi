@@ -190,7 +190,9 @@ def _kv_token_demand(values: dict) -> float | None:
         isl = _get(values, "isl_token_avg", "input_len_tokens_avg")
         osl = _get(values, "osl_token_avg", "output_len_tokens_avg")
         if concurrency is not None and isl is not None and osl is not None:
-            return float(concurrency) * (float(isl) + float(osl))
+            replicas = max(1.0, float(_get(values, "dp") or 1.0))
+            per_replica_concurrency = max(1.0, float(concurrency) / replicas)
+            return per_replica_concurrency * (float(isl) + float(osl))
     max_seq = _get(values, "max_num_seq", "max_num_seqs")
     max_tokens = _get(values, "max_num_batched_tokens")
     isl = _get(values, "isl_token_avg", "input_len_tokens_avg")

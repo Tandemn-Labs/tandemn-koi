@@ -114,6 +114,26 @@ def test_mixtral_fixed_ep_one_memory_fit_changes_with_tp():
     assert float(tp8["required_gb"]) < float(tp2["required_gb"])
 
 
+def test_online_kv_memory_is_distributed_across_replicas():
+    online = {
+        **MODEL,
+        "type": "online",
+        "gpu_mem_gb": 80,
+        "gpu_mem_util": 0.9,
+        "max_concurrent_streaming": 64,
+        "isl_token_avg": 1024,
+        "osl_token_avg": 512,
+        "tp": 4,
+        "pp": 1,
+    }
+
+    dp1 = compute_memory_v({**online, "dp": 1})
+    dp8 = compute_memory_v({**online, "dp": 8})
+
+    assert dp8["vram_headroom_gb"] > dp1["vram_headroom_gb"]
+    assert dp8["kv_pressure_score"] < dp1["kv_pressure_score"]
+
+
 def test_kvcache_auto_prefers_activation_then_weight_dtype():
     auto_activation = {**MODEL, "kvcache_dtype": "auto", "activation_dtype": "fp8"}
     auto_weight = {**MODEL, "kvcache_dtype": "auto"}

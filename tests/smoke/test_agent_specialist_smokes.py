@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from src.agent.agent import KoiAgentHarness, PlanMaterializationError, SpecialistRunner
 from src.agent.tools import agent_tools
@@ -201,6 +202,57 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
             harness._validate_ladder(PlanAction.from_dict(partial), None, Snapshot())
         finally:
             agent_tools._CTX.mechanism_registry, agent_tools._CTX.resource_map = saved
+
+    def test_swap_restores_trusted_keep_relative_scores(self):
+        raw = _valid_place()
+        raw["type"] = "swap"
+        action = PlanAction.from_dict(raw)
+        trusted = {
+            **raw,
+            "keep_baseline_sigma": -2.0,
+            "swap_gain_over_keep": 3.0,
+        }
+
+        class Snapshot:
+            @staticmethod
+            def active_jobs_summary():
+                return [
+                    {
+                        "job_id": "job_1",
+                        "job_features": {"model_id": "Qwen/Qwen2.5-7B-Instruct"},
+                        "health": {
+                            "rehabilitation_eligible": True,
+                            "status": "critical",
+                            "reasons": ["zero_throughput"],
+                        },
+                    }
+                ]
+
+        registry = type(
+            "Registry",
+            (),
+            {
+                "get_mechanism": lambda self, _mechanism_id: object(),
+                "match_scope": lambda self, _mechanism, _context: {
+                    "quality": "exact",
+                    "reasons": [],
+                },
+            },
+        )()
+        with (
+            patch.object(agent_tools._CTX, "mechanism_registry", registry),
+            patch.object(agent_tools, "config_runnable", return_value=(True, "")),
+            patch.object(agent_tools, "_rank_mechanism_context", return_value={}),
+        ):
+            KoiAgentHarness.__new__(KoiAgentHarness)._validate_ladder(
+                action,
+                None,
+                Snapshot(),
+                trusted_candidate=trusted,
+            )
+
+        self.assertEqual(action.keep_baseline_sigma, -2.0)
+        self.assertEqual(action.swap_gain_over_keep, 3.0)
 
     def test_valid_canonical_place_passes(self):
         self.assertEqual(SpecialistRunner._validate(_valid_place(), "job_1", _slice()), [])
