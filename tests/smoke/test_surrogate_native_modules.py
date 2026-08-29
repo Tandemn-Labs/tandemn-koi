@@ -86,32 +86,46 @@ def test_memory_v_quantization_tp_pp_missing_and_dp_invariance():
     assert compute_memory_v({"tp": 2}, {"gpu_mem_gb": 80}) == {}
 
 
-def test_memory_v_uses_tp_sharding_for_moe_with_fixed_ep_one():
+def test_memory_v_moe_expert_weights_shard_by_pp_not_tp_at_ep_one():
+    # EP is fixed at 1, so every TP rank holds the full expert set: an MoE model
+    # needs MORE per-GPU memory than a dense one of the same size at the same
+    # tp/pp, and widening TP alone does not reduce it. PP does.
     dense = compute_memory_v({**MODEL, **WORKLOAD, "tp": 8, "pp": 2, "ep": 1})
     moe = compute_memory_v({**MODEL, **WORKLOAD, "tp": 8, "pp": 2, "ep": 1, "is_moe": True})
-    moe_tp2 = compute_memory_v({**MODEL, **WORKLOAD, "tp": 2, "pp": 1, "ep": 1, "is_moe": True})
+    moe_tp1 = compute_memory_v({**MODEL, **WORKLOAD, "tp": 1, "pp": 2, "ep": 1, "is_moe": True})
+    moe_pp1 = compute_memory_v({**MODEL, **WORKLOAD, "tp": 8, "pp": 1, "ep": 1, "is_moe": True})
 
-    assert dense == moe
-    assert moe["vram_headroom_gb"] > moe_tp2["vram_headroom_gb"]
+    assert moe["vram_headroom_gb"] < dense["vram_headroom_gb"]
+    # Only the KV share differs between tp=1 and tp=8 for MoE; weights are identical.
+    weight_gb = model_weight_gb(MODEL)
+    assert moe_tp1["gpu_mem_used_fraction"] * 80 >= weight_gb / 2
+    assert moe["gpu_mem_used_fraction"] * 80 >= weight_gb / 2
+    assert moe["vram_headroom_gb"] > moe_pp1["vram_headroom_gb"]
 
 
-def test_mixtral_fixed_ep_one_memory_fit_changes_with_tp():
+def test_mixtral_fixed_ep_one_fits_only_through_pp():
+    # 46.7B fp16 = ~87 GiB of weights. On an 80 GB GPU (72 GiB usable) no TP degree
+    # fits at pp=1 - this is the placement the serving engine OOMs - while pp=2
+    # halves the per-GPU weight and fits.
     base = {
         "model_params_b": 46.7,
         "weight_quantization_bits": 16,
         "gpu_mem_gb": 80,
         "gpu_mem_util": 0.9,
-        "pp": 1,
         "ep": 1,
         "is_moe": True,
     }
 
-    assert target_memory_fit({**base, "tp": 1})["status"] == "physical_no_fit"
-    tp2 = target_memory_fit({**base, "tp": 2})
-    tp8 = target_memory_fit({**base, "tp": 8})
-    assert tp2["status"] in {"fit", "unknown"}
-    assert tp8["status"] in {"fit", "unknown"}
-    assert float(tp8["required_gb"]) < float(tp2["required_gb"])
+    for tp in (1, 2, 4, 8):
+        assert target_memory_fit({**base, "tp": tp, "pp": 1})["status"] == "physical_no_fit"
+    pp2 = target_memory_fit({**base, "tp": 1, "pp": 2})
+    assert pp2["status"] in {"fit", "unknown"}
+    assert float(pp2["required_gb"]) < float(
+        target_memory_fit({**base, "tp": 8, "pp": 1})["required_gb"]
+    )
+    # A dense model of the same size does shard by TP.
+    dense = {**base, "is_moe": False}
+    assert target_memory_fit({**dense, "tp": 2, "pp": 1})["status"] in {"fit", "unknown"}
 
 
 def test_online_kv_memory_is_distributed_across_replicas():

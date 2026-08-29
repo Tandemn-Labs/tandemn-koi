@@ -105,7 +105,11 @@ from src.core.models import (
     deployment_rank_identity,
     env_gpu_type,
 )
-from src.infra.deployment_x import build_rank_x, materialize_launch_config
+from src.infra.deployment_x import (
+    build_rank_x,
+    hardware_gpu_memory_gb,
+    materialize_launch_config,
+)
 from src.prediction.analytic_v import target_memory_fit
 from src.prediction.composer import compact_prediction_lineage
 from src.prediction.queue_model import estimate_queue_shadow
@@ -1889,6 +1893,58 @@ def _model_num_heads(config: dict[str, Any], job_features: dict[str, Any] | None
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 return value
     return None
+
+
+def _model_catalog_for(model_id: Any) -> dict[str, Any]:
+    """Return the Store model catalog row for a model, or {} when unavailable."""
+    resource_map = getattr(_CTX, "resource_map", None)
+    if not model_id or resource_map is None or not hasattr(resource_map, "model_catalog"):
+        return {}
+    try:
+        return dict(resource_map.model_catalog(str(model_id)) or {})
+    except Exception:
+        return {}
+
+
+def _model_num_layers(catalog: dict[str, Any], job_features: dict[str, Any] | None) -> int | None:
+    """Best-effort transformer layer count, from the catalog or job features.
+
+    PP partitions layers, so a PP degree must divide this. None when unknown
+    (then no generated PP variant is emitted and the surrogate stays the backstop).
+    """
+    for source in (catalog or {}), (job_features or {}):
+        for key in ("num_hidden_layers", "num_layers", "n_layers", "num_hidden_layer"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    return None
+
+
+# Catalog facts that decide whether a model's WEIGHTS fit one GPU. Scalars only:
+# per-GPU list fields (max_num_seq, kvcache_dtype) are deliberately left out so the
+# fit check stays a weight check and cannot trip on an unresolved list.
+_WEIGHT_FIT_FIELDS = (
+    "model_params_b",
+    "model_size_gb",
+    "weight_dtype",
+    "activation_dtype",
+    "weight_quantization_bits",
+    "weight_quantization_method",
+    "is_moe",
+)
+
+
+def _model_weight_fit_values(
+    catalog: dict[str, Any], job_features: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Return the inputs target_memory_fit needs to judge weight fit for a model."""
+    values: dict[str, Any] = {}
+    for source in (job_features or {}), (catalog or {}):
+        for key in _WEIGHT_FIT_FIELDS:
+            value = source.get(key) if isinstance(source, dict) else None
+            if value is not None and key not in values:
+                values[key] = value
+    return values
 
 
 def config_runnable(
@@ -4151,6 +4207,41 @@ def _generated_tp_options(
     return [_largest_pow2_divisor_leq(heads, gpu_cap)]
 
 
+_GENERATED_PP_DEGREES = (2, 4, 8)
+
+
+def _generated_pp_options(
+    *,
+    tp: int,
+    gpu_cap: int,
+    layers: int | None,
+    weight_fit_values: dict[str, Any],
+    gpu_mem_gb: float | None,
+) -> list[int]:
+    """Return PP degrees to generate for one (pool, tp) frame.
+
+    pp=1 is always kept, so today's frame set is unchanged. Extra PP degrees are
+    added ONLY when the model's weights provably do not fit one GPU at pp=1 and
+    provably do fit at that pp - the cheap analytic check, no surrogate call.
+    This is what places an MoE model: EP is fixed at 1, so TP does not shard its
+    expert weights and PP is the only axis that reduces per-GPU weight. A PP
+    degree must divide the layer count and keep tp*pp inside one instance.
+    """
+    options = [1]
+    if not weight_fit_values or gpu_mem_gb is None:
+        return options
+    base = {**weight_fit_values, "gpu_mem_gb": gpu_mem_gb, "tp": tp, "ep": SUPPORTED_EP}
+    if target_memory_fit({**base, "pp": 1}).get("status") != "physical_no_fit":
+        return options
+    for pp in _GENERATED_PP_DEGREES:
+        if tp * pp > gpu_cap or (layers is not None and layers % pp != 0):
+            continue
+        if target_memory_fit({**base, "pp": pp}).get("status") == "physical_no_fit":
+            continue
+        options.append(pp)
+    return options
+
+
 def _applicable_mechanism_id(rank: dict[str, Any], features: dict[str, Any]) -> str | None:
     """Best applicable mechanism id for a rank (exact, then partial), or None."""
     try:
@@ -4964,6 +5055,12 @@ def build_scored_candidates(
         if (job.get("health") or {}).get("rehabilitation_eligible") is True
     ]
     pending_ids = {str(job.get("job_id", job.get("id"))) for job in pending_jobs}
+    # Read once per tick: per-GPU memory for the generated PP gate comes from the
+    # same catalog deployment X uses, so the pre-rank check and the X check agree.
+    try:
+        hardware_catalog = _CTX.resource_map.hardware_catalog()
+    except Exception:
+        hardware_catalog = None
 
     def job_order(job: dict[str, Any]) -> tuple[float, str]:
         job_id = str(job.get("job_id", job.get("id", "")))
@@ -4987,6 +5084,9 @@ def build_scored_candidates(
         slice_ = budgets.get(jid) or {}
         slice_id = slice_.get("slice_id", jid)
         heads = _model_num_heads({"model_id": model_id}, features)
+        model_catalog = _model_catalog_for(model_id)
+        layers = _model_num_layers(model_catalog, features)
+        weight_fit_values = _model_weight_fit_values(model_catalog, features)
 
         frames: list[dict[str, Any]] = []
         seen: set = set()
@@ -5058,12 +5158,29 @@ def build_scored_candidates(
                     model_id=str(model_id or ""),
                     allocation_kind=str(allocation_kind or "instance"),
                 )
-                for tp in tp_options:
+                pool_gpu_mem_gb = (
+                    hardware_gpu_memory_gb(hardware_catalog, env, instance_type)
+                    if hardware_catalog is not None
+                    else None
+                )
+                geometries = [
+                    (tp, pp)
+                    for tp in tp_options
+                    for pp in _generated_pp_options(
+                        tp=tp,
+                        gpu_cap=gpu_cap,
+                        layers=layers,
+                        weight_fit_values=weight_fit_values,
+                        gpu_mem_gb=pool_gpu_mem_gb,
+                    )
+                ]
+                for tp, pp in geometries:
+                    engine_gpus = tp * pp
                     replica_frames: list[dict[str, Any]] = []
                     max_replicas = int(spec.get("free_instances", 0) or 0)
-                    capacity_per_replica = tp if allocation_kind == "gpu" else gpi
+                    capacity_per_replica = engine_gpus if allocation_kind == "gpu" else gpi
                     if allocation_kind == "gpu":
-                        max_replicas //= max(1, tp)
+                        max_replicas //= max(1, engine_gpus)
                     env_budget = (slice_.get("env_budget") or {}).get(env_key)
                     if env_budget is not None:
                         max_replicas = min(
@@ -5076,7 +5193,7 @@ def build_scored_candidates(
                     if pool_budget is not None:
                         allowed_units = int(pool_budget)
                         if allocation_kind == "gpu":
-                            allowed_units //= max(1, tp)
+                            allowed_units //= max(1, engine_gpus)
                         max_replicas = min(max_replicas, allowed_units)
                     replica_options = _replica_options(max_replicas) if slice_ else [1]
                     for replicas in replica_options:
@@ -5086,9 +5203,9 @@ def build_scored_candidates(
                                 "env": list(env),
                                 "config": {
                                     "instance_type": instance_type,
-                                    "gpu_count": tp,
+                                    "gpu_count": engine_gpus,
                                     "tp": tp,
-                                    "pp": 1,
+                                    "pp": pp,
                                 },
                                 "n_replicas": replicas,
                             }

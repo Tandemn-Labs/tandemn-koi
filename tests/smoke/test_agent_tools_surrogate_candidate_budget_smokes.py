@@ -2869,5 +2869,68 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         )
 
 
+class GeneratedPipelineParallelSmokeTests(unittest.TestCase):
+    MIXTRAL = {
+        "model_params_b": 46.7,
+        "weight_quantization_bits": 16,
+        "is_moe": True,
+    }
+
+    def test_pp_only_expands_when_weights_miss_at_pp_one_and_fit_at_pp(self):
+        # 87 GiB of MoE weight: no fit on one 80 GB GPU at any tp, fits at pp=2.
+        options = agent_tools._generated_pp_options(
+            tp=2, gpu_cap=8, layers=32, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
+        )
+        self.assertEqual(options, [1, 2, 4])
+        # tp*pp must stay inside the instance.
+        self.assertEqual(
+            agent_tools._generated_pp_options(
+                tp=8, gpu_cap=8, layers=32, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
+            ),
+            [1],
+        )
+        # pp must divide the layer count.
+        self.assertEqual(
+            agent_tools._generated_pp_options(
+                tp=2, gpu_cap=8, layers=30, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
+            ),
+            [1, 2],
+        )
+
+    def test_pp_stays_one_when_weights_fit_or_facts_are_missing(self):
+        small = {"model_params_b": 1.2, "weight_quantization_bits": 16}
+        self.assertEqual(
+            agent_tools._generated_pp_options(
+                tp=1, gpu_cap=8, layers=16, weight_fit_values=small, gpu_mem_gb=24
+            ),
+            [1],
+        )
+        self.assertEqual(
+            agent_tools._generated_pp_options(
+                tp=8, gpu_cap=8, layers=None, weight_fit_values={}, gpu_mem_gb=24
+            ),
+            [1],
+        )
+        self.assertEqual(
+            agent_tools._generated_pp_options(
+                tp=2, gpu_cap=8, layers=32, weight_fit_values=self.MIXTRAL, gpu_mem_gb=None
+            ),
+            [1],
+        )
+
+    def test_weight_fit_values_keep_scalars_only(self):
+        catalog = {
+            **self.MIXTRAL,
+            "num_hidden_layers": 32,
+            "max_num_seq": [{"gpu_type": "H100", "value": 1024}],
+        }
+        values = agent_tools._model_weight_fit_values(catalog, {})
+        self.assertEqual(
+            values, {"model_params_b": 46.7, "weight_quantization_bits": 16, "is_moe": True}
+        )
+        self.assertEqual(agent_tools._model_num_layers(catalog, {}), 32)
+        self.assertIsNone(agent_tools._model_num_layers({}, {}))
+
+
 if __name__ == "__main__":
     unittest.main()

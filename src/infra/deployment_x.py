@@ -8,6 +8,7 @@ hardware facts are contract errors rather than values to guess.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -400,6 +401,22 @@ def _catalog_by_instance(catalog: dict[str, Any]) -> dict[tuple[str, str, str], 
             instance_type = instance["instance_type"]
             out[(str(cloud), str(region), str(instance_type))] = dict(instance)
     return out
+
+
+def hardware_gpu_memory_gb(
+    catalog: dict[str, Any], env: EnvLabel | Sequence[str], instance_type: str
+) -> float | None:
+    """Per-GPU memory (GiB) for one pool from the hardware catalog, or None.
+
+    The same catalog value deployment X exposes as ``gpu_mem_gb``, so a memory
+    check made before a rank exists agrees with the one made on the assembled X.
+    """
+    try:
+        cloud, region, gpu_type = str(env[1]), str(env[2]), str(env[4])
+        hardware = _catalog_by_instance(catalog)[(cloud, region, instance_type)]
+        return float(_gpu(hardware, gpu_type)["memory_mib_each"]) / 1024.0
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
 
 
 def _hardware_x(hardware: dict[str, Any], gpu_type: str) -> dict[str, object]:
