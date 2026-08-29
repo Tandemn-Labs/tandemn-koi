@@ -92,6 +92,33 @@ def test_cross_vendor_gpu_is_not_silently_substituted():
     assert math.isinf(resolution.distance)
 
 
+def test_mi300_uses_temporary_h100_proxy_for_aic():
+    resolution = resolve_gpu(
+        "MI300",
+        backend="aic",
+        available=frozenset({"H100"}),
+    )
+
+    assert resolution.kind == "nearest"
+    assert resolution.resolved == "H100"
+    assert resolution.backend_value == "h100_sxm"
+    assert resolution.distance == 2.0
+    assert math.isfinite(resolution.latency_scale)
+    assert resolution.reasons == ("temporary_mi300_h100_proxy",)
+
+
+def test_mi300x_uses_temporary_h100_proxy_for_aic():
+    resolution = resolve_gpu(
+        "MI300X",
+        backend="aic",
+        available=frozenset({"H100"}),
+    )
+
+    assert resolution.canonical == "MI300"
+    assert resolution.resolved == "H100"
+    assert resolution.distance == 2.0
+
+
 def test_larger_memory_or_distant_proxy_is_rejected():
     larger_memory = resolve_gpu(
         "L4",

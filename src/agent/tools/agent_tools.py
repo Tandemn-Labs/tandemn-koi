@@ -4279,6 +4279,7 @@ def _best_mechanism_id(briefs) -> str | None:
     signals the brief already carries: exact scope match first, then confidence,
     then visits as a tie-break so a well-evidenced mechanism outranks a fresh one.
     """
+
     def number(value: Any) -> float:
         try:
             parsed = float(value)
@@ -4289,10 +4290,12 @@ def _best_mechanism_id(briefs) -> str | None:
     best_id: str | None = None
     best_score: tuple[int, float, int] | None = None
     for brief in briefs:
+        mechanism_id: str | None
         if isinstance(brief, str):
             mechanism_id, quality, confidence, visits = brief, "", 0.0, 0
         elif isinstance(brief, dict):
-            mechanism_id = brief.get("mechanism_id")
+            raw_mechanism_id = brief.get("mechanism_id")
+            mechanism_id = str(raw_mechanism_id) if raw_mechanism_id else None
             quality = str(brief.get("match_quality") or "")
             confidence = number(brief.get("c"))
             visits = int(number(brief.get("visit_count")))

@@ -91,6 +91,7 @@ _GPU_ALIASES = {
     "L40S": "L40S",
     "MI200": "MI200",
     "MI300": "MI300",
+    "MI300X": "MI300",
     "RTXPRO6000": "RTX PRO 6000",
     "RTXPRO6000SERVER": "RTX PRO 6000",
     "T4": "T4",
@@ -347,6 +348,20 @@ def resolve_gpu(
             1.0,
             1.0,
             ("exact_backend_support",),
+        )
+    if backend == "aic" and canonical == "MI300" and "H100" in choices:
+        # ponytail: temporary AIC proxy; replace when AIC supports MI300.
+        return _resolution(
+            "gpu",
+            backend,
+            requested_text,
+            canonical,
+            "H100",
+            "nearest",
+            2.0,
+            math.exp(-1.0),
+            1.0,
+            ("temporary_mi300_h100_proxy",),
         )
     if not allow_approximation or not choices:
         return _unsupported("gpu", backend, requested_text, canonical, "no_compatible_gpu")
