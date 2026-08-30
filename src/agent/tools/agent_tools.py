@@ -3548,9 +3548,23 @@ def _keep_baseline_sigma(
     job_features: dict[str, Any],
     weights: dict[str, float],
     ranges: dict[str, float],
+    *,
+    priority: float = 1.0,
 ) -> float:
     """Score the active deployment from observed service outcomes."""
     observed = dict(_active_health_for(snapshot, job_id).get("observed") or {})
+    observed_tps = observed.get(_THROUGHPUT_OBJ)
+    if (
+        observed_tps is not None
+        and float(observed_tps) <= 0.0
+        and float(observed.get("depth_req_q") or 0.0) > 0.0
+    ):
+        # Zero completions under load leaves no latency observation, so the
+        # Tchebycheff baseline below would saturate at a throughput gap of 1.0
+        # and a dead deployment would score BETTER than one serving with
+        # terrible latency. Price keeping it like leaving the job unserved -
+        # then any swap that serves anything wins.
+        return -UNSERVED_PENALTY * max(1.0, float(priority))
     if _job_mode(job_features) == "online" and float(observed.get("depth_req_q") or 0.0) <= 0:
         # At an empty queue, achieved throughput is offered load rather than capacity.
         observed.pop(_THROUGHPUT_OBJ, None)
@@ -4004,6 +4018,7 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
                 job_features,
                 w_t,
                 ranges,
+                priority=priority_by_job.get(job_id, 1.0),
             )
             swap_gain_over_keep = sigma_i - keep_baseline_sigma
             action.keep_baseline_sigma = keep_baseline_sigma
@@ -5611,13 +5626,34 @@ def jointly_select_placements(
         )
 
     eligible_candidates = []
+    selection_diagnostics: dict[str, dict[str, Any]] = {}
     for candidate in original_candidates:
+        jid = str(candidate.get("job_id") or "")
+        diag = selection_diagnostics.setdefault(
+            jid,
+            {
+                "candidates": 0,
+                "vetoed_gain_le_0": 0,
+                "vetoed_unstable": 0,
+                "eligible": 0,
+                "best_gain": None,
+                "chosen": False,
+            },
+        )
+        diag["candidates"] += 1
+        score = selection_score(candidate)
+        if math.isfinite(score) and (diag["best_gain"] is None or score > diag["best_gain"]):
+            diag["best_gain"] = round(score, 2)
         is_swap = str(candidate.get("type") or "").lower() == "swap"
-        if is_swap and (
-            selection_score(candidate) <= 0
-            or (candidate.get("queue_state") == "unstable" and not emergency_recovery(candidate))
-        ):
+        if is_swap and score <= 0:
+            diag["vetoed_gain_le_0"] += 1
             continue
+        if is_swap and candidate.get("queue_state") == "unstable" and not emergency_recovery(
+            candidate
+        ):
+            diag["vetoed_unstable"] += 1
+            continue
+        diag["eligible"] += 1
         eligible_candidates.append(candidate)
 
     def footprint(candidate: dict[str, Any]) -> int:
@@ -6032,7 +6068,12 @@ def jointly_select_placements(
         "decision_index": decision_index,
         "swap_budget": swap_budget,
         "swap_count": sum(1 for candidate in chosen if candidate.get("type") == "swap"),
+        "selection_diagnostics": selection_diagnostics,
     }
+    for candidate in chosen:
+        diag = selection_diagnostics.get(str(candidate.get("job_id") or ""))
+        if diag is not None:
+            diag["chosen"] = True
     write_event = getattr(getattr(_CTX, "trace_logger", None), "write_event", None)
     if callable(write_event):
         try:
@@ -6046,6 +6087,10 @@ def jointly_select_placements(
                     "candidate_count_after_pruning": len(candidates),
                     "combination_count": space,
                     "surrogate_budget": get_surrogate_budget_status(),
+                    # Per job: how many candidates existed and where each was lost
+                    # (gain <= 0, unstable, capacity/budget), so a job left on KEEP
+                    # is explainable from the trace instead of by inference.
+                    "selection_diagnostics": selection_diagnostics,
                     "chosen": [
                         {
                             "job_id": candidate.get("job_id"),

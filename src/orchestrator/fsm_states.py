@@ -974,7 +974,21 @@ class TickRunner:
                 if (
                     matching_attempt.get("action_type") or request.get("action_type")
                 ) == ActionType.SWAP.value:
-                    self._health_state.setdefault(jid, {})["last_swap_tick"] = ctx.tick
+                    state = self._health_state.setdefault(jid, {})
+                    previous_swap = int(state.get("last_swap_tick", -10_000))
+                    streak = int(state.get("unhealthy_ticks", 0))
+                    since = ctx.tick - previous_swap
+                    if previous_swap > -10_000 and 0 < since <= streak:
+                        # Unhealthy on every tick since the previous swap: that swap
+                        # did not help, so the next one must wait longer. Without
+                        # this, a few jobs re-swapped every cooldown consumed most
+                        # of the swap slots while never improving.
+                        state["swap_cooldown_ticks"] = min(
+                            6, 2 * int(state.get("swap_cooldown_ticks", 2) or 2)
+                        )
+                    else:
+                        state["swap_cooldown_ticks"] = 2
+                    state["last_swap_tick"] = ctx.tick
                 status = "active"
                 completed.append(jid)
             else:
@@ -1428,6 +1442,7 @@ class TickRunner:
                     "observed_slo_met": None,
                     "rehabilitation_eligible": False,
                     "last_swap_tick": int(previous.get("last_swap_tick", -10_000)),
+                    "swap_cooldown_ticks": int(previous.get("swap_cooldown_ticks", 2) or 2),
                     "last_queue_depth": float(previous.get("last_queue_depth") or 0.0),
                 }
                 self._health_state[jid] = copy.deepcopy(entry)
@@ -1439,6 +1454,11 @@ class TickRunner:
                 reasons.append("telemetry_incomplete")
             streak = int(previous.get("unhealthy_ticks", 0)) + 1 if reasons else 0
             last_swap_tick = int(previous.get("last_swap_tick", -10_000))
+            swap_cooldown = int(previous.get("swap_cooldown_ticks", 2) or 2)
+            # A job serving nothing under load keeps the base cooldown: with dead
+            # shapes remembered, each retry lands on different hardware, and speed
+            # matters more than damping there.
+            effective_cooldown = 2 if "zero_throughput" in reasons else swap_cooldown
             status = (
                 "critical"
                 if critical
@@ -1466,9 +1486,10 @@ class TickRunner:
                     )
                 ),
                 "rehabilitation_eligible": bool(
-                    (critical or streak >= 2) and ctx.tick - last_swap_tick >= 2
+                    (critical or streak >= 2) and ctx.tick - last_swap_tick >= effective_cooldown
                 ),
                 "last_swap_tick": last_swap_tick,
+                "swap_cooldown_ticks": swap_cooldown,
                 "last_queue_depth": current_depth,
             }
             self._health_state[jid] = copy.deepcopy(entry)
