@@ -94,6 +94,10 @@ log = logging.getLogger("koi.fsm")
 _DEPLOYMENT_GRACE_TICKS = 1
 _DEPLOYMENT_RETRY_BACKOFF_TICKS = 1
 _DEPLOYMENT_MAX_ATTEMPTS = 3
+# Consecutive ticks of zero throughput with a backlog before a shape is declared
+# dead - the same two-tick bar health uses before a degraded job becomes
+# rehabilitation-eligible.
+_DEAD_SHAPE_STREAK_TICKS = 2
 
 
 class FSMState(Enum):
@@ -267,6 +271,11 @@ class TickRunner:
         # as observed_dead_shapes so neither the candidate builder nor the LLM
         # proposes them again this run.
         self._dead_shapes: dict[tuple[str, str, int, int], dict[str, Any]] = {}
+        # Consecutive starved ticks per (job, rank). A shape is only declared dead
+        # after _DEAD_SHAPE_STREAK_TICKS in a row, so a warm-up or a one-tick
+        # blip never bans it; the mark clears again if any rank of that shape
+        # later serves.
+        self._starved_streaks: dict[tuple[str, str], int] = {}
 
     # ------------------------------------------------------------------
     # Entry point
@@ -396,6 +405,7 @@ class TickRunner:
             for job in jobs or []
         }
         health_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        seen_streak_keys: set[tuple[str, str]] = set()
         tick_icp_details: dict[str, dict[str, Any]] = {}
 
         # if ctx.deployment_x is None:
@@ -432,7 +442,18 @@ class TickRunner:
             # make: the shape ran and served nothing. Remember it for the run and let
             # it classify below even though no latency could be measured.
             observed_tps = y_observed_mean.get("throughput_token_per_sec")
-            dead_rank = observed_tps is not None and observed_tps <= 0.0 and queue_depth > 0
+            starved = observed_tps is not None and observed_tps <= 0.0 and queue_depth > 0
+            streak_key = (job_id, rank_id)
+            seen_streak_keys.add(streak_key)
+            if starved:
+                self._starved_streaks[streak_key] = self._starved_streaks.get(streak_key, 0) + 1
+            else:
+                self._starved_streaks.pop(streak_key, None)
+                if observed_tps is not None and observed_tps > 0.0:
+                    # The shape serves after all (recovered, or fixed mid-run): lift
+                    # the mark so it can be proposed again.
+                    self._clear_dead_shape(job_features.get(job_id, {}), env_label, x)
+            dead_rank = starved and self._starved_streaks[streak_key] >= _DEAD_SHAPE_STREAK_TICKS
             if dead_rank:
                 self._record_dead_shape(
                     ctx, job_id, rank_id, job_features.get(job_id, {}), env_label, x, queue_depth
@@ -599,6 +620,10 @@ class TickRunner:
             self.evidence_store.append_row(row)
             ctx.evidence_rows.append(row)
 
+        # A rank that left the active set takes its streak with it.
+        self._starved_streaks = {
+            key: streak for key, streak in self._starved_streaks.items() if key in seen_streak_keys
+        }
         ctx.active_health = self._update_active_health(ctx, job_features, health_samples)
 
         return FSMState.S3_SLOW_UPDATE
@@ -1200,6 +1225,17 @@ class TickRunner:
             rank_id=rank_id,
             queue_depth=float(queue_depth),
         )
+
+    def _clear_dead_shape(self, features: dict[str, Any], env_label: Any, x: dict[str, Any]) -> None:
+        model_id = features.get("model_id") or x.get("model_id")
+        gpu_type = env_gpu_type(env_label) or x.get("gpu_type")
+        if not model_id or not gpu_type:
+            return
+        try:
+            key = (str(model_id), str(gpu_type), int(x.get("tp") or 1), int(x.get("pp") or 1))
+        except (TypeError, ValueError):
+            return
+        self._dead_shapes.pop(key, None)
 
     def _annotate_dead_shapes(self, ctx: TickContext) -> None:
         """Attach observed_dead_shapes to every job descriptor for its model.

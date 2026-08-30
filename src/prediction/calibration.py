@@ -17,6 +17,7 @@ MIN_DEPLOYMENTS = 5
 # Observed throughput at or below this fraction of the prediction counts as a
 # catastrophic miss; a single such deployment may calibrate on its own.
 CATASTROPHIC_RATIO = 0.1
+CATASTROPHIC_MIN_TICKS = 2
 MAX_DEPLOYMENTS = 32
 CALIBRATION_K = 16
 EVIDENCE_SCAN_LIMIT = 1000
@@ -358,7 +359,10 @@ def _calibrate_nodes(raw, ranked, *, is_y, as_of_timestamp_utc, skip_nodes):
                     min(item[0] for item in group),
                     float(np.mean([item[1] for item in group])),
                     max(item[2] for item in group),
-                    any(item[3] for item in group),
+                    # A deployment counts as catastrophic only if EVERY tick it
+                    # reported was, and it reported at least two: a warm-up tick
+                    # followed by service is a recovery, not a dead shape.
+                    len(group) >= CATASTROPHIC_MIN_TICKS and all(item[3] for item in group),
                 )
             )
         samples.sort(key=lambda item: item[0])

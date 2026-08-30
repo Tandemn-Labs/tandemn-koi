@@ -295,10 +295,11 @@ def test_one_catastrophic_deployment_calibrates_on_its_own():
     )
     assert baseline.status == "insufficient_evidence"
 
-    # One deployment that served nothing under load is enough to pull the
-    # prediction down for this context.
-    dead = _calibration_row(9)
-    dead.y_observed_mean = {**dead.y_observed_mean, "throughput_token_per_sec": 0.0}
+    # One deployment that served nothing under load for two ticks is enough to
+    # pull the prediction down for this context.
+    dead = [_calibration_row(9, deployment_id="deploy-dead"), _calibration_row(10, deployment_id="deploy-dead")]
+    for row in dead:
+        row.y_observed_mean = {**row.y_observed_mean, "throughput_token_per_sec": 0.0}
     result = calibrate_prediction(
         {"throughput_token_per_sec": 100.0},
         {},
@@ -308,10 +309,26 @@ def test_one_catastrophic_deployment_calibrates_on_its_own():
         VERSION,
         scenario="peak",
         as_of_timestamp_utc=100.0,
-        evidence_rows=[*healthy, dead],
+        evidence_rows=[*healthy, *dead],
     )
     assert result.status == "learned"
     assert result.y_hat["throughput_token_per_sec"] < 10.0
+
+    # A single starved tick followed by service is a recovery, not a dead shape.
+    warmup = [_calibration_row(11, deployment_id="deploy-warm"), _calibration_row(12, deployment_id="deploy-warm")]
+    warmup[0].y_observed_mean = {**warmup[0].y_observed_mean, "throughput_token_per_sec": 0.0}
+    recovered = calibrate_prediction(
+        {"throughput_token_per_sec": 100.0},
+        {},
+        {**CONFIG, "dp": 2},
+        FEATURES,
+        object(),
+        VERSION,
+        scenario="peak",
+        as_of_timestamp_utc=100.0,
+        evidence_rows=[*healthy, *warmup],
+    )
+    assert recovered.status == "insufficient_evidence"
     # A merely-low observation (above the catastrophic ratio) still waits for five.
     low = _calibration_row(10)
     low.y_observed_mean = {**low.y_observed_mean, "throughput_token_per_sec": 50.0}
