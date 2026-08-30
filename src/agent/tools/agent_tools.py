@@ -4207,7 +4207,42 @@ def _generated_tp_options(
     return [_largest_pow2_divisor_leq(heads, gpu_cap)]
 
 
-_GENERATED_PP_DEGREES = (2, 4, 8)
+# Only pp=2 is generated. Every pp>=4 deployment observed so far admitted requests
+# and never ran a decode step (zero throughput under load), while pp=2 served.
+_GENERATED_PP_DEGREES = (2,)
+
+
+def _frame_shape_key(rank: dict[str, Any]) -> tuple[str, int, int]:
+    """(gpu_type, tp, pp) of a candidate rank - the identity a dead-shape record keys on."""
+    env = rank.get("env") or []
+    config = rank.get("config") or {}
+    gpu_type = str(env[4]) if isinstance(env, (list, tuple)) and len(env) >= 5 else ""
+    try:
+        return (gpu_type, int(config.get("tp") or 1), int(config.get("pp") or 1))
+    except (TypeError, ValueError):
+        return (gpu_type, 1, 1)
+
+
+def _dead_shape_keys(job: dict[str, Any]) -> set[tuple[str, int, int]]:
+    """Shapes S0 recorded as dead for this job's model: ran and served nothing
+    under load, or failed to launch for a deterministic reason. Replica count is
+    deliberately not part of the key - retrying a dead shape with more replicas
+    is what the retry loop used to do."""
+    keys: set[tuple[str, int, int]] = set()
+    for entry in job.get("observed_dead_shapes") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            keys.add(
+                (
+                    str(entry.get("gpu_type") or ""),
+                    int(entry.get("tp") or 1),
+                    int(entry.get("pp") or 1),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return keys
 
 
 def _generated_pp_options(
@@ -5239,6 +5274,16 @@ def build_scored_candidates(
                 for chains in current_groups.values()
             }
             frames = [rank for rank in frames if _deployment_shape_key(rank) not in current_shapes]
+        dead_keys = _dead_shape_keys(job)
+        if dead_keys:
+            before_dead_filter = len(frames)
+            frames = [rank for rank in frames if _frame_shape_key(rank) not in dead_keys]
+            if before_dead_filter > 0 and not frames:
+                blocked_by_job[jid] = _empty_frame_result(
+                    "deployment_shape_observed_dead",
+                    "every candidate shape already ran for this model this run and "
+                    "served nothing under load, or failed to launch",
+                )
         if attempt_gate_applies and deployment_status == "deployment_not_materialized":
             attempted = list(job.get("attempted_deployment_identities") or [])
             attempted_identities_by_job[jid] = attempted
@@ -5556,13 +5601,13 @@ def jointly_select_placements(
         return value if math.isfinite(value) else float("-inf")
 
     def emergency_recovery(candidate: dict[str, Any]) -> bool:
+        # Health already defines critical (zero throughput, throughput under 10% of
+        # required, queue depth >= 100, or TTFT >= 3x target). Re-deriving a
+        # narrower subset here left jobs at 27x target latency without a swap
+        # because their queue sat just under 100.
         return (
             str(candidate.get("type") or "").lower() == "swap"
             and candidate.get("rehabilitation_status") == "critical"
-            and bool(
-                set(candidate.get("rehabilitation_reasons") or [])
-                & {"zero_throughput", "queue_critical"}
-            )
         )
 
     eligible_candidates = []

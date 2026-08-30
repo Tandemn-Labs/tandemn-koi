@@ -14,6 +14,9 @@ from src.prediction.normalization import (
 )
 
 MIN_DEPLOYMENTS = 5
+# Observed throughput at or below this fraction of the prediction counts as a
+# catastrophic miss; a single such deployment may calibrate on its own.
+CATASTROPHIC_RATIO = 0.1
 MAX_DEPLOYMENTS = 32
 CALIBRATION_K = 16
 EVIDENCE_SCAN_LIMIT = 1000
@@ -339,7 +342,15 @@ def _calibrate_nodes(raw, ranked, *, is_y, as_of_timestamp_utc, skip_nodes):
                 math.log(observed / predicted_value) if use_log else observed - predicted_value
             )
             available = float(row.evidence_available_timestamp_utc)
-            grouped.setdefault(_deployment_id(row), []).append((distance, residual, available))
+            catastrophic = (
+                is_y
+                and node == "throughput_token_per_sec"
+                and predicted_value > 0
+                and observed <= CATASTROPHIC_RATIO * predicted_value
+            )
+            grouped.setdefault(_deployment_id(row), []).append(
+                (distance, residual, available, catastrophic)
+            )
         samples = []
         for group in grouped.values():
             samples.append(
@@ -347,15 +358,23 @@ def _calibrate_nodes(raw, ranked, *, is_y, as_of_timestamp_utc, skip_nodes):
                     min(item[0] for item in group),
                     float(np.mean([item[1] for item in group])),
                     max(item[2] for item in group),
+                    any(item[3] for item in group),
                 )
             )
         samples.sort(key=lambda item: item[0])
         samples = samples[:CALIBRATION_K]
         if len(samples) < MIN_DEPLOYMENTS:
-            continue
+            # Five independent deployments is the bar for a fine offset. A
+            # deployment that served a small fraction of its prediction under
+            # load is a different kind of evidence: one is enough to pull the
+            # prediction down for this context, instead of waiting for five
+            # more of them to fail the same way.
+            samples = [sample for sample in samples if sample[3]]
+            if not samples:
+                continue
         weights = [
             _sample_weight(distance, available, as_of_timestamp_utc)
-            for distance, _, available in samples
+            for distance, _, available, _ in samples
         ]
         total_weight = sum(weights)
         if total_weight <= 0:

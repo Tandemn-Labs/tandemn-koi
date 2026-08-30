@@ -2881,7 +2881,7 @@ class GeneratedPipelineParallelSmokeTests(unittest.TestCase):
         options = agent_tools._generated_pp_options(
             tp=2, gpu_cap=8, layers=32, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
         )
-        self.assertEqual(options, [1, 2, 4])
+        self.assertEqual(options, [1, 2])
         # tp*pp must stay inside the instance.
         self.assertEqual(
             agent_tools._generated_pp_options(
@@ -2917,6 +2917,25 @@ class GeneratedPipelineParallelSmokeTests(unittest.TestCase):
             ),
             [1],
         )
+
+    def test_dead_shapes_exclude_matching_frames_regardless_of_replicas(self):
+        job = {
+            "observed_dead_shapes": [
+                {"gpu_type": "L40S", "tp": 1, "pp": 4, "reason": "zero_throughput_under_load"},
+                {"gpu_type": "L40S", "tp": 1, "pp": 8, "reason": "SOFTWARE_STACK_RANK_FAILURE"},
+            ]
+        }
+        keys = agent_tools._dead_shape_keys(job)
+        self.assertEqual(keys, {("L40S", 1, 4), ("L40S", 1, 8)})
+        env = ["reserved", "aws", "r1", "z1", "L40S"]
+        dead_more_replicas = {"env": env, "config": {"tp": 1, "pp": 4}, "n_replicas": 3}
+        alive_pp2 = {"env": env, "config": {"tp": 1, "pp": 2}, "n_replicas": 1}
+        other_gpu = {"env": [*env[:4], "A100_80GB"], "config": {"tp": 1, "pp": 4}}
+        self.assertIn(agent_tools._frame_shape_key(dead_more_replicas), keys)
+        self.assertNotIn(agent_tools._frame_shape_key(alive_pp2), keys)
+        self.assertNotIn(agent_tools._frame_shape_key(other_gpu), keys)
+        self.assertEqual(agent_tools._dead_shape_keys({}), set())
+        self.assertEqual(agent_tools._dead_shape_keys({"observed_dead_shapes": ["junk"]}), set())
 
     def test_weight_fit_values_keep_scalars_only(self):
         catalog = {

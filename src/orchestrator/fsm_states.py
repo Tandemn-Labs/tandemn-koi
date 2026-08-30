@@ -83,6 +83,7 @@ from src.core.models import (
     PlanAction,
     deployment_ladder_identity,
     deployment_rank_identity,
+    env_gpu_type,
 )
 from src.infra.deployment_x import build_deployment_x_index
 from src.validation.cusum import CusumResult
@@ -261,6 +262,11 @@ class TickRunner:
         self._deployment_ledger: dict[str, dict[str, Any]] = {}
         self._prediction_ledger: dict[tuple[str, str], dict[str, Any]] = {}
         self._health_state: dict[str, dict[str, Any]] = {}
+        # Run-lifetime memory of shapes that launched and served nothing under
+        # load, keyed (model_id, gpu_type, tp, pp). Surfaced on job descriptors
+        # as observed_dead_shapes so neither the candidate builder nor the LLM
+        # proposes them again this run.
+        self._dead_shapes: dict[tuple[str, str, int, int], dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Entry point
@@ -343,6 +349,7 @@ class TickRunner:
             self.on_tick_start()
         ctx.cluster_snapshot = self.resource_map.snapshot_cluster_state(ctx.tick)
         ctx.deployment_reconciliation = self._reconcile_deployments(ctx)
+        self._annotate_dead_shapes(ctx)
         return FSMState.S1_OBSERVE
 
     def S1(self, ctx: TickContext) -> FSMState:
@@ -421,6 +428,15 @@ class TickRunner:
                     comparable_y_obs.pop("p99_tpot_ms", None)
             residuals_per_y = self._residuals(comparable_y_obs, y_pred)
             y_observed_mean = {name: float(np.mean(arr)) for name, arr in y_obs.items() if len(arr)}
+            # Zero throughput with a backlog is the strongest observation a rank can
+            # make: the shape ran and served nothing. Remember it for the run and let
+            # it classify below even though no latency could be measured.
+            observed_tps = y_observed_mean.get("throughput_token_per_sec")
+            dead_rank = observed_tps is not None and observed_tps <= 0.0 and queue_depth > 0
+            if dead_rank:
+                self._record_dead_shape(
+                    ctx, job_id, rank_id, job_features.get(job_id, {}), env_label, x, queue_depth
+                )
             health_sample = dict(y_observed_mean)
             if len(v_obs.get("depth_req_q", [])):
                 health_sample["depth_req_q"] = max(float(value) for value in v_obs["depth_req_q"])
@@ -483,7 +499,16 @@ class TickRunner:
                 )
                 if v_verdict is not None or y_verdict is not None:
                     cusum_per_mech[mech.mechanism_id] = (v_verdict, y_verdict)
-                fully_observable = not any(missing.values())
+                # A dead rank completes no requests, so its latency outcomes cannot
+                # be measured. That absence is the divergence, not missing data:
+                # let the diverged throughput classify the mechanism instead of
+                # leaving it unlabelled tick after tick.
+                y_keys = {"y_observed", "y_predicted", "y_unusable"}
+                v_complete = not any(value for key, value in missing.items() if key not in y_keys)
+                y_complete = not any(missing.get(key) for key in y_keys) or (
+                    dead_rank and y_verdict is CusumResult.DIVERGED
+                )
+                fully_observable = v_complete and y_complete
                 q_per_mech[mech.mechanism_id] = (
                     self.qv.classify_quadrant(v_verdict, y_verdict) if fully_observable else None
                 )
@@ -1131,6 +1156,101 @@ class TickRunner:
                     "mechanism_id": rank.mechanism_id or action.mechanism_id,
                     "shape_signature": self._prediction_shape_signature(rank.to_dict()),
                 }
+
+    # Rank failure reasons that are a property of the shape, not of the moment.
+    _DETERMINISTIC_RANK_FAILURES = frozenset(
+        {"SOFTWARE_STACK_RANK_FAILURE", "OOM", "MODEL_CATALOG_INVALID"}
+    )
+
+    def _record_dead_shape(
+        self,
+        ctx: TickContext,
+        job_id: str,
+        rank_id: str,
+        features: dict[str, Any],
+        env_label: Any,
+        x: dict[str, Any],
+        queue_depth: float,
+    ) -> None:
+        model_id = features.get("model_id") or x.get("model_id")
+        gpu_type = env_gpu_type(env_label) or x.get("gpu_type")
+        if not model_id or not gpu_type:
+            return
+        try:
+            tp, pp = int(x.get("tp") or 1), int(x.get("pp") or 1)
+        except (TypeError, ValueError):
+            return
+        key = (str(model_id), str(gpu_type), tp, pp)
+        entry = self._dead_shapes.setdefault(
+            key,
+            {
+                "model_id": str(model_id),
+                "gpu_type": str(gpu_type),
+                "tp": tp,
+                "pp": pp,
+                "reason": "zero_throughput_under_load",
+                "first_tick": ctx.tick,
+                "ticks": 0,
+            },
+        )
+        entry.update(
+            last_tick=ctx.tick,
+            ticks=int(entry.get("ticks") or 0) + 1,
+            job_id=job_id,
+            rank_id=rank_id,
+            queue_depth=float(queue_depth),
+        )
+
+    def _annotate_dead_shapes(self, ctx: TickContext) -> None:
+        """Attach observed_dead_shapes to every job descriptor for its model.
+
+        Two sources: ranks S2 saw serve nothing under load this run, and rank
+        launch failures the Store reports with a deterministic reason. Keyed on
+        (gpu_type, tp, pp) - never replicas - so a dead shape is not retried
+        wider.
+        """
+        snapshot = ctx.cluster_snapshot
+        if snapshot is None:
+            return
+        descriptors: list[dict[str, Any]] = []
+        for accessor in ("active_jobs_summary", "pending_jobs_summary"):
+            if hasattr(snapshot, accessor):
+                descriptors.extend(job for job in (getattr(snapshot, accessor)() or []) if job)
+        for job in descriptors:
+            model_id = str((job.get("job_features") or {}).get("model_id") or "")
+            dead: dict[tuple[str, int, int], dict[str, Any]] = {}
+            for entry in self._dead_shapes.values():
+                if entry.get("model_id") == model_id:
+                    dead[(entry["gpu_type"], entry["tp"], entry["pp"])] = dict(entry)
+            for failure in job.get("recent_rank_failures") or []:
+                if not isinstance(failure, dict):
+                    continue
+                if str(failure.get("reason_code") or "") not in self._DETERMINISTIC_RANK_FAILURES:
+                    continue
+                shape = dict(failure.get("shape_json") or {})
+                config = dict(shape.get("config") or shape)
+                gpu_type = env_gpu_type(shape.get("env")) or config.get("gpu_type")
+                if not gpu_type:
+                    continue
+                try:
+                    tp, pp = int(config.get("tp") or 1), int(config.get("pp") or 1)
+                except (TypeError, ValueError):
+                    continue
+                dead.setdefault(
+                    (str(gpu_type), tp, pp),
+                    {
+                        "model_id": model_id,
+                        "gpu_type": str(gpu_type),
+                        "tp": tp,
+                        "pp": pp,
+                        "reason": str(failure.get("reason_code")),
+                        "rank_id": failure.get("rank_id"),
+                    },
+                )
+            if dead:
+                job["observed_dead_shapes"] = sorted(
+                    dead.values(), key=lambda item: (item["gpu_type"], item["tp"], item["pp"])
+                )
 
     def _update_active_health(
         self,

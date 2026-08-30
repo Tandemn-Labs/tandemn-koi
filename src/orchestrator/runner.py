@@ -171,10 +171,16 @@ def build_runner(args: argparse.Namespace):
         cusum=cusum,
         tracked_v_variables=candidate_graph.v,
     )
+    # The failure lookback must not collapse to zero when ticks are driven
+    # externally with --tick-interval-sec 0 (the simulator does this): a zero
+    # window meant no rank failure ever reached a planning tick.
+    failure_window_sec = RANK_FAILURE_HISTORY_TICKS * max(
+        int(args.tick_interval_sec), int(args.telemetry_window_sec), 60
+    )
     resource_map = ResourceMapManager(
         user_id=args.user_id,
         postgres_client=client,
-        rank_failure_history_seconds=RANK_FAILURE_HISTORY_TICKS * args.tick_interval_sec,
+        rank_failure_history_seconds=failure_window_sec,
     )
     telemetry = StoreTelemetry(
         user_id=args.user_id,

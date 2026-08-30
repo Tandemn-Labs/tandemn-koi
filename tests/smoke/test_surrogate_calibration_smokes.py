@@ -276,3 +276,54 @@ def test_fusion_requires_five_deployments_versions_and_cross_fit_lower_bound():
         as_of_timestamp_utc=100.0,
     )
     assert future.sample_count == 0
+
+
+def test_one_catastrophic_deployment_calibrates_on_its_own():
+    # Three healthy rows stay below the five-deployment bar even with one more
+    # row added, so every case below exercises the under-threshold path.
+    healthy = [_calibration_row(index) for index in range(3)]
+    baseline = calibrate_prediction(
+        {"throughput_token_per_sec": 100.0},
+        {},
+        {**CONFIG, "dp": 2},
+        FEATURES,
+        object(),
+        VERSION,
+        scenario="peak",
+        as_of_timestamp_utc=100.0,
+        evidence_rows=healthy,
+    )
+    assert baseline.status == "insufficient_evidence"
+
+    # One deployment that served nothing under load is enough to pull the
+    # prediction down for this context.
+    dead = _calibration_row(9)
+    dead.y_observed_mean = {**dead.y_observed_mean, "throughput_token_per_sec": 0.0}
+    result = calibrate_prediction(
+        {"throughput_token_per_sec": 100.0},
+        {},
+        {**CONFIG, "dp": 2},
+        FEATURES,
+        object(),
+        VERSION,
+        scenario="peak",
+        as_of_timestamp_utc=100.0,
+        evidence_rows=[*healthy, dead],
+    )
+    assert result.status == "learned"
+    assert result.y_hat["throughput_token_per_sec"] < 10.0
+    # A merely-low observation (above the catastrophic ratio) still waits for five.
+    low = _calibration_row(10)
+    low.y_observed_mean = {**low.y_observed_mean, "throughput_token_per_sec": 50.0}
+    still_waiting = calibrate_prediction(
+        {"throughput_token_per_sec": 100.0},
+        {},
+        {**CONFIG, "dp": 2},
+        FEATURES,
+        object(),
+        VERSION,
+        scenario="peak",
+        as_of_timestamp_utc=100.0,
+        evidence_rows=[*healthy, low],
+    )
+    assert still_waiting.status == "insufficient_evidence"

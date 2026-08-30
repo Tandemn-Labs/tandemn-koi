@@ -235,9 +235,14 @@ class SpecialistRunner:
             "catalog-owned; do not invent engine or dtype overrides.\n\n"
             "EP is fixed at 1, so for an MoE model (model_catalog.is_moe) TP does NOT "
             "reduce per-GPU expert weight; only PP partitions it. If the model's "
-            "weights exceed one GPU at pp=1, propose pp>1 with gpu_count=tp*pp, pp "
+            "weights exceed one GPU at pp=1, propose pp=2 with gpu_count=tp*pp, pp "
             "dividing num_hidden_layers, and tp*pp within one instance; expect a "
-            "pipeline-bubble cost in exchange for fitting.\n\n"
+            "pipeline-bubble cost in exchange for fitting. Deeper pipelines have "
+            "not served in this engine.\n\n"
+            "If the Job brief carries observed_dead_shapes, those (gpu_type, tp, pp) "
+            "shapes already ran for this model this run and served nothing under "
+            "load, or failed to launch. Do not propose them, whatever the surrogate "
+            "predicts for them.\n\n"
             "Constraints:\n"
             "- type is place, keep, swap, or defer. Do not defer a physically valid "
             "frame solely because prediction coverage is unavailable; the root will "
@@ -263,8 +268,11 @@ class SpecialistRunner:
             "equal tp*pp exactly. EP is unsupported in this version; omit it and Koi "
             "will fix it to 1. Because EP is 1, TP does NOT shrink an MoE model's "
             "per-GPU expert weights - only PP does. An MoE model that misses memory "
-            "at pp=1 needs pp>1 (pp must divide its layer count, tp*pp within one "
-            "instance), which the candidate builder also generates. "
+            "at pp=1 needs pp=2 (pp must divide its layer count, tp*pp within one "
+            "instance), which the candidate builder also generates; deeper pipelines "
+            "have not served in this engine. A job's observed_dead_shapes lists "
+            "(gpu_type, tp, pp) shapes that already ran for its model this run and "
+            "served nothing under load, or failed to launch: never propose them. "
             "The engine demand must fit gpus_per_instance unless "
             "num_nodes_per_chain spans multiple instances. pool_budget counts whole "
             "instances, not GPUs.\n"
@@ -1154,6 +1162,23 @@ class KoiAgentHarness:
                     ),
                     descriptor,
                 )
+        if descriptor is not None and action.type in (ActionType.PLACE, ActionType.SWAP):
+            dead = {
+                (str(d.get("gpu_type") or ""), int(d.get("tp") or 1), int(d.get("pp") or 1))
+                for d in (descriptor.get("observed_dead_shapes") or [])
+                if isinstance(d, dict)
+            }
+            for i, rank in enumerate(action.ladder):
+                key = (
+                    str(env_gpu_type(rank.env) or ""),
+                    int(rank.config.get("tp") or 1),
+                    int(rank.config.get("pp") or 1),
+                )
+                if key in dead:
+                    raise PlanMaterializationError(
+                        f"job {jid} rank {i}: shape {key[0]} tp{key[1]}/pp{key[2]} already ran "
+                        "for this model this run and served nothing (observed_dead_shapes)"
+                    )
         if action.type == ActionType.PLACE and descriptor is not None:
             deployment_status = descriptor.get("deployment_status")
             if deployment_status == "deployment_pending":
