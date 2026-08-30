@@ -98,6 +98,11 @@ _DEPLOYMENT_MAX_ATTEMPTS = 3
 # dead - the same two-tick bar health uses before a degraded job becomes
 # rehabilitation-eligible.
 _DEAD_SHAPE_STREAK_TICKS = 2
+# Ticks after the last starved observation before a dead shape may be tried
+# again. Every stall seen so far was a fixed property of the shape, so the mark
+# is long-lived, but not permanent: an engine or catalog fix mid-run gets one
+# more chance an hour later, and a repeat stall re-arms the mark from scratch.
+_DEAD_SHAPE_RETRY_TICKS = 12
 
 
 class FSMState(Enum):
@@ -1220,6 +1225,7 @@ class TickRunner:
         )
         entry.update(
             last_tick=ctx.tick,
+            retry_after_tick=ctx.tick + _DEAD_SHAPE_RETRY_TICKS,
             ticks=int(entry.get("ticks") or 0) + 1,
             job_id=job_id,
             rank_id=rank_id,
@@ -1256,8 +1262,13 @@ class TickRunner:
             model_id = str((job.get("job_features") or {}).get("model_id") or "")
             dead: dict[tuple[str, int, int], dict[str, Any]] = {}
             for entry in self._dead_shapes.values():
-                if entry.get("model_id") == model_id:
-                    dead[(entry["gpu_type"], entry["tp"], entry["pp"])] = dict(entry)
+                if entry.get("model_id") != model_id:
+                    continue
+                # An expired mark is kept for the record but no longer attached, so
+                # the shape is proposable again; a repeat stall re-records it.
+                if ctx.tick >= int(entry.get("retry_after_tick", ctx.tick)):
+                    continue
+                dead[(entry["gpu_type"], entry["tp"], entry["pp"])] = dict(entry)
             for failure in job.get("recent_rank_failures") or []:
                 if not isinstance(failure, dict):
                     continue
