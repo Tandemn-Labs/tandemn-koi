@@ -2869,6 +2869,92 @@ class SurrogateCandidateBudgetSmokeTests(unittest.TestCase):
         )
 
 
+class CriticalRescueSmokeTests(unittest.TestCase):
+    def test_critical_job_with_only_negative_gain_swaps_still_tries_one(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 8, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 8}}}
+        candidates = [
+            {
+                "job_id": "dying",
+                "type": "swap",
+                "rehabilitation_status": "critical",
+                "ladder": [_rank(env, "p5")],
+                "target_tps": 100.0,
+                "achieved_tps": 60.0,
+                "served_fraction": 0.6,
+                "sigma": -3.0,
+                "keep_baseline_sigma": -1.0,
+                "swap_gain_over_keep": -2.0 - index,
+                "queue_state": "stable",
+                "prediction_assessment": {
+                    "basis": "aic_direct_point",
+                    "kind": "point",
+                    "status": "success",
+                    "queue_slo_verified": False,
+                },
+            }
+            for index in range(2)
+        ]
+        slow_loop = type("SlowLoop", (), {"get_sss_swap_budget_t": lambda self: 2})()
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools._CTX, "slow_loop", slow_loop),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(agent_tools, "get_pending_jobs", return_value=[]),
+            patch.object(agent_tools, "get_priority", return_value=[]),
+        ):
+            result = agent_tools.jointly_select_placements(candidates)
+
+        chosen = [c for c in result["chosen"] if c.get("job_id") == "dying"]
+        self.assertEqual(len(chosen), 1)
+        # The BEST of the negative-gain candidates is the one tried.
+        self.assertEqual(chosen[0]["swap_gain_over_keep"], -2.0)
+        self.assertTrue(chosen[0].get("rescue_floor"))
+        diag = result["selection_diagnostics"]["dying"]
+        self.assertTrue(diag.get("rescued"))
+        self.assertTrue(diag.get("chosen"))
+        self.assertEqual(diag["vetoed_gain_le_0"], 2)
+
+    def test_non_critical_negative_gain_swaps_stay_vetoed(self):
+        env = "reserved|aws|r1|z1|H100"
+        resources = {env: {"free": 8, "gpu_type": "H100"}}
+        specs = {env: {"p5": {"gpus_per_instance": 1, "free_instances": 8}}}
+        candidates = [
+            {
+                "job_id": "meh",
+                "type": "swap",
+                "rehabilitation_status": "degraded",
+                "ladder": [_rank(env, "p5")],
+                "target_tps": 100.0,
+                "achieved_tps": 60.0,
+                "served_fraction": 0.6,
+                "sigma": -3.0,
+                "swap_gain_over_keep": -2.0,
+                "queue_state": "stable",
+                "prediction_assessment": {
+                    "basis": "aic_direct_point",
+                    "kind": "point",
+                    "status": "success",
+                    "queue_slo_verified": False,
+                },
+            }
+        ]
+        slow_loop = type("SlowLoop", (), {"get_sss_swap_budget_t": lambda self: 2})()
+        with (
+            patch.object(agent_tools._CTX, "resource_map", object()),
+            patch.object(agent_tools._CTX, "slow_loop", slow_loop),
+            patch.object(agent_tools, "get_resource_map", return_value=resources),
+            patch.object(agent_tools, "instance_catalog", return_value=specs),
+            patch.object(agent_tools, "get_pending_jobs", return_value=[]),
+            patch.object(agent_tools, "get_priority", return_value=[]),
+        ):
+            result = agent_tools.jointly_select_placements(candidates)
+        self.assertEqual([c for c in result["chosen"] if c.get("job_id") == "meh"], [])
+        self.assertFalse(result["selection_diagnostics"]["meh"].get("rescued"))
+
+
 class GeneratedPipelineParallelSmokeTests(unittest.TestCase):
     MIXTRAL = {
         "model_params_b": 46.7,

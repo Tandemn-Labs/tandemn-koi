@@ -3554,17 +3554,27 @@ def _keep_baseline_sigma(
     """Score the active deployment from observed service outcomes."""
     observed = dict(_active_health_for(snapshot, job_id).get("observed") or {})
     observed_tps = observed.get(_THROUGHPUT_OBJ)
-    if (
-        observed_tps is not None
-        and float(observed_tps) <= 0.0
-        and float(observed.get("depth_req_q") or 0.0) > 0.0
-    ):
-        # Zero completions under load leaves no latency observation, so the
-        # Tchebycheff baseline below would saturate at a throughput gap of 1.0
-        # and a dead deployment would score BETTER than one serving with
-        # terrible latency. Price keeping it like leaving the job unserved -
-        # then any swap that serves anything wins.
-        return -UNSERVED_PENALTY * max(1.0, float(priority))
+    # Under-service floor. The Tchebycheff baseline below normalizes the
+    # throughput gap to at most 1.0, so a deployment serving 8% of its
+    # requirement with clean latency scored roughly like one serving 92% - a
+    # batch job once held the cluster's scarcest pool for 36 ticks that way,
+    # and a dead rank scored BETTER than one serving with terrible latency.
+    # Price the shortfall like unserved demand, in proportion: at zero service
+    # the baseline equals a full defer penalty, so any swap that serves
+    # anything wins.
+    under_service_floor = 0.0
+    demand_visible = (
+        _job_mode(job_features) != "online"
+        or float(observed.get("depth_req_q") or 0.0) > 0.0
+    )
+    if observed_tps is not None and demand_visible:
+        try:
+            required = float(required_throughput_enumerator(job_features))
+        except Exception:
+            required = 0.0
+        if required > 0:
+            shortfall = min(1.0, max(0.0, 1.0 - float(observed_tps) / required))
+            under_service_floor = -UNSERVED_PENALTY * max(1.0, float(priority)) * shortfall
     if _job_mode(job_features) == "online" and float(observed.get("depth_req_q") or 0.0) <= 0:
         # At an empty queue, achieved throughput is offered load rather than capacity.
         observed.pop(_THROUGHPUT_OBJ, None)
@@ -3579,14 +3589,17 @@ def _keep_baseline_sigma(
         normalization = ranges
     scoreable = _scoreable_y_hat(current, weights, reference, normalization)
     if not scoreable:
-        return 0.0
-    return float(
-        _CTX.tchebycheff_module.compute_tchebycheff(
-            y_hat=scoreable,
-            w_t=weights,
-            z_star_t=reference,
-            normalization_range=normalization,
-        )
+        return min(0.0, under_service_floor)
+    return min(
+        float(
+            _CTX.tchebycheff_module.compute_tchebycheff(
+                y_hat=scoreable,
+                w_t=weights,
+                z_star_t=reference,
+                normalization_range=normalization,
+            )
+        ),
+        under_service_floor,
     )
 
 
@@ -5627,6 +5640,8 @@ def jointly_select_placements(
 
     eligible_candidates = []
     selection_diagnostics: dict[str, dict[str, Any]] = {}
+    eligible_swaps_by_job: dict[str, int] = {}
+    rescue_by_job: dict[str, tuple[float, dict[str, Any]]] = {}
     for candidate in original_candidates:
         jid = str(candidate.get("job_id") or "")
         diag = selection_diagnostics.setdefault(
@@ -5647,6 +5662,15 @@ def jointly_select_placements(
         is_swap = str(candidate.get("type") or "").lower() == "swap"
         if is_swap and score <= 0:
             diag["vetoed_gain_le_0"] += 1
+            # A critical job must always be able to TRY somewhere else, even when
+            # every alternative scores below its keep baseline - a wrong baseline
+            # or a wrong prediction otherwise pins it to a failing GPU for the
+            # run. Remember its best-scoring reject; it is admitted below if
+            # nothing better survives, floored so it can never outrank real gains.
+            if emergency_recovery(candidate) and math.isfinite(score):
+                best = rescue_by_job.get(jid)
+                if best is None or score > best[0]:
+                    rescue_by_job[jid] = (score, candidate)
             continue
         if is_swap and candidate.get("queue_state") == "unstable" and not emergency_recovery(
             candidate
@@ -5654,6 +5678,17 @@ def jointly_select_placements(
             diag["vetoed_unstable"] += 1
             continue
         diag["eligible"] += 1
+        if is_swap:
+            eligible_swaps_by_job[jid] = eligible_swaps_by_job.get(jid, 0) + 1
+        eligible_candidates.append(candidate)
+
+    for jid, (score, candidate) in rescue_by_job.items():
+        if eligible_swaps_by_job.get(jid, 0) > 0:
+            continue
+        candidate["rescue_floor"] = True
+        diag = selection_diagnostics.get(jid)
+        if diag is not None:
+            diag["rescued"] = True
         eligible_candidates.append(candidate)
 
     def footprint(candidate: dict[str, Any]) -> int:
@@ -5872,8 +5907,18 @@ def jointly_select_placements(
             or swap_gain_over_keep is None
             or swap_gain_over_keep <= 0
         ):
-            continue
-        if is_swap:
+            if not (cand.get("rescue_floor") and swap_gain_over_keep is not None):
+                continue
+            # A critical job's rescue: admitted at the floor so it can never
+            # outrank a real positive-gain candidate, but the job always gets
+            # to TRY one alternative instead of staying pinned to a GPU that
+            # is not working.
+            gain = _WORK_CONSERVING_GAIN_FLOOR
+            cand["work_conserving_floor"] = True
+            cand["service_class"] = "partial"
+            if isinstance(assessment, dict):
+                assessment["selection_mode"] = "emergency_recovery"
+        elif is_swap:
             assert swap_gain_over_keep is not None
             gain = swap_gain_over_keep
         if queue_unstable:
