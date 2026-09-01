@@ -127,6 +127,38 @@ def _load_causal_graph_runtime(
     return graph, registry, StoreBackedConfidenceService(graph, registry, store)
 
 
+def ensure_passthrough_mechanism(
+    candidate_graph: CandidateGraph,
+    mechanism_registry,
+    confidence_service=None,
+) -> str:
+    """Register the sentinel mechanism used when --mechanism-mode is inert.
+
+    The planner's hard gates require every rank to resolve a mechanism_id even
+    when the causal DAG is ablated, so inert runs commit every rank to this one
+    pass-through mechanism. Its scope matches every rank (tp is always present
+    in a rank context) and its confidence is never read. The id is
+    content-derived, so re-registering on a later run returns the existing
+    mechanism.
+    """
+    if not candidate_graph.edge_table:
+        raise ValueError("cannot register the pass-through mechanism: empty edge table")
+    edge_id = sorted(candidate_graph.edge_table)[0]
+    mechanism = Mechanism(
+        edge_ids=[edge_id],
+        scope={"x": ["gpu_type", "tp"], "workload_type": "any"},
+        narrative=(
+            "Ablation pass-through: satisfies mechanism_id plumbing when the causal "
+            "DAG is disabled. Carries no causal content and is never scored."
+        ),
+        name="ablation_passthrough",
+    )
+    mechanism_id = mechanism_registry.add_mechanism(mechanism)
+    if confidence_service is not None:
+        confidence_service.seed_new_mechanism_confidence(mechanism_id)
+    return mechanism_id
+
+
 def _validate_graph_edges(graph: CandidateGraph) -> None:
     invalid = sorted(
         edge.edge_id for edge in graph.edge_table.values() if not graph.val_edges(edge)

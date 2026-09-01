@@ -92,6 +92,7 @@ from functools import wraps
 from threading import Lock
 from typing import Any
 
+from src.config import ablation
 from src.config.hyperparameters import GAMMA_SLO
 from src.config.policy import MODEL_MAX_TP, SUPPORTED_EP, VALID_TP_DEGREES, load_config_policy
 from src.core.models import (
@@ -403,6 +404,9 @@ def bind_tools(**components) -> None:
         surrogate is not None
         and evidence_store is not None
         and hasattr(surrogate, "bind_evidence_store")
+        # Frozen learning keeps the surrogate evidence-blind: binding the store
+        # here would silently re-enable calibration/fusion on every S4 rebind.
+        and not ablation.learning_frozen()
     ):
         surrogate.bind_evidence_store(evidence_store)
 
@@ -634,6 +638,27 @@ _NON_TOOL_NAMES = frozenset(
     }
 )
 
+# Tools withheld from the LLM when the causal DAG is ablated (mechanism-mode
+# inert): everything that reads or writes mechanisms, edges, or confidence.
+_MECHANISM_INERT_HIDDEN_TOOLS = frozenset(
+    {
+        "get_edge_confidence",
+        "get_mechanism_confidence",
+        "get_influencing_knobs",
+        "get_scope",
+        "get_applicable_mechanisms",
+        "get_recent_q_histogram",
+        "compute_eig",
+        "check_past_failure",
+        "set_new_mechanisms",
+        "val_new_mechanisms",
+    }
+)
+
+# Tools withheld when learning is frozen: admitting a mechanism mid-run grows
+# the causal model from observations, which is exactly what "frozen" forbids.
+_LEARNING_FROZEN_HIDDEN_TOOLS = frozenset({"set_new_mechanisms", "val_new_mechanisms"})
+
 
 def all_callables() -> dict[str, Any]:
     """Return every public LLM tool as a name -> callable dict.
@@ -642,14 +667,20 @@ def all_callables() -> dict[str, Any]:
     The __module__ filter drops imported callables (e.g. the Plan class)
     so only tool functions defined here are exposed; _NON_TOOL_NAMES drops
     the boot/infra functions (notably reset_tick_caches, which the model
-    must never call mid-trajectory).
+    must never call mid-trajectory). Ablation modes additionally hide the
+    tool families their disabled subsystem would have served.
     """
+    hidden = set(_NON_TOOL_NAMES)
+    if ablation.mechanism_inert():
+        hidden |= _MECHANISM_INERT_HIDDEN_TOOLS
+    if ablation.learning_frozen():
+        hidden |= _LEARNING_FROZEN_HIDDEN_TOOLS
     tools = {
         name: fn
         for name, fn in globals().items()
         if callable(fn)
         and not name.startswith("_")
-        and name not in _NON_TOOL_NAMES
+        and name not in hidden
         and getattr(fn, "__module__", None) == __name__
     }
     logger = getattr(_CTX, "tool_call_logger", None)
@@ -732,6 +763,8 @@ def _ranks_as_dicts(action) -> list:
     for rank in action.ladder:
         raw = rank.to_dict()
         raw["mechanism_id"] = raw.get("mechanism_id") or action.mechanism_id
+        if raw["mechanism_id"] is None and ablation.mechanism_inert():
+            raw["mechanism_id"] = ablation.passthrough_mechanism_id()
         if raw["mechanism_id"] is None:
             raise ValueError(f"job {action.job_id}: ladder rank requires mechanism_id")
         ranks.append(raw)
@@ -1263,11 +1296,12 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
     recent_q = []
     blobs = []
     for r in recent_rows:
-        q_labels = {
-            mid: (q.value if hasattr(q, "value") else q)
-            for mid, q in getattr(r, "q_label_per_mechanism", {}).items()
-        }
-        recent_q.append({"tick": r.tick, "q_labels": q_labels})
+        if not ablation.mechanism_inert():
+            q_labels = {
+                mid: (q.value if hasattr(q, "value") else q)
+                for mid, q in getattr(r, "q_label_per_mechanism", {}).items()
+            }
+            recent_q.append({"tick": r.tick, "q_labels": q_labels})
         if getattr(r, "theory_blob", None):
             blobs.append({"tick": r.tick, "theory_blob": r.theory_blob})
 
@@ -1281,7 +1315,7 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
     mechanism_context["workload_type"] = (
         features.get("workload_type") or features.get("type") or (descriptor or {}).get("kind")
     )
-    mechanisms = get_scope(mechanism_context)
+    mechanisms = [] if ablation.mechanism_inert() else get_scope(mechanism_context)
     available_instances = instance_catalog()
     hardware = sorted(
         {
@@ -1292,7 +1326,7 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
     )
     policy_rules = load_config_policy().rules_for_model(str(model_id or ""), hardware)
 
-    return {
+    brief = {
         "job_id": job_id,
         "user_id": (descriptor or {}).get("user_id"),
         "job_features": features,
@@ -1308,6 +1342,12 @@ def get_job_brief(job_id: str) -> dict[str, Any]:
         },
         "instance_catalog": available_instances,
     }
+    if ablation.mechanism_inert():
+        # The specialist prompt embeds this brief verbatim; an inert-DAG run
+        # must not surface mechanism vocabulary to the LLM at all.
+        del brief["mechanism_candidates"]
+        del brief["recent_q_labels"]
+    return brief
 
 
 def instance_catalog() -> dict[str, dict[str, dict[str, Any]]]:
@@ -2715,21 +2755,25 @@ def get_similar_deployments(
         ]
         rows = rows[-int(top_k) :]
 
-    return [
-        {
+    briefs = []
+    for r in rows:
+        brief = {
             "tick": r.tick,
             "job_id": r.job_id,
             "rank_id": r.rank_id,
             "env_label": r.env_label,
-            "mechanism_ids": list(getattr(r, "mechanism_ids", [])),
-            "q_labels": {
-                mid: (q.value if hasattr(q, "value") else q)
-                for mid, q in getattr(r, "q_label_per_mechanism", {}).items()
-            },
             "y_observed_mean": dict(getattr(r, "y_observed_mean", {}) or {}),
         }
-        for r in rows
-    ]
+        # Mechanism annotations are DAG vocabulary; an inert-DAG run keeps the
+        # observed outcomes but withholds the causal bookkeeping.
+        if not ablation.mechanism_inert():
+            brief["mechanism_ids"] = list(getattr(r, "mechanism_ids", []))
+            brief["q_labels"] = {
+                mid: (q.value if hasattr(q, "value") else q)
+                for mid, q in getattr(r, "q_label_per_mechanism", {}).items()
+            }
+        briefs.append(brief)
+    return briefs
 
 
 def set_new_mechanisms(
@@ -2759,6 +2803,17 @@ def set_new_mechanisms(
         {"ok": bool, "mechanism_id": str | None, "seed_confidence": float,
          "violations": list}.
     """
+    if ablation.mechanism_inert() or ablation.learning_frozen():
+        return {
+            "ok": False,
+            "mechanism_id": None,
+            "seed_confidence": None,
+            "violations": [
+                "mechanism admission is disabled for this ablation run "
+                f"(mechanism_mode={ablation.mechanism_mode()}, "
+                f"learning_mode={ablation.learning_mode()})"
+            ],
+        }
     _require("mechanism_registry", "candidate_graph", "confidence_service")
     from src.core.models import Mechanism
 
@@ -3413,6 +3468,8 @@ def compute_eig(candidate_ladder: dict[str, Any]) -> float:
     Returns:
         Non-negative EIG value.
     """
+    if ablation.mechanism_inert():
+        return 0.0
     _require(
         "eig_module",
         "candidate_graph",
@@ -3919,13 +3976,17 @@ def _compute_sigma(plan, finalization: bool) -> dict[str, Any]:
                 normalization_range=norm,
             )
         )
-        eig_value = float(
-            _CTX.eig_module.compute_eig(
-                L_prime=_materialize_ladder(ladder_dicts),
-                candidate_graph=_CTX.candidate_graph,
-                mechanism_registry=_CTX.mechanism_registry,
-                confidence_service=_CTX.confidence_service,
-                evidence_store=_CTX.evidence_store,
+        eig_value = (
+            0.0
+            if ablation.mechanism_inert()
+            else float(
+                _CTX.eig_module.compute_eig(
+                    L_prime=_materialize_ladder(ladder_dicts),
+                    candidate_graph=_CTX.candidate_graph,
+                    mechanism_registry=_CTX.mechanism_registry,
+                    confidence_service=_CTX.confidence_service,
+                    evidence_store=_CTX.evidence_store,
+                )
             )
         )
         prev_ladder = _prev_ladder_for(snapshot, job_id)
@@ -4308,6 +4369,10 @@ def _generated_pp_options(
 
 def _applicable_mechanism_id(rank: dict[str, Any], features: dict[str, Any]) -> str | None:
     """Best applicable mechanism id for a rank (exact, then partial), or None."""
+    if ablation.mechanism_inert():
+        # Mechanism identity carries no decision content in this mode; every
+        # rank commits to the one pass-through sentinel.
+        return ablation.passthrough_mechanism_id()
     try:
         apps = get_applicable_mechanisms(rank, features)
     except Exception:

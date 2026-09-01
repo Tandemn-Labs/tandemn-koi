@@ -51,6 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import src.agent.tools.agent_tools as agent_tools
+from src.config import ablation
 from src.config.hyperparameters import K_MAX, K_P
 from src.config.policy import SUPPORTED_EP
 from src.core.models import (
@@ -218,6 +219,30 @@ class SpecialistRunner:
 
     @staticmethod
     def _default_prompt(job_id: str, slice_: dict[str, Any], brief: dict[str, Any]) -> str:
+        if ablation.mechanism_inert():
+            mechanism_rules = ""
+            rank_mechanism_field = ""
+            output_keys = (
+                "job_id, user_id, type, ladder, budget_utilization, used_capacity, "
+                "fitness, marginal_value_of_more, unused_capacity, reasoning. "
+            )
+        else:
+            proposal_rule = (
+                "If none applies exactly, use the closest partial match.\n"
+                if ablation.learning_frozen()
+                else "If none applies, propose one without inventing an ID.\n"
+            )
+            mechanism_rules = (
+                "- Mechanism IDs are opaque: use exact mechanism_candidates first, then "
+                "partial matches. " + proposal_rule + "- Every ladder rank's mechanism_id "
+                "must also appear in the top-level mechanism_ids list.\n"
+            )
+            rank_mechanism_field = ",'mechanism_id':'M_...'"
+            output_keys = (
+                "job_id, user_id, type, ladder, budget_utilization, used_capacity, "
+                "fitness, marginal_value_of_more, unused_capacity, mechanism_ids, "
+                "new_mechanism_proposals, reasoning. "
+            )
         return (
             f"You are the bounded specialist for job {job_id}.\n"
             "Return one job-level proposal inside its BudgetSlice; the root owns "
@@ -254,14 +279,11 @@ class SpecialistRunner:
             "budget_utilization must always be JSON objects. Use {} when a map is not "
             "applicable. Every nonempty key must be a canonical "
             "market|cloud|region|zone|gpu_type env.\n"
-            "- Mechanism IDs are opaque: use exact mechanism_candidates first, then "
-            "partial matches. If none applies, propose one without inventing an ID.\n"
-            "- Every ladder rank's mechanism_id must also appear in the top-level "
-            "mechanism_ids list.\n"
+            f"{mechanism_rules}"
             "- Every env is [market,cloud,region,zone,gpu_type]. Every ladder rank is "
             "{'role':'aggregate','env':[...],'config':{'instance_type':str,"
             "'gpu_count':int,'tp':int,'pp':int,'sp':int,'cp':int},"
-            "'n_replicas':int,'mechanism_id':'M_...'}. Do not use shorthand ranks.\n"
+            f"'n_replicas':int{rank_mechanism_field}}}. Do not use shorthand ranks.\n"
             "- Ladder ranks are simultaneous deployment components, not alternatives. "
             "For place or swap, return exactly one ladder rank; the deterministic "
             "candidate builder owns alternatives and composites.\n"
@@ -281,9 +303,7 @@ class SpecialistRunner:
             "- Set only instance_type, parallelism, optional num_nodes_per_chain/"
             "interconnect_type, and replicas. Omit model_id/gpu_type (derived) and "
             "all engine, dtype, quantization, cache, batching, routing, and scheduling knobs.\n\n"
-            "Output only one JSON object with keys: job_id, user_id, type, ladder, "
-            "budget_utilization, used_capacity, fitness, marginal_value_of_more, "
-            "unused_capacity, mechanism_ids, new_mechanism_proposals, reasoning. "
+            f"Output only one JSON object with keys: {output_keys}"
             "For starved fitness report marginal capacity by canonical env; for "
             "overprovisioned fitness report unused capacity by canonical env."
         )
@@ -493,7 +513,11 @@ class SpecialistRunner:
         ladder = result.get("ladder")
         mechanism_ids = result.get("mechanism_ids") or []
         if action_name in (ActionType.PLACE.value, ActionType.SWAP.value):
-            if not isinstance(mechanism_ids, list) or not mechanism_ids:
+            # Inert mechanism mode stamps the pass-through id deterministically
+            # during candidate scoring, so the specialist owes none here.
+            if ablation.mechanism_inert():
+                pass
+            elif not isinstance(mechanism_ids, list) or not mechanism_ids:
                 violations.append(f"{action_name} requires non-empty mechanism_ids")
             elif any(
                 not isinstance(mechanism_id, str) or not mechanism_id.strip()
@@ -621,13 +645,14 @@ class SpecialistRunner:
         replicas = rank.get("n_replicas")
         if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas <= 0:
             violations.append(f"{prefix}.n_replicas must be a positive int")
-        mechanism_id = rank.get("mechanism_id")
-        if not mechanism_id:
-            violations.append(f"{prefix}.mechanism_id is required")
-        elif not isinstance(mechanism_id, str):
-            violations.append(f"{prefix}.mechanism_id must be a non-empty string")
-        elif not isinstance(mechanism_ids, list) or mechanism_id not in mechanism_ids:
-            violations.append(f"{prefix}.mechanism_id must be present in mechanism_ids")
+        if not ablation.mechanism_inert():
+            mechanism_id = rank.get("mechanism_id")
+            if not mechanism_id:
+                violations.append(f"{prefix}.mechanism_id is required")
+            elif not isinstance(mechanism_id, str):
+                violations.append(f"{prefix}.mechanism_id must be a non-empty string")
+            elif not isinstance(mechanism_ids, list) or mechanism_id not in mechanism_ids:
+                violations.append(f"{prefix}.mechanism_id must be present in mechanism_ids")
         return violations
 
 
@@ -1344,6 +1369,8 @@ class KoiAgentHarness:
                 raise PlanMaterializationError(f"job {jid} rank {i}: n_replicas must be >= 1")
             if rank.mechanism_id is None:
                 rank.mechanism_id = action.mechanism_id
+            if rank.mechanism_id is None and ablation.mechanism_inert():
+                rank.mechanism_id = ablation.passthrough_mechanism_id()
             if rank.mechanism_id is None:
                 raise PlanMaterializationError(f"job {jid} rank {i}: mechanism_id is required")
             registry = agent_tools._CTX.mechanism_registry
@@ -1360,13 +1387,15 @@ class KoiAgentHarness:
             )
             if not runnable:
                 raise PlanMaterializationError(f"job {jid} rank {i}: {policy_reason}")
-            context = agent_tools._rank_mechanism_context(rank, job_features)
-            match = registry.match_scope(mechanism, context)
-            if match["quality"] == "reject":
-                raise PlanMaterializationError(
-                    f"job {jid} rank {i}: mechanism {rank.mechanism_id!r} does not apply "
-                    f"({'; '.join(match['reasons'])})"
-                )
+            # Scope matching is causal semantics; the inert ablation removes it.
+            if not ablation.mechanism_inert():
+                context = agent_tools._rank_mechanism_context(rank, job_features)
+                match = registry.match_scope(mechanism, context)
+                if match["quality"] == "reject":
+                    raise PlanMaterializationError(
+                        f"job {jid} rank {i}: mechanism {rank.mechanism_id!r} does not apply "
+                        f"({'; '.join(match['reasons'])})"
+                    )
 
         if book is not None:
             slice_ = (book.get("job_budgets") or {}).get(jid)
@@ -1592,6 +1621,57 @@ class KoiAgentHarness:
 
         online_admission_contract = self._partial_online_admission_contract()
 
+        # Ablation-dependent prompt fragments. The text must match what the
+        # run actually does: an inert-DAG run must not describe mechanism
+        # confidence, and a frozen-learning run must not promise that priors
+        # update from outcomes.
+        if ablation.mechanism_inert():
+            carryover = "evidence and the ideal point z* carry across ticks"
+        else:
+            carryover = "evidence, mechanism confidence, and the ideal point z* all carry across ticks"
+        if ablation.learning_frozen():
+            loop_sentence = (
+                "You are one step in a closed control loop, not a one-shot "
+                f"optimizer: {carryover}. Confidence, calibration, and the "
+                "slow-loop knobs are FIXED for this run (no online learning): "
+                "predictions and priors do not update from observed outcomes.\n\n"
+            )
+        else:
+            loop_sentence = (
+                "You are one step in a closed control loop, not a one-shot "
+                f"optimizer: {carryover}, so a config that was wrong last tick "
+                "is self-correcting.\n\n"
+            )
+        mechanism_tool_listing = (
+            "" if ablation.mechanism_inert() else "get_applicable_mechanisms, get_influencing_knobs, "
+        )
+        if ablation.mechanism_inert():
+            eig_bullet = ""
+        elif ablation.learning_frozen():
+            eig_bullet = (
+                "  - EIG (weighted by beta, exploration): expected information "
+                "gain from actually trying this ladder. High when the mechanism is "
+                "low-confidence under the FIXED seed priors; confidence does not "
+                "update this run.\n"
+            )
+        else:
+            eig_bullet = (
+                "  - EIG (weighted by beta, exploration): expected information "
+                "gain from actually trying this ladder. High when the mechanism is "
+                "low-confidence - an uncertain-but-promising config is rewarded "
+                "because Koi LEARNS from deploying it.\n"
+            )
+        if ablation.mechanism_inert():
+            mechanism_id_contract = (
+                "mechanism_id on scored candidates is a fixed pass-through "
+                "identifier; carry it through unchanged and never invent another."
+            )
+        else:
+            mechanism_id_contract = (
+                "Mechanism IDs are opaque Store IDs: use applicable exact or "
+                "partial matches and never invent an ID."
+            )
+
         return (
             f"{repair_section}"
             # ---------- WHO YOU ARE ----------
@@ -1599,11 +1679,8 @@ class KoiAgentHarness:
             "Once per 5-minute tick you observe the ENTIRE cluster, decide "
             "what runs on which GPUs, and commit exactly ONE plan P_t. The "
             "executor deploys it, telemetry measures the real outcomes, and "
-            "NEXT tick you see whether you were right and correct course. You "
-            "are one step in a closed control loop, not a one-shot optimizer: "
-            "evidence, mechanism confidence, and the ideal point z* all carry "
-            "across ticks, so a config that was wrong last tick is "
-            "self-correcting.\n\n"
+            "NEXT tick you see whether you were right and correct course. "
+            f"{loop_sentence}"
             # ---------- REPL STATE ----------
             "Full cluster state is loaded in the REPL - do NOT ask for it in "
             "the prompt; inspect it with code and print summaries only. REPL "
@@ -1619,7 +1696,7 @@ class KoiAgentHarness:
             "Every agent tool is bound as a function (get_cluster_state, "
             "get_priority, build_user_envelopes, allocate_budget_book, "
             "validate_budget_book, run_job_specialists, predict_outcome, "
-            "compute_sigma, get_applicable_mechanisms, get_influencing_knobs, "
+            f"compute_sigma, {mechanism_tool_listing}"
             "optimize_config, build_scored_candidates, jointly_select_placements, "
             "get_z_star, size_ladder, check_feasibility, ...).\n\n"
             # ---------- YOUR JOB THIS TICK ----------
@@ -1644,10 +1721,7 @@ class KoiAgentHarness:
             "(max_j w_j*gap_j), so you CANNOT hide bad latency behind great cost; "
             "to raise J, lift the WEAKEST objective. get_z_star() shows z* (what "
             "'good' means now); w_t are the objective weights.\n"
-            "  - EIG (weighted by beta, exploration): expected information "
-            "gain from actually trying this ladder. High when the mechanism is "
-            "low-confidence - an uncertain-but-promising config is rewarded "
-            "because Koi LEARNS from deploying it.\n"
+            f"{eig_bullet}"
             "  - Pr_DRO (weighted by gamma, risk): uncertainty around the available "
             "point predictions. With Direct-only latency this is base-latency risk, "
             "not a queue-inclusive SLO guarantee.\n"
@@ -1752,8 +1826,7 @@ class KoiAgentHarness:
             "A specialist defer/blocked result is only a local hint. A job in exhausted has "
             "no physically valid candidate; inspect diagnostics for the typed reason. "
             "budget_limited identifies work skipped at the "
-            "surrogate cap. Mechanism IDs are opaque Store IDs: use applicable exact or "
-            "partial matches and never invent an ID.\n\n"
+            f"surrogate cap. {mechanism_id_contract}\n\n"
             "ACTIVE HEALTH CONTRACT. Active jobs include deterministic health summaries. "
             "A critical job or a job degraded for two consecutive ticks may receive SWAP "
             "candidates, subject to B_t and a two-tick cooldown. Compare KEEP against those "
@@ -1821,6 +1894,11 @@ class KoiAgentHarness:
         a job_id->action dict, and auto-fills any omitted job with KEEP
         (active) or DEFER (waiting) - so a partial plan is safe.
         """
+        mechanism_comment = (
+            "# pass-through id from the scored candidate"
+            if ablation.mechanism_inert()
+            else "# committed mechanism for the job"
+        )
         return (
             "Commit `plan` as a dict with this shape:\n"
             "  plan = {\n"
@@ -1845,7 +1923,7 @@ class KoiAgentHarness:
             "   'queue_slo_verified': bool,         # false for Direct-only prediction\n"
             "   'target_p99_ttft_ms': float,        # online SLA, copied from job_features\n"
             "   'target_p99_tpot_ms': float,        # online SLA, copied from job_features\n"
-            "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"
+            f"   'mechanism_id': 'M_...',            {mechanism_comment}\n"
             "   'swap_reason': 'scale_up|scale_down|migrate|replace|retune',  # swap only\n"
             "   'budget_ref': '<BudgetSlice id>',   # required if a BudgetBook was validated\n"
             "   'rationale': str}\n"

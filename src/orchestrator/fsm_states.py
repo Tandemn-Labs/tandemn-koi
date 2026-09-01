@@ -74,6 +74,7 @@ from enum import Enum
 from typing import Any
 
 import numpy as np
+from src.config import ablation
 from src.config.hyperparameters import PARTIAL_DIVERGENCE_BETA
 from src.core.models import (
     SWAP_BUDGET_ACTIONS,
@@ -363,7 +364,10 @@ class TickRunner:
             self.on_tick_start()
         ctx.cluster_snapshot = self.resource_map.snapshot_cluster_state(ctx.tick)
         ctx.deployment_reconciliation = self._reconcile_deployments(ctx)
-        self._annotate_dead_shapes(ctx)
+        # Dead-shape memory is observational learning (a shape is banned because
+        # it was WATCHED failing); a frozen-learning run keeps no such memory.
+        if not ablation.learning_frozen():
+            self._annotate_dead_shapes(ctx)
         return FSMState.S1_OBSERVE
 
     def S1(self, ctx: TickContext) -> FSMState:
@@ -450,15 +454,21 @@ class TickRunner:
             starved = observed_tps is not None and observed_tps <= 0.0 and queue_depth > 0
             streak_key = (job_id, rank_id)
             seen_streak_keys.add(streak_key)
-            if starved:
-                self._starved_streaks[streak_key] = self._starved_streaks.get(streak_key, 0) + 1
-            else:
-                self._starved_streaks.pop(streak_key, None)
-                if observed_tps is not None and observed_tps > 0.0:
-                    # The shape serves after all (recovered, or fixed mid-run): lift
-                    # the mark so it can be proposed again.
-                    self._clear_dead_shape(job_features.get(job_id, {}), env_label, x)
-            dead_rank = starved and self._starved_streaks[streak_key] >= _DEAD_SHAPE_STREAK_TICKS
+            if not ablation.learning_frozen():
+                if starved:
+                    self._starved_streaks[streak_key] = (
+                        self._starved_streaks.get(streak_key, 0) + 1
+                    )
+                else:
+                    self._starved_streaks.pop(streak_key, None)
+                    if observed_tps is not None and observed_tps > 0.0:
+                        # The shape serves after all (recovered, or fixed mid-run):
+                        # lift the mark so it can be proposed again.
+                        self._clear_dead_shape(job_features.get(job_id, {}), env_label, x)
+            dead_rank = (
+                starved
+                and self._starved_streaks.get(streak_key, 0) >= _DEAD_SHAPE_STREAK_TICKS
+            )
             if dead_rank:
                 self._record_dead_shape(
                     ctx, job_id, rank_id, job_features.get(job_id, {}), env_label, x, queue_depth
@@ -653,7 +663,18 @@ class TickRunner:
 
         Part 4 - meta cadence: CUSUM (delta, h) recalibration from
         accumulated residual history every recalibrate_every ticks.
+
+        A frozen-learning run skips all four parts: no residual ingestion, no
+        Beta updates, no knob updates, no recalibration. S4/S5 still need a
+        slow state, so the boot-time knobs are handed forward unchanged.
         """
+        if ablation.learning_frozen():
+            ctx.confidence_diagnostics = []
+            self.slow_loop.state.tick = int(ctx.tick)
+            ctx.new_slow_state = self.slow_loop.state
+            ctx.slow_update_diagnostics = {"learning_frozen": True}
+            return FSMState.S4_AGENTIC_PLAN
+
         ctx.confidence_diagnostics = []
         slow_before = self._slow_state_snapshot()
         coverage = self._observed_coverage_details(ctx)

@@ -13,7 +13,12 @@ from urllib.parse import urlparse
 from src.agent.agent import KoiAgentHarness
 from src.agent.llm_clients import OpenAICompatClient, RecordingLLMClient
 from src.agent.tools import agent_tools
-from src.bootstrap.initialization import init_causal_graph, init_surrogate_stack
+from src.bootstrap.initialization import (
+    ensure_passthrough_mechanism,
+    init_causal_graph,
+    init_surrogate_stack,
+)
+from src.config import ablation
 from src.core.evidence_service import EvidenceService
 from src.cost import switch_cost as switchcost_module
 from src.cost.dro import DRO
@@ -140,6 +145,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("KOI_PARTIAL_ONLINE_ADMISSION", "advisory"),
         help="Partial online admission mode (KOI_PARTIAL_ONLINE_ADMISSION; default: advisory)",
     )
+    parser.add_argument(
+        "--mechanism-mode",
+        choices=ablation.MECHANISM_MODES,
+        default=os.getenv("KOI_MECHANISM_MODE", "full"),
+        help="Causal DAG ablation: 'inert' zeroes EIG and replaces mechanism selection "
+        "with a pass-through id (KOI_MECHANISM_MODE; default: full)",
+    )
+    parser.add_argument(
+        "--learning-mode",
+        choices=ablation.LEARNING_MODES,
+        default=os.getenv("KOI_LEARNING_MODE", "online"),
+        help="Online-learning ablation: 'frozen' skips S3 learning, surrogate "
+        "calibration, and dead-shape memory (KOI_LEARNING_MODE; default: online)",
+    )
     parser.add_argument("--rust-log", default=os.getenv("RUST_LOG", "warn"))
     args = parser.parse_args(argv)
     if args.partial_online_admission not in PARTIAL_ONLINE_ADMISSION_MODES:
@@ -147,6 +166,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--partial-online-admission must be one of: "
             + ", ".join(PARTIAL_ONLINE_ADMISSION_MODES)
         )
+    # choices only guards CLI values; an env-var default bypasses it.
+    if args.mechanism_mode not in ablation.MECHANISM_MODES:
+        parser.error("--mechanism-mode must be one of: " + ", ".join(ablation.MECHANISM_MODES))
+    if args.learning_mode not in ablation.LEARNING_MODES:
+        parser.error("--learning-mode must be one of: " + ", ".join(ablation.LEARNING_MODES))
     return args
 
 
@@ -234,12 +258,22 @@ def build_runner(args: argparse.Namespace):
 
     agent_tools.configure_surrogate_call_budget(args.surrogate_call_budget)
     agent_tools.configure_partial_online_admission(args.partial_online_admission)
+    ablation.configure_mechanism_mode(args.mechanism_mode)
+    ablation.configure_learning_mode(args.learning_mode)
     os.environ["RUST_LOG"] = str(args.rust_log)
 
     client = PostgresClient()
     candidate_graph, mechanism_registry, confidence_service = init_causal_graph(
         args.user_id, postgres_client=client
     )
+    if ablation.mechanism_inert():
+        ablation.set_passthrough_mechanism_id(
+            ensure_passthrough_mechanism(candidate_graph, mechanism_registry, confidence_service)
+        )
+        log.info(
+            "mechanism-mode inert: pass-through mechanism %s",
+            ablation.passthrough_mechanism_id(),
+        )
     evidence_store = EvidenceService(user_id=args.user_id, postgres_client=client)
     dro = DRO()
     regret = RegretCalculator()
@@ -278,8 +312,11 @@ def build_runner(args: argparse.Namespace):
         resource_map=resource_map,
         partial_online_admission_mode=args.partial_online_admission,
     )
+    # Frozen learning severs the surrogate's evidence input: calibration and
+    # throughput fusion are recomputed from evidence per call, so an unbound
+    # store is what makes the surrogate truly static.
     surrogate = init_surrogate_stack(
-        evidence_store=evidence_store,
+        evidence_store=None if ablation.learning_frozen() else evidence_store,
         peer_mode=args.surrogate_peer_mode,
         lower_quantile=args.surrogate_lower_quantile,
     )
@@ -432,9 +469,12 @@ def emit_run_manifest(debug_logger: DebugLogger, args: argparse.Namespace) -> No
             "surrogate_lower_quantile": args.surrogate_lower_quantile,
             "surrogate_call_budget": args.surrogate_call_budget,
             "partial_online_admission": args.partial_online_admission,
+            "mechanism_mode": args.mechanism_mode,
+            "learning_mode": args.learning_mode,
         },
         "surrogate_budget": agent_tools.get_surrogate_budget_status(),
         "partial_online_admission": admission_status,
+        "ablation": ablation.ablation_status(),
     }
     revision = _source_revision()
     if revision is not None:
