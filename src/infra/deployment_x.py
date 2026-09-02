@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from src.config.policy import load_config_policy
 from src.core.models import EnvLabel
 
 RankKey = tuple[str, str]
@@ -339,13 +340,22 @@ def _model_catalog_x(catalog: dict[str, Any], gpu_type: str) -> dict[str, Any]:
 
 
 def materialize_launch_config(catalog: dict[str, Any], gpu_type: str) -> dict[str, Any]:
-    """Return catalog-owned launch settings resolved for one GPU type."""
+    """Return launch settings resolved for one GPU type and its policy."""
     resolved = _model_catalog_x(catalog, gpu_type)
-    return {
+    config = {
         key: value
         for key, value in resolved.items()
         if key in _LAUNCH_CONFIG_FIELDS and not _is_missing_x_value(value)
     }
+    rule = load_config_policy().rule_for(gpu_type, str(catalog.get("model_id") or ""))
+    if (
+        rule is not None
+        and rule.precision == "bf16"
+        and str(config.get("weight_quantization_method") or "none").lower() == "none"
+        and str(config.get("weight_dtype") or "").lower() in {"float16", "fp16"}
+    ):
+        config["weight_dtype"] = "bfloat16"
+    return config
 
 
 def _per_gpu_model_value(value: Any, gpu_type: str, field: str) -> Any:
