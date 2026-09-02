@@ -2963,11 +2963,13 @@ class GeneratedPipelineParallelSmokeTests(unittest.TestCase):
     }
 
     def test_pp_only_expands_when_weights_miss_at_pp_one_and_fit_at_pp(self):
-        # 87 GiB of MoE weight: no fit on one 80 GB GPU at any tp, fits at pp=2.
+        # 87 GiB of MoE weight: no fit on one 80 GB GPU at any tp; both pp=2 and
+        # pp=4 shard it enough, divide the 32 layers, and keep tp*pp inside the
+        # instance, so both are offered and the scorer arbitrates depth.
         options = agent_tools._generated_pp_options(
             tp=2, gpu_cap=8, layers=32, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
         )
-        self.assertEqual(options, [1, 2])
+        self.assertEqual(options, [1, 2, 4])
         # tp*pp must stay inside the instance.
         self.assertEqual(
             agent_tools._generated_pp_options(

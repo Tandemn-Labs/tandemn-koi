@@ -4235,9 +4235,11 @@ def _generated_tp_options(
     return [_largest_pow2_divisor_leq(heads, gpu_cap)]
 
 
-# Only pp=2 is generated. Every pp>=4 deployment observed so far admitted requests
-# and never ran a decode step (zero throughput under load), while pp=2 served.
-_GENERATED_PP_DEGREES = (2,)
+# pp=2 and pp=4 are generated. Deeper pipelines than 4 remain off: under the
+# pre-2026-09 simulator pp>=4 never ran a decode step; the engine fix landed
+# 2026-09-01 and pp=4 is now servable, so it is offered when pp=1 provably
+# cannot hold the weights and pp=4 provably can.
+_GENERATED_PP_DEGREES = (2, 4)
 
 
 def _frame_shape_key(rank: dict[str, Any]) -> tuple[str, int, int]:
