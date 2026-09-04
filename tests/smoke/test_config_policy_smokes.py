@@ -21,6 +21,22 @@ def test_policy_resolves_phi_rules_and_global_tp_ceiling():
     assert "limits TP to 2" in reason
 
 
+def test_policy_matches_servingsim_quantization_availability():
+    policy = load_config_policy()
+
+    expected_h100 = {
+        "meta-llama/Llama-3.2-1B-Instruct": "fp16",
+        "microsoft/phi-4": "fp16",
+        "mistralai/Mixtral-8x7B-Instruct-v0.1": "bf16",
+        "Qwen/Qwen2.5-Coder-32B-Instruct": "fp16",
+    }
+    for model_id, precision in expected_h100.items():
+        assert policy.rule_for("H100", model_id).precision == precision
+
+    assert policy.rule_for("L40S", "moonshotai/Kimi-K2-Instruct") is None
+    assert policy.rule_for("L40S", "deepseek-ai/DeepSeek-V3") is None
+
+
 def test_policy_accepts_allowed_phi_tp_and_enforces_known_gpu_rule():
     allowed, _ = config_runnable(
         {"model_id": "microsoft/phi-4", "tp": 2, "pp": 1, "gpu_count": 2},
@@ -45,7 +61,7 @@ def test_policy_precision_is_checked_when_catalog_launch_config_supplies_it():
             "tp": 2,
             "pp": 1,
             "gpu_count": 2,
-            "weight_dtype": "bfloat16",
+            "weight_dtype": "float16",
         },
         {"model_id": "microsoft/phi-4"},
         gpu_type="H100",
@@ -56,7 +72,7 @@ def test_policy_precision_is_checked_when_catalog_launch_config_supplies_it():
             "tp": 2,
             "pp": 1,
             "gpu_count": 2,
-            "weight_dtype": "float16",
+            "weight_dtype": "bfloat16",
         },
         {"model_id": "microsoft/phi-4"},
         gpu_type="H100",
@@ -65,7 +81,7 @@ def test_policy_precision_is_checked_when_catalog_launch_config_supplies_it():
     assert ok
     assert reason == ""
     assert not wrong_precision
-    assert "requires bf16 precision" in wrong_reason
+    assert "requires fp16 precision" in wrong_reason
 
     quantized, quantized_reason = config_runnable(
         {
@@ -73,14 +89,14 @@ def test_policy_precision_is_checked_when_catalog_launch_config_supplies_it():
             "tp": 2,
             "pp": 1,
             "gpu_count": 2,
-            "weight_dtype": "bfloat16",
+            "weight_dtype": "float16",
             "weight_quantization_method": "fp8",
         },
         {"model_id": "microsoft/phi-4"},
         gpu_type="H100",
     )
     assert not quantized
-    assert "requires bf16 precision" in quantized_reason
+    assert "requires fp16 precision" in quantized_reason
 
 
 def test_expert_parallelism_is_fixed_to_one():

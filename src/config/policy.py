@@ -46,13 +46,13 @@ H100:
 - deepseek-ai/DeepSeek-V3 -> bf16-fp8 TP: 1, 8
 - intfloat/multilingual-e5-large -> fp16 TP: 1
 - meta-llama/Llama-3.1-8B -> bf16 TP: 1, 2, 4
-- meta-llama/Llama-3.2-1B-Instruct -> bf16 TP: 1, 2, 4, 8
+- meta-llama/Llama-3.2-1B-Instruct -> fp16 TP: 1, 2, 4, 8
 - meta-llama/Llama-3.3-70B-Instruct -> bf16 TP: 2, 4, 8
-- microsoft/phi-4 -> bf16 TP: 1, 2
+- microsoft/phi-4 -> fp16 TP: 1, 2
 - mistralai/Mixtral-8x7B-Instruct-v0.1 -> bf16 TP: 1, 2, 4, 8
 - mistralai/Mixtral-8x7B-v0.1 -> bf16 TP: 1, 2
 - moonshotai/Kimi-K2-Instruct -> bf16-fp8 TP: 1, 4, 8
-- Qwen/Qwen2.5-Coder-32B-Instruct -> bf16 TP: 1, 2, 4, 8
+- Qwen/Qwen2.5-Coder-32B-Instruct -> fp16 TP: 1, 2, 4, 8
 - Qwen/Qwen3-235B-A22B -> bf16 TP: 1, 8
 - Qwen/Qwen3-30B-A3B-Instruct-2507 -> bf16 TP: 1, 2, 4
 - Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 4, 8
@@ -66,14 +66,12 @@ L4:
 - meta-llama/Llama-3.2-1B-Instruct -> bf16 TP: 1
 L40S:
 - BAAI/bge-reranker-v2-m3 -> fp16 TP: 1
-- deepseek-ai/DeepSeek-V3 -> bf16-fp8 TP: 1, 8
 - intfloat/multilingual-e5-large -> fp16 TP: 1
 - meta-llama/Llama-3.2-1B-Instruct -> fp16 TP: 1, 2, 4, 8
 - meta-llama/Llama-3.3-70B-Instruct -> bf16 TP: 2, 4, 8
 - microsoft/phi-4 -> fp16 TP: 1, 2
 - mistralai/Mixtral-8x7B-Instruct-v0.1 -> fp16 TP: 1, 2, 4, 8
 - mistralai/Mixtral-8x7B-v0.1 -> bf16 TP: 1, 2, 4
-- moonshotai/Kimi-K2-Instruct -> bf16-fp8 TP: 1, 4, 8
 - Qwen/Qwen2.5-Coder-32B-Instruct -> fp16 TP: 1, 2, 4, 8
 - Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 1, 4, 8
 - zai-org/GLM-4.5-Air -> bf16 TP: 1, 4, 8
