@@ -77,9 +77,10 @@ class OpenAICompatClient:
         api_key: str = "EMPTY",
         fold_system: bool = False,
         temperature: float | None = 0.4,
-        max_tokens: int = 8192,
+        max_tokens: int | None = 8192,
         timeout_sec: float = 120.0,
         extra: dict | None = None,
+        token_limit_param: str | None = None,
     ):
         try:
             from openai import OpenAI
@@ -91,8 +92,9 @@ class OpenAICompatClient:
         self.model = model
         self.fold_system = bool(fold_system)
         self.temperature = None if temperature is None else float(temperature)
-        self.max_tokens = int(max_tokens)
+        self.max_tokens = None if max_tokens is None else int(max_tokens)
         self.extra = dict(extra or {})
+        self.token_limit_param = token_limit_param
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         """Run one chat completion and return the assistant text."""
@@ -100,8 +102,9 @@ class OpenAICompatClient:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": cast(Any, payload),
-            self._token_limit_param(): self.max_tokens,
         }
+        if self.max_tokens is not None:
+            kwargs[self.token_limit_param or self._token_limit_param()] = self.max_tokens
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
         kwargs.update(self.extra)

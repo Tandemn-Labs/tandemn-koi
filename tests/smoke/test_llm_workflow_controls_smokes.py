@@ -473,7 +473,8 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             defaults = runner.parse_args([])
 
-        self.assertEqual(defaults.temperature, 1)
+        self.assertIsNone(defaults.temperature)
+        self.assertIsNone(defaults.max_tokens)
         self.assertEqual(defaults.wall_clock_sec, 240.0)
         self.assertEqual(defaults.k_p, 1)
         self.assertEqual(defaults.k_max, 4)
@@ -540,6 +541,71 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
             runner.build_runner(args)
         configure_budget.assert_called_once_with(17)
         configure_admission.assert_called_once_with("advisory")
+
+    def test_foundry_model_routes_supply_endpoint_and_safe_defaults(self):
+        routes = (
+            (
+                "gpt-5.6-sol",
+                "KOI_FOUNDRY_OPENAI_BASE_URL",
+                "KOI_FOUNDRY_OPENAI_API_KEY",
+                20_000,
+            ),
+            (
+                "DeepSeek-V4-Pro",
+                "KOI_FOUNDRY_DEEPSEEK_BASE_URL",
+                "KOI_FOUNDRY_DEEPSEEK_API_KEY",
+                20_000,
+            ),
+            (
+                "Cohere-command-a",
+                "KOI_FOUNDRY_COHERE_BASE_URL",
+                "KOI_FOUNDRY_COHERE_API_KEY",
+                8_000,
+            ),
+        )
+        for model, base_url_env, api_key_env, max_tokens in routes:
+            with (
+                self.subTest(model=model),
+                patch.dict(
+                    os.environ,
+                    {
+                        base_url_env: "https://resource.openai.azure.com/openai/v1",
+                        api_key_env: "foundry-key",
+                    },
+                    clear=True,
+                ),
+            ):
+                args = runner.parse_args(["--model", model])
+                base_url, api_key, temperature, resolved_max_tokens, token_limit_param = (
+                    runner.resolve_llm_settings(args)
+                )
+
+            self.assertEqual(base_url, "https://resource.openai.azure.com/openai/v1")
+            self.assertEqual(api_key, "foundry-key")
+            self.assertIsNone(temperature)
+            self.assertEqual(resolved_max_tokens, max_tokens)
+            self.assertEqual(token_limit_param, "max_completion_tokens")
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KOI_FOUNDRY_DEEPSEEK_BASE_URL": "https://resource.openai.azure.com/openai/v1",
+                    "KOI_FOUNDRY_DEEPSEEK_API_KEY": "foundry-key",
+                },
+                clear=True,
+            ),
+            self.assertRaisesRegex(SystemExit, "does not support --temperature"),
+        ):
+            runner.resolve_llm_settings(
+                runner.parse_args(["--model", "DeepSeek-V4-Pro", "--temperature", "1"])
+            )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            self.assertRaisesRegex(SystemExit, "KOI_FOUNDRY_DEEPSEEK_BASE_URL"),
+        ):
+            runner.resolve_llm_settings(runner.parse_args(["--model", "DeepSeek-V4-Pro"]))
 
     def test_root_prompt_prescribes_workflow_and_full_service_when_admission_is_off(self):
         harness = KoiAgentHarness.__new__(KoiAgentHarness)

@@ -136,6 +136,28 @@ Runner logs are written under `logs/koi/<run-id>/`:
 `--trace no-llm` keeps logs compact. `--trace all` also records full LLM calls
 and agent REPL/tool traces before the runner clears per-tick memory buffers.
 
+### Azure Foundry Models
+
+Koi uses Azure Foundry's OpenAI-compatible `/openai/v1` endpoint. Set the
+endpoint and key once for each deployed provider, then select only the model:
+
+```bash
+export KOI_FOUNDRY_DEEPSEEK_BASE_URL='https://deepseek-models.openai.azure.com/openai/v1'
+export KOI_FOUNDRY_DEEPSEEK_API_KEY='...'
+
+.venv/bin/python -m src.orchestrator.runner \
+  --model DeepSeek-V4-Pro \
+  --ticks 1 \
+  --tick-interval-sec 0
+```
+
+The supported model routes are `gpt-5.6-sol`, `DeepSeek-V4-Pro`, and
+`Cohere-command-a`. Deploy each under that exact name. Koi omits
+`temperature` for GPT-5.6 Sol and DeepSeek V4 Pro, and applies Command A's
+safe 8,000-token completion cap. It does not read OpenCode configuration or
+keys; use the corresponding `KOI_FOUNDRY_OPENAI_*`,
+`KOI_FOUNDRY_DEEPSEEK_*`, or `KOI_FOUNDRY_COHERE_*` environment variables.
+
 Koi's production surrogate uses `AIC_Direct` and requires `aiconfigurator>=0.10.0`.
 The low-level DynoSim implementation remains available only for isolated legacy tests.
 

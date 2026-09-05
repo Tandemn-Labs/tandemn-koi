@@ -8,6 +8,7 @@ import os
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from src.agent.agent import KoiAgentHarness
 from src.agent.llm_clients import OpenAICompatClient, RecordingLLMClient
@@ -46,6 +47,24 @@ DEFAULT_TYPICAL_RANGES = {
 }
 
 PARTIAL_ONLINE_ADMISSION_MODES = ("off", "advisory")
+FOUNDRY_MODEL_ROUTES = {
+    "gpt-5.6-sol": (
+        "KOI_FOUNDRY_OPENAI_BASE_URL",
+        "KOI_FOUNDRY_OPENAI_API_KEY",
+        20_000,
+    ),
+    "deepseek-v4-pro": (
+        "KOI_FOUNDRY_DEEPSEEK_BASE_URL",
+        "KOI_FOUNDRY_DEEPSEEK_API_KEY",
+        20_000,
+    ),
+    "cohere-command-a": (
+        "KOI_FOUNDRY_COHERE_BASE_URL",
+        "KOI_FOUNDRY_COHERE_API_KEY",
+        8_000,
+    ),
+}
+FOUNDRY_NO_TEMPERATURE_MODELS = {"gpt-5.6-sol", "deepseek-v4-pro"}
 
 
 def _positive_int(value: str) -> int:
@@ -74,13 +93,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ticks", type=int, default=1, help="Tick count; 0 runs forever")
     parser.add_argument("--tick-interval-sec", type=int, default=300)
     parser.add_argument("--telemetry-window-sec", type=int, default=300)
+    parser.add_argument("--openai-base-url")
     parser.add_argument(
-        "--openai-base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        "--openai-model",
+        "--model",
+        dest="openai_model",
+        default=os.getenv("OPENAI_MODEL", "gpt-5.5"),
     )
-    parser.add_argument("--openai-model", default=os.getenv("OPENAI_MODEL", "gpt-5.5"))
-    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"))
-    parser.add_argument("--temperature", type=float, default=1)
-    parser.add_argument("--max-tokens", type=int, default=20000)
+    parser.add_argument("--api-key")
+    parser.add_argument("--temperature", type=float)
+    parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--timeout-sec", type=float, default=200.0)
     parser.add_argument("--k-p", type=int, default=1)
     parser.add_argument("--k-max", type=int, default=4)
@@ -128,6 +150,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _is_foundry_endpoint(base_url: str) -> bool:
+    """Return whether a base URL targets an Azure Foundry OpenAI v1 endpoint."""
+    host = (urlparse(base_url).hostname or "").lower()
+    return host.endswith((".openai.azure.com", ".services.ai.azure.com"))
+
+
+def resolve_llm_settings(
+    args: argparse.Namespace,
+) -> tuple[str, str | None, float | None, int | None, str | None]:
+    """Resolve model-selected Foundry settings without exposing credentials in CLI args."""
+    model = str(getattr(args, "openai_model", "gpt-5.5"))
+    route = FOUNDRY_MODEL_ROUTES.get(model.lower())
+    routed_base_url = os.getenv(route[0]) if route else None
+    configured_base_url = (
+        getattr(args, "openai_base_url", None)
+        or routed_base_url
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("KOI_FOUNDRY_BASE_URL")
+    )
+    if route and not configured_base_url:
+        raise SystemExit(f"{model} requires {route[0]} or --openai-base-url")
+    base_url = configured_base_url or "https://api.openai.com/v1"
+    foundry = _is_foundry_endpoint(base_url)
+    api_key = getattr(args, "api_key", None)
+    if not api_key and route and foundry:
+        api_key = os.getenv(route[1])
+    if not api_key and foundry:
+        api_key = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("KOI_FOUNDRY_API_KEY")
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY")
+
+    requested_temperature = getattr(args, "temperature", None)
+    if (
+        foundry
+        and model.lower() in FOUNDRY_NO_TEMPERATURE_MODELS
+        and requested_temperature is not None
+    ):
+        raise SystemExit(f"{model} does not support --temperature on Azure Foundry")
+    temperature = (
+        requested_temperature if requested_temperature is not None else (None if foundry else 1.0)
+    )
+
+    requested_max_tokens = getattr(args, "max_tokens", None)
+    max_tokens = requested_max_tokens
+    if max_tokens is None and foundry:
+        max_tokens = route[2] if route else None
+    if max_tokens is None and not foundry:
+        max_tokens = 20_000
+    return (
+        str(base_url),
+        api_key,
+        temperature,
+        max_tokens,
+        "max_completion_tokens" if foundry else None,
+    )
+
+
 def configure_logging(level: str, log_file=None) -> None:
     """Configure process logging for the runner."""
     handlers: list[logging.Handler] = [logging.StreamHandler()]
@@ -145,8 +224,13 @@ def build_runner(args: argparse.Namespace):
     """Build one Store-backed TickRunner and its key debug handles."""
     if not args.user_id:
         raise SystemExit("TANDEMN_USER_ID or --user-id is required")
-    if not args.api_key:
-        raise SystemExit("OPENAI_API_KEY or --api-key is required")
+    base_url, api_key, temperature, max_tokens, token_limit_param = resolve_llm_settings(args)
+    if not api_key:
+        raise SystemExit("OPENAI_API_KEY, an Azure Foundry key, or --api-key is required")
+    args.openai_base_url = base_url
+    args.api_key = api_key
+    args.temperature = temperature
+    args.max_tokens = max_tokens
 
     agent_tools.configure_surrogate_call_budget(args.surrogate_call_budget)
     agent_tools.configure_partial_online_admission(args.partial_online_admission)
@@ -207,6 +291,7 @@ def build_runner(args: argparse.Namespace):
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             timeout_sec=args.timeout_sec,
+            token_limit_param=token_limit_param,
         ),
         live=args.live_agent,
         print_messages=args.print_llm,

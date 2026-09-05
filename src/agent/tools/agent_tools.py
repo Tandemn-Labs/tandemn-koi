@@ -3564,8 +3564,7 @@ def _keep_baseline_sigma(
     # anything wins.
     under_service_floor = 0.0
     demand_visible = (
-        _job_mode(job_features) != "online"
-        or float(observed.get("depth_req_q") or 0.0) > 0.0
+        _job_mode(job_features) != "online" or float(observed.get("depth_req_q") or 0.0) > 0.0
     )
     if observed_tps is not None and demand_visible:
         try:
@@ -5670,12 +5669,14 @@ def jointly_select_placements(
             # run. Remember its best-scoring reject; it is admitted below if
             # nothing better survives, floored so it can never outrank real gains.
             if emergency_recovery(candidate) and math.isfinite(score):
-                best = rescue_by_job.get(jid)
-                if best is None or score > best[0]:
+                rescue_best = rescue_by_job.get(jid)
+                if rescue_best is None or score > rescue_best[0]:
                     rescue_by_job[jid] = (score, candidate)
             continue
-        if is_swap and candidate.get("queue_state") == "unstable" and not emergency_recovery(
-            candidate
+        if (
+            is_swap
+            and candidate.get("queue_state") == "unstable"
+            and not emergency_recovery(candidate)
         ):
             diag["vetoed_unstable"] += 1
             continue
@@ -5684,13 +5685,13 @@ def jointly_select_placements(
             eligible_swaps_by_job[jid] = eligible_swaps_by_job.get(jid, 0) + 1
         eligible_candidates.append(candidate)
 
-    for jid, (score, candidate) in rescue_by_job.items():
+    for jid, (_score, candidate) in rescue_by_job.items():
         if eligible_swaps_by_job.get(jid, 0) > 0:
             continue
         candidate["rescue_floor"] = True
-        diag = selection_diagnostics.get(jid)
-        if diag is not None:
-            diag["rescued"] = True
+        rescue_diagnostic = selection_diagnostics.get(jid)
+        if rescue_diagnostic is not None:
+            rescue_diagnostic["rescued"] = True
         eligible_candidates.append(candidate)
 
     def footprint(candidate: dict[str, Any]) -> int:
@@ -5865,8 +5866,8 @@ def jointly_select_placements(
     by_job: dict[str, list[dict[str, Any]]] = {}
     for cand in candidates or []:
         cand.pop("work_conserving_floor", None)
-        jid = cand.get("job_id")
-        if not jid:
+        candidate_job_id = str(cand.get("job_id") or "")
+        if not candidate_job_id:
             continue
         cost = _ladder_capacity_cost(cand.get("ladder") or [], specs)
         if not cost:
@@ -5874,7 +5875,11 @@ def jointly_select_placements(
         served_fraction = candidate_served_fraction(cand)
         if served_fraction is None:
             continue
-        served_credit = penalty(jid) * served_fraction if str(jid) in pending_job_ids else 0.0
+        served_credit = (
+            penalty(candidate_job_id) * served_fraction
+            if candidate_job_id in pending_job_ids
+            else 0.0
+        )
         gain = float(cand.get("sigma", 0.0)) + served_credit
         assessment = cand.get("prediction_assessment") or {}
         exploratory = (
@@ -5956,20 +5961,20 @@ def jointly_select_placements(
             else 0
         )
         cand["solver_tier"] = floor_tier
-        by_job.setdefault(jid, []).append(
+        by_job.setdefault(candidate_job_id, []).append(
             {
                 "cand": cand,
                 "cost": cost,
                 "gain": gain,
                 "normal_gain": 0.0 if cand.get("work_conserving_floor") else gain,
-                "stable_floor_value": penalty(jid) if floor_tier == 1 else 0.0,
-                "exploratory_floor_value": penalty(jid) if floor_tier == 2 else 0.0,
+                "stable_floor_value": (penalty(candidate_job_id) if floor_tier == 1 else 0.0),
+                "exploratory_floor_value": (penalty(candidate_job_id) if floor_tier == 2 else 0.0),
                 "swap_count": 1 if is_swap else 0,
             }
         )
     jobs = [jid for jid in by_job if by_job[jid]]
 
-    best: dict[str, Any] = {
+    best_solution: dict[str, Any] = {
         "normal_objective": 0.0,
         "stable_floor_objective": 0.0,
         "exploratory_floor_objective": 0.0,
@@ -5995,14 +6000,14 @@ def jointly_select_placements(
             chosen: list[dict[str, Any]],
         ) -> None:
             if (normal_gain, stable_floor_value, exploratory_floor_value) > (
-                best["normal_objective"],
-                best["stable_floor_objective"],
-                best["exploratory_floor_objective"],
+                best_solution["normal_objective"],
+                best_solution["stable_floor_objective"],
+                best_solution["exploratory_floor_objective"],
             ):
-                best["normal_objective"] = normal_gain
-                best["stable_floor_objective"] = stable_floor_value
-                best["exploratory_floor_objective"] = exploratory_floor_value
-                best["chosen"] = list(chosen)
+                best_solution["normal_objective"] = normal_gain
+                best_solution["stable_floor_objective"] = stable_floor_value
+                best_solution["exploratory_floor_objective"] = exploratory_floor_value
+                best_solution["chosen"] = list(chosen)
             if i >= len(jobs):
                 return
             dfs(
@@ -6075,7 +6080,7 @@ def jointly_select_placements(
                         chosen.append(entry["cand"])
                         placed_greedy.add(jid)
                         break
-        best = {
+        best_solution = {
             "normal_objective": sum(
                 float(candidate.get("solver_gain", 0.0))
                 for candidate in chosen
@@ -6094,7 +6099,7 @@ def jointly_select_placements(
             "chosen": chosen,
         }
 
-    chosen = best["chosen"]
+    chosen = best_solution["chosen"]
     objective = sum(float(candidate.get("solver_gain", 0.0)) for candidate in chosen)
     placed_ids = {c.get("job_id") for c in chosen}
     used_final: dict[str, int] = {}
@@ -6118,9 +6123,9 @@ def jointly_select_placements(
         "selection_diagnostics": selection_diagnostics,
     }
     for candidate in chosen:
-        diag = selection_diagnostics.get(str(candidate.get("job_id") or ""))
-        if diag is not None:
-            diag["chosen"] = True
+        chosen_diagnostic = selection_diagnostics.get(str(candidate.get("job_id") or ""))
+        if chosen_diagnostic is not None:
+            chosen_diagnostic["chosen"] = True
     write_event = getattr(getattr(_CTX, "trace_logger", None), "write_event", None)
     if callable(write_event):
         try:

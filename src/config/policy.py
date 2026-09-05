@@ -11,7 +11,6 @@ SUPPORTED_EP = 1
 _POLICY_TEXT = """\
 A100-40GB:
 - BAAI/bge-reranker-v2-m3 -> fp16 TP: 1
-- deepseek-ai/DeepSeek-V3 -> bf16-fp8 TP: 1, 8
 - intfloat/multilingual-e5-large -> fp16 TP: 1
 - meta-llama/Llama-3.2-1B-Instruct -> fp16 TP: 1, 2, 4, 8
 - meta-llama/Llama-3.3-70B-Instruct -> bf16 TP: 2, 4, 8
@@ -19,8 +18,8 @@ A100-40GB:
 - mistralai/Mixtral-8x7B-Instruct-v0.1 -> fp16 TP: 1, 2, 4, 8
 - Qwen/Qwen2.5-Coder-32B-Instruct -> fp16 TP: 1, 2, 4, 8
 - Qwen/Qwen3-8B -> bf16 TP: 1, 2
-- Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 1, 8
-- zai-org/GLM-4.5-Air -> bf16 TP: 1, 4, 8
+- Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 8
+- zai-org/GLM-4.5-Air -> bf16 TP: 4, 8
 A100-80GB:
 - BAAI/bge-reranker-v2-m3 -> fp16 TP: 1
 - intfloat/multilingual-e5-large -> fp16 TP: 1
@@ -39,8 +38,8 @@ A10G:
 - microsoft/phi-4 -> fp16 TP: 2
 - mistralai/Mixtral-8x7B-Instruct-v0.1 -> fp16 TP: 4, 8
 - Qwen/Qwen2.5-Coder-32B-Instruct -> fp16 TP: 4, 8
-- Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 1, 8
-- zai-org/GLM-4.5-Air -> bf16 TP: 1, 8
+- Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 8
+- zai-org/GLM-4.5-Air -> bf16 TP: 8
 H100:
 - BAAI/bge-reranker-v2-m3 -> fp16 TP: 1
 - deepseek-ai/DeepSeek-V3 -> bf16-fp8 TP: 1, 8
@@ -73,8 +72,8 @@ L40S:
 - mistralai/Mixtral-8x7B-Instruct-v0.1 -> fp16 TP: 1, 2, 4, 8
 - mistralai/Mixtral-8x7B-v0.1 -> bf16 TP: 1, 2, 4
 - Qwen/Qwen2.5-Coder-32B-Instruct -> fp16 TP: 1, 2, 4, 8
-- Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 1, 4, 8
-- zai-org/GLM-4.5-Air -> bf16 TP: 1, 4, 8
+- Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 4, 8
+- zai-org/GLM-4.5-Air -> bf16 TP: 4, 8
 MI300X:
 - BAAI/bge-reranker-v2-m3 -> fp16 TP: 1
 - deepseek-ai/DeepSeek-V3 -> bf16-fp8 TP: 1, 2, 4, 8
@@ -104,7 +103,6 @@ RTXPRO6000-RUNPOD:
 - microsoft/phi-4 -> fp16 TP: 1, 2
 - mistralai/Mixtral-8x7B-Instruct-v0.1 -> fp16 TP: 1, 2, 4, 8
 - Qwen/Qwen2.5-Coder-32B-Instruct -> fp16 TP: 1, 2, 4, 8
-- Qwen/Qwen3-Next-80B-A3B-Thinking -> bf16 TP: 1
 - zai-org/GLM-4.5-Air -> bf16 TP: 1, 2, 4, 8
 """
 
