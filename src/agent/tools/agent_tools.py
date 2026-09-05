@@ -4348,9 +4348,9 @@ def _generated_pp_options(
     pp=1 is always kept, so today's frame set is unchanged. Extra PP degrees are
     added ONLY when the model's weights provably do not fit one GPU at pp=1 and
     provably do fit at that pp - the cheap analytic check, no surrogate call.
-    This is what places an MoE model: EP is fixed at 1, so TP does not shard its
-    expert weights and PP is the only axis that reduces per-GPU weight. A PP
-    degree must divide the layer count and keep tp*pp inside one instance.
+    For MoE models, TP already shards expert tensors at Koi's fixed EP=1. PP is
+    added only when those TP-sharded weights still do not fit. A PP degree must
+    divide the layer count and keep tp*pp inside one instance.
     """
     options = [1]
     if not weight_fit_values or gpu_mem_gb is None:

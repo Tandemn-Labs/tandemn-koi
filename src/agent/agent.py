@@ -258,9 +258,9 @@ class SpecialistRunner:
             "The Job brief's placement_policy is a hard baseline constraint: use only "
             "the listed TP degrees for a matching model/GPU pair. Its precision is "
             "catalog-owned; do not invent engine or dtype overrides.\n\n"
-            "EP is fixed at 1, so for an MoE model (model_catalog.is_moe) TP does NOT "
-            "reduce per-GPU expert weight; only PP partitions it. If the model's "
-            "weights exceed one GPU at pp=1, propose the smallest pp in {2, 4} "
+            "EP is fixed at 1, and TP shards MoE expert tensors in Koi's AIC topology. "
+            "If the model's TP-sharded weights still exceed one GPU at pp=1, propose "
+            "the smallest pp in {2, 4} "
             "that fits, with gpu_count=tp*pp, pp dividing num_hidden_layers, and "
             "tp*pp within one instance; expect a pipeline-bubble cost that grows "
             "with pp in exchange for fitting. Pipelines deeper than 4 are "
@@ -289,9 +289,9 @@ class SpecialistRunner:
             "candidate builder owns alternatives and composites.\n"
             "- gpu_count, tp, pp, and n_replicas are positive integers. gpu_count must "
             "equal tp*pp exactly. EP is unsupported in this version; omit it and Koi "
-            "will fix it to 1. Because EP is 1, TP does NOT shrink an MoE model's "
-            "per-GPU expert weights - only PP does. An MoE model that misses memory "
-            "at pp=1 needs the smallest pp in {2, 4} that fits (pp must divide its "
+            "will fix it to 1. At EP=1, TP shards an MoE model's per-GPU expert "
+            "weights. An MoE model that still misses memory at pp=1 needs the smallest "
+            "pp in {2, 4} that fits (pp must divide its "
             "layer count, tp*pp within one instance), which the candidate builder "
             "also generates; pipelines deeper than 4 are unsupported. A job's "
             "observed_dead_shapes lists "
@@ -1628,7 +1628,9 @@ class KoiAgentHarness:
         if ablation.mechanism_inert():
             carryover = "evidence and the ideal point z* carry across ticks"
         else:
-            carryover = "evidence, mechanism confidence, and the ideal point z* all carry across ticks"
+            carryover = (
+                "evidence, mechanism confidence, and the ideal point z* all carry across ticks"
+            )
         if ablation.learning_frozen():
             loop_sentence = (
                 "You are one step in a closed control loop, not a one-shot "
@@ -1643,7 +1645,9 @@ class KoiAgentHarness:
                 "is self-correcting.\n\n"
             )
         mechanism_tool_listing = (
-            "" if ablation.mechanism_inert() else "get_applicable_mechanisms, get_influencing_knobs, "
+            ""
+            if ablation.mechanism_inert()
+            else "get_applicable_mechanisms, get_influencing_knobs, "
         )
         if ablation.mechanism_inert():
             eig_bullet = ""
