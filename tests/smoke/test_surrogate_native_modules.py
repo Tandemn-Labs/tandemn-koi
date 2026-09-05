@@ -149,6 +149,28 @@ def test_kvcache_auto_prefers_activation_then_weight_dtype():
     assert kv_bytes_per_token(auto_weight) == 2 * 80 * 8 * 128 * 2
 
 
+def test_mla_kv_cache_uses_latent_width_with_pp_local_layers():
+    mla = {
+        "model_size_gb": 0,
+        "num_hidden_layers": 61,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "kvcache_dtype": "bf16",
+        "gpu_mem_gb": 80,
+        "active_kv_tokens": 1_024,
+    }
+
+    assert kv_bytes_per_token(mla) == 61 * (512 + 64) * 2
+    tp8 = compute_memory_v({**mla, "tp": 8, "pp": 1})
+    tp8_pp4 = compute_memory_v({**mla, "tp": 8, "pp": 4})
+
+    assert compute_memory_v({**mla, "tp": 1, "pp": 1}) == tp8
+    assert math.isclose(
+        tp8_pp4["vram_headroom_gb"] - tp8["vram_headroom_gb"],
+        (61 - 16) * 576 * 2 * 1_024 / (1024**3),
+    )
+
+
 def test_parallelism_v_uses_singular_aggregate_throughput_and_never_changes_y():
     base = {
         "activation_dtype": "bf16",

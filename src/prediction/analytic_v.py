@@ -1,5 +1,7 @@
 """Analytic per-GPU memory and KV mediator estimates."""
 
+import math
+
 GIB = 1024**3
 ACTIVATION_RESERVE_GB = 2.0
 
@@ -38,6 +40,16 @@ def model_weight_gb(values: dict) -> float | None:
 def kv_bytes_per_token(values: dict) -> float | None:
     """Return KV bytes per token for the whole model."""
     layers = _get(values, "num_hidden_layers")
+    bytes_per_elem = _kv_bytes_per_elem(values)
+    if layers is None or bytes_per_elem is None:
+        return None
+    mla_elements = _mla_cache_elements(values)
+    if mla_elements is not None:
+        # DeepSeek/Kimi MLA persist one compressed latent plus one RoPE vector,
+        # not K and V vectors for every attention head. The conventional formula
+        # below overstates their cache by about 25x at TP=1.
+        return float(layers) * mla_elements * bytes_per_elem
+
     hidden = _get(values, "hidden_size")
     heads = _get(values, "num_attn_heads")
     kv_heads = _get(values, "num_kv_heads", "num_attn_heads")
@@ -46,8 +58,7 @@ def kv_bytes_per_token(values: dict) -> float | None:
         if hidden is None or not heads:
             return None
         head_dim = float(hidden) / float(heads)
-    bytes_per_elem = _kv_bytes_per_elem(values)
-    if layers is None or kv_heads is None or bytes_per_elem is None:
+    if kv_heads is None:
         return None
     return 2.0 * float(layers) * float(kv_heads) * float(head_dim) * bytes_per_elem
 
@@ -68,11 +79,7 @@ def compute_memory_v(
     memory_gb = float(gpu_mem_gb)
     if memory_gb <= 0:
         return output
-    kv_per_token = kv_bytes_per_token(values)
-    kv_shards = _kv_shards(values)
-    per_gpu_kv_per_token = (
-        kv_per_token / kv_shards if kv_per_token is not None and kv_shards is not None else None
-    )
+    per_gpu_kv_per_token = per_gpu_kv_bytes_per_token(values)
     demand = _kv_token_demand(values)
     if demand is not None and per_gpu_kv_per_token is None:
         return output
@@ -121,14 +128,13 @@ def target_memory_fit(values: dict) -> dict[str, float | str]:
         result["status"] = "physical_no_fit"
         return result
 
-    kv_per_token = kv_bytes_per_token(values)
-    kv_shards = _kv_shards(values)
     demand = _kv_token_demand(values)
-    if kv_per_token is None or kv_shards is None or demand is None:
+    per_gpu_kv_per_token = per_gpu_kv_bytes_per_token(values)
+    if per_gpu_kv_per_token is None or demand is None:
         result["status"] = "unknown"
         return result
 
-    used_gb += demand * kv_per_token / kv_shards / GIB
+    used_gb += demand * per_gpu_kv_per_token / GIB
     result["required_gb"] = used_gb
     if used_gb > capacity_gb:
         result["status"] = "physical_no_fit"
@@ -137,6 +143,39 @@ def target_memory_fit(values: dict) -> dict[str, float | str]:
 
 def _get(values: dict, *names):
     return next((values[name] for name in names if values.get(name) is not None), None)
+
+
+def _mla_cache_elements(values: dict) -> float | None:
+    rank = _get(values, "kv_lora_rank")
+    rope = _get(values, "qk_rope_head_dim")
+    if rank is None or rope is None:
+        return None
+    return float(rank) + float(rope)
+
+
+def per_gpu_kv_bytes_per_token(values: dict) -> float | None:
+    """Return one rank's persistent KV cache bytes per token.
+
+    MLA caches one compressed latent and RoPE vector per local layer. The vector
+    is replicated across TP ranks, but pipeline ranks load disjoint layer ranges.
+    Use the largest PP stage rather than an average so memory preflight protects
+    the rank with one extra layer when the layer count does not divide PP.
+    """
+    kv_per_token = kv_bytes_per_token(values)
+    if kv_per_token is None:
+        return None
+    mla_elements = _mla_cache_elements(values)
+    if mla_elements is not None:
+        layers = _get(values, "num_hidden_layers")
+        bytes_per_elem = _kv_bytes_per_elem(values)
+        if layers is None or bytes_per_elem is None:
+            return None
+        pp = max(1, int(_get(values, "pp") or 1))
+        # TP ranks each need the latent history for their local query heads; only
+        # PP lowers that history by assigning different transformer layers to stages.
+        return math.ceil(float(layers) / pp) * mla_elements * bytes_per_elem
+    kv_shards = _kv_shards(values)
+    return kv_per_token / kv_shards if kv_shards is not None else None
 
 
 def _weight_bytes_per_param(values: dict) -> float | None:

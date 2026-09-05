@@ -47,6 +47,7 @@ class ModelProfile:
     moe_intermediate_size: int = 0
     fmha_dtype: str = "bf16"
     kv_cache_dtype: str = "bf16"
+    mla_cache_elements: int | None = None
     known_fields: frozenset[str] = _MODEL_DISTANCE_FIELDS
 
 
@@ -205,6 +206,7 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
         )
         or 0
     )
+    mla_cache_elements = _mla_cache_elements(values, raw)
     params = _number(values.get("model_params_b") or values.get("params_billion"))
     if params is not None:
         known_fields.add("parameter_count")
@@ -286,6 +288,7 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
         moe_intermediate_size=moe_intermediate,
         fmha_dtype=fmha_dtype,
         kv_cache_dtype=kv_cache_dtype,
+        mla_cache_elements=mla_cache_elements,
         known_fields=frozenset(known_fields),
     )
 
@@ -333,7 +336,11 @@ def build_operation_signature(
     workload: WorkloadProfile,
     topology: TopologyProfile,
 ) -> OperationSignature:
-    """Return target-comparable model work and memory quantities."""
+    """Return target-comparable model work and per-rank memory quantities.
+
+    MLA cache vectors are replicated across TP ranks but partitioned by the
+    transformer layers loaded on each PP rank.
+    """
     dtype_bytes = _dtype_bytes(model.weight_dtype)
     nonexpert_parameters, expert_parameters = _parameter_components(model)
     dense_shards = max(1, topology.tp * topology.pp)
@@ -347,14 +354,22 @@ def build_operation_signature(
     active_parameters_per_gpu = nonexpert_parameters / dense_shards
     active_parameters_per_gpu += active_expert_parameters / expert_shards
     weight_bytes_per_gpu = weight_parameters_per_gpu * dtype_bytes
-    kv_bytes = (
-        2.0
-        * model.layers
-        * model.kv_heads
-        * model.head_dim
-        * _dtype_bytes(model.kv_cache_dtype)
-        / max(1, topology.tp * topology.pp)
-    )
+    kv_dtype_bytes = _dtype_bytes(model.kv_cache_dtype)
+    if model.mla_cache_elements is not None:
+        kv_bytes = (
+            math.ceil(model.layers / max(1, topology.pp))
+            * model.mla_cache_elements
+            * kv_dtype_bytes
+        )
+    else:
+        kv_bytes = (
+            2.0
+            * model.layers
+            * model.kv_heads
+            * model.head_dim
+            * kv_dtype_bytes
+            / max(1, topology.tp * topology.pp)
+        )
     prefill_flops = 2.0 * active_parameters_per_gpu * workload.input_tokens * workload.batch_size
     prefill_flops += (
         4.0
@@ -674,6 +689,17 @@ def _estimate_parameter_count(
     )
     nonexpert, expert = _raw_parameter_components(model)
     return nonexpert + expert
+
+
+def _mla_cache_elements(values: dict[str, Any], raw: dict[str, Any]) -> int | None:
+    elements = _integer(values.get("mla_cache_elements"))
+    if elements is not None:
+        return elements
+    rank = _integer(values.get("kv_lora_rank") or raw.get("kv_lora_rank"))
+    rope = _integer(values.get("qk_rope_head_dim") or raw.get("qk_rope_head_dim"))
+    if rank is None or rope is None:
+        return None
+    return rank + rope
 
 
 def _parameter_components(model: ModelProfile) -> tuple[float, float]:
