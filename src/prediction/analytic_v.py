@@ -160,14 +160,6 @@ def _kv_bytes_per_elem(values: dict) -> float | None:
 def _weight_shards(values: dict) -> int:
     tp = int(_get(values, "tp") or 1)
     pp = int(_get(values, "pp") or 1)
-    if values.get("is_moe") is True:
-        # Expert weights are partitioned by EP, not TP: at EP=1 every TP rank holds
-        # the full expert set, so TP does not reduce per-GPU MoE weight and only PP
-        # does. This matches the serving engine's memory model - a 47B Mixtral at
-        # tp=8/pp=1 still needs ~85 GiB per GPU and OOMs on anything below MI300.
-        # Sharding MoE like dense here made Koi commit exactly those placements.
-        ep = int(_get(values, "ep") or 1)
-        return max(1, min(tp, ep) * pp)
     return max(1, tp * pp)
 
 
