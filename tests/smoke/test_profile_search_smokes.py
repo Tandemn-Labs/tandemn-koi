@@ -92,6 +92,38 @@ def test_operation_signature_increases_with_model_and_workload_size():
     assert tp8.decode_flops_per_token < small.decode_flops_per_token / 7
 
 
+def test_mla_profile_uses_latent_cache_with_pp_local_layers():
+    model = model_profile_from_values(
+        "deepseek-ai/DeepSeek-V3",
+        {
+            "num_hidden_layers": 61,
+            "hidden_size": 7168,
+            "num_attention_heads": 128,
+            "num_key_value_heads": 128,
+            "kv_lora_rank": 512,
+            "qk_rope_head_dim": 64,
+            "weight_dtype": "fp8",
+            "kvcache_dtype": "bf16",
+        },
+    )
+
+    assert model is not None
+    assert model.mla_cache_elements == 576
+    tp1 = build_operation_signature(
+        model, WorkloadProfile("online", 512, 128, 4), TopologyProfile()
+    )
+    tp8 = build_operation_signature(
+        model, WorkloadProfile("online", 512, 128, 4), TopologyProfile(tp=8)
+    )
+    tp8_pp4 = build_operation_signature(
+        model, WorkloadProfile("online", 512, 128, 4), TopologyProfile(tp=8, pp=4)
+    )
+
+    assert tp1.kv_bytes_per_token_per_gpu == 61 * 576 * 2
+    assert tp8.kv_bytes_per_token_per_gpu == tp1.kv_bytes_per_token_per_gpu
+    assert tp8_pp4.kv_bytes_per_token_per_gpu == 16 * 576 * 2
+
+
 def test_missing_architecture_uses_structural_model_profile_instead_of_failing():
     profile = model_profile_from_values(
         "acme/unknown-8b",
