@@ -1,6 +1,7 @@
 import math
 import unittest
 from contextlib import ExitStack
+from typing import ClassVar
 from unittest.mock import patch
 
 from src.agent.tools import agent_tools
@@ -2956,20 +2957,25 @@ class CriticalRescueSmokeTests(unittest.TestCase):
 
 
 class GeneratedPipelineParallelSmokeTests(unittest.TestCase):
-    MIXTRAL = {
+    MIXTRAL: ClassVar[dict[str, object]] = {
         "model_params_b": 46.7,
         "weight_quantization_bits": 16,
         "is_moe": True,
     }
 
-    def test_pp_only_expands_when_weights_miss_at_pp_one_and_fit_at_pp(self):
-        # 87 GiB of MoE weight: no fit on one 80 GB GPU at any tp; both pp=2 and
-        # pp=4 shard it enough, divide the 32 layers, and keep tp*pp inside the
-        # instance, so both are offered and the scorer arbitrates depth.
+    def test_pp_only_expands_when_tp_sharded_weights_still_miss(self):
+        # 87 GiB of MoE weight fits on an 80 GB GPU at TP=2, so no pipeline is
+        # needed. TP=1 still needs PP and offers both feasible PP depths.
         options = agent_tools._generated_pp_options(
             tp=2, gpu_cap=8, layers=32, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
         )
-        self.assertEqual(options, [1, 2, 4])
+        self.assertEqual(options, [1])
+        self.assertEqual(
+            agent_tools._generated_pp_options(
+                tp=1, gpu_cap=8, layers=32, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
+            ),
+            [1, 2, 4],
+        )
         # tp*pp must stay inside the instance.
         self.assertEqual(
             agent_tools._generated_pp_options(
@@ -2980,7 +2986,7 @@ class GeneratedPipelineParallelSmokeTests(unittest.TestCase):
         # pp must divide the layer count.
         self.assertEqual(
             agent_tools._generated_pp_options(
-                tp=2, gpu_cap=8, layers=30, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
+                tp=1, gpu_cap=8, layers=30, weight_fit_values=self.MIXTRAL, gpu_mem_gb=80
             ),
             [1, 2],
         )
