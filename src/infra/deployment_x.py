@@ -63,6 +63,10 @@ _GPU_FIELDS = (
 _GPU_NAME_ALIASES = {
     "MI300": "MI300X",
     "MI300-X": "MI300X",
+    # ponytail: local Store/catalog bridge; centralize GPU identity if aliases expand.
+    "RTX-PRO-6000": "RTXPRO6000",
+    "RTX-PRO-6000-BSE": "RTXPRO6000",
+    "RTX PRO 6000": "RTXPRO6000",
 }
 _ALIASES = {
     "deadline_hrs": ("deadline_hrs", "deadline_hours"),
@@ -364,7 +368,7 @@ def _per_gpu_model_value(value: Any, gpu_type: str, field: str) -> Any:
     if not value:
         return None
     for entry in value:
-        if isinstance(entry, dict) and str(entry.get("gpu_type")) == str(gpu_type):
+        if isinstance(entry, dict) and _gpu_name(entry.get("gpu_type")) == _gpu_name(gpu_type):
             return entry.get("value")
     raise ValueError(f"model catalog field {field!r} missing gpu_type {gpu_type!r}")
 

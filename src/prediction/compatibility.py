@@ -92,8 +92,10 @@ _GPU_ALIASES = {
     "MI200": "MI200",
     "MI300": "MI300",
     "MI300X": "MI300",
-    "RTXPRO6000": "RTX PRO 6000",
-    "RTXPRO6000SERVER": "RTX PRO 6000",
+    # ponytail: local surrogate alias; centralize GPU identity if aliases expand.
+    "RTXPRO6000": "RTXPRO6000",
+    "RTXPRO6000SERVER": "RTXPRO6000",
+    "RTXPRO6000BSE": "RTXPRO6000",
     "T4": "T4",
     "V100": "V100",
     "V100PCIE": "V100 PCIE",
@@ -117,7 +119,7 @@ _BACKEND_GPU_NAMES = {
         "H200": "h200_sxm",
         "L4": "l4",
         "L40S": "l40s",
-        "RTX PRO 6000": "rtx_pro_6000_server",
+        "RTXPRO6000": "rtx_pro_6000_server",
     },
     "solver": {
         "A10G": "A10G",
@@ -186,8 +188,8 @@ _GPU_PROFILES = {
     "L40S": GPUProfile(
         "L40S", architecture="ada", memory_gb=48, memory_bandwidth_gbps=864, fp16_tflops=362
     ),
-    "RTX PRO 6000": GPUProfile(
-        "RTX PRO 6000",
+    "RTXPRO6000": GPUProfile(
+        "RTXPRO6000",
         architecture="blackwell",
         memory_gb=96,
         memory_bandwidth_gbps=1792,
@@ -219,7 +221,7 @@ _PREFERRED_GPU_PROXIES = {
         "V100": "A30",
         "V100 PCIE": "A30",
     },
-    "solver": {"RTX PRO 6000": "L40S"},
+    "solver": {"RTXPRO6000": "L40S"},
 }
 
 _BACKEND_DTYPE_NAMES = {
