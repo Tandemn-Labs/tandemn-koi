@@ -142,7 +142,20 @@ class ResourceMapManager:
         catalog = ModelCatalogStore(self._client()).get(model_id)
         if catalog is None:
             raise ValueError(f"model catalog missing {model_id!r}")
-        return dict(catalog.model_dump(mode="json"))
+        value = dict(catalog.model_dump(mode="json"))
+        # ponytail: local catalog-read alias; centralize GPU identity if aliases expand.
+        for entries in value.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict) and "gpu_type" in entry:
+                    name = str(entry["gpu_type"] or "").upper().replace("_", "-")
+                    entry["gpu_type"] = {
+                        "RTX-PRO-6000": "RTXPRO6000",
+                        "RTX-PRO-6000-BSE": "RTXPRO6000",
+                        "RTX PRO 6000": "RTXPRO6000",
+                    }.get(name, name)
+        return value
 
     def _job_store(self):
         return JobStore(self._client())
