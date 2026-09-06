@@ -125,6 +125,9 @@ _HARDWARE_ALIASES = {
     "l40s-48gb": "l40s",
     "mi300": "mi300x",
     "mi300x-192gb": "mi300x",
+    # ponytail: local policy alias; centralize GPU identity if aliases expand.
+    "rtx-pro-6000": "rtxpro6000",
+    "rtx-pro-6000-bse": "rtxpro6000",
 }
 
 

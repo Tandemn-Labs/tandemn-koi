@@ -13,7 +13,9 @@ def test_gpu_aliases_are_canonical_and_exact_backend_values_are_preserved():
     assert canonicalize_gpu("nvidia-a10g") == "A10G"
     assert canonicalize_gpu("A100_80GB") == "A100 80GB"
     assert canonicalize_gpu("A100_40GB") == "A100 40GB"
-    assert canonicalize_gpu("nvidia-RTXPRO6000") == "RTX PRO 6000"
+    assert canonicalize_gpu("nvidia-RTXPRO6000") == "RTXPRO6000"
+    assert canonicalize_gpu("RTX-PRO-6000") == "RTXPRO6000"
+    assert canonicalize_gpu("RTX-PRO-6000-BSE") == "RTXPRO6000"
 
     resolution = resolve_gpu(
         "NVIDIA_L4",
