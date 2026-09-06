@@ -267,6 +267,24 @@ class DeploymentXSmokeTests(unittest.TestCase):
 
         self.assertEqual(gpu["name"], "A100-80GB")
 
+    def test_rtx_pro_6000_aliases_match_catalog_and_model_profiles(self):
+        hardware = {
+            "accelerators": [
+                {
+                    "kind": "gpu",
+                    "name": "RTX-PRO-6000-BSE",
+                    "canonical_gpu_name": "RTX-PRO-6000-BSE",
+                }
+            ]
+        }
+        catalog = {
+            "model_id": "model",
+            "max_num_seq": [{"gpu_type": "RTXPRO6000", "value": 128}],
+        }
+
+        self.assertEqual(_gpu(hardware, "RTX-PRO-6000")["name"], "RTX-PRO-6000-BSE")
+        self.assertEqual(materialize_launch_config(catalog, "RTX-PRO-6000-BSE")["max_num_seq"], 128)
+
     def test_hardware_catalog_merges_aws_and_azure_store_rows(self):
         """Expose Azure instances alongside the default AWS catalog."""
         catalogs = [

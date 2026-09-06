@@ -62,9 +62,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 _AIC_ESTIMATE_CACHE_LIMIT = _env_int("KOI_AIC_ESTIMATE_CACHE_LIMIT", 2048)
-_AIC_ESTIMATE_CACHE_ENABLED = str(
-    os.getenv("KOI_AIC_ESTIMATE_CACHE", "1")
-).strip().lower() not in {"0", "false", "no", "off"}
+_AIC_ESTIMATE_CACHE_ENABLED = str(os.getenv("KOI_AIC_ESTIMATE_CACHE", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 def _stable_cache_key(value) -> str | None:
@@ -115,6 +118,8 @@ def _model_catalog_config(model_id: str) -> tuple[dict | None, str | None]:
 
     _MODEL_CONFIG_CACHE[model_id] = (None, error)
     return _MODEL_CONFIG_CACHE[model_id]
+
+
 _AGGREGATE_PROFILE_OVERRIDES = {
     "moonshotai/Kimi-K2-Instruct": ("moonshotai/Kimi-K2.5", "sglang", "0.5.14", "h100_sxm"),
     "deepseek-ai/DeepSeek-V3": ("deepseek-ai/DeepSeek-V3", "sglang", "0.5.14", "h200_sxm"),
@@ -135,7 +140,7 @@ _AIC_GPU_CHOICES = frozenset(
         "H200",
         "L4",
         "L40S",
-        "RTX PRO 6000",
+        "RTXPRO6000",
     }
 )
 _AIC_DTYPES = frozenset({"bf16", "fp8", "fp8_e4m3", "fp8_e5m2", "int8"})
@@ -939,9 +944,7 @@ class SurrogatePrediction:
                 require_weight_fit=False,
             )
             matches = [
-                match
-                for match in matches
-                if match.supported.model.is_moe == requested.model.is_moe
+                match for match in matches if match.supported.model.is_moe == requested.model.is_moe
             ]
             matches.sort(
                 key=lambda match: (
@@ -1003,7 +1006,10 @@ class SurrogatePrediction:
         if values.get("model_params_b") is not None or not values.get("model_id"):
             return values
         profile = model_profile_from_values(str(values["model_id"]), values)
-        if profile is None or not {"layers", "hidden_size", "attention_heads"} <= profile.known_fields:
+        if (
+            profile is None
+            or not {"layers", "hidden_size", "attention_heads"} <= profile.known_fields
+        ):
             return values
         return {**values, "model_params_b": profile.parameter_count / 1e9}
 
@@ -1169,10 +1175,9 @@ class SurrogatePrediction:
             try:
                 result = self._run_aic_modes(attempt, ("SILICON", *_AIC_FALLBACK_MODES))
             except SurrogateMemoryNoFit as exc:
-                if (
-                    match.get("model_id") == surrogate_input.get("requested_model_id")
-                    and match.get("aic_system") == surrogate_input.get("requested_aic_system")
-                ):
+                if match.get("model_id") == surrogate_input.get("requested_model_id") and match.get(
+                    "aic_system"
+                ) == surrogate_input.get("requested_aic_system"):
                     raise
                 failures.append(
                     {
@@ -1197,7 +1202,9 @@ class SurrogatePrediction:
 
         self.last_metadata["aic_profile_attempts"] = failures
         details = "; ".join(attempt["error"] for attempt in failures)
-        raise SurrogateUnsupportedConfig(f"AIC has no usable estimate for ranked profiles: {details}")
+        raise SurrogateUnsupportedConfig(
+            f"AIC has no usable estimate for ranked profiles: {details}"
+        )
 
     def _run_aic_modes(self, surrogate_input, modes, fallback_reason=None):
         failures = []
