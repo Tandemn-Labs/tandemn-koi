@@ -40,6 +40,7 @@ from src.core.models import (
     Plan,
 )
 from src.infra.deployment_x import materialize_launch_config
+from src.infra.packing import capacity_unit_label
 
 # Actions whose target job must already exist in the cluster snapshot. PLACE and
 # DEFER admit waiting jobs; DIAGNOSE/TERMINATE may reference jobs outside the
@@ -292,6 +293,7 @@ class Validator:
             else {}
         )
         pool_failed_envs = set()
+        pool_failed_keys: set[tuple[str, str]] = set()
         for (env_key, instance_type), demand in sorted(requested_by_pool.items()):
             limit = pool_capacity.get((env_key, instance_type))
             if limit is None:
@@ -304,11 +306,21 @@ class Validator:
             available = int(limit["available_units"])
             if units > available:
                 pool_failed_envs.add(env_key)
-                unit = "GPUs" if limit["allocation_kind"] == "gpu" else "instances"
+                pool_failed_keys.add((env_key, instance_type))
+                unit = capacity_unit_label(limit["allocation_kind"])
                 violations.append(
                     f"C5 capacity: env {env_key} pool {instance_type} requested "
                     f"{units} {unit}, only {available} free"
                 )
+        # Packed pools (KOI_COHOST_PACKING): the slot total can fit while no
+        # single instance has room for a full-width replica.
+        if resource_map is not None and hasattr(resource_map, "packing_shortfalls"):
+            shortfalls = resource_map.packing_shortfalls(
+                requested_by_pool, resources, skip=pool_failed_keys
+            )
+            for (env_key, _instance_type), failure in sorted(shortfalls.items()):
+                pool_failed_envs.add(env_key)
+                violations.append(f"C5 capacity: {failure['message']}")
         for env_key, gpus in sorted(requested.items()):
             info = resources.get(env_key)
             if info is None:

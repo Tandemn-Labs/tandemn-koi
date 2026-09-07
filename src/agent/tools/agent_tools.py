@@ -110,6 +110,14 @@ from src.infra.deployment_x import (
     hardware_gpu_memory_gb,
     materialize_launch_config,
 )
+from src.infra.packing import (
+    PACKED,
+    apply_footprints_to_pool,
+    effective_allocation_kind,
+    is_slot_kind,
+    packable_replicas,
+    packing_shortfall,
+)
 from src.prediction.analytic_v import target_memory_fit
 from src.prediction.composer import compact_prediction_lineage
 from src.prediction.queue_model import estimate_queue_shadow
@@ -1321,6 +1329,11 @@ def instance_catalog() -> dict[str, dict[str, dict[str, Any]]]:
     tp=8 frame is an 8-GPU box (e.g. p5.48xlarge), NOT eight 1-GPU boxes
     (p5.4xlarge). pool_budget UNIT counts are how many instances are free, which
     is NOT the same as GPUs per instance - do not confuse them.
+
+    Under KOI_COHOST_PACKING an instance pool is ``packed``: its units are free
+    GPU slots (``free_instances`` == ``available_units`` == slots, as for a
+    ``gpu`` pool), and ``empty_instances`` / ``partial_free_slots`` carry the
+    packing state so full-width replicas are only sized onto empty boxes.
     """
     catalog: dict[str, dict[str, dict[str, Any]]] = {}
     for env_key, info in get_resource_map().items():
@@ -1329,15 +1342,17 @@ def instance_catalog() -> dict[str, dict[str, dict[str, Any]]]:
             instance_type = pool.get("instance_type")
             if not instance_type:
                 continue
-            allocation_kind = str(
-                pool.get("allocation_kind") or pool.get("allocation_unit") or "instance"
-            ).lower()
+            allocation_kind = effective_allocation_kind(
+                pool.get("allocation_kind") or pool.get("allocation_unit")
+            )
             raw_gpus_per_unit = int(pool.get("gpus_per_instance") or pool.get("gpus_per_unit") or 1)
             free_gpus = int(pool.get("free", 0) or 0)
             available_units = (
-                free_gpus if allocation_kind == "gpu" else int(pool.get("free_instances", 0) or 0)
+                free_gpus
+                if is_slot_kind(allocation_kind)
+                else int(pool.get("free_instances", 0) or 0)
             )
-            env_map[str(instance_type)] = {
+            entry = {
                 "gpus_per_instance": (1 if allocation_kind == "gpu" else raw_gpus_per_unit),
                 "gpus_per_unit": 1 if allocation_kind == "gpu" else raw_gpus_per_unit,
                 "candidate_gpu_cap": (
@@ -1349,6 +1364,10 @@ def instance_catalog() -> dict[str, dict[str, dict[str, Any]]]:
                 "gpu_type": info.get("gpu_type") or str(env_key).split("|")[-1],
                 "price_per_instance_hour": pool.get("price_per_instance_hour"),
             }
+            if allocation_kind == PACKED:
+                entry["empty_instances"] = int(pool.get("free_instances", 0) or 0)
+                entry["partial_free_slots"] = list(pool.get("partial_free_slots") or [])
+            env_map[str(instance_type)] = entry
         if env_map:
             catalog[str(env_key)] = env_map
     return catalog
@@ -2298,6 +2317,11 @@ def size_ladder(
             pool_key, int(allocation.get("free_capacity_gpus", env_free))
         )
         max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
+        # Packed pool: the slot total is additive, but a replica still needs its
+        # engine GPUs on ONE instance, so cap by what packs onto the pool's boxes.
+        packable = allocation.get("packable_replicas")
+        if packable is not None:
+            max_by_cap = min(max_by_cap, int(packable))
 
         runnable, validity_reason = config_runnable(
             dict(rank.config), _rank_prediction_payload(rank, job_features)["job_features"]
@@ -4106,8 +4130,37 @@ def _ladder_capacity_cost(
     L40S env's 16 GPUs, and only 4 g6e.xlarge may be free (validator C5) - so the
     solver picked an infeasible set and the planner deferred everything. Pool cost
     is added only when instance_specs knows the instance's gpus_per_instance;
-    otherwise the coarse env-GPU dimension still bounds it."""
+    otherwise the coarse env-GPU dimension still bounds it.
+
+    A ``packed`` pool (KOI_COHOST_PACKING) costs engine GPU SLOTS in both
+    dimensions, like a ``gpu`` pool; the non-additive "does it fit on whole
+    boxes" test is ``_ladder_pool_footprints`` + ``_packed_footprints_fit``."""
     cost: dict[tuple, int] = {}
+    for env_key, instance_type, spec, gpus, reps in _ladder_rank_specs(ladder, instance_specs):
+        gpi = int(spec.get("gpus_per_instance", 0) or 0) if spec else 0
+        if gpi > 0:
+            assert spec is not None
+            slot_kind = is_slot_kind(_spec_allocation_kind(spec))
+            per_replica = gpus if slot_kind else max(1, -(-gpus // gpi))
+            reserved_gpus = reps * gpus if slot_kind else reps * per_replica * gpi
+            cost[("gpu", env_key)] = cost.get(("gpu", env_key), 0) + reserved_gpus
+            key = ("pool", env_key, str(instance_type))
+            cost[key] = cost.get(key, 0) + reps * per_replica
+        else:
+            cost[("gpu", env_key)] = cost.get(("gpu", env_key), 0) + gpus * reps
+    return cost
+
+
+def _spec_allocation_kind(spec: dict[str, Any] | None) -> str:
+    """A spec is packed only when instance_catalog said so; bare specs stay atomic."""
+    return str((spec or {}).get("allocation_kind") or "instance").lower()
+
+
+def _ladder_rank_specs(
+    ladder: list[Any], instance_specs: dict[str, dict[str, dict[str, Any]]]
+) -> list[tuple[str, Any, dict[str, Any] | None, int, int]]:
+    """(env_key, instance_type, spec, gpu_count, n_replicas) per parseable rank."""
+    out = []
     for rank in ladder or []:
         if not isinstance(rank, dict):
             continue
@@ -4125,23 +4178,76 @@ def _ladder_capacity_cost(
         spec = (
             (instance_specs.get(env_key) or {}).get(str(instance_type)) if instance_type else None
         )
-        gpi = int(spec.get("gpus_per_instance", 0) or 0) if spec else 0
-        if gpi > 0:
-            assert spec is not None
-            allocation_kind = str(spec.get("allocation_kind") or "instance")
-            per_replica = gpus if allocation_kind == "gpu" else max(1, -(-gpus // gpi))
-            reserved_gpus = reps * gpus if allocation_kind == "gpu" else reps * per_replica * gpi
-            cost[("gpu", env_key)] = cost.get(("gpu", env_key), 0) + reserved_gpus
-            key = ("pool", env_key, str(instance_type))
-            cost[key] = cost.get(key, 0) + reps * per_replica
-        else:
-            cost[("gpu", env_key)] = cost.get(("gpu", env_key), 0) + gpus * reps
-    return cost
+        out.append((env_key, instance_type, spec, gpus, reps))
+    return out
 
 
-def _pending_deployment_capacity(specs: dict[str, Any]) -> dict[tuple, int]:
-    """Capacity reserved by acknowledged requests that have not materialized yet."""
-    reserved: dict[tuple, int] = {}
+def _ladder_pool_footprints(
+    ladder: list[Any], instance_specs: dict[str, dict[str, dict[str, Any]]]
+) -> dict[tuple[str, str], list[int]]:
+    """Per packed pool, one engine-GPU footprint per replica the ladder places."""
+    footprints: dict[tuple[str, str], list[int]] = {}
+    for env_key, instance_type, spec, gpus, reps in _ladder_rank_specs(ladder, instance_specs):
+        if not spec or gpus <= 0 or reps <= 0:
+            continue
+        if _spec_allocation_kind(spec) != PACKED:
+            continue
+        footprints.setdefault((env_key, str(instance_type)), []).extend([gpus] * reps)
+    return footprints
+
+
+def _packed_pool_states(
+    specs: dict[str, Any],
+) -> dict[tuple[str, str], tuple[int, list[int], int]]:
+    """(gpus_per_instance, partial_free_slots, empty_instances) per packed pool."""
+    states: dict[tuple[str, str], tuple[int, list[int], int]] = {}
+    for env_key, pools in specs.items():
+        for instance_type, spec in (pools or {}).items():
+            if _spec_allocation_kind(spec) != PACKED or "empty_instances" not in spec:
+                continue
+            states[(_env_key(env_key), str(instance_type))] = (
+                int(spec.get("gpus_per_instance") or 1),
+                list(spec.get("partial_free_slots") or []),
+                int(spec.get("empty_instances", 0) or 0),
+            )
+    return states
+
+
+def _packed_footprints_fit(
+    states: dict[tuple[str, str], tuple[int, list[int], int]],
+    footprints_by_pool: dict[tuple[str, str], list[int]],
+) -> bool:
+    """True when every packed pool can hold its footprints on whole boxes."""
+    for key, footprints in footprints_by_pool.items():
+        state = states.get(key)
+        if state is None or not footprints:
+            continue
+        gpi, partial, empty = state
+        if packing_shortfall(footprints, gpi, partial, empty) > 0:
+            return False
+    return True
+
+
+def _apply_pending_footprints(
+    specs: dict[str, Any], footprints_by_pool: dict[tuple[str, str], list[int]]
+) -> None:
+    """Fold pending (not yet materialized) replicas into packed pools' state."""
+    for (env_key, instance_type), footprints in footprints_by_pool.items():
+        spec = (specs.get(env_key) or {}).get(instance_type)
+        if not spec or _spec_allocation_kind(spec) != PACKED:
+            continue
+        partial, empty = apply_footprints_to_pool(
+            footprints,
+            int(spec.get("gpus_per_instance") or 1),
+            list(spec.get("partial_free_slots") or []),
+            int(spec.get("empty_instances", 0) or 0),
+        )
+        spec["partial_free_slots"] = partial
+        spec["empty_instances"] = empty
+
+
+def _pending_deployment_ladders() -> list[list[dict[str, Any]]]:
+    """Rank lists of acknowledged requests that have not materialized yet."""
     try:
         active_jobs = get_active_jobs()
     except (AttributeError, RuntimeError):
@@ -4151,6 +4257,7 @@ def _pending_deployment_capacity(specs: dict[str, Any]) -> dict[tuple, int]:
         for job in [*get_pending_jobs(), *active_jobs]
         if job.get("job_id") is not None
     }
+    ladders = []
     for job in jobs.values():
         if job.get("deployment_status") != "deployment_pending":
             continue
@@ -4171,9 +4278,26 @@ def _pending_deployment_capacity(specs: dict[str, Any]) -> dict[tuple, int]:
                     "n_replicas": int(shape.get("n_replicas") or 1),
                 }
             )
+        ladders.append(ranks)
+    return ladders
+
+
+def _pending_deployment_capacity(specs: dict[str, Any]) -> dict[tuple, int]:
+    """Capacity reserved by acknowledged requests that have not materialized yet."""
+    reserved: dict[tuple, int] = {}
+    for ranks in _pending_deployment_ladders():
         for key, amount in _ladder_capacity_cost(ranks, specs).items():
             reserved[key] = reserved.get(key, 0) + int(amount)
     return reserved
+
+
+def _pending_deployment_footprints(specs: dict[str, Any]) -> dict[tuple[str, str], list[int]]:
+    """Packed-pool replica footprints of pending deployments, per pool."""
+    footprints: dict[tuple[str, str], list[int]] = {}
+    for ranks in _pending_deployment_ladders():
+        for key, sizes in _ladder_pool_footprints(ranks, specs).items():
+            footprints.setdefault(key, []).extend(sizes)
+    return footprints
 
 
 def _largest_pow2_divisor_leq(heads: int | None, cap: int) -> int:
@@ -4182,7 +4306,8 @@ def _largest_pow2_divisor_leq(heads: int | None, cap: int) -> int:
     accounting a rank reserves the WHOLE instance, so a smaller tp would just idle
     the rest of the box - use as many of its GPUs as can shard the model. Scaling
     THROUGHPUT past one instance comes from explicit fixed-DP candidate variants
-    and extra heterogeneous ranks, NOT from a smaller tp inside one box."""
+    and extra heterogeneous ranks, NOT from a smaller tp inside one box. Packed
+    pools (KOI_COHOST_PACKING) do not use this: they enumerate the tp ladder."""
     if not heads or int(heads) <= 0 or cap < 1:
         return 1
     tp, power = 1, 2
@@ -4224,7 +4349,7 @@ def _generated_tp_options(
             for tp in sorted(VALID_TP_DEGREES)
             if tp <= min(gpu_cap, max_tp) and (not heads or int(heads) % tp == 0)
         ]
-    if allocation_kind == "gpu":
+    if is_slot_kind(allocation_kind):
         options = []
         tp = 1
         while tp <= gpu_cap and (not heads or int(heads) % tp == 0):
@@ -5041,7 +5166,9 @@ def build_scored_candidates(
     """Deterministic candidate pipeline for all waiting jobs: normalize specialist
     ladders (HINTS), then generate fixed-DP alternatives for each available pool at
     fill-tp (the largest power of 2 that shards the model's heads and fits the
-    instance's GPUs). Resource accounting is instance-atomic. Size and score each
+    instance's GPUs). Resource accounting is instance-atomic unless
+    KOI_COHOST_PACKING is on, in which case pools are packed (see
+    instance_catalog) and the tp ladder is enumerated. Size and score each
     exact frame via the proven chain (config_runnable ->
     get_applicable_mechanisms -> size_ladder -> check_feasibility -> compute_sigma).
     Frames the model can't fit fall out when the surrogate rejects them.
@@ -5082,6 +5209,7 @@ def build_scored_candidates(
         for instance_type, spec in pools.items():
             pending_units = pending_reserved.get(("pool", _env_key(env_key), str(instance_type)), 0)
             spec["free_instances"] = max(0, int(spec.get("free_instances", 0) or 0) - pending_units)
+    _apply_pending_footprints(specs, _pending_deployment_footprints(specs))
     free_envs: list[tuple[str, list[str]]] = []
     for raw_env_key, info in sorted(resources.items(), key=lambda item: _env_key(item[0])):
         try:
@@ -5200,7 +5328,9 @@ def build_scored_candidates(
         # for big ones). Accounting is instance-atomic, so a partial tp just idles
         # the box - fill it. Explicit fixed-DP variants scale across instances, and
         # Phase 2.5 spans pools when one is not enough. Specialist ladders above stay
-        # as exact-capacity proposals (deduped by shape).
+        # as exact-capacity proposals (deduped by shape). A packed pool
+        # (KOI_COHOST_PACKING) instead offers the whole tp ladder and caps replicas
+        # by what packs onto its partial and empty boxes.
         generated_groups: list[list[dict[str, Any]]] = []
         generated_seen = set(seen)
         for env_key, env in free_envs:
@@ -5215,6 +5345,7 @@ def build_scored_candidates(
                 if gpi <= 0 or int(spec.get("free_instances", 0) or 0) <= 0:
                     continue
                 allocation_kind = spec.get("allocation_kind")
+                slot_kind = is_slot_kind(allocation_kind)
                 gpu_cap = (
                     int(spec.get("candidate_gpu_cap", 0) or 0) if allocation_kind == "gpu" else gpi
                 )
@@ -5245,9 +5376,19 @@ def build_scored_candidates(
                     engine_gpus = tp * pp
                     replica_frames: list[dict[str, Any]] = []
                     max_replicas = int(spec.get("free_instances", 0) or 0)
-                    capacity_per_replica = engine_gpus if allocation_kind == "gpu" else gpi
-                    if allocation_kind == "gpu":
+                    capacity_per_replica = engine_gpus if slot_kind else gpi
+                    if slot_kind:
                         max_replicas //= max(1, engine_gpus)
+                    if allocation_kind == PACKED:
+                        max_replicas = min(
+                            max_replicas,
+                            packable_replicas(
+                                engine_gpus,
+                                gpi,
+                                list(spec.get("partial_free_slots") or []),
+                                int(spec.get("empty_instances", 0) or 0),
+                            ),
+                        )
                     env_budget = (slice_.get("env_budget") or {}).get(env_key)
                     if env_budget is not None:
                         max_replicas = min(
@@ -5259,7 +5400,7 @@ def build_scored_candidates(
                     )
                     if pool_budget is not None:
                         allowed_units = int(pool_budget)
-                        if allocation_kind == "gpu":
+                        if slot_kind:
                             allowed_units //= max(1, engine_gpus)
                         max_replicas = min(max_replicas, allowed_units)
                     replica_options = _replica_options(max_replicas) if slice_ else [1]
@@ -5617,6 +5758,8 @@ def jointly_select_placements(
     resources = get_resource_map()
     specs = instance_catalog()
     pending_reserved = _pending_deployment_capacity(specs)
+    _apply_pending_footprints(specs, _pending_deployment_footprints(specs))
+    packed_states = _packed_pool_states(specs)
     original_candidates = list(candidates or [])
 
     def selection_score(candidate: dict[str, Any]) -> float:
@@ -5965,6 +6108,7 @@ def jointly_select_placements(
             {
                 "cand": cand,
                 "cost": cost,
+                "footprints": _ladder_pool_footprints(cand.get("ladder") or [], specs),
                 "gain": gain,
                 "normal_gain": 0.0 if cand.get("work_conserving_floor") else gain,
                 "stable_floor_value": (penalty(candidate_job_id) if floor_tier == 1 else 0.0),
@@ -5985,6 +6129,25 @@ def jointly_select_placements(
     for jid in jobs:
         space *= 1 + len(by_job[jid])
 
+    def packed_after(
+        used_footprints: dict[tuple[str, str], list[int]], entry: dict[str, Any]
+    ) -> dict[tuple[str, str], list[int]] | None:
+        """Footprints after taking ``entry``; None when a packed pool overflows.
+
+        The additive slot budget cannot see fragmentation: eight free slots
+        spread over eight boxes hold no tp=8 replica. Packed pools re-pack the
+        chosen footprints onto their partial and empty boxes at every step.
+        """
+        added = entry.get("footprints") or {}
+        if not added:
+            return used_footprints
+        merged = dict(used_footprints)
+        for key, sizes in added.items():
+            merged[key] = [*merged.get(key, []), *sizes]
+        if not _packed_footprints_fit(packed_states, {key: merged[key] for key in added}):
+            return None
+        return merged
+
     solver_mode = "exact" if space <= 200_000 else "greedy"
     if solver_mode == "exact":
         # Exact branch-and-bound: every node is a capacity-feasible assignment
@@ -5993,6 +6156,7 @@ def jointly_select_placements(
         def dfs(
             i: int,
             used: dict[str, int],
+            used_footprints: dict[tuple[str, str], list[int]],
             normal_gain: float,
             stable_floor_value: float,
             exploratory_floor_value: float,
@@ -6013,6 +6177,7 @@ def jointly_select_placements(
             dfs(
                 i + 1,
                 used,
+                used_footprints,
                 normal_gain,
                 stable_floor_value,
                 exploratory_floor_value,
@@ -6031,10 +6196,14 @@ def jointly_select_placements(
                     continue
                 if swaps_used + entry["swap_count"] > swap_budget:
                     continue
+                new_footprints = packed_after(used_footprints, entry)
+                if new_footprints is None:
+                    continue
                 chosen.append(entry["cand"])
                 dfs(
                     i + 1,
                     new_used,
+                    new_footprints,
                     normal_gain + entry["normal_gain"],
                     stable_floor_value + entry["stable_floor_value"],
                     exploratory_floor_value + entry["exploratory_floor_value"],
@@ -6043,13 +6212,14 @@ def jointly_select_placements(
                 )
                 chosen.pop()
 
-        dfs(0, {}, 0.0, 0.0, 0.0, 0, [])
+        dfs(0, {}, {}, 0.0, 0.0, 0.0, 0, [])
     else:
         # Greedy fallback for a large choice space: best-gain frame per job in
         # priority order, taking each only if it still fits. Bounded, never over
         # capacity, not guaranteed optimal.
         log.warning("jointly_select_placements: %d combos, using greedy fallback", space)
         used: dict[str, int] = {}
+        used_footprints: dict[tuple[str, str], list[int]] = {}
         chosen: list[dict[str, Any]] = []
         total = 0.0
         swaps_used = 0
@@ -6075,7 +6245,11 @@ def jointly_select_placements(
                     if not over:
                         if swaps_used + entry["swap_count"] > swap_budget:
                             continue
+                        trial_footprints = packed_after(used_footprints, entry)
+                        if trial_footprints is None:
+                            continue
                         used, total = trial, total + entry["gain"]
+                        used_footprints = trial_footprints
                         swaps_used += entry["swap_count"]
                         chosen.append(entry["cand"])
                         placed_greedy.add(jid)

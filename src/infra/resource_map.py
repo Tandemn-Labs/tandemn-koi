@@ -8,6 +8,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.core.models import LADDER_ACTIONS, Plan, env_gpu_type
+from src.infra.packing import (
+    PACKED,
+    capacity_unit_label,
+    effective_allocation_kind,
+    is_slot_kind,
+    pack_footprints,
+    packable_replicas,
+    packing_shortfall,
+    partial_free_slots,
+)
 from tandemn_system_data.clients import (  # type: ignore[import-untyped]
     JobStore,
     PostgresClient,
@@ -300,11 +310,11 @@ class ResourceMapManager:
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
         resource_map = self.get_resource_map(user_id=user_id)
-        used_gpus, used_instances, used_pool_gpus = self._used_capacity(
+        used_gpus, used_instances, used_pool_gpus, pool_bins = self._used_capacity(
             resource_map, user_id=user_id
         )
         return self._normalized_scheduling_summary(
-            resource_map, used_gpus, used_instances, used_pool_gpus
+            resource_map, used_gpus, used_instances, used_pool_gpus, pool_bins
         )
 
     @classmethod
@@ -314,15 +324,22 @@ class ResourceMapManager:
         used_gpus: dict[str, int] | None = None,
         used_instances: dict[tuple[str, str], int] | None = None,
         used_pool_gpus: dict[tuple[str, str], int] | None = None,
+        pool_bins: dict[tuple[str, str], list[int]] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Flatten the store ResourceMap to env_key -> capacity info.
 
         The store map carries total capacity only; ``free`` is derived here
         as ``total`` minus GPUs consumed by running chains (``used``).
+
+        Under KOI_COHOST_PACKING an instance pool is reported as ``packed``:
+        ``free_instances`` counts EMPTY instances, ``partial_free_slots`` lists
+        the free GPUs on partially used instances, and ``free`` is the sum of
+        both. ``pool_bins`` carries the GPUs used per occupied instance.
         """
         used_gpus = used_gpus or {}
         used_instances = used_instances or {}
         used_pool_gpus = used_pool_gpus or {}
+        pool_bins = pool_bins or {}
         raw = dict(resource_map.scheduling_summary())
         market = cls._default_market(resource_map)
         out: dict[str, dict[str, Any]] = {}
@@ -342,9 +359,9 @@ class ResourceMapManager:
             for raw_pool in body.get("pools") or []:
                 pool = dict(raw_pool)
                 instance_type = str(pool.get("instance_type"))
-                kind = str(
-                    pool.get("allocation_kind") or pool.get("allocation_unit") or "instance"
-                ).lower()
+                kind = effective_allocation_kind(
+                    pool.get("allocation_kind") or pool.get("allocation_unit")
+                )
                 gpus_per_instance = int(pool.get("gpus_per_instance", 1))
                 total_instances = int(pool.get("total_instances", 0))
                 raw_total = pool.get("total")
@@ -353,6 +370,8 @@ class ResourceMapManager:
                 )
                 aggregate = pools_by_instance.get(instance_type)
                 if aggregate is None:
+                    if kind == PACKED:
+                        pool["allocation_kind"] = PACKED
                     pool["total_instances"] = total_instances
                     pool["total"] = total
                     pool["merged_pool_count"] = 1
@@ -406,6 +425,12 @@ class ResourceMapManager:
                         0,
                         int(pool["total"]) - used_pool_gpus.get((env_key, instance_type), 0),
                     )
+                elif kind == PACKED:
+                    bins = list(pool_bins.get((env_key, instance_type), ()))
+                    free_instances = max(0, total_instances - len(bins))
+                    partial = partial_free_slots(bins[:total_instances], gpus_per_instance)
+                    free_gpus = free_instances * gpus_per_instance + sum(partial)
+                    pool["partial_free_slots"] = partial
                 else:
                     free_instances = max(
                         0,
@@ -426,14 +451,21 @@ class ResourceMapManager:
 
     def _used_capacity(
         self, resource_map, user_id: str | None = None
-    ) -> tuple[dict[str, int], dict[tuple[str, str], int], dict[tuple[str, str], int]]:
-        """Return used GPUs by env and used instances by env/pool.
+    ) -> tuple[
+        dict[str, int],
+        dict[tuple[str, str], int],
+        dict[tuple[str, str], int],
+        dict[tuple[str, str], list[int]],
+    ]:
+        """Return used GPUs by env, used instances and GPUs by pool, and bins.
 
         Free capacity is not stored on the resource map (total-only); it is
         inferred by subtracting this from each env's total. One chain row is
         one launched serving unit. GPU-granular pools consume
         ``shape_json["count"]``; instance-atomic pools consume the full
-        instance capacity that row reserved.
+        instance capacity that row reserved. Packed pools (KOI_COHOST_PACKING)
+        consume ``count`` slots and the rows are first-fit packed into
+        instances; the fourth result is GPUs used per occupied instance.
 
         The chain's placement env is resolved with precedence
         ``target_node`` -> ``shape_json["env"]`` -> ``shape_json["pool_id"]``;
@@ -446,6 +478,7 @@ class ResourceMapManager:
         used_gpus: dict[str, int] = {}
         used_instances: dict[tuple[str, str], int] = {}
         used_pool_gpus: dict[tuple[str, str], int] = {}
+        packed_footprints: dict[tuple[str, str], tuple[int, list[int]]] = {}
         for chain in self.get_running_chains(user_id=user_id):
             shape = chain.get("shape_json") or {}
             raw_env = (
@@ -466,15 +499,22 @@ class ResourceMapManager:
                     f"'count'; got {count!r}"
                 )
             unit = self.resolve_allocation_unit(env_key, shape, resources)
-            footprint = count if unit.allocation_kind == "gpu" else unit.gpus_per_unit
+            footprint = count if is_slot_kind(unit.allocation_kind) else unit.gpus_per_unit
             used_gpus[env_key] = used_gpus.get(env_key, 0) + footprint
             if unit.allocation_kind == "instance" and unit.instance_type:
                 key = (env_key, unit.instance_type)
                 used_instances[key] = used_instances.get(key, 0) + 1
+            elif unit.allocation_kind == PACKED and unit.instance_type:
+                key = (env_key, unit.instance_type)
+                packed_footprints.setdefault(key, (unit.gpus_per_unit, []))[1].append(count)
             elif unit.instance_type:
                 key = (env_key, unit.instance_type)
                 used_pool_gpus[key] = used_pool_gpus.get(key, 0) + footprint
-        return used_gpus, used_instances, used_pool_gpus
+        pool_bins: dict[tuple[str, str], list[int]] = {}
+        for key, (gpus_per_unit, footprints) in packed_footprints.items():
+            pool_bins[key] = pack_footprints(footprints, gpus_per_unit)
+            used_instances[key] = len(pool_bins[key])
+        return used_gpus, used_instances, used_pool_gpus, pool_bins
 
     @classmethod
     def _normalize_env_key(cls, env, default_market: str) -> str:
@@ -502,11 +542,11 @@ class ResourceMapManager:
 
     def dynamic_view(self, user_id: str | None = None) -> dict[str, Any]:
         resource_map = self.get_resource_map(user_id=user_id)
-        used_gpus, used_instances, used_pool_gpus = self._used_capacity(
+        used_gpus, used_instances, used_pool_gpus, pool_bins = self._used_capacity(
             resource_map, user_id=user_id
         )
         resources = self._normalized_scheduling_summary(
-            resource_map, used_gpus, used_instances, used_pool_gpus
+            resource_map, used_gpus, used_instances, used_pool_gpus, pool_bins
         )
         return {
             "resource_map_version": resource_map.version,
@@ -555,7 +595,10 @@ class ResourceMapManager:
 
         Cloud pools are instance-atomic. A config may use fewer GPUs than the
         instance has, but the full instance capacity and price are reserved.
-        Pools marked allocation_kind="gpu" remain discrete-GPU pools.
+        Pools marked allocation_kind="gpu" remain discrete-GPU pools. Under
+        KOI_COHOST_PACKING instance pools resolve as ``packed``: the unit is
+        still the instance (``gpus_per_unit``, instance price) but a replica
+        reserves only its engine GPUs on it.
         """
         resources = resources if resources is not None else self.resources_summary()
         env_key = self._env_key(env)
@@ -567,8 +610,7 @@ class ResourceMapManager:
         if pool is None:
             return AllocationUnit(env_key, "gpu", None, info.get("gpu_type"), 1, None)
 
-        kind = str(pool.get("allocation_kind") or pool.get("allocation_unit") or "instance")
-        kind = kind.lower()
+        kind = effective_allocation_kind(pool.get("allocation_kind") or pool.get("allocation_unit"))
         instance_type = pool.get("instance_type")
         gpu_type = pool.get("gpu_type") or info.get("gpu_type")
         if kind == "gpu":
@@ -578,7 +620,12 @@ class ResourceMapManager:
         gpus = int(pool.get("gpus_per_instance") or pool.get("gpus_per_unit") or 1)
         price = pool.get("price_per_instance_hour") or pool.get("price_per_unit_hour")
         return AllocationUnit(
-            env_key, "instance", instance_type, gpu_type, gpus, _float_or_none(price)
+            env_key,
+            PACKED if kind == PACKED else "instance",
+            instance_type,
+            gpu_type,
+            gpus,
+            _float_or_none(price),
         )
 
     def rank_capacity_per_replica(
@@ -600,28 +647,51 @@ class ResourceMapManager:
         rank,
         resources: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Return engine demand plus reserved capacity for one rank replica."""
+        """Return engine demand plus reserved capacity for one rank replica.
+
+        For a packed pool ``price_per_unit_hour`` is the instance price
+        pro-rated to the replica's engine GPUs, and ``packable_replicas`` is
+        how many replicas fit today without fragmenting a full-width rank.
+        """
         resources = resources if resources is not None else self.resources_summary()
         engine_gpus = rank.gpus_per_chain()
         unit = self.resolve_allocation_unit(rank.env, rank.config, resources)
-        capacity = engine_gpus if unit.allocation_kind == "gpu" else unit.gpus_per_unit
+        capacity = engine_gpus if is_slot_kind(unit.allocation_kind) else unit.gpus_per_unit
         info = resources[unit.env_key]
         pool = self._select_pool(unit.env_key, info, rank.config)
-        return {
+        price = unit.price_per_unit_hour
+        summary = {
             "allocation_kind": unit.allocation_kind,
             "instance_type": unit.instance_type,
             "gpus_per_unit": unit.gpus_per_unit,
-            "price_per_unit_hour": unit.price_per_unit_hour,
+            "price_per_unit_hour": price,
             "capacity_per_replica": capacity,
             "free_capacity_gpus": int((pool or info).get("free", 0)),
             "engine_gpus": engine_gpus,
         }
+        if unit.allocation_kind == PACKED:
+            gpi = max(1, int(unit.gpus_per_unit))
+            if price is not None:
+                summary["instance_price_per_hour"] = price
+                summary["price_per_unit_hour"] = price * min(engine_gpus, gpi) / gpi
+            summary["packable_replicas"] = packable_replicas(
+                engine_gpus,
+                gpi,
+                list((pool or {}).get("partial_free_slots") or []),
+                int((pool or {}).get("free_instances", 0) or 0),
+            )
+        return summary
 
     def pool_capacity(
         self,
         resources: dict[str, dict[str, Any]] | None = None,
     ) -> dict[tuple[str, str], dict[str, Any]]:
-        """Return available allocation units for each instance pool."""
+        """Return available allocation units for each instance pool.
+
+        A packed pool's ``available_units`` are free GPU slots (additive
+        bound); ``empty_instances`` and ``partial_free_slots`` carry the
+        packing state for the non-additive check in ``packing_violations``.
+        """
         resources = resources if resources is not None else self.resources_summary()
         capacity = {}
         for env, info in resources.items():
@@ -629,21 +699,26 @@ class ResourceMapManager:
                 instance_type = pool.get("instance_type")
                 if not instance_type:
                     continue
-                kind = str(
-                    pool.get("allocation_kind") or pool.get("allocation_unit") or "instance"
-                ).lower()
+                kind = effective_allocation_kind(
+                    pool.get("allocation_kind") or pool.get("allocation_unit")
+                )
                 gpus_per_unit = (
                     1
                     if kind == "gpu"
                     else int(pool.get("gpus_per_instance") or pool.get("gpus_per_unit") or 1)
                 )
                 free_gpus = int(pool.get("free", 0))
-                capacity[(env, str(instance_type))] = {
+                entry = {
                     "allocation_kind": kind,
                     "available_units": free_gpus // gpus_per_unit,
                     "gpus_per_unit": gpus_per_unit,
                     "free_gpus": free_gpus,
                 }
+                if kind == PACKED:
+                    entry["available_units"] = free_gpus
+                    entry["empty_instances"] = int(pool.get("free_instances", 0) or 0)
+                    entry["partial_free_slots"] = list(pool.get("partial_free_slots") or [])
+                capacity[(env, str(instance_type))] = entry
         return capacity
 
     def requested_capacity(
@@ -651,11 +726,15 @@ class ResourceMapManager:
         plan,
         resources: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[dict[str, int], dict[tuple[str, str], dict[str, int]]]:
-        """Return a plan's reserved GPUs by env and allocation units by pool."""
+        """Return a plan's reserved GPUs by env and allocation units by pool.
+
+        Packed pools count GPU slots as units and also list each replica's
+        footprint under ``footprints`` for the packing check.
+        """
         resources = resources if resources is not None else self.resources_summary()
         typed = plan if isinstance(plan, Plan) else Plan.from_raw(plan, tick=0)
         by_env: dict[str, int] = {}
-        by_pool: dict[tuple[str, str], dict[str, int]] = {}
+        by_pool: dict[tuple[str, str], dict[str, Any]] = {}
         for action in typed.actions:
             if action.type not in LADDER_ACTIONS:
                 continue
@@ -670,11 +749,68 @@ class ResourceMapManager:
                     continue
                 key = (env, str(instance_type))
                 requested = by_pool.setdefault(key, {"units": 0, "gpus": 0})
-                requested["units"] += (
-                    gpus if allocation.get("allocation_kind") == "gpu" else int(rank.n_replicas)
-                )
+                kind = allocation.get("allocation_kind")
+                requested["units"] += gpus if is_slot_kind(kind) else int(rank.n_replicas)
                 requested["gpus"] += gpus
+                if kind == PACKED:
+                    requested.setdefault("footprints", []).extend(
+                        [int(allocation["engine_gpus"])] * int(rank.n_replicas)
+                    )
         return by_env, by_pool
+
+    def packing_shortfalls(
+        self,
+        requested_by_pool: dict[tuple[str, str], dict[str, Any]],
+        resources: dict[str, dict[str, Any]] | None = None,
+        skip: set[tuple[str, str]] | None = None,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Packed pools whose requested replicas do not fit without fragmenting.
+
+        The additive slot check can pass while no instance has room for a
+        full-width replica; this first-fit packs the request onto the pool's
+        partial instances and charges new instances against the empty ones.
+        Returns ``{(env, instance_type): {"shortfall": int, "message": str}}``.
+        """
+        resources = resources if resources is not None else self.resources_summary()
+        pool_capacity = self.pool_capacity(resources)
+        failures: dict[tuple[str, str], dict[str, Any]] = {}
+        for key, demand in sorted(requested_by_pool.items()):
+            if skip and key in skip:
+                continue
+            limit = pool_capacity.get(key)
+            footprints = list(demand.get("footprints") or [])
+            if limit is None or limit.get("allocation_kind") != PACKED or not footprints:
+                continue
+            shortfall = packing_shortfall(
+                footprints,
+                int(limit["gpus_per_unit"]),
+                limit.get("partial_free_slots") or [],
+                int(limit.get("empty_instances", 0)),
+            )
+            if shortfall > 0:
+                env, instance_type = key
+                failures[key] = {
+                    "shortfall": shortfall,
+                    "message": (
+                        f"env {env} pool {instance_type}: {len(footprints)} replicas "
+                        f"(footprints {sorted(footprints, reverse=True)}) do not pack into "
+                        f"{limit.get('empty_instances', 0)} empty instances plus partial slots "
+                        f"{list(limit.get('partial_free_slots') or [])}; short {shortfall} "
+                        "instances"
+                    ),
+                }
+        return failures
+
+    def packing_violations(
+        self,
+        requested_by_pool: dict[tuple[str, str], dict[str, Any]],
+        resources: dict[str, dict[str, Any]] | None = None,
+        skip: set[tuple[str, str]] | None = None,
+    ) -> list[str]:
+        return [
+            str(entry["message"])
+            for entry in self.packing_shortfalls(requested_by_pool, resources, skip).values()
+        ]
 
     def switch_pricing_map(self, resources: dict[str, dict[str, Any]] | None = None) -> dict:
         resources = resources if resources is not None else self.resources_summary()
@@ -682,14 +818,24 @@ class ResourceMapManager:
         for env, info in resources.items():
             by_instance = {}
             prices = []
+            packed_gpus_per_instance = {}
             for pool in info.get("pools") or []:
                 inst = pool.get("instance_type")
                 price = pool.get("price_per_instance_hour") or pool.get("price_per_unit_hour")
                 if inst and price is not None:
                     by_instance[str(inst)] = float(price)
                     prices.append(float(price))
+                kind = effective_allocation_kind(
+                    pool.get("allocation_kind") or pool.get("allocation_unit")
+                )
+                if inst and kind == PACKED:
+                    packed_gpus_per_instance[str(inst)] = int(
+                        pool.get("gpus_per_instance") or pool.get("gpus_per_unit") or 1
+                    )
             if by_instance:
                 pricing[env] = {"by_instance_type": by_instance, "default": max(prices)}
+                if packed_gpus_per_instance:
+                    pricing[env]["packed_gpus_per_instance"] = packed_gpus_per_instance
         return pricing
 
     def check_resource_feasibility(self, plan):
@@ -699,9 +845,12 @@ class ResourceMapManager:
         for env, info in future.items():
             for pool in info.get("pools") or []:
                 if pool.get("free_units_after", 0) >= 0:
+                    if pool.get("packing_shortfall", 0) > 0:
+                        pool_failed_envs.add(env)
+                        violations.append(str(pool["packing_violation"]))
                     continue
                 pool_failed_envs.add(env)
-                unit = "GPUs" if pool.get("allocation_kind") == "gpu" else "instances"
+                unit = capacity_unit_label(pool.get("allocation_kind"))
                 violations.append(
                     f"env {env} pool {pool.get('instance_type')}: requested "
                     f"{pool.get('requested_units', 0)} {unit}, only "
@@ -718,6 +867,7 @@ class ResourceMapManager:
         resources = self.resources_summary()
         requested, requested_by_pool = self.requested_capacity(plan, resources)
         pool_capacity = self.pool_capacity(resources)
+        packing_failures = self.packing_shortfalls(requested_by_pool, resources)
         out = {}
         for env, info in resources.items():
             free_now = int(info.get("free", 0))
@@ -732,6 +882,9 @@ class ResourceMapManager:
                 pool["requested_units"] = int(demand.get("units", 0))
                 pool["free_units_after"] = pool["free_units_now"] - pool["requested_units"]
                 pool["free_after"] = int(pool.get("free", 0)) - int(demand.get("gpus", 0))
+                if key in packing_failures:
+                    pool["packing_shortfall"] = int(packing_failures[key]["shortfall"])
+                    pool["packing_violation"] = str(packing_failures[key]["message"])
                 pools.append(pool)
             out[env] = {
                 **info,
