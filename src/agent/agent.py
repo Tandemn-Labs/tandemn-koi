@@ -63,6 +63,7 @@ from src.core.models import (
     env_gpu_type,
 )
 from src.infra.deployment_x import materialize_launch_config
+from src.infra.packing import cohost_packing_enabled
 
 log = logging.getLogger("koi.agent")
 
@@ -1812,7 +1813,22 @@ class KoiAgentHarness:
         )
 
     @staticmethod
-    def _plan_schema_section() -> str:
+    def _reservation_contract() -> str:
+        """How a rank's gpu_count maps to reserved capacity and price."""
+        if cohost_packing_enabled():
+            return (
+                "gpu_count is engine GPU demand; with co-hosted packing on, each replica "
+                "reserves and pays for gpu_count GPUs on a shared instance, several "
+                "replicas may share one instance, and a full-width replica needs an "
+                "EMPTY instance (see partial_free_slots / free_instances in the pools)."
+            )
+        return (
+            "gpu_count is engine GPU demand, not reserved capacity; Koi reserves "
+            "and charges one full instance per n_replicas."
+        )
+
+    @classmethod
+    def _plan_schema_section(cls) -> str:
         """The exact plan schema the LLM must build, with field-by-field shape.
 
         Spelling out the dict shape (not just naming fields) is what lets a
@@ -1884,9 +1900,8 @@ class KoiAgentHarness:
             "to 1 when omitted and EP is fixed to 1. gpu_count MUST equal tp*pp. "
             "For cloud instance pools, "
             "config.instance_type is required when the env has multiple pools. "
-            "gpu_count is engine GPU demand, not "
-            "reserved capacity; Koi reserves and charges one full instance per "
-            "n_replicas. n_replicas is the rank's DP/max endpoint count; do not "
+            f"{cls._reservation_contract()} "
+            "n_replicas is the rank's DP/max endpoint count; do not "
             "set dp separately. Discrete on-prem GPU pools may remain GPU-granular. "
             "Jobs without a joint-chosen placement may be omitted and are auto-kept "
             "(running) or auto-deferred (waiting). Overriding a joint-chosen job still "

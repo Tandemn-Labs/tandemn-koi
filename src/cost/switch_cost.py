@@ -385,7 +385,16 @@ def hourly_rate(chain, pricing_map: dict | None = None) -> float:
         if env and env in pricing_map and isinstance(pricing_map[env], dict):
             by_instance = pricing_map[env].get("by_instance_type") or {}
             if instance_type and instance_type in by_instance:
-                return float(by_instance[instance_type])
+                rate = float(by_instance[instance_type])
+                # Packed pool (KOI_COHOST_PACKING): a replica pays for the
+                # GPUs it occupies on the instance, not the whole instance.
+                packed = (pricing_map[env].get("packed_gpus_per_instance") or {}).get(instance_type)
+                if packed:
+                    engine = cfg.get("gpu_count", cfg.get("count"))
+                    if engine is None:
+                        engine = int(cfg.get("tp", 1) or 1) * int(cfg.get("pp", 1) or 1)
+                    rate *= min(1.0, max(1, int(engine)) / max(1, int(packed)))
+                return rate
             if "default" in pricing_map[env]:
                 return float(pricing_map[env]["default"])
         if gpu and gpu in pricing_map:
