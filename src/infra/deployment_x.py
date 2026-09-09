@@ -7,6 +7,7 @@ hardware facts are contract errors rather than values to guess.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from src.config.policy import load_config_policy
 from src.core.models import EnvLabel
 
 RankKey = tuple[str, str]
+
+log = logging.getLogger(__name__)
 
 # ponytail: predictions ride in shape_json, but they are evidence inputs, not X.
 _X_SKIP = {
@@ -541,7 +544,23 @@ def _rank_traffic_share(shape: dict[str, Any], replica_count: int, total_replica
         return share
     if total_replicas == replica_count:
         return 1.0
-    raise ValueError("multi-rank jobs require rank_traffic_share per rank")
+    # The launch compile keeps config knobs but drops top-level rank fields, so
+    # a deployed multi-rank shape can lack the planned share (koi_debug_run_v4:
+    # this raise wedged the whole control loop in S1_OBSERVE, 1,744 aborted
+    # ticks). Attribute load by replica proportion instead of raising -
+    # telemetry corrects the estimate as soon as it observes the deployment.
+    if 0 < replica_count <= total_replicas:
+        share = replica_count / total_replicas
+    else:
+        share = 1.0
+    log.warning(
+        "multi-rank shape missing rank_traffic_share; using replica proportion "
+        "%.4f (%d of %d replicas)",
+        share,
+        replica_count,
+        total_replicas,
+    )
+    return share
 
 
 def _project_x(x: dict[str, Any], x_fields: list[str] | tuple[str, ...]) -> dict[str, object]:
