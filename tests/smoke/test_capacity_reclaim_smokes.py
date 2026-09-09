@@ -131,5 +131,49 @@ class StrandedSlotSmokeTests(unittest.TestCase):
         self.assertEqual(chosen[0]["marker"], "tight")
 
 
+class ReclaimRankReconstructionSmokeTests(unittest.TestCase):
+    """_reclaim_current_rank must invert both ladder encodings: the real
+    executor's one-chain-per-replica rows and sim-style n_replicas ranks."""
+
+    def _chain(self, rank_id: str = "r1", status: str = "running",
+               instance: str = "p5", tp: int = 8) -> dict:
+        return {
+            "chain_id": f"{rank_id}_chain_x",
+            "chain_status": status,
+            "shape_json": {
+                "rank_id": rank_id,
+                "env": ENV.split("|"),
+                "instance_type": instance,
+                "gpu_count": tp,
+                "count": tp,
+                "tp": tp,
+                "pp": 1,
+            },
+        }
+
+    def test_chain_rows_reconstruct_dp_from_multiplicity(self):
+        current = agent_tools._reclaim_current_rank([self._chain(), self._chain()])
+        self.assertIsNotNone(current)
+        self.assertEqual(current["n_replicas"], 2)
+        self.assertEqual(current["config"]["instance_type"], "p5")
+        self.assertEqual(current["config"]["tp"], 8)
+
+    def test_rank_style_ladder_keeps_explicit_n_replicas(self):
+        current = agent_tools._reclaim_current_rank(
+            [_rank("p5", gpu_count=8, n_replicas=3)]
+        )
+        self.assertIsNotNone(current)
+        self.assertEqual(current["n_replicas"], 3)
+
+    def test_single_replica_multi_rank_and_launching_are_not_subjects(self):
+        single = agent_tools._reclaim_current_rank([self._chain()])
+        self.assertEqual(single["n_replicas"], 1)  # caller rejects < 2
+        two_ranks = [self._chain("r1"), self._chain("r2", instance="p4", tp=4)]
+        self.assertIsNone(agent_tools._reclaim_current_rank(two_ranks))
+        launching = [self._chain(), self._chain(status="launching")]
+        self.assertIsNone(agent_tools._reclaim_current_rank(launching))
+        self.assertIsNone(agent_tools._reclaim_current_rank([]))
+
+
 if __name__ == "__main__":
     unittest.main()
