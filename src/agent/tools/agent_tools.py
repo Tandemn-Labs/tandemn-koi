@@ -237,6 +237,13 @@ DEFAULT_COLD_START_Z_STAR = {
 # Opportunity cost charged per WAITING job the plan leaves unserved, so a
 # feasible placement (sigma ~ J<=0 + EIG) beats defer (0). Scaled by priority.
 UNSERVED_PENALTY = 1.0
+
+# Capacity-reclaim guards. All three are inert while instance pools have
+# plentiful free boxes; they exist for small real fleets (about 14 instances)
+# where whole-instance reservation let tick-0 placements starve later arrivals.
+_SCARCITY_FREE_INSTANCE_THRESHOLD = 2
+_SCARCITY_MAX_REPLICAS = 2
+_RECLAIM_MAX_PER_TICK = 1
 _WORK_CONSERVING_GAIN_FLOOR = 1e-9
 # COST is a weighted OPTIMIZE objective (see compute_sigma), governed by the slow
 # loop's weight w_t["cost_per_token"] - the SAME code serves any market, only the
@@ -5262,6 +5269,16 @@ def build_scored_candidates(
                         if allocation_kind == "gpu":
                             allowed_units //= max(1, engine_gpus)
                         max_replicas = min(max_replicas, allowed_units)
+                    if (
+                        allocation_kind != "gpu"
+                        and int(spec.get("free_instances", 0) or 0)
+                        <= _SCARCITY_FREE_INSTANCE_THRESHOLD
+                    ):
+                        # Scarcity guard: on a nearly-empty instance pool a wide
+                        # replica fan lets the first-arriving jobs strand every
+                        # later arrival (the real fleet's 14-box lockout). Inert
+                        # whenever the pool still has free boxes to spare.
+                        max_replicas = min(max_replicas, _SCARCITY_MAX_REPLICAS)
                     replica_options = _replica_options(max_replicas) if slice_ else [1]
                     for replicas in replica_options:
                         rank = _normalize_candidate_rank(
@@ -5551,6 +5568,90 @@ def build_scored_candidates(
                 "; ".join(dict.fromkeys(reasons)) if reasons else "no runnable, feasible frame"
             )
 
+    # Capacity reclamation (koi-side only): when waiting jobs are exhausted by
+    # no_pool_capacity, offer the joint solver shrink-one-replica SWAPs on
+    # healthy multi-replica actives so a blocked job can be placed next tick.
+    # Bounded: lowest-priority subjects first, at most three scored, and the
+    # joint solver admits at most _RECLAIM_MAX_PER_TICK of them, floored below
+    # every real gain. Inert whenever nothing is capacity-blocked.
+    blocked_by_capacity = [
+        jid for jid, reason in exhausted.items() if "no_pool_capacity" in str(reason)
+    ]
+    if blocked_by_capacity:
+        reclaim_subjects: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+        for job in get_active_jobs():
+            health = job.get("health") or {}
+            if health.get("rehabilitation_eligible") is True:
+                continue
+            if str(health.get("status") or "").lower() == "critical":
+                continue
+            subject_id = str(job.get("job_id", job.get("id") or ""))
+            if not subject_id or subject_id in exhausted:
+                continue
+            ladder = list(job.get("current_ladder") or job.get("active_chains") or [])
+            if len(ladder) != 1:
+                continue
+            raw_rank = ladder[0]
+            current = _normalize_candidate_rank(raw_rank)
+            if (
+                current is None
+                and isinstance(raw_rank, dict)
+                and isinstance(raw_rank.get("shape_json"), dict)
+            ):
+                shape = raw_rank["shape_json"]
+                current = _normalize_candidate_rank(
+                    {
+                        "role": "aggregate",
+                        "env": shape.get("env"),
+                        "config": {
+                            "instance_type": shape.get("instance_type"),
+                            "gpu_count": shape.get("gpu_count") or shape.get("count"),
+                            "tp": shape.get("tp"),
+                            "pp": shape.get("pp"),
+                        },
+                        "n_replicas": raw_rank.get("n_replicas") or shape.get("n_replicas"),
+                    }
+                )
+            if current is None or int(current.get("n_replicas") or 1) < 2:
+                continue
+            try:
+                subject_priority = float(
+                    (budgets.get(subject_id) or {}).get("priority_score", 1.0)
+                )
+            except (TypeError, ValueError):
+                subject_priority = 1.0
+            reclaim_subjects.append((subject_priority, job, current))
+        reclaim_subjects.sort(key=lambda item: item[0])
+        for _subject_priority, job, current in reclaim_subjects[:3]:
+            subject_id = str(job.get("job_id", job.get("id")))
+            shrunk = copy.deepcopy(current)
+            shrunk["n_replicas"] = int(current.get("n_replicas") or 2) - 1
+            shrunk["proposal_source"] = "capacity_reclaim"
+            features = _job_features_for(snapshot, subject_id) or dict(
+                job.get("job_features") or {}
+            )
+            features["_active_health"] = copy.deepcopy(job.get("health") or {})
+            slice_ = budgets.get(subject_id) or {}
+            outcome = _score_one_frame(
+                subject_id,
+                job.get("user_id") or features.get("user_id"),
+                slice_.get("slice_id", subject_id),
+                shrunk,
+                features,
+                action_type="swap",
+            )
+            diagnostics.setdefault(subject_id, []).append(outcome["diag"])
+            reclaim_candidate = outcome.get("candidate")
+            if reclaim_candidate is not None:
+                reclaim_candidate["capacity_reclaim"] = True
+                reclaim_candidate["reclaim_for"] = list(blocked_by_capacity)
+                reclaim_candidate["rationale"] = (
+                    "Capacity reclaim: shrink one replica so a no_pool_capacity-"
+                    f"blocked waiting job ({', '.join(blocked_by_capacity[:3])}) "
+                    "can be placed next tick."
+                )
+                candidates.append(reclaim_candidate)
+
     result = {
         "candidates": candidates,
         "exhausted": exhausted,
@@ -5561,6 +5662,28 @@ def build_scored_candidates(
         _scored_candidates_cache[cache_key] = copy.deepcopy(result)
         return copy.deepcopy(_scored_candidates_cache[cache_key])
     return copy.deepcopy(result)
+
+
+def _ladder_stranded_gpus(ladder: list[dict[str, Any]] | None, specs: dict[str, Any]) -> int:
+    """GPUs left unusable inside instances this ladder reserves (whole-box pools
+    only): a 1-GPU replica on an 8-GPU box strands 7. Tie-breaker input for the
+    joint solver; 0 when the pool or its width is unknown."""
+    stranded = 0
+    for rank in ladder or []:
+        config = rank.get("config") or {}
+        spec = (specs.get(_env_key(rank.get("env"))) or {}).get(str(config.get("instance_type")))
+        if not isinstance(spec, dict):
+            continue
+        try:
+            gpi = int(spec.get("gpus_per_instance") or 0)
+            gpus = int(config.get("gpu_count") or 0)
+            replicas = int(rank.get("n_replicas") or 1)
+        except (TypeError, ValueError):
+            continue
+        if gpi <= 0 or gpus <= 0 or gpus > gpi:
+            continue
+        stranded += replicas * (gpi - gpus)
+    return stranded
 
 
 def jointly_select_placements(
@@ -5643,6 +5766,7 @@ def jointly_select_placements(
     selection_diagnostics: dict[str, dict[str, Any]] = {}
     eligible_swaps_by_job: dict[str, int] = {}
     rescue_by_job: dict[str, tuple[float, dict[str, Any]]] = {}
+    reclaim_best: dict[str, Any] = {"score": float("-inf"), "entry": None}
     for candidate in original_candidates:
         jid = str(candidate.get("job_id") or "")
         diag = selection_diagnostics.setdefault(
@@ -5662,6 +5786,16 @@ def jointly_select_placements(
             diag["best_gain"] = round(score, 2)
         is_swap = str(candidate.get("type") or "").lower() == "swap"
         if is_swap and score <= 0:
+            if candidate.get("capacity_reclaim"):
+                # A reclaim swap is deliberately negative-gain: it trades part of
+                # a healthy job's throughput for a freed instance while waiting
+                # jobs are blocked by no_pool_capacity. Keep only the single best
+                # (_RECLAIM_MAX_PER_TICK); it is floored below every real gain
+                # at admission time so it can never displace normal work.
+                if math.isfinite(score) and score > reclaim_best["score"]:
+                    reclaim_best.update(score=score, entry=candidate)
+                diag["reclaim_considered"] = True
+                continue
             diag["vetoed_gain_le_0"] += 1
             # A critical job must always be able to TRY somewhere else, even when
             # every alternative scores below its keep baseline - a wrong baseline
@@ -5693,6 +5827,13 @@ def jointly_select_placements(
         if rescue_diagnostic is not None:
             rescue_diagnostic["rescued"] = True
         eligible_candidates.append(candidate)
+
+    if reclaim_best["entry"] is not None:
+        reclaim_entry = reclaim_best["entry"]
+        reclaim_diagnostic = selection_diagnostics.get(str(reclaim_entry.get("job_id") or ""))
+        if reclaim_diagnostic is not None:
+            reclaim_diagnostic["reclaim_admitted"] = True
+        eligible_candidates.append(reclaim_entry)
 
     def footprint(candidate: dict[str, Any]) -> int:
         return sum(_ladder_capacity_cost(candidate.get("ladder") or [], specs).values())
@@ -5914,7 +6055,10 @@ def jointly_select_placements(
             or swap_gain_over_keep is None
             or swap_gain_over_keep <= 0
         ):
-            if not (cand.get("rescue_floor") and swap_gain_over_keep is not None):
+            if not (
+                (cand.get("rescue_floor") or cand.get("capacity_reclaim"))
+                and swap_gain_over_keep is not None
+            ):
                 continue
             # A critical job's rescue: admitted at the floor so it can never
             # outrank a real positive-gain candidate, but the job always gets
@@ -5924,7 +6068,9 @@ def jointly_select_placements(
             cand["work_conserving_floor"] = True
             cand["service_class"] = "partial"
             if isinstance(assessment, dict):
-                assessment["selection_mode"] = "emergency_recovery"
+                assessment["selection_mode"] = (
+                    "capacity_reclaim" if cand.get("capacity_reclaim") else "emergency_recovery"
+                )
         elif is_swap:
             assert swap_gain_over_keep is not None
             gain = swap_gain_over_keep
@@ -5970,9 +6116,16 @@ def jointly_select_placements(
                 "stable_floor_value": (penalty(candidate_job_id) if floor_tier == 1 else 0.0),
                 "exploratory_floor_value": (penalty(candidate_job_id) if floor_tier == 2 else 0.0),
                 "swap_count": 1 if is_swap else 0,
+                "stranded": _ladder_stranded_gpus(cand.get("ladder"), specs),
             }
         )
     jobs = [jid for jid in by_job if by_job[jid]]
+    # Deterministic ordering with a stranded-slot tie-break: among equal-gain
+    # frames the one wasting fewer intra-box GPU slots is explored first, and
+    # the exact solver keeps the FIRST solution at any given objective, so ties
+    # resolve toward tighter packing without touching any score.
+    for jid in jobs:
+        by_job[jid].sort(key=lambda item: (-item["gain"], item.get("stranded", 0)))
 
     best_solution: dict[str, Any] = {
         "normal_objective": 0.0,
@@ -6064,7 +6217,9 @@ def jointly_select_placements(
                     for entry in by_job[jid]
                     if int(entry["cand"].get("solver_tier") or 0) == tier
                 ]
-                for entry in sorted(entries, key=lambda item: item["gain"], reverse=True):
+                for entry in sorted(
+                    entries, key=lambda item: (-item["gain"], item.get("stranded", 0))
+                ):
                     trial = dict(used)
                     over = False
                     for key, need in entry["cost"].items():
