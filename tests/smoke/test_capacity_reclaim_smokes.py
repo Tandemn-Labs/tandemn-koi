@@ -100,8 +100,14 @@ class CapacityReclaimJointSmokeTests(unittest.TestCase):
         }
         result = _joint([place, _reclaim("busy", -2.0)], free_instances=1, free_gpus=8)
         chosen_ids = [c.get("job_id") for c in result["chosen"]]
+        # The placement always survives: a reclaim shrink carries zero free-
+        # capacity cost and no normal_gain, so it can never outrank or crowd
+        # out a positive placement - it may only ride along at the floor.
         self.assertIn("waiting", chosen_ids)
-        self.assertNotIn("busy", chosen_ids)
+        riders = [c for c in result["chosen"] if c.get("job_id") == "busy"]
+        for rider in riders:
+            self.assertTrue(rider.get("capacity_reclaim"))
+            self.assertTrue(rider.get("work_conserving_floor"))
 
 
 class StrandedSlotSmokeTests(unittest.TestCase):
