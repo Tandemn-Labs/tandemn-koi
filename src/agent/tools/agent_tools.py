@@ -5537,7 +5537,15 @@ def build_scored_candidates(
                     max_replicas = min(
                         max_replicas, max(1, job_cap_gpus // max(1, capacity_per_replica))
                     )
-                    replica_options = _replica_options(max_replicas) if slice_ else [1]
+                    # Slice-less jobs are normally held to one replica, but a
+                    # growth subject NEEDS multi-replica frames (its point is a
+                    # bigger ladder than it holds); the footprint cap above
+                    # already bounds how much bigger.
+                    replica_options = (
+                        _replica_options(max_replicas)
+                        if (slice_ or str(jid) in growth_ids)
+                        else [1]
+                    )
                     for replicas in replica_options:
                         rank = _normalize_candidate_rank(
                             {
@@ -5641,6 +5649,11 @@ def build_scored_candidates(
                     frames[frame_index],
                     features,
                     action_type="swap",
+                    # Growth subjects are healthy actives: they hold no
+                    # BudgetSlice (same wall reclaim hit), and their footprint
+                    # is bounded by the cap at generation plus the joint
+                    # delta charge - so the slice check is waived for them.
+                    budget_exempt=str(jid) in growth_ids,
                 )
             )
             scored_by_job[jid].append(scored)
