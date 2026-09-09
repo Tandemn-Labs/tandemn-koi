@@ -252,6 +252,9 @@ _RECLAIM_MAX_PER_TICK = 1
 # capped job expand later, when the queue drains.
 _FOOTPRINT_FLEET_FRACTION = 0.35
 _GROWTH_MAX_PER_TICK = 2
+# Reclaim will not shrink a live replica of a bursty online job: sizing was
+# deliberate headroom for the peak. Batch and low-peak online jobs are fair game.
+_RECLAIM_BURST_PTM_MAX = 3.0
 _WORK_CONSERVING_GAIN_FLOOR = 1e-9
 # COST is a weighted OPTIMIZE objective (see compute_sigma), governed by the slow
 # loop's weight w_t["cost_per_token"] - the SAME code serves any market, only the
@@ -5869,17 +5872,71 @@ def build_scored_candidates(
             isinstance(d, dict) and d.get("status") == "no_pool_capacity" for d in job_diags
         )
     )
+    # actives/active_ids are needed by both the zero-candidate filter and the
+    # Layer 3 lost-the-race widening below, so compute them unconditionally.
+    actives = [job for job in (get_active_jobs() or []) if isinstance(job, dict)]
+    active_ids = {str(job.get("job_id", job.get("id") or "")) for job in actives}
     if blocked_by_capacity:
-        actives = [job for job in (get_active_jobs() or []) if isinstance(job, dict)]
         # Actives land in the blocked set too when the fleet is full - their
         # ALTERNATE frames are trivially pool-vetoed - but reclaim exists for
         # starved WAITING jobs, so drop actives from the trigger list.
-        active_ids = {str(job.get("job_id", job.get("id") or "")) for job in actives}
         blocked_by_capacity = [
             jid for jid in blocked_by_capacity if str(jid) not in active_ids
         ]
+    # Layer 3: also treat as capacity-blocked any WAITING job that DID produce
+    # candidates but whose every candidate footprint exceeds current free pool
+    # capacity (the lost-the-race face reclaim previously missed). Free counts
+    # here already reflect Layer 2's phantom reclamation.
+    free_by_pool: dict[tuple[str, str], int] = {}
+    for env_key, pools in specs.items():
+        for instance_type, spec in pools.items():
+            free_by_pool[(_env_key(env_key), str(instance_type))] = int(
+                spec.get("free_instances", 0) or 0
+            )
+
+    def _candidate_fits(cand: dict[str, Any]) -> bool:
+        cost = _ladder_capacity_cost(cand.get("ladder") or [], specs)
+        pool_needs = {k: v for k, v in cost.items() if isinstance(k, tuple) and k[:1] == ("pool",)}
+        if not pool_needs:
+            return True
+        return all(free_by_pool.get((k[1], k[2]), 0) >= v for k, v in pool_needs.items())
+
+    candidates_by_waiting: dict[str, list[dict[str, Any]]] = {}
+    for cand in candidates:
+        wid = str(cand.get("job_id") or "")
+        if wid in pending_ids and str(cand.get("type") or "place").lower() == "place":
+            candidates_by_waiting.setdefault(wid, []).append(cand)
+    already_blocked = set(blocked_by_capacity)
+    for wid, cands in candidates_by_waiting.items():
+        if wid in already_blocked or wid in active_ids:
+            continue
+        if not any(_candidate_fits(c) for c in cands):
+            blocked_by_capacity.append(wid)
+            diagnostics.setdefault(wid, []).append(
+                {
+                    "status": "capacity_contended",
+                    "reason": "candidates exist but none fit free pool capacity this tick",
+                }
+            )
+    blocked_by_capacity = sorted(set(blocked_by_capacity))
     if blocked_by_capacity:
-        reclaim_subjects: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+        reclaim_subjects: list[tuple[tuple[float, float, float], dict[str, Any], dict[str, Any]]] = []
+        # Observed per-rank utilization (defensive; empty when telemetry is
+        # unavailable, which keeps ordering to burst-risk then priority).
+        subject_util: dict[str, dict[str, Any]] = {}
+        _rmap = getattr(_CTX, "resource_map", None)
+        _liveness_fn = getattr(_rmap, "observed_replica_liveness", None)
+        if callable(_liveness_fn):
+            try:
+                subject_util = (
+                    _liveness_fn(
+                        None,
+                        {str(j.get("job_id", j.get("id") or "")) for j in actives},
+                    )
+                    or {}
+                )
+            except Exception:
+                subject_util = {}
         for job in actives:
             health = job.get("health") or {}
             if health.get("rehabilitation_eligible") is True:
@@ -5896,13 +5953,40 @@ def build_scored_candidates(
             current = _reclaim_current_rank(ladder)
             if current is None or int(current.get("n_replicas") or 1) < 2:
                 continue
+            # Burst gate: never shrink a live replica of a bursty online job -
+            # its extra replica is deliberate peak headroom, not waste.
+            subj_features = _job_features_for(snapshot, subject_id) or dict(
+                job.get("job_features") or {}
+            )
+            job_kind = str(subj_features.get("type") or job.get("kind") or "").lower()
+            try:
+                peak_to_mean = float(subj_features.get("peak_to_mean_ratio") or 1.0)
+            except (TypeError, ValueError):
+                peak_to_mean = 1.0
+            if job_kind == "online" and peak_to_mean >= _RECLAIM_BURST_PTM_MAX:
+                continue
+            burst_risk = peak_to_mean if job_kind == "online" else 0.0
+            rank_id = None
+            for chain in ladder:
+                candidate_rank = (chain.get("shape_json") or {}).get("rank_id") if isinstance(
+                    chain, dict
+                ) else None
+                if candidate_rank:
+                    rank_id = str(candidate_rank)
+                    break
+            avg_util = (subject_util.get(rank_id) or {}).get("avg_util") if rank_id else None
+            util_key = float(avg_util) if isinstance(avg_util, (int, float)) else 0.0
             try:
                 subject_priority = float(
                     (budgets.get(subject_id) or {}).get("priority_score", 1.0)
                 )
             except (TypeError, ValueError):
                 subject_priority = 1.0
-            reclaim_subjects.append((subject_priority, job, current))
+            # Prefer the safest shrink first: low burst-risk, then low observed
+            # utilization (genuinely over-provisioned), then lowest priority.
+            reclaim_subjects.append(
+                ((burst_risk, util_key, subject_priority), job, current)
+            )
         if not reclaim_subjects:
             # Observability: an empty subject scan must never be silent - it is
             # exactly the state this trigger exists to escape.

@@ -1393,9 +1393,28 @@ class KoiAgentHarness:
             if job_id in covered:
                 continue
             if state == "waiting":
-                plan.actions.append(PlanAction(job_id=job_id, type=ActionType.DEFER))
+                plan.actions.append(
+                    PlanAction(
+                        job_id=job_id,
+                        type=ActionType.DEFER,
+                        rationale=(
+                            "auto-filled coverage: waiting job the planner left out of "
+                            "the plan; deterministic floor deferred it to keep the cluster "
+                            "covered (typed capacity/budget reason in selection_diagnostics)"
+                        ),
+                    )
+                )
             else:
-                plan.actions.append(PlanAction(job_id=job_id, type=ActionType.KEEP))
+                plan.actions.append(
+                    PlanAction(
+                        job_id=job_id,
+                        type=ActionType.KEEP,
+                        rationale=(
+                            "auto-filled coverage: active job the planner left out of the "
+                            "plan; deterministic floor kept it running unchanged"
+                        ),
+                    )
+                )
             log.warning(
                 "job %s omitted from plan; auto-filled %s",
                 job_id,
