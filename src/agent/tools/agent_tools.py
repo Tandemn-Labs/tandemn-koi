@@ -5658,8 +5658,16 @@ def build_scored_candidates(
         )
     )
     if blocked_by_capacity:
-        reclaim_subjects: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
         actives = [job for job in (get_active_jobs() or []) if isinstance(job, dict)]
+        # Actives land in the blocked set too when the fleet is full - their
+        # ALTERNATE frames are trivially pool-vetoed - but reclaim exists for
+        # starved WAITING jobs, so drop actives from the trigger list.
+        active_ids = {str(job.get("job_id", job.get("id") or "")) for job in actives}
+        blocked_by_capacity = [
+            jid for jid in blocked_by_capacity if str(jid) not in active_ids
+        ]
+    if blocked_by_capacity:
+        reclaim_subjects: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
         for job in actives:
             health = job.get("health") or {}
             if health.get("rehabilitation_eligible") is True:
@@ -5667,7 +5675,10 @@ def build_scored_candidates(
             if str(health.get("status") or "").lower() == "critical":
                 continue
             subject_id = str(job.get("job_id", job.get("id") or ""))
-            if not subject_id or subject_id in exhausted:
+            # No `in exhausted` guard here: on a full fleet every active's
+            # alternate frames are pool-vetoed, putting healthy actives into
+            # exhausted - which is not a shrink disqualifier.
+            if not subject_id:
                 continue
             ladder = list(job.get("current_ladder") or job.get("active_chains") or [])
             current = _reclaim_current_rank(ladder)
