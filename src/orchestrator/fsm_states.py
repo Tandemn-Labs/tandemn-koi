@@ -1504,6 +1504,10 @@ class TickRunner:
 
     def _handle_s7(self, ctx: TickContext) -> None:
         """Sleep the remainder of the tick interval (no drift)."""
+        self._last_abort_signature = None
+        self._sleep_tick_remainder(ctx)
+
+    def _sleep_tick_remainder(self, ctx: TickContext) -> None:
         if self.tick_interval_sec <= 0:
             return
         elapsed = time.time() - ctx.tick_started_at
@@ -1514,20 +1518,38 @@ class TickRunner:
             log.warning("tick %d overran its interval by %.1fs", ctx.tick, -remaining)
 
     def _handle_abort(self, ctx: TickContext) -> None:
-        """Deploy the keep-all fallback after an unrecoverable error."""
-        try:
-            ctx.validated_plan = self._fallback_keep_all(ctx)
-            ctx.deploy_acks = self.executor.send_to_executor(ctx.validated_plan)
-        except Exception:
-            log.exception("keep-all fallback deploy failed; cluster held this tick")
+        """Hold the cluster safe after an unrecoverable error, at tick pace.
+
+        The first abort of a failure deploys the keep-all fallback; repeats of
+        the SAME failure skip the redeploy (the fallback is already the live
+        plan) so a persistent observe error cannot spam the executor, and the
+        abort path sleeps the tick remainder exactly like S7 so it cannot spin
+        (koi_debug_run_v4: 1,744 machine-speed aborts, 244 deployed plans).
+        """
+        signature = (
+            type(ctx.error).__name__ if ctx.error is not None else None,
+            str(ctx.error),
+            getattr(getattr(ctx, "aborted_from_state", None), "value", None),
+        )
+        if signature == getattr(self, "_last_abort_signature", None):
+            log.warning(
+                "repeat abort (%s); fallback already deployed, holding", signature[1]
+            )
+        else:
+            try:
+                ctx.validated_plan = self._fallback_keep_all(ctx)
+                ctx.deploy_acks = self.executor.send_to_executor(ctx.validated_plan)
+            except Exception:
+                log.exception("keep-all fallback deploy failed; cluster held this tick")
+            self._last_abort_signature = signature
         if self.trace is not None:
             persist_tick = getattr(self.trace, "persist_tick", None)
-            if not callable(persist_tick):
-                return
-            try:
-                persist_tick(ctx)
-            except Exception:
-                log.exception("trace persist failed at tick %d (abort)", ctx.tick)
+            if callable(persist_tick):
+                try:
+                    persist_tick(ctx)
+                except Exception:
+                    log.exception("trace persist failed at tick %d (abort)", ctx.tick)
+        self._sleep_tick_remainder(ctx)
 
     # ------------------------------------------------------------------
     # S2 helpers
