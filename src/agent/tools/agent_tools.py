@@ -244,6 +244,14 @@ UNSERVED_PENALTY = 1.0
 _SCARCITY_FREE_INSTANCE_THRESHOLD = 2
 _SCARCITY_MAX_REPLICAS = 2
 _RECLAIM_MAX_PER_TICK = 1
+
+# Footprint cap: candidate generation divides free capacity among this tick's
+# waiting jobs, and no single job is ever offered more than this fraction of
+# the whole fleet (koi_debug_run_v4: one job took 80 of 104 GPUs, a second took
+# 16, and the fourth arrival was deferred into a wall). Growth swaps let a
+# capped job expand later, when the queue drains.
+_FOOTPRINT_FLEET_FRACTION = 0.35
+_GROWTH_MAX_PER_TICK = 2
 _WORK_CONSERVING_GAIN_FLOOR = 1e-9
 # COST is a weighted OPTIMIZE objective (see compute_sigma), governed by the slow
 # loop's weight w_t["cost_per_token"] - the SAME code serves any market, only the
@@ -766,6 +774,36 @@ def _active_health_for(snapshot, job_id: str) -> dict[str, Any]:
         if job.get("job_id", job.get("id")) == job_id:
             return dict(job.get("health") or {})
     return {}
+
+
+def _predicted_active_tps(snapshot, job_id: str) -> float | None:
+    """Launch-time predicted total throughput of a job's active chains.
+
+    Real snapshots often carry no observed telemetry yet; the deploy path
+    stores each chain's predicted_y in shape_json, so summing the per-chain
+    throughput reconstructs what the deployment was sized to deliver.
+    """
+    if snapshot is None or not hasattr(snapshot, "active_jobs_summary"):
+        return None
+    for job in snapshot.active_jobs_summary() or []:
+        if job.get("job_id", job.get("id")) != job_id:
+            continue
+        total = 0.0
+        found = False
+        for chain in job.get("current_ladder") or job.get("active_chains") or []:
+            if not isinstance(chain, dict):
+                continue
+            shape = chain.get("shape_json")
+            shape = shape if isinstance(shape, dict) else chain
+            predicted = shape.get("predicted_y")
+            if not isinstance(predicted, dict):
+                continue
+            value = predicted.get(_THROUGHPUT_OBJ)
+            if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+                total += float(value)
+                found = True
+        return total if found else None
+    return None
 
 
 def _rank_prediction_payload(
@@ -3566,6 +3604,15 @@ def _keep_baseline_sigma(
     """Score the active deployment from observed service outcomes."""
     observed = dict(_active_health_for(snapshot, job_id).get("observed") or {})
     observed_tps = observed.get(_THROUGHPUT_OBJ)
+    predicted_basis = False
+    if observed_tps is None:
+        # Real snapshots attach no health/observed telemetry; without a
+        # baseline every under-served active scored keep=0 and no growth swap
+        # could ever win. Fall back to launch-time predicted throughput.
+        predicted = _predicted_active_tps(snapshot, job_id)
+        if predicted is not None:
+            observed_tps = predicted
+            predicted_basis = True
     # Under-service floor. The Tchebycheff baseline below normalizes the
     # throughput gap to at most 1.0, so a deployment serving 8% of its
     # requirement with clean latency scored roughly like one serving 92% - a
@@ -3576,7 +3623,9 @@ def _keep_baseline_sigma(
     # anything wins.
     under_service_floor = 0.0
     demand_visible = (
-        _job_mode(job_features) != "online" or float(observed.get("depth_req_q") or 0.0) > 0.0
+        predicted_basis
+        or _job_mode(job_features) != "online"
+        or float(observed.get("depth_req_q") or 0.0) > 0.0
     )
     if observed_tps is not None and demand_visible:
         try:
@@ -4215,6 +4264,55 @@ def _replica_options(cap: int) -> list[int]:
     return options
 
 
+def _fleet_gpu_capacity(resources: dict[str, Any]) -> tuple[int, int]:
+    """(free_gpus, total_gpus) across every pool in the resource map.
+
+    Totals come from merged_pool_sources; a pool reporting no total contributes
+    its free count, so the ceiling degrades toward free-only, never overcounts.
+    """
+    free = 0
+    total = 0
+    for info in (resources or {}).values():
+        if not isinstance(info, dict):
+            continue
+        try:
+            free += max(0, int(info.get("free", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        for pool in info.get("pools") or []:
+            if not isinstance(pool, dict):
+                continue
+            pool_total = 0
+            for source in pool.get("merged_pool_sources") or []:
+                if isinstance(source, dict):
+                    try:
+                        pool_total += max(0, int(source.get("total", 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+            if pool_total <= 0:
+                try:
+                    pool_total = max(0, int(pool.get("total", pool.get("free", 0)) or 0))
+                except (TypeError, ValueError):
+                    pool_total = 0
+            total += pool_total
+    return free, max(total, free)
+
+
+def _per_job_gpu_cap(free_gpus: int, waiting_count: int, total_gpus: int) -> int:
+    """Footprint cap in GPUs for one job this tick.
+
+    Divide free capacity among the waiting jobs, and never hand one job more
+    than _FOOTPRINT_FLEET_FRACTION of the fleet even when it waits alone.
+    Generation still guarantees at least one replica of any valid geometry, so
+    the cap shapes candidates without ever zeroing a job out.
+    """
+    ceiling = max(1, math.ceil(_FOOTPRINT_FLEET_FRACTION * max(0, total_gpus)))
+    if free_gpus <= 0:
+        return ceiling
+    share = math.ceil(free_gpus / max(1, waiting_count))
+    return max(1, min(share, ceiling))
+
+
 def _generated_tp_options(
     *,
     heads: int | None,
@@ -4830,8 +4928,40 @@ def _score_one_frame(
     return {"candidate": act, "meets_target": meets, "diag": diag}
 
 
+def _cap_composite_ranks(
+    scored_ranks: list[dict[str, Any]], gpu_cap: int
+) -> list[dict[str, Any]]:
+    """Trim a composite's rank list to the per-job footprint cap, in order.
+
+    Whole ranks are included while they fit; a rank that does not fit is shrunk
+    to the replicas that do (dropped when not even one fits).
+    """
+    capped: list[dict[str, Any]] = []
+    used = 0
+    for rank in scored_ranks:
+        per_replica = int((rank.get("config") or {}).get("gpu_count") or 1)
+        replicas = int(rank.get("n_replicas") or 1)
+        if per_replica <= 0 or replicas <= 0:
+            continue
+        room = gpu_cap - used
+        fit = min(replicas, room // per_replica) if room >= per_replica else 0
+        if fit < 1:
+            continue
+        if fit != replicas:
+            rank = dict(rank)
+            rank["n_replicas"] = fit
+        capped.append(rank)
+        used += fit * per_replica
+    return capped
+
+
 def _score_composite(
-    jid: str, user_id: Any, slice_id: Any, ranks: list[dict[str, Any]], features: dict[str, Any]
+    jid: str,
+    user_id: Any,
+    slice_id: Any,
+    ranks: list[dict[str, Any]],
+    features: dict[str, Any],
+    gpu_cap: int | None = None,
 ) -> dict[str, Any]:
     """Score ONE heterogeneous, data-parallel multi-rank ladder for a job.
 
@@ -4867,6 +4997,8 @@ def _score_composite(
         sr = dict(rank)
         sr["mechanism_id"] = mid
         scored_ranks.append(sr)
+    if gpu_cap is not None and gpu_cap > 0:
+        scored_ranks = _cap_composite_ranks(scored_ranks, gpu_cap)
     if len(scored_ranks) < 2:
         diag.update(
             status="no_composite", reason=f"only {len(scored_ranks)} runnable rank(s) to combine"
@@ -5198,11 +5330,47 @@ def build_scored_candidates(
     blocked_by_job: dict[str, dict[str, Any]] = {}
     attempted_identities_by_job: dict[str, list[Any]] = {}
     pending_jobs = list(get_pending_jobs())
+    fleet_free_gpus, fleet_total_gpus = _fleet_gpu_capacity(resources)
+    job_cap_gpus = _per_job_gpu_cap(fleet_free_gpus, len(pending_jobs), fleet_total_gpus)
+    all_actives = [job for job in get_active_jobs() if isinstance(job, dict)]
     active_rehabilitation = [
         job
-        for job in get_active_jobs()
+        for job in all_actives
         if (job.get("health") or {}).get("rehabilitation_eligible") is True
     ]
+    # Growth path: real snapshots attach no health dict, so a healthy active
+    # admitted below the footprint cap would otherwise never re-enter scoring
+    # and could never be grown once the queue drains. Bounded: the smallest
+    # under-cap single-rank actives, at most _GROWTH_MAX_PER_TICK per tick;
+    # their frames score as ordinary SWAPs and survive only on positive gain
+    # over the keep baseline.
+    rehab_ids = {str(j.get("job_id", j.get("id") or "")) for j in active_rehabilitation}
+    growth_jobs: list[dict[str, Any]] = []
+    growth_ids: set[str] = set()
+    if fleet_free_gpus > 0:
+        growth_pool: list[tuple[int, dict[str, Any]]] = []
+        for job in all_actives:
+            growth_jid = str(job.get("job_id", job.get("id") or ""))
+            if not growth_jid or growth_jid in rehab_ids:
+                continue
+            if str(job.get("status") or "running").lower() not in {"running", "active"}:
+                continue
+            current = _reclaim_current_rank(
+                list(job.get("current_ladder") or job.get("active_chains") or [])
+            )
+            if current is None:
+                continue
+            current_cfg = current.get("config") or {}
+            current_gpus = int(current.get("n_replicas") or 1) * int(
+                current_cfg.get("gpu_count") or 1
+            )
+            if current_gpus >= job_cap_gpus:
+                continue
+            growth_pool.append((current_gpus, job))
+        growth_pool.sort(key=lambda item: item[0])
+        for _current_gpus, job in growth_pool[:_GROWTH_MAX_PER_TICK]:
+            growth_jobs.append(job)
+            growth_ids.add(str(job.get("job_id", job.get("id") or "")))
     pending_ids = {str(job.get("job_id", job.get("id"))) for job in pending_jobs}
     # Read once per tick: per-GPU memory for the generated PP gate comes from the
     # same catalog deployment X uses, so the pre-rank check and the X check agree.
@@ -5220,7 +5388,9 @@ def build_scored_candidates(
             priority = 0.0
         return -priority, job_id
 
-    candidate_jobs = sorted([*pending_jobs, *active_rehabilitation], key=job_order)
+    candidate_jobs = sorted(
+        [*pending_jobs, *active_rehabilitation, *growth_jobs], key=job_order
+    )
     for job in candidate_jobs:
         jid = job.get("job_id", job.get("id"))
         if not jid:
@@ -5272,10 +5442,18 @@ def build_scored_candidates(
                 continue
         for raw in (spec_by_job.get(jid) or {}).get("ladder") or []:
             rank = _normalize_candidate_rank(raw)
-            if rank is not None and _deployment_shape_key(rank) not in seen:
-                rank["proposal_source"] = "specialist"
-                seen.add(_deployment_shape_key(rank))
-                frames.append(rank)
+            if rank is None or _deployment_shape_key(rank) in seen:
+                continue
+            rank_gpus = int(rank.get("n_replicas") or 1) * int(
+                (rank.get("config") or {}).get("gpu_count") or 1
+            )
+            if rank_gpus > job_cap_gpus:
+                # Footprint cap: oversize specialist proposals are dropped; the
+                # generated menu below always offers capped alternatives.
+                continue
+            rank["proposal_source"] = "specialist"
+            seen.add(_deployment_shape_key(rank))
+            frames.append(rank)
         # For every pool, enumerate bounded fixed-DP alternatives. Direct evaluates
         # each exact frame; size_ladder never mutates a specialist's replica count.
         # a 1-GPU box -> tp=1 (right for small models), an 8-GPU box -> tp=8 (right
@@ -5354,6 +5532,11 @@ def build_scored_candidates(
                         # later arrival (the real fleet's 14-box lockout). Inert
                         # whenever the pool still has free boxes to spare.
                         max_replicas = min(max_replicas, _SCARCITY_MAX_REPLICAS)
+                    # Footprint cap: one job's frame may not exceed its share of
+                    # free capacity this tick (one replica always stays offered).
+                    max_replicas = min(
+                        max_replicas, max(1, job_cap_gpus // max(1, capacity_per_replica))
+                    )
                     replica_options = _replica_options(max_replicas) if slice_ else [1]
                     for replicas in replica_options:
                         rank = _normalize_candidate_rank(
@@ -5562,7 +5745,9 @@ def build_scored_candidates(
                     for identity in attempted_identities_by_job.get(jid, [])
                 ):
                     continue
-                composite = _score_composite(jid, user_id, slice_id, order, features)
+                composite = _score_composite(
+                    jid, user_id, slice_id, order, features, gpu_cap=job_cap_gpus
+                )
                 scored_by_job[jid].append(composite)
                 if composite.get("diag", {}).get("status") == "budget_exhausted":
                     budget_exhausted = True
@@ -5642,6 +5827,14 @@ def build_scored_candidates(
             exhausted[jid] = (
                 "; ".join(dict.fromkeys(reasons)) if reasons else "no runnable, feasible frame"
             )
+
+    if growth_ids:
+        for cand in candidates:
+            if (
+                str(cand.get("job_id") or "") in growth_ids
+                and str(cand.get("type") or "").lower() == "swap"
+            ):
+                cand["growth_swap"] = True
 
     # Capacity reclamation (koi-side only): when waiting jobs are exhausted by
     # no_pool_capacity, offer the joint solver shrink-one-replica SWAPs on
@@ -6115,6 +6308,24 @@ def jointly_select_placements(
                 return None
         return fraction
 
+    current_deployment_cost: dict[str, dict[tuple, int]] = {}
+    if any(isinstance(c, dict) and c.get("growth_swap") for c in candidates or []):
+        for active_job in get_active_jobs() or []:
+            if not isinstance(active_job, dict):
+                continue
+            active_jid = str(active_job.get("job_id", active_job.get("id") or ""))
+            current = _reclaim_current_rank(
+                list(
+                    active_job.get("current_ladder")
+                    or active_job.get("active_chains")
+                    or []
+                )
+            )
+            if active_jid and current is not None:
+                current_deployment_cost[active_jid] = _ladder_capacity_cost(
+                    [current], specs
+                )
+
     # Group scored candidates by job, attaching each frame's per-env GPU cost and
     # its GAIN over deferring that job. Under-target frames only avoid the defer
     # penalty in proportion to delivered throughput; a 50%-served frame is not the
@@ -6131,6 +6342,16 @@ def jointly_select_placements(
             # already holds: it consumes no free capacity this tick, and the
             # one-per-tick reclaim cap replaces the churn swap budget B_t.
             cost = {}
+        elif cand.get("growth_swap"):
+            # A growth swap replaces the job's current deployment; charge only
+            # the delta above what it already holds (steady-state accounting -
+            # the executor owns the transition).
+            held = current_deployment_cost.get(str(cand.get("job_id") or ""), {})
+            cost = {
+                key: need - held.get(key, 0)
+                for key, need in cost.items()
+                if need - held.get(key, 0) > 0
+            }
         elif not cost:
             continue  # no real GPU footprint -> not a placeable frame
         served_fraction = candidate_served_fraction(cand)
@@ -6500,6 +6721,28 @@ def check_feasibility(plan) -> dict[str, Any]:
                 if not ok_cfg:
                     feasible = False
                     violations.append(f"job {action.job_id} rank {i}: {reason}")
+    # Footprint ceiling, PLACE only: no single placement may hold more than
+    # _FOOTPRINT_FLEET_FRACTION of the fleet (koi_debug_run_v4: an 80-of-104-GPU
+    # single-job ladder validated cleanly). Swaps are exempt so an oversize
+    # legacy deployment can still be shrunk.
+    _free_gpus, fleet_total_gpus = _fleet_gpu_capacity(get_resource_map())
+    if fleet_total_gpus > 0:
+        ceiling = max(1, math.ceil(_FOOTPRINT_FLEET_FRACTION * fleet_total_gpus))
+        for action in typed.actions:
+            if action.type != ActionType.PLACE or not action.ladder:
+                continue
+            try:
+                ladder_gpus = sum(int(rank.total_gpus()) for rank in action.ladder)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if ladder_gpus > ceiling:
+                feasible = False
+                violations.append(
+                    f"job {action.job_id}: ladder holds {ladder_gpus} GPUs, above "
+                    f"the per-job footprint ceiling of {ceiling} "
+                    f"({int(_FOOTPRINT_FLEET_FRACTION * 100)}% of the "
+                    f"{fleet_total_gpus}-GPU fleet)"
+                )
     # Return BOTH keys (ok + feasible) so either planner convention reads it
     # right - check_feasibility historically used "feasible" while every other
     # validation tool uses "ok"; exposing both removes that footgun.
