@@ -5045,6 +5045,71 @@ def _empty_frame_result(status: str, reason: str, **details: Any) -> dict[str, A
     }
 
 
+def _reclaim_current_rank(ladder):
+    """The single current rank of a shrinkable deployment, with dp restored.
+
+    Accepts both ladder encodings. Plan/sim-style ladders keep one rank dict
+    that carries n_replicas. The real executor materializes dp as one chain
+    row per replica (resource_map expands a rank with n_replicas=N into N
+    entries whose shape_json repeats the rank_id), so there dp survives only
+    as chain multiplicity. Returns a normalized rank whose n_replicas is the
+    actual replica count, or None when the deployment is not a simple shrink
+    subject: empty, malformed, multi-rank, or any replica not running.
+    """
+    entries = list(ladder or [])
+    if not entries or not all(isinstance(e, dict) for e in entries):
+        return None
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    for entry in entries:
+        shape = entry.get("shape_json")
+        shape = shape if isinstance(shape, dict) else {}
+        cfg = entry.get("config")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        rank_id = shape.get("rank_id") or entry.get("rank_id")
+        src = shape or cfg
+        key: Any
+        if rank_id:
+            key = ("rank", str(rank_id))
+        else:
+            key = (
+                "shape",
+                tuple(src.get("env") or entry.get("env") or []),
+                src.get("instance_type"),
+                src.get("gpu_count") or src.get("count"),
+                src.get("tp"),
+                src.get("pp"),
+            )
+        groups.setdefault(key, []).append(entry)
+    if len(groups) != 1:
+        return None
+    chains = next(iter(groups.values()))
+    if any(str(c.get("chain_status") or "running").lower() != "running" for c in chains):
+        return None
+    head = chains[0]
+    current = _normalize_candidate_rank(head)
+    if current is None and isinstance(head.get("shape_json"), dict):
+        shape = head["shape_json"]
+        current = _normalize_candidate_rank(
+            {
+                "role": "aggregate",
+                "env": shape.get("env"),
+                "config": {
+                    "instance_type": shape.get("instance_type"),
+                    "gpu_count": shape.get("gpu_count") or shape.get("count"),
+                    "tp": shape.get("tp"),
+                    "pp": shape.get("pp"),
+                },
+                "n_replicas": head.get("n_replicas")
+                or shape.get("n_replicas")
+                or len(chains),
+            }
+        )
+    if current is None:
+        return None
+    current["n_replicas"] = max(int(current.get("n_replicas") or 1), len(chains))
+    return current
+
+
 def build_scored_candidates(
     budget_book: dict[str, Any] | None = None,
     specialist_results: Any = None,
@@ -5594,7 +5659,8 @@ def build_scored_candidates(
     )
     if blocked_by_capacity:
         reclaim_subjects: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
-        for job in get_active_jobs():
+        actives = [job for job in (get_active_jobs() or []) if isinstance(job, dict)]
+        for job in actives:
             health = job.get("health") or {}
             if health.get("rehabilitation_eligible") is True:
                 continue
@@ -5604,29 +5670,7 @@ def build_scored_candidates(
             if not subject_id or subject_id in exhausted:
                 continue
             ladder = list(job.get("current_ladder") or job.get("active_chains") or [])
-            if len(ladder) != 1:
-                continue
-            raw_rank = ladder[0]
-            current = _normalize_candidate_rank(raw_rank)
-            if (
-                current is None
-                and isinstance(raw_rank, dict)
-                and isinstance(raw_rank.get("shape_json"), dict)
-            ):
-                shape = raw_rank["shape_json"]
-                current = _normalize_candidate_rank(
-                    {
-                        "role": "aggregate",
-                        "env": shape.get("env"),
-                        "config": {
-                            "instance_type": shape.get("instance_type"),
-                            "gpu_count": shape.get("gpu_count") or shape.get("count"),
-                            "tp": shape.get("tp"),
-                            "pp": shape.get("pp"),
-                        },
-                        "n_replicas": raw_rank.get("n_replicas") or shape.get("n_replicas"),
-                    }
-                )
+            current = _reclaim_current_rank(ladder)
             if current is None or int(current.get("n_replicas") or 1) < 2:
                 continue
             try:
@@ -5636,6 +5680,20 @@ def build_scored_candidates(
             except (TypeError, ValueError):
                 subject_priority = 1.0
             reclaim_subjects.append((subject_priority, job, current))
+        if not reclaim_subjects:
+            # Observability: an empty subject scan must never be silent - it is
+            # exactly the state this trigger exists to escape.
+            for blocked_id in blocked_by_capacity:
+                diagnostics.setdefault(blocked_id, []).append(
+                    {
+                        "status": "reclaim_no_subjects",
+                        "reason": (
+                            "capacity reclaim stood down: no healthy running "
+                            "single-rank multi-replica active among "
+                            f"{len(actives)} actives to shrink"
+                        ),
+                    }
+                )
         reclaim_subjects.sort(key=lambda item: item[0])
         for _subject_priority, job, current in reclaim_subjects[:3]:
             subject_id = str(job.get("job_id", job.get("id")))
