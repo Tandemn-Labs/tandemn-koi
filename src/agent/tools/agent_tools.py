@@ -2015,6 +2015,7 @@ def size_ladder(
     job_features: dict[str, Any],
     target_tps: float | None = None,
     utilization_target: float | None = None,
+    capacity_credit: dict[tuple[str, Any], int] | None = None,
 ) -> dict[str, Any]:
     """Evaluate fixed-rank proposals with Direct point estimates.
 
@@ -2301,9 +2302,13 @@ def size_ladder(
             }
             capacity_per_replica = max(1, gpus_per_chain)
         pool_key = (env_key, allocation["instance_type"])
-        free = remaining_by_pool.setdefault(
-            pool_key, int(allocation.get("free_capacity_gpus", env_free))
-        )
+        base_free = int(allocation.get("free_capacity_gpus", env_free))
+        if capacity_credit:
+            # A reclaim shrink re-uses GPUs its job already holds; the caller
+            # credits that current allocation so the shrunk frame is not
+            # pool-vetoed on a full fleet (free counts exclude held instances).
+            base_free += int(capacity_credit.get(pool_key, 0) or 0)
+        free = remaining_by_pool.setdefault(pool_key, base_free)
         max_by_cap = free // capacity_per_replica if capacity_per_replica > 0 else 0
 
         runnable, validity_reason = config_runnable(
@@ -4582,6 +4587,7 @@ def _score_one_frame(
     features: dict[str, Any],
     action_type: str = "place",
     budget_exempt: bool = False,
+    capacity_credit: dict[tuple[str, Any], int] | None = None,
 ) -> dict[str, Any]:
     """The proven per-frame pipeline: runnable -> mechanism -> size_ladder ->
     feasibility -> per-job sigma. Returns {candidate|None, meets_target, diag}."""
@@ -4628,7 +4634,7 @@ def _score_one_frame(
         diag.update(status="resource_budget", reason="; ".join(budget_errors)[:200])
         return {"candidate": None, "meets_target": False, "diag": diag}
     try:
-        sized = size_ladder([scored_rank], features)
+        sized = size_ladder([scored_rank], features, capacity_credit=capacity_credit)
     except SurrogateBudgetExceeded as exc:
         diag.update(status="budget_exhausted", reason=str(exc))
         return {"candidate": None, "meets_target": False, "diag": diag}
@@ -5716,6 +5722,16 @@ def build_scored_candidates(
             )
             features["_active_health"] = copy.deepcopy(job.get("health") or {})
             slice_ = budgets.get(subject_id) or {}
+            # Credit the subject's current whole-instance allocation: the shrink
+            # occupies a strict subset of it, so scoring must not demand free
+            # pool capacity (there is none on the ticks reclaim exists for).
+            current_cfg = current.get("config") or {}
+            reclaim_credit = {
+                (_env_key(current.get("env")), current_cfg.get("instance_type")): (
+                    int(current.get("n_replicas") or 1)
+                    * int(current_cfg.get("gpu_count") or 1)
+                )
+            }
             try:
                 outcome = _score_one_frame(
                     subject_id,
@@ -5725,6 +5741,7 @@ def build_scored_candidates(
                     features,
                     action_type="swap",
                     budget_exempt=True,
+                    capacity_credit=reclaim_credit,
                 )
             except SurrogateBudgetExceeded as exc:
                 # Reclaim runs after the main loop, so on a budget-spent tick it
@@ -6109,7 +6126,12 @@ def jointly_select_placements(
         if not candidate_job_id:
             continue
         cost = _ladder_capacity_cost(cand.get("ladder") or [], specs)
-        if not cost:
+        if cand.get("capacity_reclaim"):
+            # A reclaim shrink occupies a strict subset of the GPUs its job
+            # already holds: it consumes no free capacity this tick, and the
+            # one-per-tick reclaim cap replaces the churn swap budget B_t.
+            cost = {}
+        elif not cost:
             continue  # no real GPU footprint -> not a placeable frame
         served_fraction = candidate_served_fraction(cand)
         if served_fraction is None:
@@ -6213,7 +6235,9 @@ def jointly_select_placements(
                 "normal_gain": 0.0 if cand.get("work_conserving_floor") else gain,
                 "stable_floor_value": (penalty(candidate_job_id) if floor_tier == 1 else 0.0),
                 "exploratory_floor_value": (penalty(candidate_job_id) if floor_tier == 2 else 0.0),
-                "swap_count": 1 if is_swap else 0,
+                "swap_count": (
+                    0 if cand.get("capacity_reclaim") else (1 if is_swap else 0)
+                ),
                 "stranded": _ladder_stranded_gpus(cand.get("ladder"), specs),
             }
         )

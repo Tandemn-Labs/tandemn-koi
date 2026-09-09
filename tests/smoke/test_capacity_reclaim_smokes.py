@@ -52,10 +52,12 @@ def _reclaim(job_id: str, gain: float) -> dict:
     }
 
 
-def _joint(candidates, free_instances=8, free_gpus=8):
+def _joint(candidates, free_instances=8, free_gpus=8, swap_budget=2):
     resources = {ENV: {"free": free_gpus, "gpu_type": "H100"}}
     specs = {ENV: {"p5": {"gpus_per_instance": 8, "free_instances": free_instances}}}
-    slow_loop = type("SlowLoop", (), {"get_sss_swap_budget_t": lambda self: 2})()
+    slow_loop = type(
+        "SlowLoop", (), {"get_sss_swap_budget_t": lambda self: swap_budget}
+    )()
     with (
         patch.object(agent_tools._CTX, "resource_map", object()),
         patch.object(agent_tools._CTX, "slow_loop", slow_loop),
@@ -129,6 +131,27 @@ class StrandedSlotSmokeTests(unittest.TestCase):
         chosen = [c for c in result["chosen"] if c.get("job_id") == "j"]
         self.assertEqual(len(chosen), 1)
         self.assertEqual(chosen[0]["marker"], "tight")
+
+
+class ReclaimFullFleetSmokeTests(unittest.TestCase):
+    """Run-16 regression: on a fully committed fleet (0 free instances, 0 free
+    GPUs, and even a spent swap budget) a reclaim shrink must still be chosen -
+    it occupies a strict subset of GPUs its job already holds."""
+
+    def test_reclaim_swap_survives_a_fully_committed_fleet(self):
+        result = _joint([_reclaim("busy", -2.0)], free_instances=0, free_gpus=0)
+        chosen = [c for c in result["chosen"] if c.get("job_id") == "busy"]
+        self.assertEqual(len(chosen), 1)
+        self.assertTrue(chosen[0].get("capacity_reclaim"))
+
+    def test_reclaim_swap_is_exempt_from_the_churn_swap_budget(self):
+        result = _joint(
+            [_reclaim("busy", -2.0)], free_instances=0, free_gpus=0, swap_budget=0
+        )
+        self.assertEqual(
+            [c.get("job_id") for c in result["chosen"] if c.get("capacity_reclaim")],
+            ["busy"],
+        )
 
 
 class ReclaimRankReconstructionSmokeTests(unittest.TestCase):
