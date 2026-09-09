@@ -4581,6 +4581,7 @@ def _score_one_frame(
     rank: dict[str, Any],
     features: dict[str, Any],
     action_type: str = "place",
+    budget_exempt: bool = False,
 ) -> dict[str, Any]:
     """The proven per-frame pipeline: runnable -> mechanism -> size_ladder ->
     feasibility -> per-job sigma. Returns {candidate|None, meets_target, diag}."""
@@ -4609,7 +4610,10 @@ def _score_one_frame(
         return {"candidate": None, "meets_target": False, "diag": diag}
     scored_rank = dict(rank)
     scored_rank["mechanism_id"] = mid
-    budget_errors = _candidate_budget_errors(
+    # budget_exempt: a capacity-reclaim shrink strictly reduces the resources of
+    # a deployment the validated book already tolerates, and healthy actives
+    # hold no BudgetSlice of their own - the slice check would reject them all.
+    budget_errors = [] if budget_exempt else _candidate_budget_errors(
         jid,
         {
             "job_id": jid,
@@ -4787,7 +4791,7 @@ def _score_one_frame(
         )
     one = {"tick_rationale": "candidate scoring", "actions": [act]}
     try:
-        budget_errors = _candidate_budget_errors(jid, act)
+        budget_errors = [] if budget_exempt else _candidate_budget_errors(jid, act)
         if budget_errors:
             diag.update(status="resource_budget", reason="; ".join(budget_errors)[:200])
             return {"candidate": None, "meets_target": meets, "diag": diag}
@@ -5574,9 +5578,20 @@ def build_scored_candidates(
     # Bounded: lowest-priority subjects first, at most three scored, and the
     # joint solver admits at most _RECLAIM_MAX_PER_TICK of them, floored below
     # every real gain. Inert whenever nothing is capacity-blocked.
-    blocked_by_capacity = [
-        jid for jid, reason in exhausted.items() if "no_pool_capacity" in str(reason)
-    ]
+    # A capacity-blocked job is one that produced ZERO candidates while at least
+    # one of its frames was hard-rejected with status no_pool_capacity.  The
+    # exhausted map only carries joined reason TEXTS ("no free capacity in
+    # pool"), and a blocked job can also land in budget_limited when the
+    # surrogate budget ran out first, so key on diagnostics statuses instead.
+    jobs_with_candidates = {str(c.get("job_id") or "") for c in candidates}
+    blocked_by_capacity = sorted(
+        jid
+        for jid, job_diags in diagnostics.items()
+        if str(jid) not in jobs_with_candidates
+        and any(
+            isinstance(d, dict) and d.get("status") == "no_pool_capacity" for d in job_diags
+        )
+    )
     if blocked_by_capacity:
         reclaim_subjects: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
         for job in get_active_jobs():
@@ -5632,14 +5647,28 @@ def build_scored_candidates(
             )
             features["_active_health"] = copy.deepcopy(job.get("health") or {})
             slice_ = budgets.get(subject_id) or {}
-            outcome = _score_one_frame(
-                subject_id,
-                job.get("user_id") or features.get("user_id"),
-                slice_.get("slice_id", subject_id),
-                shrunk,
-                features,
-                action_type="swap",
-            )
+            try:
+                outcome = _score_one_frame(
+                    subject_id,
+                    job.get("user_id") or features.get("user_id"),
+                    slice_.get("slice_id", subject_id),
+                    shrunk,
+                    features,
+                    action_type="swap",
+                    budget_exempt=True,
+                )
+            except SurrogateBudgetExceeded as exc:
+                # Reclaim runs after the main loop, so on a budget-spent tick it
+                # simply stands down and tries again next tick.
+                diagnostics.setdefault(subject_id, []).append(
+                    {"status": "budget_exhausted", "reason": f"reclaim skipped: {exc}"}
+                )
+                break
+            except Exception as exc:
+                diagnostics.setdefault(subject_id, []).append(
+                    {"status": "score_error", "reason": f"reclaim scoring failed: {exc}"}
+                )
+                continue
             diagnostics.setdefault(subject_id, []).append(outcome["diag"])
             reclaim_candidate = outcome.get("candidate")
             if reclaim_candidate is not None:
