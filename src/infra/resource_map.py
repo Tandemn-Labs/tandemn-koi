@@ -164,6 +164,133 @@ class ResourceMapManager:
         return datetime.now(UTC) - timedelta(seconds=self._rank_failure_history_seconds)
 
     # ------------------------------------------------------------------
+    # Live-state reconciliation (Layer 2): reserve LIVE replicas, not the
+    # committed n_replicas. The store tracks status per rank_id, not per
+    # replica, so a rank whose second replica never materialized stays
+    # RUNNING and koi reserved a whole box that sits physically empty
+    # (real100gpubenchmark run-17: one H100 and one A100-80 held by dead
+    # replicas of 8YFER0 / 9R10Y5, starving GLM/phi). gpu_metrics carry
+    # (rank_id, chain_index), so per-replica liveness IS observable.
+    # ------------------------------------------------------------------
+    _REPLICA_LIVENESS_WINDOW_SECONDS = 2 * DEFAULT_TICK_INTERVAL_SECONDS
+    _REPLICA_GRACE = timedelta(seconds=2 * DEFAULT_TICK_INTERVAL_SECONDS)
+
+    def observed_replica_liveness(
+        self,
+        user_id: str | None,
+        job_ids,
+        window_seconds: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Per-rank live replicas + mean SM utilization from recent telemetry.
+
+        Returns ``{rank_id: {"live_indexes": set[int], "avg_util": float|None}}``
+        over the last ``window_seconds`` (default two ticks). A replica counts
+        as LIVE if it emitted any gpu_metric row in the window - liveness, not
+        activity - so an idle-but-alive low-traffic replica is never mistaken
+        for dead. Fully defensive: any store failure yields ``{}`` so callers
+        fall back to trusting the committed plan (keeps sim inert).
+        """
+        result: dict[str, dict[str, Any]] = {}
+        ids = {str(j) for j in (job_ids or []) if j}
+        if not ids:
+            return result
+        try:
+            from tandemn_system_data.clients import GpuMetricStore  # type: ignore
+
+            store = GpuMetricStore(self._client())
+            effective_user = self._effective_user_id(user_id)
+        except Exception:
+            return result
+        seconds = int(window_seconds or self._REPLICA_LIVENESS_WINDOW_SECONDS)
+        end = datetime.now(UTC)
+        start = end - timedelta(seconds=seconds)
+        for job_id in ids:
+            try:
+                rows = store.rows_for_job_window(effective_user, job_id, start, end)
+            except Exception:
+                continue
+            for row in rows or []:
+                rank_id = getattr(row, "rank_id", None)
+                chain_index = getattr(row, "chain_index", None)
+                if rank_id is None or chain_index is None:
+                    continue
+                if isinstance(chain_index, bool) or not isinstance(chain_index, int):
+                    continue
+                entry = result.setdefault(
+                    str(rank_id),
+                    {"live_indexes": set(), "_util_sum": 0.0, "_util_n": 0},
+                )
+                entry["live_indexes"].add(int(chain_index))
+                util = getattr(row, "sm_utilization", None)
+                if isinstance(util, (int, float)) and not isinstance(util, bool):
+                    entry["_util_sum"] += float(util)
+                    entry["_util_n"] += 1
+        for entry in result.values():
+            n = entry.pop("_util_n", 0)
+            total = entry.pop("_util_sum", 0.0)
+            entry["avg_util"] = (total / n) if n else None
+        return result
+
+    @staticmethod
+    def _as_utc(value) -> datetime | None:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=UTC)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        return None
+
+    def _phantom_chain_ids(self, chains, user_id: str | None) -> set[str]:
+        """Chain ids whose replica is DEAD - reserved but physically absent.
+
+        A chain is reaped only when its rank has at least one live replica
+        (positive-contrast: the telemetry channel works for this rank), the
+        rank is older than the 2-tick launch grace, and this replica emitted
+        nothing in the window. Never reaps a whole silent rank (fail-safe for
+        sim, monitoring gaps, and cold starts - a fully-dead rank is handled
+        by the store's active-status filter instead).
+        """
+        by_rank: dict[str, list[dict[str, Any]]] = {}
+        job_ids: set[str] = set()
+        for chain in chains:
+            shape = chain.get("shape_json") or {}
+            rank_id = shape.get("rank_id")
+            if not rank_id:
+                continue
+            by_rank.setdefault(str(rank_id), []).append(chain)
+            if chain.get("job_id"):
+                job_ids.add(str(chain.get("job_id")))
+        if not by_rank:
+            return set()
+        live = self.observed_replica_liveness(user_id, job_ids)
+        if not live:
+            return set()
+        now = datetime.now(UTC)
+        reap: set[str] = set()
+        for rank_id, members in by_rank.items():
+            live_indexes = (live.get(rank_id) or {}).get("live_indexes") or set()
+            if not live_indexes:
+                continue  # fail-safe: no telemetry for this rank -> trust commit
+            for chain in members:
+                created = self._as_utc(chain.get("rank_created_at"))
+                if created is not None and (now - created) < self._REPLICA_GRACE:
+                    continue  # launch grace: young rank, replicas may be cold-starting
+                index = chain.get("chain_index")
+                if index is None:
+                    tail = str(chain.get("chain_id") or "").rsplit("_chain_", 1)
+                    index = int(tail[1]) if len(tail) == 2 and tail[1].isdigit() else None
+                if index is None:
+                    continue
+                if int(index) not in live_indexes:
+                    chain_id = chain.get("chain_id")
+                    if chain_id:
+                        reap.add(str(chain_id))
+        return reap
+
+    # ------------------------------------------------------------------
     # Jobs and chains
     # ------------------------------------------------------------------
 
@@ -265,9 +392,11 @@ class ResourceMapManager:
         return [
             {
                 "chain_id": chain_id_for_rank(rank_id, chain_index),
+                "chain_index": chain_index,
                 "plan_id": raw.get("plan_id"),
                 "role": raw.get("role"),
                 "chain_status": raw.get("status"),
+                "rank_created_at": raw.get("created_at"),
                 "shape_json": dict(shape),
                 "target_node": shape.get("target_node"),
             }
@@ -446,7 +575,13 @@ class ResourceMapManager:
         used_gpus: dict[str, int] = {}
         used_instances: dict[tuple[str, str], int] = {}
         used_pool_gpus: dict[tuple[str, str], int] = {}
-        for chain in self.get_running_chains(user_id=user_id):
+        running_chains = list(self.get_running_chains(user_id=user_id))
+        # Layer 2: drop reservations for dead replicas so a box held by a
+        # phantom replica is returned to free capacity.
+        phantom_chain_ids = self._phantom_chain_ids(running_chains, user_id)
+        for chain in running_chains:
+            if chain.get("chain_id") in phantom_chain_ids:
+                continue
             shape = chain.get("shape_json") or {}
             raw_env = (
                 chain.get("target_node")
