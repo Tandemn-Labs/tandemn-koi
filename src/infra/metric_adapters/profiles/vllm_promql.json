@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "source": "vllm",
+  "language": "promql",
+  "queries": {
+    "p99_ttft_ms": "histogram_quantile(0.99, sum by (le, job_id, rank_id, chain_index) (rate(vllm:time_to_first_token_seconds_bucket{target}[5m]))) * 1000",
+    "p99_tpot_ms": "histogram_quantile(0.99, sum by (le, job_id, rank_id, chain_index) (rate(vllm:request_time_per_output_token_seconds_bucket{target}[5m]))) * 1000",
+    "throughput_token_per_sec": "sum by (job_id, rank_id, chain_index) (rate(vllm:generation_tokens_total{target}[1m]))",
+    "live_batch_size": "sum by (job_id, rank_id, chain_index) (vllm:num_requests_running{target})",
+    "depth_req_q": "sum by (job_id, rank_id, chain_index) (vllm:num_requests_waiting{target})",
+    "kv_cache_util": "max by (job_id, rank_id, chain_index) (dynamo_component_gpu_cache_usage_percent{target} or vllm:kv_cache_usage_perc{target})",
+    "kvcache_hit_rate": "sum by (job_id, rank_id, chain_index) (rate(vllm:prefix_cache_hits_total{target}[5m])) / sum by (job_id, rank_id, chain_index) (rate(vllm:prefix_cache_queries_total{target}[5m]))",
+    "input_length_observed": "sum by (job_id, rank_id, chain_index) (rate(vllm:request_prompt_tokens_sum{target}[5m])) / sum by (job_id, rank_id, chain_index) (rate(vllm:request_prompt_tokens_count{target}[5m]))",
+    "output_length_observed": "sum by (job_id, rank_id, chain_index) (rate(vllm:request_generation_tokens_sum{target}[5m])) / sum by (job_id, rank_id, chain_index) (rate(vllm:request_generation_tokens_count{target}[5m]))",
+    "prefill_iteration_counts_per_second": "sum by (job_id, rank_id, chain_index) (rate(vllm:request_prefill_time_seconds_count{target}[1m]))",
+    "decode_itr_counts_per_second": "sum by (job_id, rank_id, chain_index) (rate(vllm:request_decode_time_seconds_count{target}[1m]))",
+    "pd_inbalance": "sum by (job_id, rank_id, chain_index) (rate(vllm:request_prefill_time_seconds_sum{target}[5m])) / sum by (job_id, rank_id, chain_index) (rate(vllm:request_decode_time_seconds_sum{target}[5m]))"
+  }
+}
