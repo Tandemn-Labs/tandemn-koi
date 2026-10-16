@@ -317,7 +317,7 @@ class PeerPredictorClient:
             block_size=max(1, int(values.get("block_size") or 64)),
             gpu_memory_utilization=float(values.get("gpu_mem_util") or 0.9),
             prefix_cache_enabled=bool(values.get("prefix_cache_enabled", False)),
-            chunked_prefill_enabledd=bool(values.get("chunked_prefill_enabled", False)),
+            chunked_prefill_enabled=bool(values.get("chunked_prefill_enabled", False)),
             router_policy=str(values.get("router_policy") or "round-robin"),
             preemption_policy=values.get("preemption_policy"),
             context=context,
