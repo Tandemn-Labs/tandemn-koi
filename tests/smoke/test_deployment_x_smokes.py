@@ -48,8 +48,8 @@ def _x_fields():
         "max_model_len",
         "block_size",
         "gpu_mem_util",
-        "kvcache_dtype",
-        "chunked_prefill_enable",
+        "kv_cache_dtype",
+        "chunked_prefill_enabled",
         "cloud",
         "region",
         "market",
@@ -197,11 +197,11 @@ def _model_catalogs():
             "gpu_mem_util": 0.85,
             "prefix_cache_enabled": True,
             "max_model_len": 8192,
-            "chunked_prefill_enable": True,
+            "chunked_prefill_enabled": True,
             "max_num_seq": [{"gpu_type": "H100", "value": 256}],
             "max_num_batched_tokens": [{"gpu_type": "H100", "value": 8192}],
             "block_size": [{"gpu_type": "H100", "value": 16}],
-            "kvcache_dtype": [{"gpu_type": "H100", "value": "auto"}],
+            "kv_cache_dtype": [{"gpu_type": "H100", "value": "auto"}],
         }
     }
 
@@ -244,9 +244,9 @@ def _catalog_x_assertions():
         "max_num_batched_tokens": 8192,
         "block_size": 16,
         "gpu_mem_util": 0.85,
-        "kvcache_dtype": "auto",
+        "kv_cache_dtype": "auto",
         "max_model_len": 8192,
-        "chunked_prefill_enable": True,
+        "chunked_prefill_enabled": True,
     }
 
 
@@ -476,11 +476,11 @@ class DeploymentXSmokeTests(unittest.TestCase):
                 "gpu_mem_util": 0.85,
                 "prefix_cache_enabled": True,
                 "max_model_len": 8192,
-                "chunked_prefill_enable": True,
+                "chunked_prefill_enabled": True,
                 "max_num_seq": 256,
                 "max_num_batched_tokens": 8192,
                 "block_size": 16,
-                "kvcache_dtype": "auto",
+                "kv_cache_dtype": "auto",
             },
         )
 

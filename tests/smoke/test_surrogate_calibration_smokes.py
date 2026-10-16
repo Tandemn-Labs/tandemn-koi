@@ -37,12 +37,12 @@ class _Store:
 
 def test_prediction_context_canonicalizes_gpu_and_isolates_component_dtypes():
     bf16 = build_prediction_context(
-        {**CONFIG, "activation_dtype": "bfloat16", "kvcache_dtype": "bf16"},
+        {**CONFIG, "activation_dtype": "bfloat16", "kv_cache_dtype": "bf16"},
         {**FEATURES, "gpu_type": "NVIDIA_H100"},
         scenario="peak",
     )
     fp8 = build_prediction_context(
-        {**CONFIG, "activation_dtype": "fp8", "kvcache_dtype": "fp8"},
+        {**CONFIG, "activation_dtype": "fp8", "kv_cache_dtype": "fp8"},
         {**FEATURES, "gpu_type": "H100"},
         scenario="peak",
     )
@@ -297,7 +297,10 @@ def test_one_catastrophic_deployment_calibrates_on_its_own():
 
     # One deployment that served nothing under load for two ticks is enough to
     # pull the prediction down for this context.
-    dead = [_calibration_row(9, deployment_id="deploy-dead"), _calibration_row(10, deployment_id="deploy-dead")]
+    dead = [
+        _calibration_row(9, deployment_id="deploy-dead"),
+        _calibration_row(10, deployment_id="deploy-dead"),
+    ]
     for row in dead:
         row.y_observed_mean = {**row.y_observed_mean, "throughput_token_per_sec": 0.0}
     result = calibrate_prediction(
@@ -315,7 +318,10 @@ def test_one_catastrophic_deployment_calibrates_on_its_own():
     assert result.y_hat["throughput_token_per_sec"] < 10.0
 
     # A single starved tick followed by service is a recovery, not a dead shape.
-    warmup = [_calibration_row(11, deployment_id="deploy-warm"), _calibration_row(12, deployment_id="deploy-warm")]
+    warmup = [
+        _calibration_row(11, deployment_id="deploy-warm"),
+        _calibration_row(12, deployment_id="deploy-warm"),
+    ]
     warmup[0].y_observed_mean = {**warmup[0].y_observed_mean, "throughput_token_per_sec": 0.0}
     recovered = calibrate_prediction(
         {"throughput_token_per_sec": 100.0},
