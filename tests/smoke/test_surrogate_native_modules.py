@@ -21,7 +21,7 @@ MODEL = {
     "num_attn_heads": 64,
     "num_kv_heads": 8,
     "weight_dtype": "bf16",
-    "kvcache_dtype": "fp16",
+    "kv_cache_dtype": "fp16",
 }
 WORKLOAD = {
     "type": "batch",
@@ -142,8 +142,8 @@ def test_online_kv_memory_is_distributed_across_replicas():
 
 
 def test_kvcache_auto_prefers_activation_then_weight_dtype():
-    auto_activation = {**MODEL, "kvcache_dtype": "auto", "activation_dtype": "fp8"}
-    auto_weight = {**MODEL, "kvcache_dtype": "auto"}
+    auto_activation = {**MODEL, "kv_cache_dtype": "auto", "activation_dtype": "fp8"}
+    auto_weight = {**MODEL, "kv_cache_dtype": "auto"}
 
     assert kv_bytes_per_token(auto_activation) == 2 * 80 * 8 * 128
     assert kv_bytes_per_token(auto_weight) == 2 * 80 * 8 * 128 * 2
@@ -155,7 +155,7 @@ def test_mla_kv_cache_uses_latent_width_with_pp_local_layers():
         "num_hidden_layers": 61,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "kvcache_dtype": "bf16",
+        "kv_cache_dtype": "bf16",
         "gpu_mem_gb": 80,
         "active_kv_tokens": 1_024,
     }

@@ -106,7 +106,7 @@ def build_prediction_context(
             "activation_dtype": canonicalize_dtype(values.get("activation_dtype")),
             "fmha_dtype": canonicalize_dtype(values.get("fmha_quant_mode")),
             "kv_cache_dtype": canonicalize_dtype(
-                values.get("kvcache_quant_mode") or values.get("kvcache_dtype")
+                values.get("kvcache_quant_mode") or values.get("kv_cache_dtype")
             ),
         }
         hard.update({name: value for name, value in optional_dtypes.items() if value is not None})

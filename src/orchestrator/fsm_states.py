@@ -1170,7 +1170,7 @@ class TickRunner:
             deployment_rank_identity(raw, replicas=replicas),
             config.get("weight_dtype"),
             config.get("activation_dtype"),
-            config.get("kvcache_dtype"),
+            config.get("kv_cache_dtype"),
             config.get("weight_quantization_bits"),
             config.get("weight_quantization_method"),
             config.get("engine_name"),
@@ -1246,7 +1246,9 @@ class TickRunner:
             queue_depth=float(queue_depth),
         )
 
-    def _clear_dead_shape(self, features: dict[str, Any], env_label: Any, x: dict[str, Any]) -> None:
+    def _clear_dead_shape(
+        self, features: dict[str, Any], env_label: Any, x: dict[str, Any]
+    ) -> None:
         model_id = features.get("model_id") or x.get("model_id")
         gpu_type = env_gpu_type(env_label) or x.get("gpu_type")
         if not model_id or not gpu_type:
@@ -1504,7 +1506,7 @@ class TickRunner:
 
     def _handle_s7(self, ctx: TickContext) -> None:
         """Sleep the remainder of the tick interval (no drift)."""
-        self._last_abort_signature = None
+        self._last_abort_signature: tuple[str | None, str, Any | None] | None = None
         self._sleep_tick_remainder(ctx)
 
     def _sleep_tick_remainder(self, ctx: TickContext) -> None:
@@ -1532,9 +1534,7 @@ class TickRunner:
             getattr(getattr(ctx, "aborted_from_state", None), "value", None),
         )
         if signature == getattr(self, "_last_abort_signature", None):
-            log.warning(
-                "repeat abort (%s); fallback already deployed, holding", signature[1]
-            )
+            log.warning("repeat abort (%s); fallback already deployed, holding", signature[1])
         else:
             try:
                 ctx.validated_plan = self._fallback_keep_all(ctx)

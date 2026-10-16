@@ -432,7 +432,7 @@
         "beta": 1.6,
         "strength": 4.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.85,
         "alpha": 6.8,
         "beta": 1.2,
@@ -474,7 +474,7 @@
         "beta": 1.8,
         "strength": 4.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.4,
         "alpha": 0.8,
         "beta": 1.2,
@@ -1010,7 +1010,7 @@
         "beta": 1.36,
         "strength": 4.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.5,
         "alpha": 2.0,
         "beta": 2.0,
@@ -1052,7 +1052,7 @@
         "beta": 1.12,
         "strength": 4.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.55,
         "alpha": 2.2,
         "beta": 1.8,
@@ -1588,7 +1588,7 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -1630,7 +1630,7 @@
         "beta": 1.7,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.68,
         "alpha": 2.72,
         "beta": 1.28,
@@ -2166,7 +2166,7 @@
         "beta": 2.2,
         "strength": 4.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.7,
         "alpha": 2.8,
         "beta": 1.2,
@@ -2208,7 +2208,7 @@
         "beta": 1.2,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.35,
         "alpha": 0.7,
         "beta": 1.3,
@@ -2744,7 +2744,7 @@
         "beta": 1.5,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
@@ -2786,7 +2786,7 @@
         "beta": 1.2,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.62,
         "alpha": 2.48,
         "beta": 1.52,
@@ -3322,7 +3322,7 @@
         "beta": 1.64,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -3364,7 +3364,7 @@
         "beta": 1.3,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.4,
         "alpha": 0.8,
         "beta": 1.2,
@@ -3900,7 +3900,7 @@
         "beta": 1.88,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.05,
         "alpha": 0.1,
         "beta": 1.9,
@@ -3942,7 +3942,7 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.45,
         "alpha": 1.8,
         "beta": 2.2,
@@ -4478,7 +4478,7 @@
         "beta": 1.9,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.05,
         "alpha": 0.1,
         "beta": 1.9,
@@ -4520,7 +4520,7 @@
         "beta": 1.84,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.1,
         "alpha": 0.2,
         "beta": 1.8,
@@ -5056,7 +5056,7 @@
         "beta": 2.2,
         "strength": 4.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -5098,7 +5098,7 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.45,
         "alpha": 1.8,
         "beta": 2.2,
@@ -5634,7 +5634,7 @@
         "beta": 1.5,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.58,
         "alpha": 2.32,
         "beta": 1.68,
@@ -5676,7 +5676,7 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
@@ -6212,7 +6212,7 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -6254,7 +6254,7 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -6790,7 +6790,7 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -6832,7 +6832,7 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -7368,7 +7368,7 @@
         "beta": 1.6,
         "strength": 4.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -7410,7 +7410,7 @@
         "beta": 0.96,
         "strength": 8.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -7946,7 +7946,7 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -7988,7 +7988,7 @@
         "beta": 1.36,
         "strength": 4.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.72,
         "alpha": 2.88,
         "beta": 1.12,
@@ -8524,7 +8524,7 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.45,
         "alpha": 1.8,
         "beta": 2.2,
@@ -8566,7 +8566,7 @@
         "beta": 1.4,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.4,
         "alpha": 0.8,
         "beta": 1.2,
@@ -9102,7 +9102,7 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -9144,7 +9144,7 @@
         "beta": 1.5,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.6,
         "alpha": 2.4,
         "beta": 1.6,
@@ -9680,7 +9680,7 @@
         "beta": 1.84,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.08,
         "alpha": 0.16,
         "beta": 1.84,
@@ -9722,7 +9722,7 @@
         "beta": 1.76,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.15,
         "alpha": 0.3,
         "beta": 1.7,
@@ -10258,7 +10258,7 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -10300,7 +10300,7 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.2,
         "alpha": 0.4,
         "beta": 1.6,
@@ -10836,7 +10836,7 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.08,
         "alpha": 0.16,
         "beta": 1.84,
@@ -10878,7 +10878,7 @@
         "beta": 1.8,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.52,
         "alpha": 2.08,
         "beta": 1.92,
@@ -11414,7 +11414,7 @@
         "beta": 1.84,
         "strength": 2.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -11456,7 +11456,7 @@
         "beta": 1.84,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -11992,7 +11992,7 @@
         "beta": 1.52,
         "strength": 4.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.62,
         "alpha": 2.48,
         "beta": 1.52,
@@ -12034,7 +12034,7 @@
         "beta": 1.68,
         "strength": 4.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.4,
         "alpha": 0.8,
         "beta": 1.2,
@@ -12570,7 +12570,7 @@
         "beta": 2.2,
         "strength": 4.0
       },
-      "kvcache_dtype": {
+      "kv_cache_dtype": {
         "c": 0.12,
         "alpha": 0.24,
         "beta": 1.76,
@@ -12612,7 +12612,7 @@
         "beta": 1.6,
         "strength": 2.0
       },
-      "chunked_prefill_enable": {
+      "chunked_prefill_enabled": {
         "c": 0.3,
         "alpha": 0.6,
         "beta": 1.4,
