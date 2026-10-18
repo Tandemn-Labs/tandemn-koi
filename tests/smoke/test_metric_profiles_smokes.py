@@ -14,22 +14,17 @@ EXPECTED_QUERIES = {
         "running_requests",
         "waiting_requests",
         "kv_cache_usage_fraction",
-        "prefix_cache_hits_per_second",
-        "prefix_cache_queries_per_second",
+        "prefix_cache_hit_fraction",
         "prompt_tokens_per_request",
         "generated_tokens_per_request",
         "prefill_observations_per_second",
         "decode_observations_per_second",
-        "prefill_time_seconds_per_second",
-        "decode_time_seconds_per_second",
-        "cache_config_chains_by_block_shape",
+        "prefill_decode_time_ratio",
+        "num_kv_blocks_mean",
     },
     "dcgm_promql.json": {
-        "gpu_memory_used_mib_total",
-        "gpu_memory_free_mib_total",
-        "gpu_memory_reserved_mib_total",
+        "gpu_memory_used_fraction_mean",
         "gpu_memory_free_mib_mean",
-        "gpu_reporting_device_count",
         "sm_active_fraction_mean",
         "dram_active_fraction_mean",
         "pcie_bytes_per_second_mean",
@@ -54,14 +49,11 @@ class MetricProfileSmokeTests(unittest.TestCase):
                         self.assertIn("{target}", item["expression"])
                         self.assertIn("job_id", item["expression"])
                         self.assertIn("rank_id", item["expression"])
+                        self.assertNotIn("chain_id", item["expression"])
 
     def test_vllm_counters_get_rates_before_rank_sums(self):
         profile = json.loads((PROFILE_DIR / "vllm_promql.json").read_text())
-        for name in (
-            "generated_output_tokens_per_second",
-            "prefix_cache_hits_per_second",
-            "prefix_cache_queries_per_second",
-        ):
+        for name in ("generated_output_tokens_per_second", "prefill_observations_per_second"):
             with self.subTest(input=name):
                 expression = profile["queries"][name]["expression"]
                 self.assertIn("sum by (job_id, rank_id) (rate(", expression)
@@ -69,29 +61,25 @@ class MetricProfileSmokeTests(unittest.TestCase):
             "sum by (le, job_id, rank_id)",
             profile["queries"]["ttft_p99_seconds"]["expression"],
         )
-        self.assertNotIn("chain_id", profile["queries"]["ttft_p99_seconds"]["expression"])
-
-    def test_vllm_cache_metadata_drops_chain_id_from_the_result(self):
-        profile = json.loads((PROFILE_DIR / "vllm_promql.json").read_text())
-        expression = profile["queries"]["cache_config_chains_by_block_shape"]["expression"]
-
-        self.assertIn("num_gpu_blocks", expression)
-        self.assertIn("block_size", expression)
-        self.assertIn("chain_id", expression)
         self.assertIn(
-            "count by (job_id, rank_id, num_gpu_blocks, block_size)",
-            expression,
+            "histogram_quantile(0.99", profile["queries"]["ttft_p99_seconds"]["expression"]
         )
+
+    def test_ratios_are_calculated_from_rank_level_totals(self):
+        profile = json.loads((PROFILE_DIR / "vllm_promql.json").read_text())
+        for name in (
+            "prefix_cache_hit_fraction",
+            "prompt_tokens_per_request",
+            "generated_tokens_per_request",
+            "prefill_decode_time_ratio",
+        ):
+            with self.subTest(input=name):
+                expression = profile["queries"][name]["expression"]
+                self.assertIn("sum by (job_id, rank_id)", expression)
+                self.assertTrue(expression.startswith("sum by (job_id, rank_id)"))
 
     def test_dcgm_uses_reserved_memory_and_does_not_redifferentiate_rates(self):
         profile = json.loads((PROFILE_DIR / "dcgm_promql.json").read_text())
-        self.assertTrue(
-            {
-                "gpu_memory_used_mib_total",
-                "gpu_memory_free_mib_total",
-                "gpu_memory_reserved_mib_total",
-            }.issubset(profile["queries"])
-        )
         for name in ("pcie_bytes_per_second_mean", "nvlink_bytes_per_second_mean"):
             with self.subTest(input=name):
                 expression = profile["queries"][name]["expression"]
