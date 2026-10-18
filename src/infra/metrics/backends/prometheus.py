@@ -155,7 +155,47 @@ def collect_measurements(
     step_seconds: int,
     parse_result: Callable[[str, QueryResult], QueryResult] | None = None,
 ) -> tuple[dict[tuple[str, str], dict[str, TimeSeries]], tuple[str, ...], tuple[str, ...]]:
-    """Run rank-scoped PromQL queries and validate their results."""
+    """
+    Run rank-scoped PromQL queries and validate their results.
+
+    This function executes Prometheus queries that are scoped to specific job and rank IDs,
+    collecting time series metrics for each (job_id, rank_id) combination listed in the given
+    contexts. For each provided query name, the PromQL expression may use the placeholder
+    "{target}", which will be replaced by a suitably constructed label selector matching
+    all ranks for a given job. If multiple ranks share a job_id, their rank_ids will be
+    grouped under a regex selector for efficient querying.
+
+    The function returns a tuple containing:
+      - a dictionary mapping (job_id, rank_id) tuples to a dictionary of queried metric names
+        to their corresponding TimeSeries;
+      - a tuple of warning messages from all queries, each prefixed with its query name;
+      - a tuple of info messages from all queries, each prefixed with its query name.
+
+    Validation ensures that each series returned has only the 'job_id' and 'rank_id' labels,
+    every expected (job_id, rank_id) is represented, and no duplicates exist. Any mismatch or
+    unexpected result raises a MetricQueryError.
+
+    Optionally, a custom `parse_result` function may post-process QueryResults per metric.
+
+    Args:
+        reader: MetricReader used to query Prometheus.
+        contexts: Iterable of RankContext pointing to the desired job and rank pairs.
+        queries: Mapping of metric names to PromQL expressions, using "{target}" as a placeholder
+                 for rank/job selectors.
+        start:   datetime, beginning of the query range (must include timezone).
+        end:     datetime, end of the query range (must include timezone).
+        step_seconds: step interval for the query in seconds, must be positive integer.
+        parse_result: Optional function to further process QueryResults for each query.
+
+    Returns:
+        measurements: dict mapping (job_id, rank_id) -> {metric_name: TimeSeries};
+        warnings: tuple of warning message strings;
+        infos:    tuple of info message strings.
+
+    Raises:
+        ValueError: if duplicate or missing contexts are detected.
+        MetricQueryError: for unexpected response structure or other Prometheus errors.
+    """
     measurements: dict[tuple[str, str], dict[str, TimeSeries]] = {}
     ranks_by_job: dict[str, list[str]] = defaultdict(list)
     for context in contexts:
