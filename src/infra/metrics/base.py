@@ -2,11 +2,13 @@
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from math import isfinite
 from typing import Any, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
+from src.core.telemetry_models import ObservedV, ObservedY
 
 
 class MetricQueryError(RuntimeError):
@@ -37,6 +39,55 @@ class QueryResult:
     series: tuple[TimeSeries, ...]
     warnings: tuple[str, ...] = ()
     infos: tuple[str, ...] = ()
+
+
+class MetricReader(Protocol):
+    """
+    MetricReader Protocol
+
+    Provides an abstract interface for executing numeric time series range queries,
+    typically against a metrics database such as Prometheus.
+
+    Implementations of this protocol must provide a ``query_range`` method, which
+    performs a time-ranged query for numeric samples, returning a QueryResult containing
+    all relevant time series for the requested query and period.
+
+    Source adapters use this protocol to decouple the mechanics of metrics access
+    from their own translation, validation, and higher-level logic.
+
+    See PrometheusReader in `backends/prometheus.py` for a reference implementation.
+
+    Typical usage:
+      reader: MetricReader = ...
+      result: QueryResult = reader.query_range(
+          "some_promql_expression",
+          start=datetime_a,
+          end=datetime_b,
+          step_seconds=10,
+      )
+      # result.series contains TimeSeries objects to be processed by adapters.
+    """
+
+    def query_range(
+        self,
+        query: str,
+        *,
+        start: datetime,
+        end: datetime,
+        step_seconds: int = 10,
+    ) -> QueryResult: ...
+
+
+@dataclass
+class RankObservations:
+    """Translated V/Y and auxiliary features, with sample times and database messages."""
+
+    v: ObservedV = field(default_factory=lambda: ObservedV())
+    y: ObservedY = field(default_factory=lambda: ObservedY())
+    timestamps: dict[str, NDArray[np.float64]] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+    infos: tuple[str, ...] = ()
+    features: dict[str, NDArray[np.float64]] = field(default_factory=dict)
 
 
 # TODO: map node types and hourly prices from the finalized resource-map format.
@@ -118,6 +169,17 @@ class MetricAdapter(Protocol):
 
     kind: str
     name: str
+
+    def collect(
+        self,
+        contexts: Iterable[RankContext],
+        *,
+        start: datetime,
+        end: datetime,
+        step_seconds: int = 10,
+    ) -> dict[tuple[str, str], RankObservations]:
+        """Query compatible ranks together and translate into observed V/Y."""
+        ...
 
 
 def load_plugins(adapters: Iterable[MetricAdapter]) -> dict[tuple[str, str], MetricAdapter]:
