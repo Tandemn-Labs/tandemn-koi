@@ -1,14 +1,23 @@
 """Read numeric time series through the Prometheus range-query interface."""
 
 import json
+import re
 import urllib.parse
 import urllib.request
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 from math import isfinite
 from typing import Any
 
 import numpy as np
-from src.infra.metrics.base import MetricQueryError, QueryResult, TimeSeries
+from src.infra.metrics.base import (
+    MetricQueryError,
+    MetricReader,
+    QueryResult,
+    RankContext,
+    TimeSeries,
+)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -134,6 +143,62 @@ class PrometheusReader:
         except (OSError, ValueError) as error:
             raise MetricQueryError(f"Prometheus request failed: {error}") from error
         return _parse_matrix(payload, start.timestamp(), end.timestamp())
+
+
+def collect_measurements(
+    reader: MetricReader,
+    contexts: Iterable[RankContext],
+    queries: Mapping[str, str],
+    *,
+    start: datetime,
+    end: datetime,
+    step_seconds: int,
+    parse_result: Callable[[str, QueryResult], QueryResult] | None = None,
+) -> tuple[dict[tuple[str, str], dict[str, TimeSeries]], tuple[str, ...], tuple[str, ...]]:
+    """Run rank-scoped PromQL queries and validate their results."""
+    measurements: dict[tuple[str, str], dict[str, TimeSeries]] = {}
+    ranks_by_job: dict[str, list[str]] = defaultdict(list)
+    for context in contexts:
+        key = (context.job_id, context.rank_id)
+        if key in measurements:
+            raise ValueError(f"duplicate rank context for job/rank {key!r}")
+        measurements[key] = {}
+        ranks_by_job[context.job_id].append(context.rank_id)
+    if not measurements:
+        return {}, (), ()
+
+    selectors = []
+    for job_id, rank_ids in ranks_by_job.items():
+        if len(rank_ids) == 1:
+            rank_selector = "rank_id=" + json.dumps(rank_ids[0])
+        else:
+            escaped = [re.sub(r"([\\.^$|?*+(){}\[\]])", r"\\\1", rank) for rank in rank_ids]
+            rank_selector = "rank_id=~" + json.dumps("|".join(escaped))
+        selectors.append("{job_id=" + json.dumps(job_id) + "," + rank_selector + "}")
+
+    warnings: list[str] = []
+    infos: list[str] = []
+    for name, expression in queries.items():
+        scoped = [expression.replace("{target}", selector) for selector in selectors]
+        query = scoped[0] if len(scoped) == 1 else " or ".join(f"({item})" for item in scoped)
+        result = reader.query_range(query, start=start, end=end, step_seconds=step_seconds)
+        for series in result.series:
+            raw_key = (series.labels.get("job_id"), series.labels.get("rank_id"))
+            if raw_key not in measurements:
+                raise MetricQueryError(f"{name}: unexpected job/rank {raw_key!r}")
+        if parse_result is not None:
+            result = parse_result(name, result)
+        warnings.extend(f"{name}: {message}" for message in result.warnings)
+        infos.extend(f"{name}: {message}" for message in result.infos)
+        for series in result.series:
+            if set(series.labels) != {"job_id", "rank_id"}:
+                raise MetricQueryError(f"{name}: expected only job_id and rank_id labels")
+            key = (series.labels["job_id"], series.labels["rank_id"])
+            if name in measurements[key]:
+                raise MetricQueryError(f"{name}: duplicate series for job/rank {key!r}")
+            if len(series.values):
+                measurements[key][name] = series
+    return measurements, tuple(warnings), tuple(infos)
 
 
 def _parse_matrix(payload: Any, start: float, end: float) -> QueryResult:
