@@ -160,10 +160,9 @@ def collect_measurements(
 
     This function executes Prometheus queries that are scoped to specific job and rank IDs,
     collecting time series metrics for each (job_id, rank_id) combination listed in the given
-    contexts. For each provided query name, the PromQL expression may use the placeholder
-    "{target}", which will be replaced by a suitably constructed label selector matching
-    all ranks for a given job. If multiple ranks share a job_id, their rank_ids will be
-    grouped under a regex selector for efficient querying.
+    contexts. Each PromQL expression must contain "__KOI_RANK_FILTER__" inside its label
+    selectors. This marker is replaced by matchers for the requested job and ranks. If
+    multiple ranks share a job_id, their rank_ids are grouped under a regex selector.
 
     The function returns a tuple containing:
       - a dictionary mapping (job_id, rank_id) tuples to a dictionary of queried metric names
@@ -180,8 +179,8 @@ def collect_measurements(
     Args:
         reader: MetricReader used to query Prometheus.
         contexts: Iterable of RankContext pointing to the desired job and rank pairs.
-        queries: Mapping of metric names to PromQL expressions, using "{target}" as a placeholder
-                 for rank/job selectors.
+        queries: Mapping of metric names to PromQL expressions, using
+                 "__KOI_RANK_FILTER__" as the rank/job matcher placeholder.
         start:   datetime, beginning of the query range (must include timezone).
         end:     datetime, end of the query range (must include timezone).
         step_seconds: step interval for the query in seconds, must be positive integer.
@@ -214,12 +213,14 @@ def collect_measurements(
         else:
             escaped = [re.sub(r"([\\.^$|?*+(){}\[\]])", r"\\\1", rank) for rank in rank_ids]
             rank_selector = "rank_id=~" + json.dumps("|".join(escaped))
-        selectors.append("{job_id=" + json.dumps(job_id) + "," + rank_selector + "}")
+        selectors.append("job_id=" + json.dumps(job_id) + "," + rank_selector)
 
     warnings: list[str] = []
     infos: list[str] = []
     for name, expression in queries.items():
-        scoped = [expression.replace("{target}", selector) for selector in selectors]
+        if "__KOI_RANK_FILTER__" not in expression:
+            raise ValueError(f"{name}: expression is missing __KOI_RANK_FILTER__")
+        scoped = [expression.replace("__KOI_RANK_FILTER__", selector) for selector in selectors]
         query = scoped[0] if len(scoped) == 1 else " or ".join(f"({item})" for item in scoped)
         result = reader.query_range(query, start=start, end=end, step_seconds=step_seconds)
         for series in result.series:
