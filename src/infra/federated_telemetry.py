@@ -28,7 +28,55 @@ class _TelemetryBundle:
 
 
 class FederatedTelemetry:
-    """Coordinate preloaded adapters using the existing Koi collection interface."""
+    """
+    Coordinate collection of rank-level metrics using all preloaded metric adapters.
+
+    FederatedTelemetry maintains a registry of MetricAdapters (engines, device sources, etc.)
+    and orchestrates time-bounded collection of numeric observations—including V (runtime conditions),
+    Y (results), and auxiliary features—for each rank identified by the resource map or snapshot.
+
+    At each collection window (e.g., on FSM tick), it:
+      - Resolves the full set of RankContexts to query, based on the provided snapshot.
+      - Organizes all eligible ranks by their required adapter(s) and associated MetricAdapter plugins.
+      - Dispatches queries to each relevant MetricAdapter for batched collection over the target window,
+        using configured sample intervals and time bounds.
+      - Merges all collected metric series and feature arrays with node-level cost records.
+      - Returns data as a _TelemetryBundle, preserving per-metric timestamps, warnings, and database infos.
+
+    Plugins are registered at construction and remain fixed for the lifetime of the coordinator.
+    All database access multiplexing, adapter selection, and data merging is handled automatically.
+
+    This class should be instantiated once for each candidate graph or control FSM needing
+    federated telemetry collection across all ranks of interest.
+    """
+
+    # TODO - A part of the telemetry bundle should also include
+    # expected replica count, given that we have that in the existing
+    # implementation. have to make it still\
+    # to get how many number of chains are beneath it,
+    # I have to group the database by ANOTHER key which is more granular than rank id
+
+    """
+    Proposed flow
+    1. Resource map supplies live replicas for each rank.
+    Use the live count, excluding replicas the map says are dead.
+    Keep this distinct from configured or desired replicas;
+    ideally expose it as live_replicas in RankContext.
+    2. PromQL counts contributing replicas before collapsing the result.
+    The query selector remains scoped by job_id and rank_id.
+    Within the count query, use a stable Prometheus target label—such
+    as pod or instance—to deduplicate multiple series from one external replica,
+     then aggregate the count back to job_id and rank_id. This uses no Koi chain_id.
+    3. Count health contributors, not just any responders.
+    A replica should count toward health_observed_replicas only if it
+    reported the health inputs Koi requires for that workload.
+    Merely finding one metric or a successful HTTP query is not enough.
+    4. Put both counts on RankTelemetry. Set its existing expected_replicas
+    from the map's live count and set health_observed_replicas from Prometheus.
+     The FSM can then compare them without changing telemetry.py.
+    For example: 3 live in the map, 2 health contributors in Prometheus → incomplete.
+     If one is dead and the map says only 2 are live, with 2 contributors → complete.
+    """
 
     def __init__(
         self,
