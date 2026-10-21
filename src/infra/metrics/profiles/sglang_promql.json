@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "source": "sglang",
+  "release": "v0.5.21",
+  "language": "promql",
+  "rank_labels": ["job_id", "rank_id"],
+  "queries": {
+    "ttft_p99_seconds": {
+      "expression": "histogram_quantile(0.99, sum by (le, job_id, rank_id) (rate(sglang:time_to_first_token_seconds_bucket{__KOI_RANK_FILTER__}[5m])))",
+      "unit": "seconds",
+      "aggregation": "Pool histogram bucket rates across the rank, then calculate the rank-level 99th percentile."
+    },
+    "tpot_p99_seconds": {
+      "expression": "histogram_quantile(0.99, sum by (le, job_id, rank_id) (rate(sglang:request_time_per_output_token_seconds_bucket{__KOI_RANK_FILTER__}[5m])))",
+      "unit": "seconds per output token",
+      "aggregation": "Pool bucket rates across the rank and streaming modes, then calculate the rank-level 99th percentile."
+    },
+    "generation_throughput": {
+      "expression": "sum by (job_id, rank_id) (max by (job_id, rank_id, instance) (sglang:gen_throughput{__KOI_RANK_FILTER__}))",
+      "unit": "output tokens per second",
+      "aggregation": "Use the instantaneous per-replica generation-throughput gauge, deduplicate internal series per scrape target, then sum external replicas."
+    },
+    "running_requests": {
+      "expression": "sum by (job_id, rank_id) (max by (job_id, rank_id, instance) (max without (priority) (sglang:num_running_reqs{__KOI_RANK_FILTER__})))",
+      "unit": "requests",
+      "aggregation": "Collapse optional priority series to the total gauge, deduplicate per scrape target, then sum external replicas."
+    },
+    "waiting_requests": {
+      "expression": "sum by (job_id, rank_id) (max by (job_id, rank_id, instance) (max without (priority) (sglang:num_queue_reqs{__KOI_RANK_FILTER__})))",
+      "unit": "requests",
+      "aggregation": "Collapse optional priority series to the total gauge, deduplicate per scrape target, then sum external replicas."
+    },
+    "full_token_usage": {
+      "expression": "avg by (job_id, rank_id) (max by (job_id, rank_id, instance) (sglang:full_token_usage{__KOI_RANK_FILTER__}))",
+      "unit": "fraction from 0 to 1",
+      "aggregation": "Average full-attention KV-pool utilization across external replicas after deduplicating internal series per scrape target."
+    },
+    "prompt_tokens_per_request": {
+      "expression": "sum by (job_id, rank_id) (rate(sglang:prompt_tokens_histogram_sum{__KOI_RANK_FILTER__}[5m])) / (sum by (job_id, rank_id) (rate(sglang:prompt_tokens_histogram_count{__KOI_RANK_FILTER__}[5m])) > 0)",
+      "unit": "input tokens per request",
+      "aggregation": "Divide rank-wide observed prompt-token rate by request-observation rate; omit ranks with no observations. Requires token histograms."
+    },
+    "generated_tokens_per_request": {
+      "expression": "sum by (job_id, rank_id) (rate(sglang:generation_tokens_histogram_sum{__KOI_RANK_FILTER__}[5m])) / (sum by (job_id, rank_id) (rate(sglang:generation_tokens_histogram_count{__KOI_RANK_FILTER__}[5m])) > 0)",
+      "unit": "output tokens per request",
+      "aggregation": "Divide rank-wide observed output-token rate by request-observation rate; omit ranks with no observations. Requires token histograms."
+    },
+    "prefill_observations_per_second": {
+      "expression": "sum by (job_id, rank_id) (rate(sglang:time_to_first_token_seconds_count{__KOI_RANK_FILTER__}[1m]))",
+      "unit": "first-token request observations per second",
+      "aggregation": "Count requests reaching a TTFT observation across the rank; this is a prefill-observation proxy, not a scheduler-iteration count."
+    },
+    "decode_observations_per_second": {
+      "expression": "sum by (job_id, rank_id) (rate(sglang:request_time_per_output_token_seconds_count{__KOI_RANK_FILTER__}[1m]))",
+      "unit": "TPOT request observations per second",
+      "aggregation": "Count successfully finished requests with a TPOT observation across the rank; excludes aborted requests and outputs shorter than two tokens."
+    },
+    "prefix_cache_hit_fraction": {
+      "expression": "sum by (job_id, rank_id) (rate(sglang:prefill_effective_tokens_total{__KOI_RANK_FILTER__,mode=~\"device_hit|host_hit|storage_hit\"}[5m])) / (sum by (job_id, rank_id) (rate(sglang:prefill_effective_tokens_total{__KOI_RANK_FILTER__,mode=~\"input|device_hit|host_hit|storage_hit\"}[5m])) > 0)",
+      "unit": "fraction of prefill tokens served from cache",
+      "aggregation": "Sum cache-hit tokens across tiers and divide by all effective prefill tokens; the counters exclude retracted-request recounts."
+    }
+  }
+}

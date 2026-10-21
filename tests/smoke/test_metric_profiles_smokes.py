@@ -30,6 +30,19 @@ EXPECTED_QUERIES = {
         "pcie_bytes_per_second_mean",
         "nvlink_bytes_per_second_mean",
     },
+    "sglang_promql.json": {
+        "ttft_p99_seconds",
+        "tpot_p99_seconds",
+        "generation_throughput",
+        "running_requests",
+        "waiting_requests",
+        "full_token_usage",
+        "prefix_cache_hit_fraction",
+        "prompt_tokens_per_request",
+        "generated_tokens_per_request",
+        "prefill_observations_per_second",
+        "decode_observations_per_second",
+    },
 }
 
 
@@ -46,7 +59,7 @@ class MetricProfileSmokeTests(unittest.TestCase):
                     with self.subTest(profile=filename, input=name):
                         self.assertTrue(item["unit"])
                         self.assertTrue(item["aggregation"])
-                        self.assertIn("{target}", item["expression"])
+                        self.assertIn("__KOI_RANK_FILTER__", item["expression"])
                         self.assertIn("job_id", item["expression"])
                         self.assertIn("rank_id", item["expression"])
                         self.assertNotIn("chain_id", item["expression"])
@@ -86,6 +99,27 @@ class MetricProfileSmokeTests(unittest.TestCase):
                 self.assertIn("TX_BYTES", expression)
                 self.assertIn("RX_BYTES", expression)
                 self.assertNotIn("rate(", expression)
+
+    def test_sglang_uses_v0521_gauge_and_token_cache_counters(self):
+        queries = json.loads((PROFILE_DIR / "sglang_promql.json").read_text())["queries"]
+        self.assertIn("sglang:gen_throughput", queries["generation_throughput"]["expression"])
+        self.assertNotIn("rate(", queries["generation_throughput"]["expression"])
+        self.assertIn(
+            "sglang:prefill_effective_tokens_total",
+            queries["prefix_cache_hit_fraction"]["expression"],
+        )
+        self.assertIn(
+            'mode=~"device_hit|host_hit|storage_hit"',
+            queries["prefix_cache_hit_fraction"]["expression"],
+        )
+        self.assertNotIn("sglang:cache_hit_rate", str(queries))
+        self.assertIn(
+            'mode=~"input|device_hit|host_hit|storage_hit"',
+            queries["prefix_cache_hit_fraction"]["expression"],
+        )
+        for name in ("ttft_p99_seconds", "tpot_p99_seconds"):
+            self.assertIn("histogram_quantile(0.99", queries[name]["expression"])
+            self.assertIn("sum by (le, job_id, rank_id)", queries[name]["expression"])
 
 
 if __name__ == "__main__":

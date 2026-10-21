@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 from src.infra.metrics.adapters.dcgm import DCGMAdapter
 from src.infra.metrics.adapters.vllm import VLLMAdapter
+from src.infra.metrics.backends.prometheus import collect_measurements
 from src.infra.metrics.base import (
     MetricQueryError,
     QueryResult,
@@ -46,7 +47,9 @@ class FakeReader:
         self.calls.append((query, start, end, step_seconds))
         # A single rank makes the rendered expression directly comparable to its profile.
         for name, item in self.queries.items():
-            expected = item["expression"].replace("{target}", '{job_id="job_1",rank_id="rank_1"}')
+            expected = item["expression"].replace(
+                "__KOI_RANK_FILTER__", 'job_id="job_1",rank_id="rank_1"'
+            )
             if query == expected:
                 return self.results.get(name, QueryResult(()))
         return QueryResult(())
@@ -59,6 +62,19 @@ class MetricsAdapterSmokeTests(unittest.TestCase):
     def test_shared_query_helper_is_in_the_prometheus_backend(self):
         backend = importlib.import_module("src.infra.metrics.backends.prometheus")
         self.assertTrue(callable(getattr(backend, "collect_measurements", None)))
+
+    def test_query_without_rank_filter_marker_is_rejected(self):
+        reader = FakeReader("vllm")
+        with self.assertRaisesRegex(ValueError, "missing __KOI_RANK_FILTER__"):
+            collect_measurements(
+                reader,
+                [context()],
+                {"unscoped": "up"},
+                start=START,
+                end=END,
+                step_seconds=15,
+            )
+        self.assertEqual(reader.calls, [])
 
     def test_vllm_translates_units_and_preserves_zero(self):
         measurements = {
@@ -174,7 +190,7 @@ class MetricsAdapterSmokeTests(unittest.TestCase):
         for query, *_ in reader.calls:
             self.assertIn('job_id="job_1",rank_id=~"rank_1|rank_2"', query)
             self.assertIn('job_id="job_2",rank_id="rank_3"', query)
-            self.assertNotIn("{target}", query)
+            self.assertNotIn("__KOI_RANK_FILTER__", query)
 
     def test_job_and_regex_labels_are_escaped(self):
         reader = FakeReader("vllm")
