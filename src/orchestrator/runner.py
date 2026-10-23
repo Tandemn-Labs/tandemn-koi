@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import subprocess
 from pathlib import Path
+from threading import Event
 from typing import Any
 from urllib.parse import urlparse
 
@@ -454,15 +456,21 @@ def run_ticks(
     ticks: int,
     run_tick_fn,
     debug_logger: DebugLogger | None = None,
+    stop_event: Event | None = None,
 ) -> int:
     """Run ticks until count is exhausted or shutdown is requested."""
     if ticks < 0:
         raise SystemExit("--ticks must be >= 0")
 
+    if stop_event is None:
+        stop_event = Event()
+    if stop_event.is_set():
+        return 0
+
     tick = next_tick(evidence_store, requested_tick)
     completed = 0
     exit_code = 0
-    while ticks == 0 or completed < ticks:
+    while (ticks == 0 or completed < ticks) and not stop_event.is_set():
         log.info("starting koi tick %d", tick)
         ctx = run_tick_fn(tick)
         log_tick_summary(ctx)
@@ -490,13 +498,21 @@ def main(
     debug_logger = DebugLogger(args.log_dir, trace=args.trace, run_id=args.run_id)
     configure_logging(args.log_level, debug_logger.runner_log_path)
     log.info("debug logs: %s", debug_logger.run_dir)
-    runner, evidence_store, agent, llm = build_runner_fn(args)
-    emit_run_manifest(debug_logger, args)
-    if hasattr(runner, "trace"):
-        runner.trace = debug_logger
-    agent_tools.bind_tools(trace_logger=debug_logger)
-    fsm_states.bind_runner(runner)
+    stop_event = Event()
+
+    def request_shutdown(_signum, _frame) -> None:
+        stop_event.set()
+
+    previous_sigterm_handler = signal.signal(signal.SIGTERM, request_shutdown)
     try:
+        runner, evidence_store, agent, llm = build_runner_fn(args)
+        if hasattr(runner, "stop_event"):
+            runner.stop_event = stop_event
+        emit_run_manifest(debug_logger, args)
+        if hasattr(runner, "trace"):
+            runner.trace = debug_logger
+        agent_tools.bind_tools(trace_logger=debug_logger)
+        fsm_states.bind_runner(runner)
         return run_ticks(
             evidence_store=evidence_store,
             agent=agent,
@@ -505,10 +521,13 @@ def main(
             ticks=args.ticks,
             run_tick_fn=run_tick_fn,
             debug_logger=debug_logger,
+            stop_event=stop_event,
         )
     except KeyboardInterrupt:
         log.info("shutdown requested")
         return 130
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 if __name__ == "__main__":

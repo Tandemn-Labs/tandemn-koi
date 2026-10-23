@@ -9,6 +9,7 @@ dependencies = [
     "huggingface_hub>=0.23.0",
     "numpy>=1.26.0",
     "openai>=1.0.0",
+    "pydantic>=2.7",
     "python-dotenv>=1.0.0",
     "scipy>=1.11.0",
     "sqlalchemy>=2.0",
