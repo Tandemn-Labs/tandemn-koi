@@ -198,7 +198,7 @@ class RunnerSmokeTests(unittest.TestCase):
             requested_tick=None,
             ticks=0,
             run_tick_fn=run_tick,
-            stop_event=stop_event,
+            should_stop=stop_event.is_set,
         )
 
         self.assertEqual(code, 0)
@@ -223,7 +223,7 @@ class RunnerSmokeTests(unittest.TestCase):
             ticks=0,
             run_tick_fn=run_tick,
             debug_logger=debug_logger,
-            stop_event=stop_event,
+            should_stop=stop_event.is_set,
         )
 
         self.assertEqual(code, 0)
@@ -232,7 +232,7 @@ class RunnerSmokeTests(unittest.TestCase):
 
     def test_main_sigterm_finishes_fsm_tick_without_triggering_abort(self):
         tick_runner = object.__new__(TickRunner)
-        tick_runner.stop_event = Event()
+        tick_runner.should_stop = None
         tick_runner.tick_interval_sec = 300
         tick_runner.trace = None
         states = list(FSMState)[:-1]
@@ -266,6 +266,28 @@ class RunnerSmokeTests(unittest.TestCase):
         self.assertIsNone(contexts[0].error)
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
 
+    def test_main_sigterm_does_not_acquire_event_lock(self):
+        def run_tick(tick):
+            signal.raise_signal(signal.SIGTERM)
+            return _Context(tick)
+
+        with (
+            patch.multiple(
+                runner, DebugLogger=DEFAULT, configure_logging=DEFAULT, emit_run_manifest=DEFAULT
+            ),
+            patch.object(runner.agent_tools, "bind_tools"),
+            patch.object(
+                Event, "set", side_effect=AssertionError("SIGTERM must not call Event.set()")
+            ),
+        ):
+            code = runner.main(
+                ["--ticks", "0"],
+                build_runner_fn=lambda args: (object(), _Evidence(0), _Agent(), _LLM()),
+                run_tick_fn=run_tick,
+            )
+
+        self.assertEqual(code, 0)
+
     def test_main_restores_sigterm_handler_after_initialization_failure(self):
         previous_handler = signal.getsignal(signal.SIGTERM)
         with (
@@ -276,9 +298,10 @@ class RunnerSmokeTests(unittest.TestCase):
 
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
 
-    def test_shutdown_event_wakes_terminal_wait(self):
+    def test_shutdown_request_wakes_terminal_wait(self):
         tick_runner = object.__new__(TickRunner)
-        tick_runner.stop_event = Event()
+        stop_event = Event()
+        tick_runner.should_stop = stop_event.is_set
         tick_runner.tick_interval_sec = 300
         ctx = TickContext(tick=1, tick_started_at=time.time())
         started = Event()
@@ -292,10 +315,29 @@ class RunnerSmokeTests(unittest.TestCase):
         try:
             self.assertTrue(started.wait(timeout=2))
         finally:
-            tick_runner.stop_event.set()
+            stop_event.set()
             thread.join(timeout=2)
 
         self.assertFalse(thread.is_alive(), "tick sleep ignored shutdown")
+
+    def test_terminal_wait_sleeps_only_the_remaining_interval(self):
+        tick_runner = object.__new__(TickRunner)
+        tick_runner.should_stop = None
+        tick_runner.tick_interval_sec = 1
+        ctx = TickContext(tick=1, tick_started_at=99.25)
+
+        with (
+            patch("src.orchestrator.fsm_states.time.time", return_value=100),
+            patch(
+                "src.orchestrator.fsm_states.time.monotonic", side_effect=[10, 10.1, 10.2, 10.25]
+            ),
+            patch("src.orchestrator.fsm_states.time.sleep") as sleep,
+        ):
+            tick_runner._sleep_tick_remainder(ctx)
+
+        self.assertEqual(sleep.call_count, 3)
+        self.assertAlmostEqual(sum(call.args[0] for call in sleep.call_args_list), 0.25)
+        self.assertTrue(all(call.args[0] <= 0.1 for call in sleep.call_args_list))
 
     def test_run_ticks_all_trace_persists_llm_calls_and_agent_events(self):
         """All trace mode persists LLM calls and agent events."""

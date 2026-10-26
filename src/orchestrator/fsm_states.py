@@ -68,10 +68,9 @@ import copy
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from threading import Event
 from typing import Any
 
 import numpy as np
@@ -181,7 +180,7 @@ class _MechanismBundle:
 class TickRunner:
     """One TickRunner per cluster; run_tick(tick_id) drives one full tick.
 
-    Setting stop_event wakes the terminal wait without interrupting active states.
+    should_stop ends the terminal wait without interrupting active states.
 
     Construction wires every component. The telemetry adapter must yield
         per-rank bundles via iter_per_rank(telemetry); each bundle exposes:
@@ -263,7 +262,7 @@ class TickRunner:
         self.tchebycheff = tchebycheff
         self.trace = trace_logger
         self.tick_interval_sec = int(tick_interval_sec)
-        self.stop_event = Event()
+        self.should_stop: Callable[[], bool] | None = None
         self.recalibrate_every = int(recalibrate_every)
         self.on_tick_start = on_tick_start
         self.typical_ranges = typical_ranges or getattr(slow_loop, "typical_ranges", {})
@@ -1519,7 +1518,12 @@ class TickRunner:
         elapsed = time.time() - ctx.tick_started_at
         remaining = self.tick_interval_sec - elapsed
         if remaining > 0:
-            self.stop_event.wait(timeout=remaining)
+            deadline = time.monotonic() + remaining
+            while remaining > 0:
+                if self.should_stop is not None and self.should_stop():
+                    return
+                time.sleep(min(remaining, 0.1))
+                remaining = deadline - time.monotonic()
         else:
             log.warning("tick %d overran its interval by %.1fs", ctx.tick, -remaining)
 
