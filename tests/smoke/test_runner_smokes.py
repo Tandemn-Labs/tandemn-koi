@@ -1,14 +1,18 @@
 """Smoke tests for the Koi runner entry point."""
 
 import json
+import signal
 import tempfile
+import time
 import types
 import unittest
-from unittest.mock import DEFAULT, patch
+from itertools import pairwise
+from threading import Event, Thread
+from unittest.mock import DEFAULT, Mock, patch
 
 from src.orchestrator import runner
 from src.orchestrator.debug_logging import DebugLogger
-from src.orchestrator.fsm_states import FSMState, TickRunner
+from src.orchestrator.fsm_states import FSMState, TickContext, TickRunner
 
 
 class RunnerSmokeTests(unittest.TestCase):
@@ -180,6 +184,160 @@ class RunnerSmokeTests(unittest.TestCase):
         self.assertEqual(seen, [11, 12, 13])
         self.assertEqual(agent.trace.events, [])
         self.assertEqual(llm.calls, [])
+
+    def test_run_ticks_skips_store_access_when_shutdown_is_already_requested(self):
+        stop_event = Event()
+        stop_event.set()
+        evidence = Mock()
+        run_tick = Mock()
+
+        code = runner.run_ticks(
+            evidence_store=evidence,
+            agent=_Agent(),
+            llm=_LLM(),
+            requested_tick=None,
+            ticks=0,
+            run_tick_fn=run_tick,
+            should_stop=stop_event.is_set,
+        )
+
+        self.assertEqual(code, 0)
+        evidence.current_tick.assert_not_called()
+        run_tick.assert_not_called()
+
+    def test_run_ticks_finishes_and_persists_tick_before_stopping(self):
+        stop_event = Event()
+        seen = []
+        debug_logger = Mock()
+
+        def run_tick(tick):
+            seen.append(tick)
+            stop_event.set()
+            return _Context(tick)
+
+        code = runner.run_ticks(
+            evidence_store=_Evidence(current_tick=10),
+            agent=_Agent(),
+            llm=_LLM(),
+            requested_tick=None,
+            ticks=0,
+            run_tick_fn=run_tick,
+            debug_logger=debug_logger,
+            should_stop=stop_event.is_set,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [11])
+        debug_logger.persist_runner_tick.assert_called_once()
+
+    def test_main_sigterm_finishes_fsm_tick_without_triggering_abort(self):
+        tick_runner = object.__new__(TickRunner)
+        tick_runner.should_stop = None
+        tick_runner.tick_interval_sec = 300
+        tick_runner.trace = None
+        states = list(FSMState)[:-1]
+        next_states = dict(pairwise(states))
+        contexts = []
+
+        def dispatch(state, ctx):
+            if state == FSMState.S0_ENTER_TICK:
+                contexts.append(ctx)
+            if state == FSMState.S4_AGENTIC_PLAN:
+                signal.raise_signal(signal.SIGTERM)
+            return next_states[state]
+
+        tick_runner._dispatch = dispatch
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        with (
+            patch.multiple(
+                runner, DebugLogger=DEFAULT, configure_logging=DEFAULT, emit_run_manifest=DEFAULT
+            ),
+            patch.object(runner.agent_tools, "bind_tools"),
+        ):
+            code = runner.main(
+                ["--ticks", "0"],
+                build_runner_fn=lambda args: (tick_runner, _Evidence(0), _Agent(), _LLM()),
+                run_tick_fn=tick_runner.run_tick,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0].state_history, states)
+        self.assertIsNone(contexts[0].error)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+
+    def test_main_sigterm_does_not_acquire_event_lock(self):
+        def run_tick(tick):
+            signal.raise_signal(signal.SIGTERM)
+            return _Context(tick)
+
+        with (
+            patch.multiple(
+                runner, DebugLogger=DEFAULT, configure_logging=DEFAULT, emit_run_manifest=DEFAULT
+            ),
+            patch.object(runner.agent_tools, "bind_tools"),
+            patch.object(
+                Event, "set", side_effect=AssertionError("SIGTERM must not call Event.set()")
+            ),
+        ):
+            code = runner.main(
+                ["--ticks", "0"],
+                build_runner_fn=lambda args: (object(), _Evidence(0), _Agent(), _LLM()),
+                run_tick_fn=run_tick,
+            )
+
+        self.assertEqual(code, 0)
+
+    def test_main_restores_sigterm_handler_after_initialization_failure(self):
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        with (
+            patch.multiple(runner, DebugLogger=DEFAULT, configure_logging=DEFAULT),
+            self.assertRaisesRegex(RuntimeError, "initialization failed"),
+        ):
+            runner.main([], build_runner_fn=Mock(side_effect=RuntimeError("initialization failed")))
+
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+
+    def test_shutdown_request_wakes_terminal_wait(self):
+        tick_runner = object.__new__(TickRunner)
+        stop_event = Event()
+        tick_runner.should_stop = stop_event.is_set
+        tick_runner.tick_interval_sec = 300
+        ctx = TickContext(tick=1, tick_started_at=time.time())
+        started = Event()
+
+        def sleep_tick():
+            started.set()
+            tick_runner._sleep_tick_remainder(ctx)
+
+        thread = Thread(target=sleep_tick, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(timeout=2))
+        finally:
+            stop_event.set()
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive(), "tick sleep ignored shutdown")
+
+    def test_terminal_wait_sleeps_only_the_remaining_interval(self):
+        tick_runner = object.__new__(TickRunner)
+        tick_runner.should_stop = None
+        tick_runner.tick_interval_sec = 1
+        ctx = TickContext(tick=1, tick_started_at=99.25)
+
+        with (
+            patch("src.orchestrator.fsm_states.time.time", return_value=100),
+            patch(
+                "src.orchestrator.fsm_states.time.monotonic", side_effect=[10, 10.1, 10.2, 10.25]
+            ),
+            patch("src.orchestrator.fsm_states.time.sleep") as sleep,
+        ):
+            tick_runner._sleep_tick_remainder(ctx)
+
+        self.assertEqual(sleep.call_count, 3)
+        self.assertAlmostEqual(sum(call.args[0] for call in sleep.call_args_list), 0.25)
+        self.assertTrue(all(call.args[0] <= 0.1 for call in sleep.call_args_list))
 
     def test_run_ticks_all_trace_persists_llm_calls_and_agent_events(self):
         """All trace mode persists LLM calls and agent events."""
