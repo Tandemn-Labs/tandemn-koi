@@ -7,8 +7,8 @@ import logging
 import os
 import signal
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
-from threading import Event
 from typing import Any
 from urllib.parse import urlparse
 
@@ -456,21 +456,21 @@ def run_ticks(
     ticks: int,
     run_tick_fn,
     debug_logger: DebugLogger | None = None,
-    stop_event: Event | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> int:
     """Run ticks until count is exhausted or shutdown is requested."""
     if ticks < 0:
         raise SystemExit("--ticks must be >= 0")
 
-    if stop_event is None:
-        stop_event = Event()
-    if stop_event.is_set():
+    if should_stop is not None and should_stop():
         return 0
 
     tick = next_tick(evidence_store, requested_tick)
     completed = 0
     exit_code = 0
-    while (ticks == 0 or completed < ticks) and not stop_event.is_set():
+    while ticks == 0 or completed < ticks:
+        if should_stop is not None and should_stop():
+            break
         log.info("starting koi tick %d", tick)
         ctx = run_tick_fn(tick)
         log_tick_summary(ctx)
@@ -498,16 +498,21 @@ def main(
     debug_logger = DebugLogger(args.log_dir, trace=args.trace, run_id=args.run_id)
     configure_logging(args.log_level, debug_logger.runner_log_path)
     log.info("debug logs: %s", debug_logger.run_dir)
-    stop_event = Event()
+    shutdown_requested = False
 
     def request_shutdown(_signum, _frame) -> None:
-        stop_event.set()
+        nonlocal shutdown_requested
+        # Signal handlers must not acquire locks held by the interrupted thread.
+        shutdown_requested = True
+
+    def should_stop() -> bool:
+        return shutdown_requested
 
     previous_sigterm_handler = signal.signal(signal.SIGTERM, request_shutdown)
     try:
         runner, evidence_store, agent, llm = build_runner_fn(args)
-        if hasattr(runner, "stop_event"):
-            runner.stop_event = stop_event
+        if hasattr(runner, "should_stop"):
+            runner.should_stop = should_stop
         emit_run_manifest(debug_logger, args)
         if hasattr(runner, "trace"):
             runner.trace = debug_logger
@@ -521,7 +526,7 @@ def main(
             ticks=args.ticks,
             run_tick_fn=run_tick_fn,
             debug_logger=debug_logger,
-            stop_event=stop_event,
+            should_stop=should_stop,
         )
     except KeyboardInterrupt:
         log.info("shutdown requested")
