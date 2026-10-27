@@ -96,14 +96,14 @@ class MockCandidateGraph:
         "gpu_mem_util",
         "max_model_len",
         "block_size",
-        "kvcache_dtype",
+        "kv_cache_dtype",
         "weight_dtype",
         "weight_quantization_method",
         "weight_quantization_bits",
         "activation_quantization_method",
         "activation_dtype",
         "prefix_cache_enabled",
-        "chunked_prefill_enable",
+        "chunked_prefill_enabled",
         "chunk_size",
         "sliding_window_size",
         "lmcache_enabled",
@@ -187,7 +187,7 @@ class PredictionSmokeTests(unittest.TestCase):
                 "max_num_seq": 4,
                 "max_num_batched_tokens": 2048,
                 "weight_dtype": "fp16",
-                "kvcache_dtype": "fp8",
+                "kv_cache_dtype": "fp8",
             },
             {"request_count": 4, "replay_mode": "offline"},
             ("AIC_DynoSim",),
@@ -1054,7 +1054,9 @@ class PredictionSmokeTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual([attempt["aic_system"] for attempt in attempts], ["first_system", "second_system"])
+        self.assertEqual(
+            [attempt["aic_system"] for attempt in attempts], ["first_system", "second_system"]
+        )
         self.assertEqual(y_hat["throughput_token_per_sec"], 50.0)
         self.assertEqual(attempts[1]["aic_backend"], "sglang")
         self.assertEqual(attempts[1]["aic_backend_version"], "0.5.14")
@@ -1153,10 +1155,13 @@ class PredictionSmokeTests(unittest.TestCase):
             enriched = predictor._enrich_requested_model_values({"model_id": "microsoft/phi-4"})
 
         self.assertEqual(enriched["model_params_b"], 14)
-        self.assertEqual(predictor.last_metadata["model_profile_enrichment"], {
-            "status": "success",
-            "source": "huggingface",
-        })
+        self.assertEqual(
+            predictor.last_metadata["model_profile_enrichment"],
+            {
+                "status": "success",
+                "source": "huggingface",
+            },
+        )
         self.assertEqual(load_config.call_args.kwargs["token"], None)
 
     def test_direct_memory_fit_uses_enriched_requested_model(self):
@@ -1232,7 +1237,9 @@ class PredictionSmokeTests(unittest.TestCase):
             SupportedProfile(
                 "a100-near",
                 gpu,
-                ModelProfile(**{**target.__dict__, "model_id": "aic/dense-32b", "parameter_count": 32e9}),
+                ModelProfile(
+                    **{**target.__dict__, "model_id": "aic/dense-32b", "parameter_count": 32e9}
+                ),
                 "vllm",
                 "0.22.0",
                 "a100_sxm",
@@ -1240,7 +1247,9 @@ class PredictionSmokeTests(unittest.TestCase):
             SupportedProfile(
                 "a100-far",
                 gpu,
-                ModelProfile(**{**target.__dict__, "model_id": "aic/dense-70b", "parameter_count": 70e9}),
+                ModelProfile(
+                    **{**target.__dict__, "model_id": "aic/dense-70b", "parameter_count": 70e9}
+                ),
                 "vllm",
                 "0.22.0",
                 "a100_sxm",
@@ -1382,7 +1391,7 @@ class PredictionSmokeTests(unittest.TestCase):
                 "head_dim": 128,
                 "vocab_size": 100352,
                 "weight_dtype": "bf16",
-                "kvcache_dtype": "bf16",
+                "kv_cache_dtype": "bf16",
                 "tp": 2,
             },
             {
@@ -1401,7 +1410,7 @@ class PredictionSmokeTests(unittest.TestCase):
                 "num_active_experts": 2,
                 "moe_intermediate_size": 14336,
                 "weight_dtype": "bf16",
-                "kvcache_dtype": "bf16",
+                "kv_cache_dtype": "bf16",
                 "tp": 8,
             },
         )
@@ -1590,7 +1599,7 @@ class PredictionSmokeTests(unittest.TestCase):
             "nvlink_bandwidth_gbps": 900,
             "weight_dtype": "fp16",
             "activation_dtype": "fp16",
-            "kvcache_dtype": "fp16",
+            "kv_cache_dtype": "fp16",
             "tp": 1,
             "pp": 1,
             "dp": 1,
@@ -1738,7 +1747,7 @@ class PredictionSmokeTests(unittest.TestCase):
             "max_num_seq": 256,
             "max_num_batched_tokens": 8192,
             "prefix_cache_enabled": True,
-            "chunked_prefill_enable": True,
+            "chunked_prefill_enabled": True,
             "pd_enabled": False,
             "prefill_worker_count": 1,
             "decode_worker_count": 1,

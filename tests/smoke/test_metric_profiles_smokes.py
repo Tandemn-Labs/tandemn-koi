@@ -1,0 +1,126 @@
+"""Check query profiles define labelled, rank-level source measurements."""
+
+import json
+import unittest
+from pathlib import Path
+
+PROFILE_DIR = Path(__file__).resolve().parents[2] / "src" / "infra" / "metrics" / "profiles"
+
+EXPECTED_QUERIES = {
+    "vllm_promql.json": {
+        "ttft_p99_seconds",
+        "tpot_p99_seconds",
+        "generated_output_tokens_per_second",
+        "running_requests",
+        "waiting_requests",
+        "kv_cache_usage_fraction",
+        "prefix_cache_hit_fraction",
+        "prompt_tokens_per_request",
+        "generated_tokens_per_request",
+        "prefill_observations_per_second",
+        "decode_observations_per_second",
+        "prefill_decode_time_ratio",
+        "num_kv_blocks_mean",
+    },
+    "dcgm_promql.json": {
+        "gpu_memory_used_fraction_mean",
+        "gpu_memory_free_mib_mean",
+        "sm_active_fraction_mean",
+        "dram_active_fraction_mean",
+        "pcie_bytes_per_second_mean",
+        "nvlink_bytes_per_second_mean",
+    },
+    "sglang_promql.json": {
+        "ttft_p99_seconds",
+        "tpot_p99_seconds",
+        "generation_throughput",
+        "running_requests",
+        "waiting_requests",
+        "full_token_usage",
+        "prefix_cache_hit_fraction",
+        "prompt_tokens_per_request",
+        "generated_tokens_per_request",
+        "prefill_observations_per_second",
+        "decode_observations_per_second",
+    },
+}
+
+
+class MetricProfileSmokeTests(unittest.TestCase):
+    def test_each_profile_has_a_unit_and_rank_query_for_every_input(self):
+        for filename, expected_queries in EXPECTED_QUERIES.items():
+            with self.subTest(profile=filename):
+                profile = json.loads((PROFILE_DIR / filename).read_text())
+                self.assertEqual(profile["version"], 1)
+                self.assertEqual(profile["language"], "promql")
+                self.assertEqual(profile["rank_labels"], ["job_id", "rank_id"])
+                self.assertEqual(set(profile["queries"]), expected_queries)
+                for name, item in profile["queries"].items():
+                    with self.subTest(profile=filename, input=name):
+                        self.assertTrue(item["unit"])
+                        self.assertTrue(item["aggregation"])
+                        self.assertIn("__KOI_RANK_FILTER__", item["expression"])
+                        self.assertIn("job_id", item["expression"])
+                        self.assertIn("rank_id", item["expression"])
+                        self.assertNotIn("chain_id", item["expression"])
+
+    def test_vllm_counters_get_rates_before_rank_sums(self):
+        profile = json.loads((PROFILE_DIR / "vllm_promql.json").read_text())
+        for name in ("generated_output_tokens_per_second", "prefill_observations_per_second"):
+            with self.subTest(input=name):
+                expression = profile["queries"][name]["expression"]
+                self.assertIn("sum by (job_id, rank_id) (rate(", expression)
+        self.assertIn(
+            "sum by (le, job_id, rank_id)",
+            profile["queries"]["ttft_p99_seconds"]["expression"],
+        )
+        self.assertIn(
+            "histogram_quantile(0.99", profile["queries"]["ttft_p99_seconds"]["expression"]
+        )
+
+    def test_ratios_are_calculated_from_rank_level_totals(self):
+        profile = json.loads((PROFILE_DIR / "vllm_promql.json").read_text())
+        for name in (
+            "prefix_cache_hit_fraction",
+            "prompt_tokens_per_request",
+            "generated_tokens_per_request",
+            "prefill_decode_time_ratio",
+        ):
+            with self.subTest(input=name):
+                expression = profile["queries"][name]["expression"]
+                self.assertIn("sum by (job_id, rank_id)", expression)
+                self.assertTrue(expression.startswith("sum by (job_id, rank_id)"))
+
+    def test_dcgm_uses_reserved_memory_and_does_not_redifferentiate_rates(self):
+        profile = json.loads((PROFILE_DIR / "dcgm_promql.json").read_text())
+        for name in ("pcie_bytes_per_second_mean", "nvlink_bytes_per_second_mean"):
+            with self.subTest(input=name):
+                expression = profile["queries"][name]["expression"]
+                self.assertIn("TX_BYTES", expression)
+                self.assertIn("RX_BYTES", expression)
+                self.assertNotIn("rate(", expression)
+
+    def test_sglang_uses_v0521_gauge_and_token_cache_counters(self):
+        queries = json.loads((PROFILE_DIR / "sglang_promql.json").read_text())["queries"]
+        self.assertIn("sglang:gen_throughput", queries["generation_throughput"]["expression"])
+        self.assertNotIn("rate(", queries["generation_throughput"]["expression"])
+        self.assertIn(
+            "sglang:prefill_effective_tokens_total",
+            queries["prefix_cache_hit_fraction"]["expression"],
+        )
+        self.assertIn(
+            'mode=~"device_hit|host_hit|storage_hit"',
+            queries["prefix_cache_hit_fraction"]["expression"],
+        )
+        self.assertNotIn("sglang:cache_hit_rate", str(queries))
+        self.assertIn(
+            'mode=~"input|device_hit|host_hit|storage_hit"',
+            queries["prefix_cache_hit_fraction"]["expression"],
+        )
+        for name in ("ttft_p99_seconds", "tpot_p99_seconds"):
+            self.assertIn("histogram_quantile(0.99", queries[name]["expression"])
+            self.assertIn("sum by (le, job_id, rank_id)", queries[name]["expression"])
+
+
+if __name__ == "__main__":
+    unittest.main()

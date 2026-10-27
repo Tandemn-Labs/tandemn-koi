@@ -247,14 +247,14 @@
     {
       "name": "chunked_prefill_ttft_long_input",
       "edge_ids": [
-        "chunked_prefill_enable->prefill_iteration_counts_per_second",
+        "chunked_prefill_enabled->prefill_iteration_counts_per_second",
         "chunk_size->prefill_iteration_counts_per_second",
         "isl_token_avg->prefill_iteration_counts_per_second",
-        "chunked_prefill_enable->live_batch_size",
+        "chunked_prefill_enabled->live_batch_size",
         "prefill_iteration_counts_per_second->p99_ttft_ms"
       ],
       "scope": {
-        "x": ["chunked_prefill_enable", "chunk_size", "isl_token_avg"],
+        "x": ["chunked_prefill_enabled", "chunk_size", "isl_token_avg"],
         "v": ["prefill_iteration_counts_per_second"],
         "workload_type": "online",
         "model_type": "any",
@@ -519,12 +519,12 @@
       "edge_ids": [
         "max_num_batched_tokens->activation_mem_pressure",
         "chunk_size->activation_mem_pressure",
-        "chunked_prefill_enable->activation_mem_pressure",
+        "chunked_prefill_enabled->activation_mem_pressure",
         "activation_mem_pressure->slo_margin",
         "activation_mem_pressure->p99_tpot_ms"
       ],
       "scope": {
-        "x": ["max_num_batched_tokens", "chunk_size", "chunked_prefill_enable", "isl_token_avg"],
+        "x": ["max_num_batched_tokens", "chunk_size", "chunked_prefill_enabled", "isl_token_avg"],
         "v": ["activation_mem_pressure"],
         "workload_type": "any",
         "model_type": "any",
@@ -947,14 +947,14 @@
     {
       "name": "kv_fp8_decode_bandwidth",
       "edge_ids": [
-        "kvcache_dtype->mem_bandwidth_utilization",
-        "kvcache_dtype->gpu_mem_used_fraction",
-        "kvcache_dtype->kv_pressure_score",
+        "kv_cache_dtype->mem_bandwidth_utilization",
+        "kv_cache_dtype->gpu_mem_used_fraction",
+        "kv_cache_dtype->kv_pressure_score",
         "mem_bandwidth_utilization->p99_tpot_ms",
         "kv_pressure_score->slo_margin"
       ],
       "scope": {
-        "x": ["kvcache_dtype"],
+        "x": ["kv_cache_dtype"],
         "v": ["mem_bandwidth_utilization", "gpu_mem_used_fraction", "kv_pressure_score"],
         "workload_type": "any",
         "model_type": "any",
@@ -1356,13 +1356,13 @@
     {
       "name": "prefill_decode_interference_chunked",
       "edge_ids": [
-        "chunked_prefill_enable->live_batch_size",
+        "chunked_prefill_enabled->live_batch_size",
         "chunk_size->prefill_iteration_counts_per_second",
         "prefill_iteration_counts_per_second->p99_ttft_ms",
         "live_batch_size->p99_tpot_ms"
       ],
       "scope": {
-        "x": ["chunked_prefill_enable", "chunk_size"],
+        "x": ["chunked_prefill_enabled", "chunk_size"],
         "v": ["prefill_iteration_counts_per_second", "live_batch_size"],
         "workload_type": "online",
         "model_type": "any",
@@ -1382,7 +1382,7 @@
         "kvcache_hit_rate->p99_ttft_ms"
       ],
       "scope": {
-        "x": ["isl_token_avg", "prefix_cache_enabled", "chunked_prefill_enable"],
+        "x": ["isl_token_avg", "prefix_cache_enabled", "chunked_prefill_enabled"],
         "v": ["prefill_iteration_counts_per_second", "input_length_observed", "kvcache_hit_rate"],
         "workload_type": "online",
         "model_type": "any",
@@ -1622,7 +1622,7 @@
         "decode_itr_counts_per_second->p99_tpot_ms"
       ],
       "scope": {
-        "x": ["isl_token_avg", "osl_token_avg", "chunked_prefill_enable"],
+        "x": ["isl_token_avg", "osl_token_avg", "chunked_prefill_enabled"],
         "v": ["prefill_iteration_counts_per_second", "kv_cache_util", "decode_itr_counts_per_second"],
         "workload_type": "online",
         "model_type": "any",
@@ -1727,14 +1727,14 @@
     {
       "name": "long_context_chunked_prefill_mandatory",
       "edge_ids": [
-        "chunked_prefill_enable->activation_mem_pressure",
+        "chunked_prefill_enabled->activation_mem_pressure",
         "chunk_size->activation_mem_pressure",
         "isl_token_avg->prefill_iteration_counts_per_second",
         "activation_mem_pressure->slo_margin",
         "prefill_iteration_counts_per_second->p99_ttft_ms"
       ],
       "scope": {
-        "x": ["chunked_prefill_enable", "chunk_size", "isl_token_avg", "max_model_len"],
+        "x": ["chunked_prefill_enabled", "chunk_size", "isl_token_avg", "max_model_len"],
         "v": ["activation_mem_pressure", "prefill_iteration_counts_per_second"],
         "workload_type": "any",
         "model_type": "any",

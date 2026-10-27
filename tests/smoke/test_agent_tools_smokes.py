@@ -90,7 +90,7 @@ class _ResourceMap:
             "max_num_seq": [{"gpu_type": "H100", "value": 256}],
             "max_num_batched_tokens": [{"gpu_type": "H100", "value": 8192}],
             "block_size": [{"gpu_type": "H100", "value": 16}],
-            "kvcache_dtype": [{"gpu_type": "H100", "value": "auto"}],
+            "kv_cache_dtype": [{"gpu_type": "H100", "value": "auto"}],
         }
 
 

@@ -103,7 +103,7 @@ def test_mla_profile_uses_latent_cache_with_pp_local_layers():
             "kv_lora_rank": 512,
             "qk_rope_head_dim": 64,
             "weight_dtype": "fp8",
-            "kvcache_dtype": "bf16",
+            "kv_cache_dtype": "bf16",
         },
     )
 

@@ -32,7 +32,7 @@ _X_SKIP = {
 }
 _LOAD_FIELDS = ("request_arrival_rate", "total_token_budget")
 _MODEL_IDENTITY_FIELDS = {"model_id", "updated_at"}
-_PER_GPU_MODEL_FIELDS = {"max_num_seq", "max_num_batched_tokens", "block_size", "kvcache_dtype"}
+_PER_GPU_MODEL_FIELDS = {"max_num_seq", "max_num_batched_tokens", "block_size", "kv_cache_dtype"}
 _LAUNCH_CONFIG_FIELDS = frozenset(
     {
         "engine_name",
@@ -42,13 +42,13 @@ _LAUNCH_CONFIG_FIELDS = frozenset(
         "gpu_mem_util",
         "max_model_len",
         "block_size",
-        "kvcache_dtype",
+        "kv_cache_dtype",
         "weight_dtype",
         "activation_dtype",
         "weight_quantization_method",
         "weight_quantization_bits",
         "prefix_cache_enabled",
-        "chunked_prefill_enable",
+        "chunked_prefill_enabled",
         "scheduling_policy",
         "preemption_policy",
         "router_policy",
@@ -549,10 +549,7 @@ def _rank_traffic_share(shape: dict[str, Any], replica_count: int, total_replica
     # this raise wedged the whole control loop in S1_OBSERVE, 1,744 aborted
     # ticks). Attribute load by replica proportion instead of raising -
     # telemetry corrects the estimate as soon as it observes the deployment.
-    if 0 < replica_count <= total_replicas:
-        share = replica_count / total_replicas
-    else:
-        share = 1.0
+    share = replica_count / total_replicas if 0 < replica_count <= total_replicas else 1.0
     log.warning(
         "multi-rank shape missing rank_traffic_share; using replica proportion "
         "%.4f (%d of %d replicas)",
