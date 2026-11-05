@@ -1,10 +1,59 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class RequestModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+PositiveInt = Annotated[int, Field(gt=0)]
+GpuMemoryUtilization = Annotated[float, Field(gt=0, le=1)]
+Probability = Annotated[float, Field(ge=0, le=1)]
+
+
+class PerGpuIntOverride(RequestModel):
+    gpu_type: str = Field(min_length=1)
+    value: PositiveInt
+
+
+class PerGpuStringOverride(RequestModel):
+    gpu_type: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+
+
+class JobEngineArguments(RequestModel):
+    max_model_len: PositiveInt | None = None
+    gpu_mem_util: GpuMemoryUtilization | None = None
+
+    # Scalar applies to any GPU; a list overrides only the listed GPU types.
+    max_num_seq: PositiveInt | list[PerGpuIntOverride] | None = None
+    max_num_batched_tokens: PositiveInt | list[PerGpuIntOverride] | None = None
+    block_size: PositiveInt | list[PerGpuIntOverride] | None = None
+    kvcache_dtype: str | list[PerGpuStringOverride] | None = None
+
+    attn_backend: str | None = None
+    activation_quantization_method: str | None = None
+    activation_dtype: str | None = None
+
+    prefix_cache_enabled: bool | None = None
+    chunked_prefill_enable: bool | None = None
+    lmcache_enabled: bool | None = None
+
+    spec_decoding_enabled: bool | None = None
+    draft_model_id: str | None = None
+    spec_decoding_method: str | None = None
+    num_speculative_tokens: PositiveInt | None = None
+    spec_acceptance_threshold: Probability | None = None
+
+    cuda_graph_enabled: bool | None = None
+    torch_compile_enabled: bool | None = None
+
+    chunk_size: PositiveInt | None = None
+    max_chunked_steps_per_request: PositiveInt | None = None
+
+    # Exact argv tokens; do not join into or execute as a shell command.
+    extra_args: list[str] = Field(default_factory=list)
 
 
 class JobFeatures(RequestModel):
@@ -44,13 +93,14 @@ class JobFeatures(RequestModel):
     is_session_affinity: bool = True
     total_token_budget: int = 1_000_000  # only for batched
     priority_class: Literal["HIGH", "STANDARD", "LOW"] = "STANDARD"
-    preemption_policy: Literal["lifo", "fifo"] = "lifo"
-    router_policy: Literal["kv_router"] = "kv_router"
+    scheduling_policy: Literal["fcfs", "lcfs", "wspt"] | None = None
+    router_policy: Literal["kv_aware", "round_robin"] | None = None
 
 
 class JobSpec(RequestModel):
     model_id: str
     job_features: JobFeatures = Field(default_factory=JobFeatures)
+    engine_config: JobEngineArguments | None = None
 
 
 class JobSubmission(RequestModel):
