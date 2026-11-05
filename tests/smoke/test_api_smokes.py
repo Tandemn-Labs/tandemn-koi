@@ -1,10 +1,12 @@
-"""Smoke tests for Koi HTTP endpoints without Store or LLM access."""
+"""Smoke tests for Koi HTTP endpoints and job-submission schemas."""
 
 import unittest
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from src.api.app import app
+from src.api.schemas import JobSubmission
 
 
 class ApiSmokeTests(unittest.TestCase):
@@ -74,6 +76,93 @@ class ApiSmokeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 501)
         self.assertEqual(response.json(), {"detail": "Not implemented"})
+
+
+class EngineConfigSchemaTests(unittest.TestCase):
+    """Verify the optional engine_config schema parses and rejects bad input."""
+
+    def test_job_spec_without_engine_config_still_parses(self):
+        submission = JobSubmission.model_validate({"kind": "online", "spec": {"model_id": "test"}})
+
+        self.assertIsNone(submission.spec.engine_config)
+
+    def test_partial_engine_config_leaves_unset_fields_unset(self):
+        submission = JobSubmission.model_validate(
+            {
+                "kind": "batch",
+                "spec": {
+                    "model_id": "test",
+                    "engine_config": {"gpu_mem_util": 0.92, "prefix_cache_enabled": False},
+                },
+            }
+        )
+
+        engine = submission.spec.engine_config
+        self.assertEqual(engine.gpu_mem_util, 0.92)
+        self.assertFalse(engine.prefix_cache_enabled)
+        self.assertIsNone(engine.max_model_len)
+        self.assertIsNone(engine.max_num_seq)
+        self.assertEqual(engine.extra_args, [])
+
+    def test_per_gpu_overrides_and_extra_args_parse(self):
+        submission = JobSubmission.model_validate(
+            {
+                "kind": "online",
+                "spec": {
+                    "model_id": "test",
+                    "engine_config": {
+                        "max_num_seq": [{"gpu_type": "H100", "value": 256}],
+                        "kvcache_dtype": [{"gpu_type": "MI300X", "value": "fp8"}],
+                        "extra_args": ["--enable-prefix-caching", "--swap-space", "4"],
+                    },
+                },
+            }
+        )
+
+        engine = submission.spec.engine_config
+        self.assertEqual(engine.max_num_seq[0].value, 256)
+        self.assertEqual(engine.kvcache_dtype[0].gpu_type, "MI300X")
+        self.assertEqual(engine.extra_args, ["--enable-prefix-caching", "--swap-space", "4"])
+
+    def test_scalar_overrides_parse_without_per_gpu_entries(self):
+        submission = JobSubmission.model_validate(
+            {
+                "kind": "online",
+                "spec": {
+                    "model_id": "test",
+                    "engine_config": {"max_num_seq": 256, "gpu_mem_util": 0.9},
+                },
+            }
+        )
+
+        engine = submission.spec.engine_config
+        self.assertEqual(engine.max_num_seq, 256)
+        self.assertEqual(engine.gpu_mem_util, 0.9)
+
+    def test_invalid_engine_config_is_rejected(self):
+        bad_engine_configs = [
+            {"gpu_mem_util": 0},
+            {"gpu_mem_util": 1.5},
+            {"max_model_len": 0},
+            {"max_num_seq": -1},
+            {"block_size": [{"gpu_type": "", "value": 16}]},
+            {"chunk_size": 0.5},
+            {"scheduling_policy": "wspt-lowercase"},
+            {"router_policy": "kv_router"},
+            {"spec_acceptance_threshold": -0.1},
+            {"unknown_engine_field": True},
+        ]
+        for engine_config in bad_engine_configs:
+            with (
+                self.subTest(engine_config=engine_config),
+                self.assertRaises(ValidationError),
+            ):
+                JobSubmission.model_validate(
+                    {
+                        "kind": "online",
+                        "spec": {"model_id": "test", "engine_config": engine_config},
+                    }
+                )
 
 
 if __name__ == "__main__":
