@@ -56,7 +56,7 @@ class JobEngineArguments(RequestModel):
     extra_args: list[str] = Field(default_factory=list)
 
 
-class JobFeatures(RequestModel):
+class JobIntent(RequestModel):
     # Required for online jobs; not used to select batch duration.
     target_p99_ttft_ms: float | None = None
     target_p99_tpot_ms: float | None = None
@@ -99,7 +99,7 @@ class JobFeatures(RequestModel):
 
 class JobSpec(RequestModel):
     model_id: str
-    job_features: JobFeatures = Field(default_factory=JobFeatures)
+    job_intent: JobIntent = Field(default_factory=JobIntent)
     engine_config: JobEngineArguments | None = None
 
 
