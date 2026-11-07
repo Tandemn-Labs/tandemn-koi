@@ -101,6 +101,7 @@ class JobSpec(RequestModel):
     model_id: str
     job_intent: JobIntent = Field(default_factory=JobIntent)
     engine_config: JobEngineArguments | None = None
+    kubernetes_labels: dict[str, str] = Field(default_factory=dict)
 
 
 class JobSubmission(RequestModel):

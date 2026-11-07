@@ -81,10 +81,27 @@ class ApiSmokeTests(unittest.TestCase):
 class EngineConfigSchemaTests(unittest.TestCase):
     """Verify the optional engine_config schema parses and rejects bad input."""
 
+    def test_job_spec_stores_user_kubernetes_labels(self):
+        submission = JobSubmission.model_validate(
+            {
+                "kind": "online",
+                "spec": {
+                    "model_id": "test",
+                    "kubernetes_labels": {"team": "inference", "app": "chat"},
+                },
+            }
+        )
+
+        self.assertEqual(
+            submission.spec.kubernetes_labels,
+            {"team": "inference", "app": "chat"},
+        )
+
     def test_job_spec_without_engine_config_still_parses(self):
         submission = JobSubmission.model_validate({"kind": "online", "spec": {"model_id": "test"}})
 
         self.assertIsNone(submission.spec.engine_config)
+        self.assertEqual(submission.spec.kubernetes_labels, {})
 
     def test_partial_engine_config_leaves_unset_fields_unset(self):
         submission = JobSubmission.model_validate(
