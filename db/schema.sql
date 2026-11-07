@@ -96,6 +96,7 @@ CREATE TABLE hardware_catalog (
 CREATE TABLE jobs (
     job_id TEXT PRIMARY KEY,
     kind job_kind NOT NULL,
+    status job_status NOT NULL,
     model_id TEXT NOT NULL REFERENCES model_architecture (model_id)
 );
 
