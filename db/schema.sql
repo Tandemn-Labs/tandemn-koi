@@ -175,6 +175,16 @@ CREATE TABLE master_table (
     job_id TEXT NOT NULL REFERENCES jobs (job_id),
     rank_id TEXT NOT NULL,
     mechanisms TEXT[] NOT NULL DEFAULT '{}',
+    -- debt, probably need removal soon - not needed for now
+    cusum_per_mechanism JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(cusum_per_mechanism) = 'object'),
+    q_label_per_mechanism JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(q_label_per_mechanism) = 'object'),
+    icp_result_per_edge JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(icp_result_per_edge) = 'object'),
+    -- shortcut: snapshot resolved X per evidence row; replace with joins over immutable tick-scoped source revisions when available.
+    x_snapshot JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(x_snapshot) = 'object'),
     reasoning TEXT NOT NULL,
     job_status job_status NOT NULL,
     rank_beta DOUBLE PRECISION,
