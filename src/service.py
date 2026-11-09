@@ -6,9 +6,11 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
+from pathlib import Path
 
 import uvicorn
 
@@ -172,11 +174,32 @@ async def run_service(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Start the service; all command-line arguments belong to the runner."""
+    """Migrate before starting services; forward arguments to the runner."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    try:
+        subprocess.run(
+            [
+                "dbmate",
+                "--wait",
+                "--wait-timeout",  # Give PostgreSQL up to 60 seconds to become available
+                "60s",
+                "--migration-lock",
+                "--migration-lock-timeout",  # Acquire a PostgreSQL lock so only one Koi instance applies migrations at a time.
+                "5m",
+                "--no-dump-schema",
+                "--migrations-dir",
+                str(Path(__file__).resolve().parent.parent / "db" / "migrations"),
+                "migrate",
+                "--strict",
+            ],
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        log.exception("Database migration failed; Koi will not start")
+        return 1
     return asyncio.run(run_service(sys.argv[1:] if argv is None else argv))
 
 
