@@ -61,7 +61,29 @@ def test_concurrent_and_repeated_migrations(migration_database):
             SELECT count(*) FROM information_schema.tables
             WHERE table_schema = 'public' AND table_name <> 'schema_migrations'
             """
-        ).fetchone() == (18,)
+        ).fetchone() == (19,)
+        assert conn.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'plan_rank_predictions'
+            ORDER BY ordinal_position
+            """
+        ).fetchall() == [
+            ("plan_id",),
+            ("job_id",),
+            ("rank_id",),
+            ("v_predicted",),
+            ("y_predicted",),
+            ("mechanism_id",),
+            ("created_at",),
+        ]
+        assert conn.execute(
+            """
+            SELECT tgname FROM pg_trigger
+            WHERE tgrelid = 'public.plan_rank_predictions'::regclass
+              AND NOT tgisinternal
+            """
+        ).fetchall() == [("plan_rank_predictions_append_only",)]
 
 
 def test_failed_migration_rolls_back(migration_database, tmp_path):

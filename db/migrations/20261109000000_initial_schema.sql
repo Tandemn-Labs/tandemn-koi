@@ -323,6 +323,26 @@ ALTER TABLE placement
     FOREIGN KEY (plan_id, job_id)
     REFERENCES plan_actions (plan_id, job_id);
 
+CREATE TABLE plan_rank_predictions (
+    plan_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    rank_id TEXT NOT NULL,
+    v_predicted JSONB NOT NULL
+        CHECK (jsonb_typeof(v_predicted) = 'object'),
+    y_predicted JSONB NOT NULL
+        CHECK (jsonb_typeof(y_predicted) = 'object'),
+    mechanism_id TEXT REFERENCES causal_mechanisms (mechanism_id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (plan_id, job_id, rank_id),
+    FOREIGN KEY (plan_id, job_id, rank_id)
+        REFERENCES placement (plan_id, job_id, rank_id)
+);
+
+CREATE TRIGGER plan_rank_predictions_append_only
+BEFORE UPDATE OR DELETE OR TRUNCATE ON plan_rank_predictions
+FOR EACH STATEMENT
+EXECUTE FUNCTION reject_append_only_mutation();
+
 CREATE TABLE resource_map_snapshots (
     snapshot_id TEXT PRIMARY KEY,
     stored_at TIMESTAMPTZ,
