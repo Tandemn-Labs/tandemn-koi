@@ -365,6 +365,23 @@ CREATE TABLE public.plan_actions (
 
 
 --
+-- Name: plan_rank_predictions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.plan_rank_predictions (
+    plan_id text NOT NULL,
+    job_id text NOT NULL,
+    rank_id text NOT NULL,
+    v_predicted jsonb NOT NULL,
+    y_predicted jsonb NOT NULL,
+    mechanism_id text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT plan_rank_predictions_v_predicted_check CHECK ((jsonb_typeof(v_predicted) = 'object'::text)),
+    CONSTRAINT plan_rank_predictions_y_predicted_check CHECK ((jsonb_typeof(y_predicted) = 'object'::text))
+);
+
+
+--
 -- Name: plans; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -556,6 +573,14 @@ ALTER TABLE ONLY public.plan_actions
 
 
 --
+-- Name: plan_rank_predictions plan_rank_predictions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.plan_rank_predictions
+    ADD CONSTRAINT plan_rank_predictions_pkey PRIMARY KEY (plan_id, job_id, rank_id);
+
+
+--
 -- Name: plans plans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -651,6 +676,13 @@ CREATE TRIGGER placement_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON publ
 --
 
 CREATE TRIGGER plan_actions_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.plan_actions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
+
+
+--
+-- Name: plan_rank_predictions plan_rank_predictions_append_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER plan_rank_predictions_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.plan_rank_predictions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
 
 
 --
@@ -774,6 +806,22 @@ ALTER TABLE ONLY public.plan_actions
 
 ALTER TABLE ONLY public.plan_actions
     ADD CONSTRAINT plan_actions_plan_id_fkey FOREIGN KEY (plan_id) REFERENCES public.plans(plan_id);
+
+
+--
+-- Name: plan_rank_predictions plan_rank_predictions_mechanism_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.plan_rank_predictions
+    ADD CONSTRAINT plan_rank_predictions_mechanism_id_fkey FOREIGN KEY (mechanism_id) REFERENCES public.causal_mechanisms(mechanism_id);
+
+
+--
+-- Name: plan_rank_predictions plan_rank_predictions_plan_id_job_id_rank_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.plan_rank_predictions
+    ADD CONSTRAINT plan_rank_predictions_plan_id_job_id_rank_id_fkey FOREIGN KEY (plan_id, job_id, rank_id) REFERENCES public.placement(plan_id, job_id, rank_id);
 
 
 --
