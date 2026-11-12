@@ -18,6 +18,13 @@ from src.orchestrator.fsm_states import FSMState, TickContext, TickRunner
 class RunnerSmokeTests(unittest.TestCase):
     """Verify runner control flow without touching Tandemn Store."""
 
+    def setUp(self):
+        self.database_url = "postgresql://localhost/koi_test"
+        self.enterContext(patch.dict(runner.os.environ, {"DATABASE_URL": self.database_url}))
+        self.pool_factory = self.enterContext(patch.object(runner, "postgres_pool"))
+        self.pool_context = self.pool_factory.return_value
+        self.pool = self.pool_context.__enter__.return_value
+
     def test_parse_args_accepts_surrogate_configuration(self):
         args = runner.parse_args(
             [
@@ -79,8 +86,9 @@ class RunnerSmokeTests(unittest.TestCase):
             )
             dependencies["ResourceMapManager"].return_value = resource_map
             dependencies["Validator"].side_effect = RuntimeError("validator wired")
-            runner.build_runner(args)
+            runner.build_runner(args, pool=self.pool)
 
+        dependencies["init_causal_graph"].assert_called_once_with(self.pool)
         dependencies["Validator"].assert_called_once_with(
             candidate_graph=candidate_graph,
             mechanism_registry=mechanism_registry,
@@ -93,8 +101,9 @@ class RunnerSmokeTests(unittest.TestCase):
         captured = {}
         evidence = _Evidence(current_tick=41)
 
-        def build_runner(args):
+        def build_runner(args, *, pool):
             captured["args"] = args
+            captured["pool"] = pool
             return object(), evidence, object(), object()
 
         def run_tick(tick):
@@ -124,12 +133,15 @@ class RunnerSmokeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(captured["args"].user_id, "user_1")
         self.assertEqual(captured["tick"], 42)
+        self.assertIs(captured["pool"], self.pool)
+        self.pool_factory.assert_called_once_with(self.database_url)
+        self.pool_context.__exit__.assert_called_once_with(None, None, None)
 
     def test_main_respects_explicit_tick(self):
         """An explicit --tick overrides persisted evidence state."""
         captured = {}
 
-        def build_runner(args):
+        def build_runner(args, *, pool):
             return object(), _Evidence(current_tick=41), object(), object()
 
         def run_tick(tick):
@@ -240,6 +252,7 @@ class RunnerSmokeTests(unittest.TestCase):
         contexts = []
 
         def dispatch(state, ctx):
+            self.pool_context.__exit__.assert_not_called()
             if state == FSMState.S0_ENTER_TICK:
                 contexts.append(ctx)
             if state == FSMState.S4_AGENTIC_PLAN:
@@ -256,7 +269,7 @@ class RunnerSmokeTests(unittest.TestCase):
         ):
             code = runner.main(
                 ["--ticks", "0"],
-                build_runner_fn=lambda args: (tick_runner, _Evidence(0), _Agent(), _LLM()),
+                build_runner_fn=lambda args, pool: (tick_runner, _Evidence(0), _Agent(), _LLM()),
                 run_tick_fn=tick_runner.run_tick,
             )
 
@@ -265,6 +278,7 @@ class RunnerSmokeTests(unittest.TestCase):
         self.assertEqual(contexts[0].state_history, states)
         self.assertIsNone(contexts[0].error)
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+        self.pool_context.__exit__.assert_called_once_with(None, None, None)
 
     def test_main_sigterm_does_not_acquire_event_lock(self):
         def run_tick(tick):
@@ -282,7 +296,7 @@ class RunnerSmokeTests(unittest.TestCase):
         ):
             code = runner.main(
                 ["--ticks", "0"],
-                build_runner_fn=lambda args: (object(), _Evidence(0), _Agent(), _LLM()),
+                build_runner_fn=lambda args, pool: (object(), _Evidence(0), _Agent(), _LLM()),
                 run_tick_fn=run_tick,
             )
 
@@ -297,6 +311,46 @@ class RunnerSmokeTests(unittest.TestCase):
             runner.main([], build_runner_fn=Mock(side_effect=RuntimeError("initialization failed")))
 
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+        self.assertEqual(self.pool_context.__exit__.call_args.args[0], RuntimeError)
+
+    def test_main_requires_database_url_before_opening_pool(self):
+        build_runner = Mock()
+        with (
+            patch.dict(runner.os.environ, {}, clear=True),
+            self.assertRaisesRegex(SystemExit, "DATABASE_URL is required"),
+        ):
+            runner.main([], build_runner_fn=build_runner)
+
+        self.pool_factory.assert_not_called()
+        build_runner.assert_not_called()
+
+    def test_main_closes_pool_on_tick_failure_or_interrupt(self):
+        for error in (RuntimeError("tick failed"), KeyboardInterrupt()):
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.multiple(
+                    runner,
+                    DebugLogger=DEFAULT,
+                    configure_logging=DEFAULT,
+                    emit_run_manifest=DEFAULT,
+                ),
+                patch.object(runner.agent_tools, "bind_tools"),
+            ):
+                self.pool_context.reset_mock()
+                build_runner = Mock(return_value=(object(), _Evidence(0), _Agent(), _LLM()))
+                run_tick = Mock(side_effect=error)
+                if isinstance(error, KeyboardInterrupt):
+                    self.assertEqual(
+                        runner.main([], build_runner_fn=build_runner, run_tick_fn=run_tick), 130
+                    )
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "tick failed"):
+                        runner.main([], build_runner_fn=build_runner, run_tick_fn=run_tick)
+
+                self.pool_context.__exit__.assert_called_once()
+                self.assertEqual(
+                    self.pool_context.__exit__.call_args.args[:2], (type(error), error)
+                )
 
     def test_shutdown_request_wakes_terminal_wait(self):
         tick_runner = object.__new__(TickRunner)
@@ -569,7 +623,7 @@ class RunnerSmokeTests(unittest.TestCase):
         args = types.SimpleNamespace(user_id="user_1", api_key=None)
 
         with self.assertRaisesRegex(SystemExit, "OPENAI_API_KEY"):
-            runner.build_runner(args)
+            runner.build_runner(args, pool=self.pool)
 
 
 class _Evidence:
