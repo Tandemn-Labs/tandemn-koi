@@ -5,126 +5,124 @@ from pathlib import Path
 
 from src.core.candidate_graph import CandidateGraph
 from src.core.causal_graph_store_adapter import (
-    StoreBackedConfidenceService,
-    StoreBackedMechanismRegistry,
-    koi_edge_metadata_to_store,
-    koi_edge_to_store,
-    koi_mechanism_metadata_to_store,
-    koi_mechanism_to_store,
-    koi_node_to_store,
+    PostgresConfidenceService,
+    PostgresMechanismRegistry,
+    _q_histogram,
     parse_seed_tables,
-    store_edge_metadata_to_koi,
-    store_edge_to_koi,
-    store_mechanism_metadata_to_koi,
-    store_mechanism_to_koi,
-    store_node_to_koi,
+    save_edge_metadata,
+    save_mechanism,
 )
-from src.core.models import Mechanism, MechanismMetadata
-from tandemn_system_data.clients import (  # type: ignore[import-untyped]
-    CausalGraphStore,
-    PostgresClient,
-)
-from tandemn_system_data.clients.causal_graph_store import (  # type: ignore[import-untyped]
-    edge_to_row,
-    node_to_row,
-)
+from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node
 
 
 def init_causal_graph(
-    user_id: str,
-    postgres_client=None,
+    pool,
     edge_table_path: str | Path | None = None,
     mechanism_table_path: str | Path | None = None,
-) -> tuple[CandidateGraph, StoreBackedMechanismRegistry, StoreBackedConfidenceService]:
-    """Load Koi causal graph state from Tandemn Store, importing seeds if empty."""
-    client = postgres_client or PostgresClient()
-    store = CausalGraphStore(client, user_id=user_id)
+) -> tuple[CandidateGraph, PostgresMechanismRegistry, PostgresConfidenceService]:
+    """Load Koi's causal graph, atomically importing seeds if all tables are empty."""
+    with pool.connection() as conn, conn.transaction():
+        counts = conn.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM causal_nodes) AS nodes,
+                (SELECT count(*) FROM causal_edges) AS edges,
+                (SELECT count(*) FROM causal_mechanisms) AS mechanisms
+            """
+        ).fetchone()
+        if not any(counts.values()):
+            _import_seed_causal_graph(
+                conn,
+                _optional_path(edge_table_path),
+                _optional_path(mechanism_table_path),
+            )
+        elif not all(counts.values()):
+            raise ValueError(
+                f"Incomplete causal graph: nodes={counts['nodes']}, "
+                f"edges={counts['edges']}, mechanisms={counts['mechanisms']}"
+            )
 
-    nodes = store.load_nodes()
-    edges, _ = store.load_edges()
-    mechanisms, _ = store.load_mechanisms()
-    if not nodes and not edges and not mechanisms:
-        _import_seed_causal_graph(
-            client,
-            store,
-            user_id,
-            _optional_path(edge_table_path),
-            _optional_path(mechanism_table_path),
-        )
-    elif not (nodes and edges and mechanisms):
-        raise ValueError(
-            "Incomplete Tandemn Store causal graph for "
-            f"user {user_id!r}: nodes={len(nodes)}, edges={len(edges)}, "
-            f"mechanisms={len(mechanisms)}"
-        )
-
-    return _load_causal_graph_runtime(store)
+        return _load_causal_graph_runtime(conn, pool)
 
 
 def _import_seed_causal_graph(
-    client,
-    store,
-    user_id: str,
+    conn,
     edge_table_path: Path | None,
     mechanism_table_path: Path | None,
 ) -> None:
     graph, registry = parse_seed_tables(edge_table_path, mechanism_table_path)
-    with client.begin() as session:
-        for node in graph.node_table.values():
-            session.add(node_to_row(user_id, koi_node_to_store(node)))
-        for edge_id, edge in graph.edge_table.items():
-            metadata = graph.edge_metadata_table[edge_id]
-            session.add(
-                edge_to_row(
-                    user_id,
-                    koi_edge_to_store(edge),
-                    koi_edge_metadata_to_store(metadata),
-                )
-            )
-
-    store.sync_mechanisms(
-        {
-            mechanism_id: koi_mechanism_to_store(mechanism)
-            for mechanism_id, mechanism in registry.mechanism_table.items()
-        },
-        {
-            mechanism_id: koi_mechanism_metadata_to_store(metadata)
-            for mechanism_id, metadata in registry.mechanism_metadata_table.items()
-        },
-    )
+    _validate_graph_edges(graph)
+    _validate_mechanism_tables(graph, registry.mechanism_table, registry.mechanism_metadata_table)
+    with conn.cursor() as cursor:
+        cursor.executemany(
+            "INSERT INTO causal_nodes (node_id, node_type, description, unit) "
+            "VALUES (%s, %s, %s, %s)",
+            [
+                (node.node_id, node.node_type, node.description, node.unit)
+                for node in graph.node_table.values()
+            ],
+        )
+        cursor.executemany(
+            "INSERT INTO causal_edges (edge_id, src, dst, src_type, dst_type, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            [
+                (edge.edge_id, edge.src, edge.dst, edge.src_type, edge.dst_type, edge.status)
+                for edge in graph.edge_table.values()
+            ],
+        )
+    save_edge_metadata(conn, graph.edge_metadata_table)
+    for mechanism_id, mechanism in registry.mechanism_table.items():
+        save_mechanism(conn, mechanism, registry.mechanism_metadata_table[mechanism_id])
 
 
 def _load_causal_graph_runtime(
-    store,
-) -> tuple[CandidateGraph, StoreBackedMechanismRegistry, StoreBackedConfidenceService]:
-    nodes = {node_id: store_node_to_koi(node) for node_id, node in store.load_nodes().items()}
-    store_edges, store_edge_metadata = store.load_edges()
-    store_mechanisms, store_mechanism_metadata = store.load_mechanisms()
-
-    edge_table = {edge_id: store_edge_to_koi(edge) for edge_id, edge in store_edges.items()}
-    edge_metadata_table = {
-        edge_id: store_edge_metadata_to_koi(metadata)
-        for edge_id, metadata in store_edge_metadata.items()
+    conn, pool
+) -> tuple[CandidateGraph, PostgresMechanismRegistry, PostgresConfidenceService]:
+    nodes = {
+        row["node_id"]: Node(**row)
+        for row in conn.execute("SELECT * FROM causal_nodes ORDER BY node_id")
     }
+    edge_table = {}
+    edge_metadata_table = {}
+    for row in conn.execute("SELECT * FROM causal_edges ORDER BY edge_id"):
+        edge_id = row["edge_id"]
+        edge_table[edge_id] = Edge(
+            edge_id=edge_id,
+            src=row.pop("src"),
+            dst=row.pop("dst"),
+            src_type=row.pop("src_type"),
+            dst_type=row.pop("dst_type"),
+            status=row.pop("status"),
+        )
+        row["envs_seen"] = {tuple(env) for env in row["envs_seen"] or []}
+        row["q_histogram"] = _q_histogram(row["q_histogram"])
+        edge_metadata_table[edge_id] = EdgeMetadata(**row)
     graph = CandidateGraph(nodes, edge_table, edge_metadata_table)
     _validate_graph_edges(graph)
 
-    mechanism_table = {
-        mechanism_id: store_mechanism_to_koi(mechanism)
-        for mechanism_id, mechanism in store_mechanisms.items()
-    }
-    mechanism_metadata_table = {
-        mechanism_id: store_mechanism_metadata_to_koi(metadata)
-        for mechanism_id, metadata in store_mechanism_metadata.items()
-    }
+    mechanism_table = {}
+    mechanism_metadata_table = {}
+    for row in conn.execute("SELECT * FROM causal_mechanisms ORDER BY mechanism_id"):
+        mechanism_id = row["mechanism_id"]
+        mechanism_table[mechanism_id] = Mechanism(
+            mechanism_id=mechanism_id,
+            name=row.pop("name") or None,
+            edge_ids=row.pop("edge_ids") or [],
+            scope=row.pop("scope") or {},
+            narrative=row.pop("narrative"),
+            status=row.pop("status"),
+        )
+        row["envs_seen"] = {tuple(env) for env in row.pop("envs_last_seen") or []}
+        row["q_histogram"] = _q_histogram(row["q_histogram"])
+        mechanism_metadata_table[mechanism_id] = MechanismMetadata(**row)
     _validate_mechanism_tables(graph, mechanism_table, mechanism_metadata_table)
 
-    registry = StoreBackedMechanismRegistry(
-        store,
+    registry = PostgresMechanismRegistry(
+        pool,
         mechanism_table,
         mechanism_metadata_table,
     )
-    return graph, registry, StoreBackedConfidenceService(graph, registry, store)
+    return graph, registry, PostgresConfidenceService(graph, registry, pool)
 
 
 def _validate_graph_edges(graph: CandidateGraph) -> None:
@@ -132,7 +130,7 @@ def _validate_graph_edges(graph: CandidateGraph) -> None:
         edge.edge_id for edge in graph.edge_table.values() if not graph.val_edges(edge)
     )
     if invalid:
-        raise ValueError(f"Invalid Tandemn Store causal edges: {invalid}")
+        raise ValueError(f"Invalid causal edges: {invalid}")
 
 
 def _validate_mechanism_tables(
