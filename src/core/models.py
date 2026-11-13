@@ -303,6 +303,7 @@ class RankSpec:
     predicted_y: dict | None = None
     predicted_v: dict | None = None
     prediction_lineage: dict | None = None
+    rationale: str | None = None
 
     @classmethod
     def from_dict(cls, raw) -> "RankSpec":
@@ -344,6 +345,7 @@ class RankSpec:
                 predicted_y = inner.pop("predicted_y", None)
                 predicted_v = inner.pop("predicted_v", None)
                 prediction_lineage = inner.pop("prediction_lineage", None)
+                rationale = inner.pop("rationale", None)
                 n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1))
                 n_rep = _positive_replica_count(n_rep_raw)
                 return cls(
@@ -358,6 +360,7 @@ class RankSpec:
                     predicted_y=predicted_y,
                     predicted_v=predicted_v,
                     prediction_lineage=prediction_lineage,
+                    rationale=rationale,
                 )
 
         role = raw.get("role")
@@ -379,6 +382,7 @@ class RankSpec:
             predicted_y=raw.get("predicted_y"),
             predicted_v=raw.get("predicted_v"),
             prediction_lineage=raw.get("prediction_lineage"),
+            rationale=raw.get("rationale"),
         )
 
     def to_dict(self) -> dict:
@@ -394,6 +398,7 @@ class RankSpec:
             "predicted_y": self.predicted_y,
             "predicted_v": self.predicted_v,
             "prediction_lineage": self.prediction_lineage,
+            "rationale": self.rationale,
         }
 
     def gpus_per_chain(self) -> int:
@@ -463,6 +468,8 @@ class PlanAction:
                 f"job {self.job_id}: service_class must be one of "
                 f"{sorted(ALLOWED_SERVICE_CLASSES)}, got {self.service_class!r}"
             )
+        for rank in self.ladder or []:
+            rank.rationale = self.rationale
 
     @classmethod
     def from_dict(cls, raw, job_id: str | None = None) -> "PlanAction":

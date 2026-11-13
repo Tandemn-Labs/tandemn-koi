@@ -26,6 +26,7 @@ _X_SKIP = {
     "rank_id",
     "replica_index",
     "mechanism_id",
+    "rationale",
     "predicted_y",
     "predicted_v",
     "prediction_lineage",
