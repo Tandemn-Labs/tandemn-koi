@@ -34,7 +34,6 @@ build/
 .idea/
 .vscode/
 *.swp
-uv.lock
 
 # Local planning notes
 docs/plans/

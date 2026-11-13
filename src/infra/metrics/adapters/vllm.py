@@ -45,6 +45,7 @@ class VLLMAdapter:
 
     def __init__(self, reader: MetricReader) -> None:
         self.reader = reader
+        # TODO: Generate PromQL/OTel queries here instead of loading a static profile.
         profile = json.loads(
             (Path(__file__).resolve().parents[1] / "profiles/vllm_promql.json").read_text()
         )
