@@ -74,9 +74,32 @@ def test_concurrent_and_repeated_migrations(migration_database):
             ("rank_id",),
             ("v_predicted",),
             ("y_predicted",),
+            ("prediction_lineage",),
             ("mechanism_id",),
             ("created_at",),
         ]
+        assert conn.execute(
+            """
+            SELECT column_name, data_type FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'placement'
+              AND column_name IN ('cluster_id', 'pool_id', 'node_type_id')
+            ORDER BY ordinal_position
+            """
+        ).fetchall() == [("cluster_id", "text"), ("pool_id", "text"), ("node_type_id", "text")]
+        assert conn.execute(
+            """
+            SELECT data_type, is_nullable, column_default FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'plan_rank_predictions'
+              AND column_name = 'prediction_lineage'
+            """
+        ).fetchone() == ("jsonb", "NO", "'{}'::jsonb")
+        assert conn.execute(
+            """
+            SELECT pg_get_constraintdef(oid) FROM pg_constraint
+            WHERE conrelid = 'public.plan_rank_predictions'::regclass
+              AND conname = 'plan_rank_predictions_prediction_lineage_check'
+            """
+        ).fetchone() == ("CHECK ((jsonb_typeof(prediction_lineage) = 'object'::text))",)
         assert conn.execute(
             """
             SELECT column_name FROM information_schema.columns
