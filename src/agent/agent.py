@@ -67,8 +67,8 @@ from src.infra.deployment_x import materialize_launch_config
 log = logging.getLogger("koi.agent")
 
 # A specialist optimizes ONE job inside its BudgetSlice, so it may only
-# propose place/keep/swap/defer. Root-only actions remain terminate and
-# diagnose. TODO(v0): restore preempt/resume/retry with lifecycle support.
+# propose place/keep/swap/defer. The root-only action remains terminate.
+# TODO(v0): restore preempt/resume/retry with lifecycle support.
 SPECIALIST_ACTIONS = frozenset(
     {
         ActionType.PLACE.value,
@@ -1655,7 +1655,7 @@ class KoiAgentHarness:
             # ---------- THE OBJECTIVE, EXACTLY ----------
             "THE OBJECTIVE, EXACTLY. PLACE contributes sigma_i; SWAP contributes "
             "swap_gain_over_keep = sigma_i - keep_baseline_sigma; keep / defer / "
-            "terminate / diagnose add nothing. Aggregate sigma is the sum of those "
+            "terminate add nothing. Aggregate sigma is the sum of those "
             "action gains MINUS an "
             "unserved-demand penalty for every WAITING job you leave unplaced. So "
             "deferring a serveable job LOWERS aggregate sigma - it is NOT free.\n"
@@ -1916,7 +1916,6 @@ class KoiAgentHarness:
             "  swap     running->running   (needs ladder; scale/migrate/retune/replace)\n"
             "  defer    waiting->waiting    (no ladder)\n"
             "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
-            "  diagnose  no change          (no ladder; record a theory only)\n"
             "Every ladder rank MUST carry a unique rank_id (or let Koi auto-fill one), "
             "MUST carry a 5-element env, and MUST resolve a "
             "mechanism_id, either on the rank or inherited from the action. "

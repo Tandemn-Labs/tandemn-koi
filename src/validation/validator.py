@@ -42,9 +42,9 @@ from src.core.models import (
 from src.infra.deployment_x import materialize_launch_config
 
 # Actions whose target job must already exist in the cluster snapshot. PLACE and
-# DEFER admit waiting jobs; DIAGNOSE/TERMINATE may reference jobs outside the
-# running/waiting inventory (post-mortems, cleanup), so existence is not enforced
-# for them. TODO(v0): add preempt/resume/retry with lifecycle snapshot support.
+# DEFER admit waiting jobs; TERMINATE may reference jobs outside the
+# running/waiting inventory (cleanup), so existence is not enforced for it.
+# TODO(v0): add preempt/resume/retry with lifecycle snapshot support.
 _EXISTENCE_REQUIRED = frozenset({ActionType.KEEP, ActionType.SWAP})
 
 _KNOWN_WORKLOAD_TYPES = frozenset({"any", "online", "batch"})

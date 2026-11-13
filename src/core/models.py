@@ -137,7 +137,6 @@ class ActionType(Enum):
                                       a dead chain - see swap_reason)
     DEFER     waiting  -> waiting    stay queued
     TERMINATE any      -> stopped    give up (budget/policy exhausted)
-    DIAGNOSE  no state change        record a theory only
     """
 
     PLACE = "place"
@@ -160,7 +159,7 @@ LADDER_ACTIONS = frozenset(
 )
 
 # # Active-job churn counted against the swap budget B_t (C4). PLACE/DEFER are
-# # admission, not churn; KEEP/DIAGNOSE/TERMINATE move no running workload.
+# # admission, not churn; KEEP/TERMINATE move no running workload.
 SWAP_BUDGET_ACTIONS = frozenset(
     {
         ActionType.SWAP,
@@ -174,7 +173,6 @@ REQUIRED_JOB_STATE = {
     ActionType.KEEP: "running",
     ActionType.SWAP: "running",
     ActionType.TERMINATE: None,
-    ActionType.DIAGNOSE: None,
 }
 
 # v0 is AGGREGATE-ONLY: one engine serves prefill+decode for a job. Prefill/

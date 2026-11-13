@@ -93,7 +93,7 @@ class AllocationUnit:
 
 
 class ResourceMapManager:
-    """Read PostgreSQL catalogs and Store-backed resource/job state."""
+    """Read PostgreSQL catalogs/queued jobs and Store-backed runtime state."""
 
     def __init__(
         self,
@@ -101,7 +101,7 @@ class ResourceMapManager:
         postgres_client=None,
         rank_failure_history_seconds: int = RANK_FAILURE_HISTORY_TICKS
         * DEFAULT_TICK_INTERVAL_SECONDS,
-        # Inject the runner-owned pool for direct PostgreSQL catalog reads.
+        # Inject the runner-owned pool for direct PostgreSQL reads.
         *,
         pool=None,
     ):
@@ -309,9 +309,9 @@ class ResourceMapManager:
     # Jobs and chains
     # ------------------------------------------------------------------
 
-    def get_submitted_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return waiting jobs for compatibility with the old submitted name."""
-        return self.get_waiting_jobs(user_id=user_id)
+    def get_submitted_jobs(self) -> list[dict[str, Any]]:
+        """Return queued jobs waiting for admission."""
+        return self.get_waiting_jobs()
 
     def get_running_jobs(
         self, user_id: str | None = None, *, failure_since: datetime | None = None
@@ -328,17 +328,34 @@ class ResourceMapManager:
             for running_job in jobs.running_jobs(effective_user_id)
         ]
 
-    def get_waiting_jobs(
-        self, user_id: str | None = None, *, failure_since: datetime | None = None
-    ) -> list[dict[str, Any]]:
-        """Return waiting jobs with failures from prior placement attempts."""
-        effective_user_id = self._effective_user_id(user_id)
-        jobs = self._job_store()
-        failure_since = failure_since or self._failure_since()
-        return [
-            self._job_to_summary(job, jobs.failed_ranks_since(job.job_id, failure_since))
-            for job in jobs.waiting_jobs(effective_user_id)
-        ]
+    def get_waiting_jobs(self) -> list[dict[str, Any]]:
+        """Read queued jobs and their intent for Koi's planning view."""
+        if self._pool is None:
+            raise ValueError("database pool is required for waiting-job reads")
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                JOIN job_intent USING (job_id)
+                WHERE status = %s
+                ORDER BY job_id
+                """,
+                ("queued",),
+            ).fetchall()
+        jobs = []
+        for row in rows:
+            job_id = row.pop("job_id")
+            kind = row.pop("kind")
+            status = row.pop("status")
+            jobs.append(
+                {
+                    "job_id": job_id,
+                    "kind": kind,
+                    "status": status,
+                    "job_features": {"type": kind, **row},
+                }
+            )
+        return jobs
 
     def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
         """Return paused jobs for future preempt/resume support."""
@@ -439,7 +456,7 @@ class ResourceMapManager:
             tick=tick,
             resources=self.resources_summary(),
             active_jobs=self.get_running_jobs(failure_since=failure_since),
-            pending_jobs=self.get_waiting_jobs(failure_since=failure_since),
+            pending_jobs=self.get_waiting_jobs(),
         )
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
@@ -663,7 +680,7 @@ class ResourceMapManager:
             "updated_at": resource_map.updated_at,
             "resources": resources,
             "running_jobs": self.get_running_jobs(user_id=user_id),
-            "waiting_jobs": self.get_waiting_jobs(user_id=user_id),
+            "waiting_jobs": self.get_waiting_jobs(),
             "paused_jobs": self.get_paused_jobs(user_id=user_id),
             "running_chains": self.get_running_chains(user_id=user_id),
         }
@@ -1004,9 +1021,7 @@ class _SmokeResourceMapManager(ResourceMapManager):
     ) -> list[dict[str, Any]]:
         return []
 
-    def get_waiting_jobs(
-        self, user_id: str | None = None, *, failure_since: datetime | None = None
-    ) -> list[dict[str, Any]]:
+    def get_waiting_jobs(self) -> list[dict[str, Any]]:
         return []
 
     def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:

@@ -883,7 +883,7 @@ class TickRunner:
         """Submit the validated plan and record swap bookkeeping.
 
         The executor owns A/B canary semantics and submits only changed or
-        new ladders (keep / defer / diagnose are bookkeeping).
+        new ladders (keep / defer are bookkeeping).
         The swap count recorded here feeds next tick's observed_swap_rate,
         which drives lambda_swit.
         """

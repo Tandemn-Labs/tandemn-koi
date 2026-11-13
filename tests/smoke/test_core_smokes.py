@@ -8,6 +8,8 @@ from src.core.confidence_service import ConfidenceService
 from src.core.evidence_service import EvidenceService, inclusive_lookback_bounds
 from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import (
+    REQUIRED_JOB_STATE,
+    ActionType,
     Edge,
     EdgeMetadata,
     EvidenceRow,
@@ -104,6 +106,13 @@ def test_evidence_window_counts_prior_ticks_plus_current():
 
 
 class CoreSmokeTests(unittest.TestCase):
+    def test_action_types_match_job_state_contract(self):
+        self.assertEqual(
+            {action.value for action in ActionType},
+            {"place", "keep", "swap", "defer", "terminate"},
+        )
+        self.assertEqual(set(REQUIRED_JOB_STATE), set(ActionType))
+
     def test_plan_action_preserves_online_targets(self):
         plan = Plan.from_raw(
             {
