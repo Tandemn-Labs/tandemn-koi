@@ -89,6 +89,7 @@ class RunnerSmokeTests(unittest.TestCase):
             runner.build_runner(args, pool=self.pool)
 
         dependencies["init_causal_graph"].assert_called_once_with(self.pool)
+        self.assertIs(dependencies["ResourceMapManager"].call_args.kwargs["pool"], self.pool)
         dependencies["Validator"].assert_called_once_with(
             candidate_graph=candidate_graph,
             mechanism_registry=mechanism_registry,

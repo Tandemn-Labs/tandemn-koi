@@ -266,6 +266,7 @@ def build_runner(args: argparse.Namespace, *, pool):
         user_id=args.user_id,
         postgres_client=client,
         rank_failure_history_seconds=failure_window_sec,
+        pool=pool,
     )
     telemetry = StoreTelemetry(
         user_id=args.user_id,

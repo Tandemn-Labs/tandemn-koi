@@ -1,8 +1,17 @@
+import os
+import shutil
+import subprocess
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 import numpy as np
+import psycopg
+from db.postgres import postgres_pool
+from psycopg import sql
+from psycopg.types.json import Jsonb
 from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
@@ -284,25 +293,6 @@ class DeploymentXSmokeTests(unittest.TestCase):
 
         self.assertEqual(_gpu(hardware, "RTX-PRO-6000")["name"], "RTX-PRO-6000-BSE")
         self.assertEqual(materialize_launch_config(catalog, "RTX-PRO-6000-BSE")["max_num_seq"], 128)
-
-    def test_hardware_catalog_merges_aws_and_azure_store_rows(self):
-        """Expose Azure instances alongside the default AWS catalog."""
-        catalogs = [
-            SimpleNamespace(catalog=_hardware_catalog()),
-            SimpleNamespace(catalog=_azure_hardware_catalog()),
-        ]
-        store = SimpleNamespace(all=lambda: catalogs)
-
-        with patch("tandemn_system_data.clients.HardwareCatalogStore", return_value=store):
-            catalog = ResourceMapManager(postgres_client=object()).hardware_catalog()
-
-        by_instance = {
-            (region["cloud"], region["region"], instance["instance_type"])
-            for region in catalog["regions"]
-            for instance in region["instance_types"]
-        }
-        self.assertIn(("aws", "us-east-2", "p5.48xlarge"), by_instance)
-        self.assertIn(("azure", "eastus", "Standard_ND96amsr_A100_v4"), by_instance)
 
     def test_composite_ranks_split_workload_by_traffic_share(self):
         snapshot = _snapshot()
@@ -989,6 +979,239 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(metadata.beta, 1.5)
         self.assertEqual(metadata.q_histogram["Q4"], 0)
         self.assertTrue(ctx.confidence_diagnostics[0]["partial_divergence"])
+
+
+@unittest.skipUnless(
+    os.environ.get("TEST_DATABASE_URL") and shutil.which("dbmate"),
+    "Requires dbmate and TEST_DATABASE_URL pointing to local PostgreSQL",
+)
+class ResourceMapCatalogPostgresTests(unittest.TestCase):
+    def setUp(self):
+        url = os.environ["TEST_DATABASE_URL"]
+        parsed = urlsplit(url)
+        self.assertIn(parsed.hostname, {"localhost", "127.0.0.1", "::1"})
+        name = f"koi_catalog_test_{uuid4().hex}"
+        admin = psycopg.connect(url, autocommit=True)
+        self.addCleanup(admin.close)
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+        self.addCleanup(
+            admin.execute,
+            sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)),
+        )
+        database_url = urlunsplit(parsed._replace(path=f"/{name}"))
+        subprocess.run(
+            [
+                "dbmate",
+                "--migration-lock",
+                "--no-dump-schema",
+                "--migrations-dir",
+                str(Path(__file__).resolve().parents[2] / "db" / "migrations"),
+                "migrate",
+                "--strict",
+            ],
+            env={**os.environ, "DATABASE_URL": database_url},
+            check=True,
+            timeout=60,
+        )
+        self.pool = self.enterContext(postgres_pool(database_url))
+
+    def test_catalogs_are_read_from_postgres(self):
+        # Schema-supported fields from the legacy model_catalog logged by
+        # koi-3h-cohere-20260906T051213Z on 2026-09-06. updated_at and
+        # runtime_image are not represented in the current schema.
+        legacy_catalog = {
+            "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+            "engine_name": "vllm",
+            "engine_version": "0.16.0",
+            "model_params_b": 70.553706496,
+            "model_size_gb": 141.107412992,
+            "num_hidden_layers": 80,
+            "hidden_size": 8192,
+            "num_attn_heads": 64,
+            "num_kv_heads": 8,
+            "attn_heads_per_kv_head": 8,
+            "intermediate_size": 28672,
+            "max_pos_embeddings": 131072,
+            "vocab_size": 128256,
+            "is_moe": False,
+            "num_routed_experts": 0,
+            "num_active_experts": 0,
+            "flops_per_param": None,
+            "weight_dtype": "bfloat16",
+            "weight_quantization_method": "none",
+            "weight_quantization_bits": 16,
+            "sliding_window_size": None,
+            "min_chain_warmup_time": 10.0,
+            "max_model_len": 131072,
+            "gpu_mem_util": 0.9,
+            "max_num_seq": [
+                {"gpu_type": "H100", "value": 1024},
+                {"gpu_type": "A100-80GB", "value": 256},
+                {"gpu_type": "RTXPRO6000", "value": 256},
+            ],
+            "max_num_batched_tokens": [
+                {"gpu_type": "H100", "value": 8192},
+                {"gpu_type": "A100-80GB", "value": 2048},
+                {"gpu_type": "RTXPRO6000", "value": 2048},
+            ],
+            "block_size": [
+                {"gpu_type": "H100", "value": 16},
+                {"gpu_type": "A100-80GB", "value": 16},
+                {"gpu_type": "RTXPRO6000", "value": 16},
+            ],
+            "kvcache_dtype": [
+                {"gpu_type": "H100", "value": "auto"},
+                {"gpu_type": "A100-80GB", "value": "auto"},
+                {"gpu_type": "RTXPRO6000", "value": "auto"},
+            ],
+            "attn_backend": "auto",
+            "activation_quantization_method": "none",
+            "activation_dtype": "bfloat16",
+            "prefix_cache_enabled": True,
+            "chunked_prefill_enable": True,
+            "lmcache_enabled": False,
+            "spec_decoding_enabled": False,
+            "draft_model_id": "",
+            "spec_decoding_method": "none",
+            "num_speculative_tokens": 0,
+            "spec_acceptance_threshold": 0.0,
+            "cuda_graph_enabled": True,
+            "torch_compile_enabled": True,
+            "preemption_policy": "recompute",
+            "pd_enabled": False,
+            "kv_transfer_method": "default",
+            "chunk_size": 100,
+            "max_chunked_steps_per_request": 2,
+        }
+        with self.pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO hardware_catalog (cloud_name, catalog) VALUES (%s, %s)",
+                ("aws", Jsonb(_hardware_catalog())),
+            )
+            conn.execute(
+                "INSERT INTO hardware_catalog (cloud_name, catalog) VALUES (%s, %s)",
+                ("azure", Jsonb(_azure_hardware_catalog())),
+            )
+            conn.execute(
+                "INSERT INTO model_architecture "
+                "(model_id, model_params_b, model_size_gb, num_hidden_layers, hidden_size, "
+                "num_attn_heads, num_kv_heads, attn_heads_per_kv_head, intermediate_size, "
+                "max_pos_embeddings, vocab_size, is_moe, num_routed_experts, "
+                "num_active_experts, flops_per_param, weight_dtype, "
+                "weight_quantization_method, weight_quantization_bits, sliding_window_size, "
+                "min_chain_warmup_time) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s)",
+                tuple(
+                    legacy_catalog[key]
+                    for key in (
+                        "model_id",
+                        "model_params_b",
+                        "model_size_gb",
+                        "num_hidden_layers",
+                        "hidden_size",
+                        "num_attn_heads",
+                        "num_kv_heads",
+                        "attn_heads_per_kv_head",
+                        "intermediate_size",
+                        "max_pos_embeddings",
+                        "vocab_size",
+                        "is_moe",
+                        "num_routed_experts",
+                        "num_active_experts",
+                        "flops_per_param",
+                        "weight_dtype",
+                        "weight_quantization_method",
+                        "weight_quantization_bits",
+                        "sliding_window_size",
+                        "min_chain_warmup_time",
+                    )
+                ),
+            )
+            conn.execute(
+                "INSERT INTO job_engine_defaults "
+                "(model_id, engine_name, engine_version, max_num_seq, max_num_batched_tokens, "
+                "block_size, kvcache_dtype, "
+                "gpu_mem_util, max_model_len, attn_backend, activation_quantization_method, "
+                "activation_dtype, prefix_cache_enabled, chunked_prefill_enabled, "
+                "lmcache_enabled, spec_decoding_enabled, draft_model_id, spec_decoding_method, "
+                "num_speculative_tokens, spec_acceptance_threshold, cuda_graph_enabled, "
+                "torch_compile_enabled, preemption_policy, pd_enabled, kv_transfer_method, "
+                "chunk_size, max_chunked_steps_per_request) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    legacy_catalog["model_id"],
+                    legacy_catalog["engine_name"],
+                    legacy_catalog["engine_version"],
+                    Jsonb(legacy_catalog["max_num_seq"]),
+                    Jsonb(legacy_catalog["max_num_batched_tokens"]),
+                    Jsonb(legacy_catalog["block_size"]),
+                    Jsonb(legacy_catalog["kvcache_dtype"]),
+                    legacy_catalog["gpu_mem_util"],
+                    legacy_catalog["max_model_len"],
+                    legacy_catalog["attn_backend"],
+                    legacy_catalog["activation_quantization_method"],
+                    legacy_catalog["activation_dtype"],
+                    legacy_catalog["prefix_cache_enabled"],
+                    legacy_catalog["chunked_prefill_enable"],
+                    legacy_catalog["lmcache_enabled"],
+                    legacy_catalog["spec_decoding_enabled"],
+                    legacy_catalog["draft_model_id"],
+                    legacy_catalog["spec_decoding_method"],
+                    legacy_catalog["num_speculative_tokens"],
+                    legacy_catalog["spec_acceptance_threshold"],
+                    legacy_catalog["cuda_graph_enabled"],
+                    legacy_catalog["torch_compile_enabled"],
+                    legacy_catalog["preemption_policy"],
+                    legacy_catalog["pd_enabled"],
+                    legacy_catalog["kv_transfer_method"],
+                    legacy_catalog["chunk_size"],
+                    legacy_catalog["max_chunked_steps_per_request"],
+                ),
+            )
+            conn.execute(
+                "INSERT INTO model_architecture (model_id) VALUES (%s)",
+                ("architecture-without-defaults",),
+            )
+
+        manager = ResourceMapManager(pool=self.pool, postgres_client=object())
+        hardware = manager.hardware_catalog()
+        by_instance = {
+            (region["cloud"], region["region"], instance["instance_type"])
+            for region in hardware["regions"]
+            for instance in region["instance_types"]
+        }
+        self.assertIn(("aws", "us-east-2", "p5.48xlarge"), by_instance)
+        self.assertIn(("azure", "eastus", "Standard_ND96amsr_A100_v4"), by_instance)
+
+        catalog = manager.model_catalog(legacy_catalog["model_id"])
+        for field, expected_value in legacy_catalog.items():
+            with self.subTest(field=field):
+                self.assertEqual(catalog[field], expected_value)
+        self.assertNotIn("chunked_prefill_enabled", catalog)
+        for gpu_type, expected in (
+            ("H100", 1024),
+            ("A100-80GB", 256),
+            ("RTXPRO6000", 256),
+        ):
+            config = materialize_launch_config(catalog, gpu_type)
+            legacy_config = materialize_launch_config(legacy_catalog, gpu_type)
+            self.assertEqual(config, legacy_config)
+            self.assertEqual(config["engine_name"], "vllm")
+            self.assertEqual(config["engine_version"], "0.16.0")
+            self.assertEqual(config["max_num_seq"], expected)
+
+        for missing_model_id in (
+            "missing-model",
+            "architecture-without-defaults",
+            "' OR 1=1 --",
+        ):
+            with (
+                self.subTest(model_id=missing_model_id),
+                self.assertRaisesRegex(ValueError, "model catalog missing"),
+            ):
+                manager.model_catalog(missing_model_id)
 
 
 class _Telemetry:
