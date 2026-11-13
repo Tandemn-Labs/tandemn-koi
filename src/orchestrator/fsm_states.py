@@ -1182,7 +1182,7 @@ class TickRunner:
             config.get("scheduling_policy"),
             config.get("preemption_policy"),
             config.get("prefix_cache_enabled"),
-            config.get("chunked_prefill_enable"),
+            config.get("chunked_prefill_enabled"),
             config.get("interconnect_type"),
         )
 

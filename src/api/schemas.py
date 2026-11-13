@@ -30,14 +30,14 @@ class JobEngineArguments(RequestModel):
     max_num_seq: PositiveInt | list[PerGpuIntOverride] | None = None
     max_num_batched_tokens: PositiveInt | list[PerGpuIntOverride] | None = None
     block_size: PositiveInt | list[PerGpuIntOverride] | None = None
-    kvcache_dtype: str | list[PerGpuStringOverride] | None = None
+    kv_cache_dtype: str | list[PerGpuStringOverride] | None = None
 
     attn_backend: str | None = None
     activation_quantization_method: str | None = None
     activation_dtype: str | None = None
 
     prefix_cache_enabled: bool | None = None
-    chunked_prefill_enable: bool | None = None
+    chunked_prefill_enabled: bool | None = None
     lmcache_enabled: bool | None = None
 
     spec_decoding_enabled: bool | None = None
