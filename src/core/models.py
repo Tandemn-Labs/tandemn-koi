@@ -592,17 +592,11 @@ class PlanAction:
 
 @dataclass
 class Plan:
-    """The cluster-wide decision for one tick: one action per job.
-
-    A Plan spans every tenant's jobs, so tenant identity lives on each
-    PlanAction (not on the Plan). operator_id is provenance only - who/what
-    produced the plan - mapping the illustrative "user_id" field.
-    """
+    """The cluster-wide decision for one tick: one action per job."""
 
     tick: int
     actions: list[PlanAction] = field(default_factory=list)
     koi_version: str | None = None
-    # operator_id: str | None = None #TODO - Remove- it is noise
     tick_rationale: str | None = None
 
     def action_for(self, job_id: str) -> PlanAction | None:
@@ -653,6 +647,5 @@ class Plan:
             tick=int(meta.get("tick", tick)),
             actions=actions,
             koi_version=meta.get("koi_version"),
-            operator_id=meta.get("operator_id", meta.get("user_id")),
             tick_rationale=meta.get("tick_rationale"),
         )
