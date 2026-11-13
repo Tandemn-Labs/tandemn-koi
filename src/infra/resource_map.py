@@ -157,7 +157,6 @@ class ResourceMapManager:
             ).fetchone()
         if value is None:
             raise ValueError(f"model catalog missing {model_id!r}")
-        value["chunked_prefill_enable"] = value.pop("chunked_prefill_enabled")
         # ponytail: local catalog-read alias; centralize GPU identity if aliases expand.
         for entries in value.values():
             if not isinstance(entries, list):

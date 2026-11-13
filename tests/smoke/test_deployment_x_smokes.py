@@ -1016,8 +1016,8 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
         self.pool = self.enterContext(postgres_pool(database_url))
 
     def test_catalogs_are_read_from_postgres(self):
-        # Schema-supported fields from the legacy model_catalog logged by
-        # koi-3h-cohere-20260906T051213Z on 2026-09-06. updated_at and
+        # Schema-supported values from the legacy model_catalog logged by
+        # koi-3h-cohere-20260906T051213Z on 2026-09-06, using canonical names. updated_at and
         # runtime_image are not represented in the current schema.
         legacy_catalog = {
             "model_id": "meta-llama/Llama-3.3-70B-Instruct",
@@ -1059,7 +1059,7 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
                 {"gpu_type": "A100-80GB", "value": 16},
                 {"gpu_type": "RTXPRO6000", "value": 16},
             ],
-            "kvcache_dtype": [
+            "kv_cache_dtype": [
                 {"gpu_type": "H100", "value": "auto"},
                 {"gpu_type": "A100-80GB", "value": "auto"},
                 {"gpu_type": "RTXPRO6000", "value": "auto"},
@@ -1068,7 +1068,7 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
             "activation_quantization_method": "none",
             "activation_dtype": "bfloat16",
             "prefix_cache_enabled": True,
-            "chunked_prefill_enable": True,
+            "chunked_prefill_enabled": True,
             "lmcache_enabled": False,
             "spec_decoding_enabled": False,
             "draft_model_id": "",
@@ -1131,7 +1131,7 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
             conn.execute(
                 "INSERT INTO job_engine_defaults "
                 "(model_id, engine_name, engine_version, max_num_seq, max_num_batched_tokens, "
-                "block_size, kvcache_dtype, "
+                "block_size, kv_cache_dtype, "
                 "gpu_mem_util, max_model_len, attn_backend, activation_quantization_method, "
                 "activation_dtype, prefix_cache_enabled, chunked_prefill_enabled, "
                 "lmcache_enabled, spec_decoding_enabled, draft_model_id, spec_decoding_method, "
@@ -1147,14 +1147,14 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
                     Jsonb(legacy_catalog["max_num_seq"]),
                     Jsonb(legacy_catalog["max_num_batched_tokens"]),
                     Jsonb(legacy_catalog["block_size"]),
-                    Jsonb(legacy_catalog["kvcache_dtype"]),
+                    Jsonb(legacy_catalog["kv_cache_dtype"]),
                     legacy_catalog["gpu_mem_util"],
                     legacy_catalog["max_model_len"],
                     legacy_catalog["attn_backend"],
                     legacy_catalog["activation_quantization_method"],
                     legacy_catalog["activation_dtype"],
                     legacy_catalog["prefix_cache_enabled"],
-                    legacy_catalog["chunked_prefill_enable"],
+                    legacy_catalog["chunked_prefill_enabled"],
                     legacy_catalog["lmcache_enabled"],
                     legacy_catalog["spec_decoding_enabled"],
                     legacy_catalog["draft_model_id"],
@@ -1189,7 +1189,6 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
         for field, expected_value in legacy_catalog.items():
             with self.subTest(field=field):
                 self.assertEqual(catalog[field], expected_value)
-        self.assertNotIn("chunked_prefill_enabled", catalog)
         for gpu_type, expected in (
             ("H100", 1024),
             ("A100-80GB", 256),
@@ -1201,6 +1200,8 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
             self.assertEqual(config["engine_name"], "vllm")
             self.assertEqual(config["engine_version"], "0.16.0")
             self.assertEqual(config["max_num_seq"], expected)
+            self.assertEqual(config["kv_cache_dtype"], "auto")
+            self.assertTrue(config["chunked_prefill_enabled"])
 
         for missing_model_id in (
             "missing-model",

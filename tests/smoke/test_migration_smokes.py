@@ -87,6 +87,20 @@ def test_concurrent_and_repeated_migrations(migration_database):
         ).fetchall() == [("engine_name",), ("engine_version",)]
         assert conn.execute(
             """
+            SELECT table_name, column_name, data_type FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name IN ('job_engine_defaults', 'job_engine_arguments')
+              AND column_name IN ('kv_cache_dtype', 'chunked_prefill_enabled')
+            ORDER BY table_name, column_name
+            """
+        ).fetchall() == [
+            ("job_engine_arguments", "chunked_prefill_enabled", "boolean"),
+            ("job_engine_arguments", "kv_cache_dtype", "text"),
+            ("job_engine_defaults", "chunked_prefill_enabled", "boolean"),
+            ("job_engine_defaults", "kv_cache_dtype", "jsonb"),
+        ]
+        assert conn.execute(
+            """
             SELECT tgname FROM pg_trigger
             WHERE tgrelid = 'public.plan_rank_predictions'::regclass
               AND NOT tgisinternal

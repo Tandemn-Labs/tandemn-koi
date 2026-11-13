@@ -109,7 +109,11 @@ class EngineConfigSchemaTests(unittest.TestCase):
                 "kind": "batch",
                 "spec": {
                     "model_id": "test",
-                    "engine_config": {"gpu_mem_util": 0.92, "prefix_cache_enabled": False},
+                    "engine_config": {
+                        "gpu_mem_util": 0.92,
+                        "prefix_cache_enabled": False,
+                        "chunked_prefill_enabled": False,
+                    },
                 },
             }
         )
@@ -117,6 +121,7 @@ class EngineConfigSchemaTests(unittest.TestCase):
         engine = submission.spec.engine_config
         self.assertEqual(engine.gpu_mem_util, 0.92)
         self.assertFalse(engine.prefix_cache_enabled)
+        self.assertFalse(engine.chunked_prefill_enabled)
         self.assertIsNone(engine.max_model_len)
         self.assertIsNone(engine.max_num_seq)
         self.assertEqual(engine.extra_args, [])
@@ -129,7 +134,7 @@ class EngineConfigSchemaTests(unittest.TestCase):
                     "model_id": "test",
                     "engine_config": {
                         "max_num_seq": [{"gpu_type": "H100", "value": 256}],
-                        "kvcache_dtype": [{"gpu_type": "MI300X", "value": "fp8"}],
+                        "kv_cache_dtype": [{"gpu_type": "MI300X", "value": "fp8"}],
                         "extra_args": ["--enable-prefix-caching", "--swap-space", "4"],
                     },
                 },
@@ -138,7 +143,8 @@ class EngineConfigSchemaTests(unittest.TestCase):
 
         engine = submission.spec.engine_config
         self.assertEqual(engine.max_num_seq[0].value, 256)
-        self.assertEqual(engine.kvcache_dtype[0].gpu_type, "MI300X")
+        self.assertEqual(engine.kv_cache_dtype[0].gpu_type, "MI300X")
+        self.assertEqual(engine.kv_cache_dtype[0].value, "fp8")
         self.assertEqual(engine.extra_args, ["--enable-prefix-caching", "--swap-space", "4"])
 
     def test_scalar_overrides_parse_without_per_gpu_entries(self):
