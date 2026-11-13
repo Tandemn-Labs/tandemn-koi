@@ -260,6 +260,8 @@ CREATE TABLE placement (
     job_id TEXT REFERENCES jobs (job_id),
     rank_id TEXT,
     cluster_id TEXT,
+    pool_id TEXT,
+    node_type_id TEXT,
     role TEXT,
     max_replicas INTEGER,
     min_replicas INTEGER,
@@ -415,6 +417,9 @@ CREATE TABLE plan_rank_predictions (
         CHECK (jsonb_typeof(v_predicted) = 'object'),
     y_predicted JSONB NOT NULL
         CHECK (jsonb_typeof(y_predicted) = 'object'),
+    -- TODO: clarify why prediction_lineage needs persistence and which fields are required.
+    prediction_lineage JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(prediction_lineage) = 'object'),
     mechanism_id TEXT REFERENCES causal_mechanisms (mechanism_id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (plan_id, job_id, rank_id),

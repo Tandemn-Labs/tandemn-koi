@@ -335,6 +335,8 @@ CREATE TABLE public.placement (
     job_id text NOT NULL,
     rank_id text NOT NULL,
     cluster_id text,
+    pool_id text,
+    node_type_id text,
     role text,
     max_replicas integer,
     min_replicas integer,
@@ -374,8 +376,10 @@ CREATE TABLE public.plan_rank_predictions (
     rank_id text NOT NULL,
     v_predicted jsonb NOT NULL,
     y_predicted jsonb NOT NULL,
+    prediction_lineage jsonb DEFAULT '{}'::jsonb NOT NULL,
     mechanism_id text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT plan_rank_predictions_prediction_lineage_check CHECK ((jsonb_typeof(prediction_lineage) = 'object'::text)),
     CONSTRAINT plan_rank_predictions_v_predicted_check CHECK ((jsonb_typeof(v_predicted) = 'object'::text)),
     CONSTRAINT plan_rank_predictions_y_predicted_check CHECK ((jsonb_typeof(y_predicted) = 'object'::text))
 );
