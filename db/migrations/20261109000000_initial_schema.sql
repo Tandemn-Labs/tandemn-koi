@@ -59,6 +59,8 @@ CREATE TABLE model_architecture (
 
 CREATE TABLE job_engine_defaults (
     model_id TEXT PRIMARY KEY REFERENCES model_architecture (model_id),
+    engine_name TEXT,
+    engine_version TEXT,
     max_model_len INTEGER,
     gpu_mem_util DOUBLE PRECISION,
     max_num_seq JSONB,

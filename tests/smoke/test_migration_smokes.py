@@ -79,6 +79,14 @@ def test_concurrent_and_repeated_migrations(migration_database):
         ]
         assert conn.execute(
             """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'job_engine_defaults'
+              AND column_name IN ('engine_name', 'engine_version')
+            ORDER BY column_name
+            """
+        ).fetchall() == [("engine_name",), ("engine_version",)]
+        assert conn.execute(
+            """
             SELECT tgname FROM pg_trigger
             WHERE tgrelid = 'public.plan_rank_predictions'::regclass
               AND NOT tgisinternal

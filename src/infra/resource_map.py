@@ -25,10 +25,9 @@ def chain_id_for_rank(rank_id: str, chain_index: int) -> str:
 
 
 def merge_hardware_catalogs(catalogs: Sequence[object]) -> dict[str, Any]:
-    """Normalize Store provider catalogs into deployment X's region schema."""
+    """Normalize provider catalog JSON into deployment X's region schema."""
     regions = []
-    for hardware in catalogs:
-        catalog = getattr(hardware, "catalog", None)
+    for catalog in catalogs:
         if not isinstance(catalog, dict):
             continue
         source_regions = catalog.get("regions", [])
@@ -94,7 +93,7 @@ class AllocationUnit:
 
 
 class ResourceMapManager:
-    """Read Koi resource/job state from Tandemn Store public clients."""
+    """Read PostgreSQL catalogs and Store-backed resource/job state."""
 
     def __init__(
         self,
@@ -102,9 +101,13 @@ class ResourceMapManager:
         postgres_client=None,
         rank_failure_history_seconds: int = RANK_FAILURE_HISTORY_TICKS
         * DEFAULT_TICK_INTERVAL_SECONDS,
+        # Inject the runner-owned pool for direct PostgreSQL catalog reads.
+        *,
+        pool=None,
     ):
         self.user_id = user_id
         self._postgres_client = postgres_client
+        self._pool = pool
         self._rank_failure_history_seconds = int(rank_failure_history_seconds)
 
     # ------------------------------------------------------------------
@@ -126,23 +129,35 @@ class ResourceMapManager:
         return ResourceMapStore(self._client(), user_id=self._effective_user_id(user_id))
 
     def hardware_catalog(self) -> dict[str, Any]:
-        """Return all Store provider catalogs in deployment X's region schema."""
-        from tandemn_system_data.clients import HardwareCatalogStore
-
-        catalogs = HardwareCatalogStore(self._client()).all()
+        """Read provider catalogs in deployment X's region schema."""
+        if self._pool is None:
+            raise ValueError("database pool is required for catalog reads")
+        with self._pool.connection() as conn:
+            catalogs = [
+                row["catalog"]
+                for row in conn.execute("SELECT catalog FROM hardware_catalog ORDER BY cloud_name")
+            ]
         catalog = merge_hardware_catalogs(catalogs)
         if not catalog["regions"]:
             raise ValueError("hardware catalog is required for deployment X")
         return catalog
 
     def model_catalog(self, model_id: str) -> dict[str, Any]:
-        """Return one Store model catalog row, raising when absent."""
-        from tandemn_system_data.clients import ModelCatalogStore
-
-        catalog = ModelCatalogStore(self._client()).get(model_id)
-        if catalog is None:
+        """Read model architecture and engine defaults, raising when absent."""
+        if self._pool is None:
+            raise ValueError("database pool is required for catalog reads")
+        with self._pool.connection() as conn:
+            value = conn.execute(
+                """
+                SELECT * FROM model_architecture
+                JOIN job_engine_defaults USING (model_id)
+                WHERE model_id = %s
+                """,
+                (model_id,),
+            ).fetchone()
+        if value is None:
             raise ValueError(f"model catalog missing {model_id!r}")
-        value = dict(catalog.model_dump(mode="json"))
+        value["chunked_prefill_enable"] = value.pop("chunked_prefill_enabled")
         # ponytail: local catalog-read alias; centralize GPU identity if aliases expand.
         for entries in value.values():
             if not isinstance(entries, list):
@@ -155,6 +170,7 @@ class ResourceMapManager:
                         "RTX-PRO-6000-BSE": "RTXPRO6000",
                         "RTX PRO 6000": "RTXPRO6000",
                     }.get(name, name)
+                    # TODO: We need to coalese all aliasing in one dictionary somewhere
         return value
 
     def _job_store(self):
