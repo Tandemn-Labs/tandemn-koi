@@ -190,7 +190,7 @@ def _weight_bytes_per_param(values: dict) -> float | None:
 
 
 def _kv_bytes_per_elem(values: dict) -> float | None:
-    dtype = _get(values, "kvcache_dtype", "kvcache_quantization")
+    dtype = _get(values, "kv_cache_dtype", "kvcache_quantization")
     if dtype is not None and str(dtype).lower() == "auto":
         dtype = _get(values, "activation_dtype", "weight_dtype")
     return _DTYPE_BYTES.get(str(dtype).lower()) if dtype is not None else None

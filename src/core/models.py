@@ -149,7 +149,6 @@ class ActionType(Enum):
     # RESUME = "resume"
     # RETRY = "retry"
     TERMINATE = "terminate"
-    DIAGNOSE = "diagnose"
 
 
 # Actions that deploy or relaunch a ladder (require one).
@@ -160,15 +159,15 @@ LADDER_ACTIONS = frozenset(
     }
 )
 
-# Active-job churn counted against the swap budget B_t (C4). PLACE/DEFER are
-# admission, not churn; KEEP/DIAGNOSE/TERMINATE move no running workload.
+# # Active-job churn counted against the swap budget B_t (C4). PLACE/DEFER are
+# # admission, not churn; KEEP/DIAGNOSE/TERMINATE move no running workload.
 SWAP_BUDGET_ACTIONS = frozenset(
     {
         ActionType.SWAP,
     }
 )
 
-# Required job state per action for the consistency check. None = any state.
+# # Required job state per action for the consistency check. None = any state.
 REQUIRED_JOB_STATE = {
     ActionType.PLACE: "waiting",
     ActionType.DEFER: "waiting",
@@ -598,7 +597,7 @@ class Plan:
     tick: int
     actions: list[PlanAction] = field(default_factory=list)
     koi_version: str | None = None
-    operator_id: str | None = None
+    # operator_id: str | None = None #TODO - Remove- it is noise
     tick_rationale: str | None = None
 
     def action_for(self, job_id: str) -> PlanAction | None:

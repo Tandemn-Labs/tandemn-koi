@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "source": "dcgm",
+  "language": "promql",
+  "rank_labels": ["job_id", "rank_id"],
+  "queries": {
+    "gpu_memory_free_mib_mean": {
+      "expression": "avg by (job_id, rank_id) (DCGM_FI_DEV_FB_FREE{__KOI_RANK_FILTER__})",
+      "unit": "MiB per reported device",
+      "aggregation": "Take the mean free memory across reported devices in the rank."
+    },
+    "gpu_memory_used_fraction_mean": {
+      "expression": "avg by (job_id, rank_id) (DCGM_FI_DEV_FB_USED{__KOI_RANK_FILTER__} / (DCGM_FI_DEV_FB_USED{__KOI_RANK_FILTER__} + DCGM_FI_DEV_FB_FREE{__KOI_RANK_FILTER__} + DCGM_FI_DEV_FB_RESERVED{__KOI_RANK_FILTER__}))",
+      "unit": "fraction from 0 to 1",
+      "aggregation": "Calculate each device's used fraction including reserved capacity, then take the rank mean."
+    },
+    "sm_active_fraction_mean": {
+      "expression": "avg by (job_id, rank_id) (DCGM_FI_PROF_SM_ACTIVE{__KOI_RANK_FILTER__})",
+      "unit": "fraction from 0 to 1",
+      "aggregation": "Take the mean across reported devices in the rank."
+    },
+    "dram_active_fraction_mean": {
+      "expression": "avg by (job_id, rank_id) (DCGM_FI_PROF_DRAM_ACTIVE{__KOI_RANK_FILTER__})",
+      "unit": "fraction from 0 to 1",
+      "aggregation": "Take the mean across reported devices in the rank."
+    },
+    "pcie_bytes_per_second_mean": {
+      "expression": "avg by (job_id, rank_id) (DCGM_FI_PROF_PCIE_TX_BYTES{__KOI_RANK_FILTER__} + DCGM_FI_PROF_PCIE_RX_BYTES{__KOI_RANK_FILTER__})",
+      "unit": "bytes per second per reported device",
+      "aggregation": "Add transmit and receive rates per device, then take the rank mean. Do not apply rate() again."
+    },
+    "nvlink_bytes_per_second_mean": {
+      "expression": "avg by (job_id, rank_id) (DCGM_FI_PROF_NVLINK_TX_BYTES{__KOI_RANK_FILTER__} + DCGM_FI_PROF_NVLINK_RX_BYTES{__KOI_RANK_FILTER__})",
+      "unit": "bytes per second per reported device",
+      "aggregation": "Add transmit and receive rates per device, then take the rank mean. Do not apply rate() again."
+    }
+  }
+}

@@ -252,7 +252,7 @@ def model_profile_from_values(model_id: str, values: dict[str, Any]) -> ModelPro
     )
     kv_cache_dtype = (
         canonicalize_dtype(
-            values.get("kvcache_quant_mode") or values.get("kvcache_dtype") or "bf16"
+            values.get("kvcache_quant_mode") or values.get("kv_cache_dtype") or "bf16"
         )
         or "bf16"
     )

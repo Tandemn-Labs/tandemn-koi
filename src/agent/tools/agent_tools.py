@@ -88,6 +88,7 @@ import json
 import logging
 import math
 import time
+from contextlib import suppress
 from functools import wraps
 from threading import Lock
 from typing import Any
@@ -161,10 +162,10 @@ _ENGINE_OWNED_X = frozenset(
         "engine_name",
         "engine_version",
         "weight_dtype",
-        "kvcache_dtype",
+        "kv_cache_dtype",
         "weight_quantization_bits",
         "prefix_cache_enabled",
-        "chunked_prefill_enable",
+        "chunked_prefill_enabled",
         "router_policy",
         "scheduling_policy",
         "preemption_policy",
@@ -1969,7 +1970,7 @@ def _model_num_layers(catalog: dict[str, Any], job_features: dict[str, Any] | No
 
 
 # Catalog facts that decide whether a model's WEIGHTS fit one GPU. Scalars only:
-# per-GPU list fields (max_num_seq, kvcache_dtype) are deliberately left out so the
+# per-GPU list fields (max_num_seq, kv_cache_dtype) are deliberately left out so the
 # fit check stays a weight check and cannot trip on an unresolved list.
 _WEIGHT_FIT_FIELDS = (
     "model_params_b",
@@ -4278,20 +4279,16 @@ def _fleet_gpu_capacity(resources: dict[str, Any]) -> tuple[int, int]:
     for info in (resources or {}).values():
         if not isinstance(info, dict):
             continue
-        try:
+        with suppress(TypeError, ValueError):
             free += max(0, int(info.get("free", 0) or 0))
-        except (TypeError, ValueError):
-            pass
         for pool in info.get("pools") or []:
             if not isinstance(pool, dict):
                 continue
             pool_total = 0
             for source in pool.get("merged_pool_sources") or []:
                 if isinstance(source, dict):
-                    try:
+                    with suppress(TypeError, ValueError):
                         pool_total += max(0, int(source.get("total", 0) or 0))
-                    except (TypeError, ValueError):
-                        pass
             if pool_total <= 0:
                 try:
                     pool_total = max(0, int(pool.get("total", pool.get("free", 0)) or 0))
@@ -4720,16 +4717,20 @@ def _score_one_frame(
     # budget_exempt: a capacity-reclaim shrink strictly reduces the resources of
     # a deployment the validated book already tolerates, and healthy actives
     # hold no BudgetSlice of their own - the slice check would reject them all.
-    budget_errors = [] if budget_exempt else _candidate_budget_errors(
-        jid,
-        {
-            "job_id": jid,
-            "type": action_type,
-            "user_id": user_id,
-            "ladder": [scored_rank],
-            "mechanism_id": mid,
-            "budget_ref": slice_id,
-        },
+    budget_errors = (
+        []
+        if budget_exempt
+        else _candidate_budget_errors(
+            jid,
+            {
+                "job_id": jid,
+                "type": action_type,
+                "user_id": user_id,
+                "ladder": [scored_rank],
+                "mechanism_id": mid,
+                "budget_ref": slice_id,
+            },
+        )
     )
     if budget_errors:
         diag.update(status="resource_budget", reason="; ".join(budget_errors)[:200])
@@ -4931,9 +4932,7 @@ def _score_one_frame(
     return {"candidate": act, "meets_target": meets, "diag": diag}
 
 
-def _cap_composite_ranks(
-    scored_ranks: list[dict[str, Any]], gpu_cap: int
-) -> list[dict[str, Any]]:
+def _cap_composite_ranks(scored_ranks: list[dict[str, Any]], gpu_cap: int) -> list[dict[str, Any]]:
     """Trim a composite's rank list to the per-job footprint cap, in order.
 
     Whole ranks are included while they fit; a rank that does not fit is shrunk
@@ -5240,9 +5239,7 @@ def _reclaim_current_rank(ladder):
                     "tp": shape.get("tp"),
                     "pp": shape.get("pp"),
                 },
-                "n_replicas": head.get("n_replicas")
-                or shape.get("n_replicas")
-                or len(chains),
+                "n_replicas": head.get("n_replicas") or shape.get("n_replicas") or len(chains),
             }
         )
     if current is None:
@@ -5391,9 +5388,7 @@ def build_scored_candidates(
             priority = 0.0
         return -priority, job_id
 
-    candidate_jobs = sorted(
-        [*pending_jobs, *active_rehabilitation, *growth_jobs], key=job_order
-    )
+    candidate_jobs = sorted([*pending_jobs, *active_rehabilitation, *growth_jobs], key=job_order)
     for job in candidate_jobs:
         jid = job.get("job_id", job.get("id"))
         if not jid:
@@ -5868,9 +5863,7 @@ def build_scored_candidates(
         jid
         for jid, job_diags in diagnostics.items()
         if str(jid) not in jobs_with_candidates
-        and any(
-            isinstance(d, dict) and d.get("status") == "no_pool_capacity" for d in job_diags
-        )
+        and any(isinstance(d, dict) and d.get("status") == "no_pool_capacity" for d in job_diags)
     )
     # actives/active_ids are needed by both the zero-candidate filter and the
     # Layer 3 lost-the-race widening below, so compute them unconditionally.
@@ -5880,9 +5873,7 @@ def build_scored_candidates(
         # Actives land in the blocked set too when the fleet is full - their
         # ALTERNATE frames are trivially pool-vetoed - but reclaim exists for
         # starved WAITING jobs, so drop actives from the trigger list.
-        blocked_by_capacity = [
-            jid for jid in blocked_by_capacity if str(jid) not in active_ids
-        ]
+        blocked_by_capacity = [jid for jid in blocked_by_capacity if str(jid) not in active_ids]
     # Layer 3: also treat as capacity-blocked any WAITING job that DID produce
     # candidates but whose every candidate footprint exceeds current free pool
     # capacity (the lost-the-race face reclaim previously missed). Free counts
@@ -5920,7 +5911,9 @@ def build_scored_candidates(
             )
     blocked_by_capacity = sorted(set(blocked_by_capacity))
     if blocked_by_capacity:
-        reclaim_subjects: list[tuple[tuple[float, float, float], dict[str, Any], dict[str, Any]]] = []
+        reclaim_subjects: list[
+            tuple[tuple[float, float, float], dict[str, Any], dict[str, Any]]
+        ] = []
         # Observed per-rank utilization (defensive; empty when telemetry is
         # unavailable, which keeps ordering to burst-risk then priority).
         subject_util: dict[str, dict[str, Any]] = {}
@@ -5966,27 +5959,29 @@ def build_scored_candidates(
             if job_kind == "online" and peak_to_mean >= _RECLAIM_BURST_PTM_MAX:
                 continue
             burst_risk = peak_to_mean if job_kind == "online" else 0.0
-            rank_id = None
+            subject_rank_id: str | None = None
             for chain in ladder:
-                candidate_rank = (chain.get("shape_json") or {}).get("rank_id") if isinstance(
-                    chain, dict
-                ) else None
+                candidate_rank = (
+                    (chain.get("shape_json") or {}).get("rank_id")
+                    if isinstance(chain, dict)
+                    else None
+                )
                 if candidate_rank:
-                    rank_id = str(candidate_rank)
+                    subject_rank_id = str(candidate_rank)
                     break
-            avg_util = (subject_util.get(rank_id) or {}).get("avg_util") if rank_id else None
+            avg_util = (
+                (subject_util.get(subject_rank_id) or {}).get("avg_util")
+                if subject_rank_id
+                else None
+            )
             util_key = float(avg_util) if isinstance(avg_util, (int, float)) else 0.0
             try:
-                subject_priority = float(
-                    (budgets.get(subject_id) or {}).get("priority_score", 1.0)
-                )
+                subject_priority = float((budgets.get(subject_id) or {}).get("priority_score", 1.0))
             except (TypeError, ValueError):
                 subject_priority = 1.0
             # Prefer the safest shrink first: low burst-risk, then low observed
             # utilization (genuinely over-provisioned), then lowest priority.
-            reclaim_subjects.append(
-                ((burst_risk, util_key, subject_priority), job, current)
-            )
+            reclaim_subjects.append(((burst_risk, util_key, subject_priority), job, current))
         if not reclaim_subjects:
             # Observability: an empty subject scan must never be silent - it is
             # exactly the state this trigger exists to escape.
@@ -6018,8 +6013,7 @@ def build_scored_candidates(
             current_cfg = current.get("config") or {}
             reclaim_credit = {
                 (_env_key(current.get("env")), current_cfg.get("instance_type")): (
-                    int(current.get("n_replicas") or 1)
-                    * int(current_cfg.get("gpu_count") or 1)
+                    int(current.get("n_replicas") or 1) * int(current_cfg.get("gpu_count") or 1)
                 )
             }
             try:
@@ -6412,16 +6406,10 @@ def jointly_select_placements(
                 continue
             active_jid = str(active_job.get("job_id", active_job.get("id") or ""))
             current = _reclaim_current_rank(
-                list(
-                    active_job.get("current_ladder")
-                    or active_job.get("active_chains")
-                    or []
-                )
+                list(active_job.get("current_ladder") or active_job.get("active_chains") or [])
             )
             if active_jid and current is not None:
-                current_deployment_cost[active_jid] = _ladder_capacity_cost(
-                    [current], specs
-                )
+                current_deployment_cost[active_jid] = _ladder_capacity_cost([current], specs)
 
     # Group scored candidates by job, attaching each frame's per-env GPU cost and
     # its GAIN over deferring that job. Under-target frames only avoid the defer
@@ -6553,9 +6541,7 @@ def jointly_select_placements(
                 "normal_gain": 0.0 if cand.get("work_conserving_floor") else gain,
                 "stable_floor_value": (penalty(candidate_job_id) if floor_tier == 1 else 0.0),
                 "exploratory_floor_value": (penalty(candidate_job_id) if floor_tier == 2 else 0.0),
-                "swap_count": (
-                    0 if cand.get("capacity_reclaim") else (1 if is_swap else 0)
-                ),
+                "swap_count": (0 if cand.get("capacity_reclaim") else (1 if is_swap else 0)),
                 "stranded": _ladder_stranded_gpus(cand.get("ladder"), specs),
             }
         )

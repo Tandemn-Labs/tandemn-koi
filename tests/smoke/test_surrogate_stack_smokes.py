@@ -127,7 +127,7 @@ CONFIG = {
     "model_id": "model-a",
     "gpu_type": "H100",
     "weight_dtype": "bf16",
-    "kvcache_dtype": "fp16",
+    "kv_cache_dtype": "fp16",
     "engine_name": "vllm",
     "engine_version": "0.22.0",
     "model_params_b": 8,

@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "source": "vllm",
+  "language": "promql",
+  "rank_labels": ["job_id", "rank_id"],
+  "queries": {
+    "num_kv_blocks_mean": {
+      "expression": "group by (job_id, rank_id, num_gpu_blocks) (vllm:cache_config_info{__KOI_RANK_FILTER__})",
+      "unit": "allocated GPU KV blocks per reported configuration",
+      "aggregation": "Deduplicate equal capacities across the rank. The adapter reads num_gpu_blocks and requires one common capacity per timestamp; for homogeneous ranks this equals the mean."
+    },
+    "ttft_p99_seconds": {
+      "expression": "histogram_quantile(0.99, sum by (le, job_id, rank_id) (rate(vllm:time_to_first_token_seconds_bucket{__KOI_RANK_FILTER__}[5m])))",
+      "unit": "seconds",
+      "aggregation": "Sum histogram bucket rates across the rank, then calculate the rank-level 99th percentile."
+    },
+    "tpot_p99_seconds": {
+      "expression": "histogram_quantile(0.99, sum by (le, job_id, rank_id) (rate(vllm:request_time_per_output_token_seconds_bucket{__KOI_RANK_FILTER__}[5m])))",
+      "unit": "seconds per output token",
+      "aggregation": "Sum histogram bucket rates across the rank, then calculate the rank-level 99th percentile."
+    },
+    "generated_output_tokens_per_second": {
+      "expression": "sum by (job_id, rank_id) (rate(vllm:generation_tokens_total{__KOI_RANK_FILTER__}[1m]))",
+      "unit": "output tokens per second",
+      "aggregation": "Calculate each counter rate, then sum the rates across the rank."
+    },
+    "running_requests": {
+      "expression": "sum by (job_id, rank_id) (vllm:num_requests_running{__KOI_RANK_FILTER__})",
+      "unit": "requests",
+      "aggregation": "Sum running requests across the rank."
+    },
+    "waiting_requests": {
+      "expression": "sum by (job_id, rank_id) (vllm:num_requests_waiting{__KOI_RANK_FILTER__})",
+      "unit": "requests",
+      "aggregation": "Sum waiting requests across the rank."
+    },
+    "kv_cache_usage_fraction": {
+      "expression": "avg by (job_id, rank_id) (vllm:kv_cache_usage_perc{__KOI_RANK_FILTER__})",
+      "unit": "fraction from 0 to 1",
+      "aggregation": "Take the mean cache usage across the rank's reported series."
+    },
+    "prefix_cache_hit_fraction": {
+      "expression": "sum by (job_id, rank_id) (rate(vllm:prefix_cache_hits_total{__KOI_RANK_FILTER__}[5m])) / (sum by (job_id, rank_id) (rate(vllm:prefix_cache_queries_total{__KOI_RANK_FILTER__}[5m])) > 0)",
+      "unit": "fraction from 0 to 1",
+      "aggregation": "Divide rank-wide hit rate by rank-wide lookup rate; omit ranks with no lookups."
+    },
+    "prompt_tokens_per_request": {
+      "expression": "sum by (job_id, rank_id) (rate(vllm:request_prompt_tokens_sum{__KOI_RANK_FILTER__}[5m])) / (sum by (job_id, rank_id) (rate(vllm:request_prompt_tokens_count{__KOI_RANK_FILTER__}[5m])) > 0)",
+      "unit": "input tokens per request",
+      "aggregation": "Divide rank-wide prompt-token rate by rank-wide request rate; omit ranks with no requests."
+    },
+    "generated_tokens_per_request": {
+      "expression": "sum by (job_id, rank_id) (rate(vllm:request_generation_tokens_sum{__KOI_RANK_FILTER__}[5m])) / (sum by (job_id, rank_id) (rate(vllm:request_generation_tokens_count{__KOI_RANK_FILTER__}[5m])) > 0)",
+      "unit": "output tokens per request",
+      "aggregation": "Divide rank-wide generated-token rate by rank-wide completed-request rate; omit ranks with no requests."
+    },
+    "prefill_observations_per_second": {
+      "expression": "sum by (job_id, rank_id) (rate(vllm:request_prefill_time_seconds_count{__KOI_RANK_FILTER__}[1m]))",
+      "unit": "completed prefill observations per second",
+      "aggregation": "Calculate each counter rate, then sum the rates across the rank."
+    },
+    "decode_observations_per_second": {
+      "expression": "sum by (job_id, rank_id) (rate(vllm:request_decode_time_seconds_count{__KOI_RANK_FILTER__}[1m]))",
+      "unit": "completed decode observations per second",
+      "aggregation": "Calculate each counter rate, then sum the rates across the rank."
+    },
+    "prefill_decode_time_ratio": {
+      "expression": "sum by (job_id, rank_id) (rate(vllm:request_prefill_time_seconds_sum{__KOI_RANK_FILTER__}[5m])) / (sum by (job_id, rank_id) (rate(vllm:request_decode_time_seconds_sum{__KOI_RANK_FILTER__}[5m])) > 0)",
+      "unit": "prefill time divided by decode time",
+      "aggregation": "Divide rank-wide prefill-time rate by rank-wide decode-time rate; omit ranks with no decode time."
+    }
+  }
+}

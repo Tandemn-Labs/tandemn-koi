@@ -158,7 +158,7 @@ AIC_MEMORY_X_FIELDS = frozenset(
         "kvcache_quant_mode",
         "fmha_quant_mode",
         "comm_quant_mode",
-        "kvcache_dtype",
+        "kv_cache_dtype",
         "model_size_gb",
         "weight_dtype",
         "weight_quantization_bits",
@@ -177,7 +177,7 @@ AIC_PERFORMANCE_X_FIELDS = frozenset(
         "tp",
         "ep",
         "prefix_cache_enabled",
-        "chunked_prefill_enable",
+        "chunked_prefill_enabled",
         "preemption_policy",
         "scheduling_policy",
     }
@@ -424,7 +424,7 @@ class SurrogatePrediction:
                     "max_num_batched_tokens",
                     "gpu_mem_util",
                     "prefix_cache_enabled",
-                    "chunked_prefill_enable",
+                    "chunked_prefill_enabled",
                     "pd_enabled",
                     "prefill_worker_count",
                     "decode_worker_count",
@@ -469,7 +469,7 @@ class SurrogatePrediction:
                     "num_routed_experts",
                     "num_active_experts",
                     "weight_dtype",
-                    "kvcache_dtype",
+                    "kv_cache_dtype",
                     "weight_quantization_bits",
                 },
                 "direct_v": {"input_length_observed", "output_length_observed", "kvcache_hit_rate"},
@@ -759,7 +759,7 @@ class SurrogatePrediction:
             "aic_tp_size": direct_x_values.get("tp", 1),
             "aic_moe_ep_size": direct_x_values.get("ep", 1),
             "enable_prefix_caching": direct_x_values.get("prefix_cache_enabled", False),
-            "enable_chunked_prefill": direct_x_values.get("chunked_prefill_enable", False),
+            "enable_chunked_prefill": direct_x_values.get("chunked_prefill_enabled", False),
             "preemption_mode": direct_x_values.get("preemption_policy"),
         }
         if selected_match is not None:
@@ -1019,7 +1019,7 @@ class SurrogatePrediction:
             "fmha": values.get("fmha_quant_mode")
             or values.get("activation_dtype")
             or values.get("weight_dtype"),
-            "kv_cache": values.get("kvcache_quant_mode") or values.get("kvcache_dtype"),
+            "kv_cache": values.get("kvcache_quant_mode") or values.get("kv_cache_dtype"),
         }
         compatibility = self.last_metadata.setdefault("compatibility", {})
         for component, dtype in requested.items():

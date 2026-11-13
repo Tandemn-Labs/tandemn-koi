@@ -1173,7 +1173,7 @@ class TickRunner:
             deployment_rank_identity(raw, replicas=replicas),
             config.get("weight_dtype"),
             config.get("activation_dtype"),
-            config.get("kvcache_dtype"),
+            config.get("kv_cache_dtype"),
             config.get("weight_quantization_bits"),
             config.get("weight_quantization_method"),
             config.get("engine_name"),

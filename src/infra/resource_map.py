@@ -195,7 +195,7 @@ class ResourceMapManager:
         if not ids:
             return result
         try:
-            from tandemn_system_data.clients import GpuMetricStore  # type: ignore
+            from tandemn_system_data.clients import GpuMetricStore
 
             store = GpuMetricStore(self._client())
             effective_user = self._effective_user_id(user_id)
