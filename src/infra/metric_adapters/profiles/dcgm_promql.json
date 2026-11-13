@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "source": "dcgm",
+  "language": "promql",
+  "queries": {
+    "gpu_mem_used_fraction": "DCGM_FI_DEV_FB_USED{target} / (DCGM_FI_DEV_FB_USED{target} + DCGM_FI_DEV_FB_FREE{target})",
+    "vram_headroom_gb": "DCGM_FI_DEV_FB_FREE{target} / 1024",
+    "accelerator_compute_active_fraction": "DCGM_FI_PROF_SM_ACTIVE{target}",
+    "mem_bandwidth_utilization": "DCGM_FI_PROF_DRAM_ACTIVE{target}",
+    "pcie_tput_bytes_per_sec": "DCGM_FI_PROF_PCIE_TX_BYTES{target} + DCGM_FI_PROF_PCIE_RX_BYTES{target}",
+    "inter_gpu_tput_bytes_per_sec": "DCGM_FI_PROF_NVLINK_TX_BYTES{target} + DCGM_FI_PROF_NVLINK_RX_BYTES{target}"
+  }
+}
