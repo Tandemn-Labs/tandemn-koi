@@ -1120,6 +1120,9 @@ class KoiAgentHarness:
         if not plan.actions and states is None:
             raise PlanMaterializationError("plan has no actions and no job inventory to cover")
 
+        for action in plan.actions:
+            for rank in action.ladder or []:
+                rank.rationale = action.rationale
         return plan
 
     def _materialize_launch_configs(self, plan: Plan, cluster_snapshot) -> None:
@@ -1900,6 +1903,7 @@ class KoiAgentHarness:
             "   'n_replicas': int,       # rank DP / max endpoint count; do NOT put dp in config\n"
             "   'rank_traffic_share': float,        # optional partial-admission traffic share\n"
             "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
+            "Koi copies the job action's rationale onto every rank; do not write separate rank reasons.\n"
             "v0 is AGGREGATE-ONLY per rank: every rank is one full "
             "prefill+decode engine (role 'aggregate'); do NOT split prefill/"
             "decode or set pd_enabled / prefill_worker_count / "
