@@ -3707,7 +3707,7 @@ def compute_sigma(plan) -> dict[str, Any]:
     scoring inputs are DERIVED, not trusted from the LLM: prev_ladder and
     slo_thresholds come from the snapshot, y_hat from the action's
     advisory predicted_y or a fresh surrogate call. Non-ladder actions
-    (keep/defer/terminate/diagnose) deploy nothing new and score 0.
+    (keep/defer/terminate) deploy nothing new and score 0.
 
     Args:
         plan: A typed Plan or any raw form Plan.from_raw accepts.
@@ -6895,7 +6895,7 @@ def swap_counter(plan) -> int:
     """Count active-job churn against the C4 swap budget B_t.
 
     Counts actions in SWAP_BUDGET_ACTIONS (swap). PLACE
-    and DEFER are admission, not churn; KEEP/DIAGNOSE/TERMINATE move no
+    and DEFER are admission, not churn; KEEP/TERMINATE move no
     running workload.
 
     Args:

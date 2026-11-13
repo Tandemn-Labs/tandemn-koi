@@ -1015,6 +1015,55 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
         )
         self.pool = self.enterContext(postgres_pool(database_url))
 
+    def test_waiting_jobs_are_read_from_jobs_and_intent(self):
+        model_id = "test/queued-context"
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO model_architecture (model_id) VALUES (%s)", (model_id,))
+            for job_id, kind, status in (
+                ("queued-b", "batch", "queued"),
+                ("queued-a", "online", "queued"),
+                ("running-job", "online", "running"),
+                ("finished-job", "batch", "finished"),
+            ):
+                conn.execute(
+                    "INSERT INTO jobs (job_id, kind, status, model_id) VALUES (%s, %s, %s, %s)",
+                    (job_id, kind, status, model_id),
+                )
+                conn.execute(
+                    "INSERT INTO job_intent "
+                    "(job_id, target_p99_ttft_ms, deadline_hrs, is_session_affinity) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (
+                        job_id,
+                        600.0 if kind == "online" else None,
+                        0.0 if kind == "online" else 2.0,
+                        False,
+                    ),
+                )
+
+        manager = ResourceMapManager(pool=self.pool, postgres_client=object())
+        jobs = manager.get_waiting_jobs()
+        self.assertEqual([job["job_id"] for job in jobs], ["queued-a", "queued-b"])
+        for job, kind in zip(jobs, ("online", "batch"), strict=True):
+            self.assertEqual(job["kind"], kind)
+            self.assertEqual(job["status"], "queued")
+            features = job["job_features"]
+            self.assertEqual(features["type"], kind)
+            self.assertEqual(features["model_id"], model_id)
+            self.assertEqual(features["target_p99_ttft_ms"], 600.0 if kind == "online" else None)
+            self.assertEqual(features["deadline_hrs"], 0.0 if kind == "online" else 2.0)
+            self.assertFalse(features["is_session_affinity"])
+            self.assertIsNone(features["priority_class"])
+            self.assertNotIn("user_id", job)
+            self.assertNotIn("spec_json", job)
+            self.assertNotIn("recent_rank_failures", job)
+        self.assertEqual(manager.get_submitted_jobs(), jobs)
+        manager.resources_summary = lambda: {}
+        manager.get_running_jobs = lambda **kwargs: []
+        self.assertEqual(manager.snapshot_cluster_state(5).pending_jobs_summary(), jobs)
+        with self.assertRaisesRegex(ValueError, "database pool is required"):
+            ResourceMapManager().get_waiting_jobs()
+
     def test_catalogs_are_read_from_postgres(self):
         # Schema-supported values from the legacy model_catalog logged by
         # koi-3h-cohere-20260906T051213Z on 2026-09-06, using canonical names. updated_at and
