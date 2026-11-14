@@ -61,7 +61,27 @@ def test_concurrent_and_repeated_migrations(migration_database):
             SELECT count(*) FROM information_schema.tables
             WHERE table_schema = 'public' AND table_name <> 'schema_migrations'
             """
-        ).fetchone() == (19,)
+        ).fetchone() == (18,)
+        assert conn.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'resource_map_snapshots'
+            ORDER BY ordinal_position
+            """
+        ).fetchall() == [
+            ("tick",),
+            ("snapshot_id",),
+            ("stored_at",),
+            ("schema_version",),
+            ("resource_map",),
+        ]
+        assert conn.execute("SELECT to_regclass('public.tick_resource_map')").fetchone() == (None,)
+        assert conn.execute(
+            """
+            SELECT pg_get_constraintdef(oid) FROM pg_constraint
+            WHERE conrelid = 'public.resource_map_snapshots'::regclass AND contype = 'p'
+            """
+        ).fetchone() == ("PRIMARY KEY (tick)",)
         assert conn.execute(
             """
             SELECT column_name FROM information_schema.columns

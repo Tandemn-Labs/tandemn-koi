@@ -420,17 +420,13 @@ CREATE TABLE public.rank_metrics (
 --
 
 CREATE TABLE public.resource_map_snapshots (
+    tick integer NOT NULL,
     snapshot_id text NOT NULL,
     stored_at timestamp with time zone,
     schema_version text,
-    cluster jsonb,
-    collected_at timestamp with time zone,
-    source_logical_counter numeric(20,0),
-    capacity_pools jsonb,
-    observed_jobs jsonb,
-    topology jsonb,
-    installed_components jsonb,
-    api_resources jsonb
+    resource_map jsonb NOT NULL,
+    CONSTRAINT resource_map_snapshots_resource_map_check CHECK ((jsonb_typeof(resource_map) = 'object'::text)),
+    CONSTRAINT resource_map_snapshots_tick_check CHECK ((tick >= 0))
 );
 
 
@@ -466,17 +462,6 @@ CREATE TABLE public.slow_state_job (
     job_id text NOT NULL,
     w_t jsonb,
     z_star jsonb
-);
-
-
---
--- Name: tick_resource_map; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.tick_resource_map (
-    tick integer NOT NULL,
-    cluster_id text NOT NULL,
-    snapshot_id text
 );
 
 
@@ -605,7 +590,15 @@ ALTER TABLE ONLY public.rank_metrics
 --
 
 ALTER TABLE ONLY public.resource_map_snapshots
-    ADD CONSTRAINT resource_map_snapshots_pkey PRIMARY KEY (snapshot_id);
+    ADD CONSTRAINT resource_map_snapshots_pkey PRIMARY KEY (tick);
+
+
+--
+-- Name: resource_map_snapshots resource_map_snapshots_snapshot_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_map_snapshots
+    ADD CONSTRAINT resource_map_snapshots_snapshot_id_key UNIQUE (snapshot_id);
 
 
 --
@@ -633,14 +626,6 @@ ALTER TABLE ONLY public.slow_state_job
 
 
 --
--- Name: tick_resource_map tick_resource_map_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.tick_resource_map
-    ADD CONSTRAINT tick_resource_map_pkey PRIMARY KEY (tick, cluster_id);
-
-
---
 -- Name: master_table_rank_history_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -652,13 +637,6 @@ CREATE INDEX master_table_rank_history_idx ON public.master_table USING btree (j
 --
 
 CREATE INDEX rank_metrics_history_idx ON public.rank_metrics USING btree (job_id, rank_id, cluster_id, tick DESC);
-
-
---
--- Name: resource_map_snapshots_cluster_time_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX resource_map_snapshots_cluster_time_idx ON public.resource_map_snapshots USING btree (((cluster ->> 'cluster_id'::text)), collected_at DESC NULLS LAST);
 
 
 --
@@ -715,13 +693,6 @@ CREATE TRIGGER slow_state_cluster_append_only BEFORE DELETE OR UPDATE OR TRUNCAT
 --
 
 CREATE TRIGGER slow_state_job_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.slow_state_job FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
--- Name: tick_resource_map tick_resource_map_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER tick_resource_map_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.tick_resource_map FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
 
 
 --
@@ -842,14 +813,6 @@ ALTER TABLE ONLY public.rank_metrics
 
 ALTER TABLE ONLY public.slow_state_job
     ADD CONSTRAINT slow_state_job_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(job_id);
-
-
---
--- Name: tick_resource_map tick_resource_map_snapshot_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.tick_resource_map
-    ADD CONSTRAINT tick_resource_map_snapshot_id_fkey FOREIGN KEY (snapshot_id) REFERENCES public.resource_map_snapshots(snapshot_id);
 
 
 --

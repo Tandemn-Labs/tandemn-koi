@@ -351,39 +351,16 @@ FOR EACH STATEMENT
 EXECUTE FUNCTION reject_append_only_mutation();
 
 CREATE TABLE resource_map_snapshots (
-    snapshot_id TEXT PRIMARY KEY,
+    tick INTEGER PRIMARY KEY CHECK (tick >= 0),
+    snapshot_id TEXT NOT NULL UNIQUE,
     stored_at TIMESTAMPTZ,
     schema_version TEXT,
-    cluster JSONB,
-    collected_at TIMESTAMPTZ,
-    source_logical_counter NUMERIC(20, 0),
-    capacity_pools JSONB,
-    observed_jobs JSONB,
-    topology JSONB,
-    installed_components JSONB,
-    api_resources JSONB
+    -- One received GlobalResourceMap, preserving its cluster snapshots and vector clock.
+    resource_map JSONB NOT NULL CHECK (jsonb_typeof(resource_map) = 'object')
 );
-
-CREATE INDEX resource_map_snapshots_cluster_time_idx
-    ON resource_map_snapshots (
-        (cluster ->> 'cluster_id'),
-        collected_at DESC NULLS LAST
-    );
 
 CREATE TRIGGER resource_map_snapshots_append_only
 BEFORE UPDATE OR DELETE OR TRUNCATE ON resource_map_snapshots
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
-
-CREATE TABLE tick_resource_map (
-    tick INTEGER,
-    cluster_id TEXT,
-    snapshot_id TEXT REFERENCES resource_map_snapshots (snapshot_id),
-    PRIMARY KEY (tick, cluster_id)
-);
-
-CREATE TRIGGER tick_resource_map_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON tick_resource_map
 FOR EACH STATEMENT
 EXECUTE FUNCTION reject_append_only_mutation();
 
