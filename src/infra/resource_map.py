@@ -357,13 +357,6 @@ class ResourceMapManager:
             )
         return jobs
 
-    def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return paused jobs for future preempt/resume support."""
-        effective_user_id = self._effective_user_id(user_id)
-        return [
-            self._job_to_summary(job) for job in self._job_store().paused_jobs(effective_user_id)
-        ]
-
     def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
         """Return active chains with owning job context."""
         chains: list[dict[str, Any]] = []
@@ -681,7 +674,6 @@ class ResourceMapManager:
             "resources": resources,
             "running_jobs": self.get_running_jobs(user_id=user_id),
             "waiting_jobs": self.get_waiting_jobs(),
-            "paused_jobs": self.get_paused_jobs(user_id=user_id),
             "running_chains": self.get_running_chains(user_id=user_id),
         }
 
@@ -1022,9 +1014,6 @@ class _SmokeResourceMapManager(ResourceMapManager):
         return []
 
     def get_waiting_jobs(self) -> list[dict[str, Any]]:
-        return []
-
-    def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
         return []
 
     def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
