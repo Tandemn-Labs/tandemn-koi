@@ -1,0 +1,26 @@
+{
+  "cluster_resource_maps": [
+    {
+      "cluster": {
+        "cluster_id": "cluster-a",
+        "provider": "aws",
+        "region": "us-east-1"
+      },
+      "collected_at": "2026-11-13T00:00:00Z",
+      "logical_counter": "1"
+    },
+    {
+      "cluster": {
+        "cluster_id": "cluster-b",
+        "provider": "aws",
+        "region": "us-east-1"
+      },
+      "collected_at": "2026-11-12T23:59:00Z",
+      "logical_counter": "18446744073709551615"
+    }
+  ],
+  "vector_clock": {
+    "cluster-a": "1",
+    "cluster-b": "18446744073709551615"
+  }
+}

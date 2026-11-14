@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -59,10 +60,13 @@ def merge_hardware_catalogs(catalogs: Sequence[object]) -> dict[str, Any]:
 
 @dataclass
 class ClusterResourceSnapshot:
+    """Tick inputs; PostgreSQL resources retain the raw per-cluster structure."""
+
     tick: int | None
     resources: dict[str, Any]
     active_jobs: list[dict[str, Any]]
     pending_jobs: list[dict[str, Any]]
+    resource_map_snapshot: dict[str, Any] | None = None
 
     def resources_summary(self) -> dict[str, Any]:
         return self.resources
@@ -93,7 +97,7 @@ class AllocationUnit:
 
 
 class ResourceMapManager:
-    """Read PostgreSQL catalogs/job context and Store-backed runtime inventory."""
+    """Read PostgreSQL inputs and retain one planning view per tick."""
 
     def __init__(
         self,
@@ -108,6 +112,7 @@ class ResourceMapManager:
         self.user_id = user_id
         self._postgres_client = postgres_client
         self._pool = pool
+        self._tick_snapshot: ClusterResourceSnapshot | None = None
         self._rank_failure_history_seconds = int(rank_failure_history_seconds)
 
     # ------------------------------------------------------------------
@@ -316,46 +321,13 @@ class ResourceMapManager:
     def get_running_jobs(
         self, user_id: str | None = None, *, failure_since: datetime | None = None
     ) -> list[dict[str, Any]]:
-        """Enrich Store-observed ranks with Koi's SQL job and intent context."""
-        if self._pool is None:
-            raise ValueError("database pool is required for running-job context reads")
-        effective_user_id = self._effective_user_id(user_id)
-        store = self._job_store()
-        running_jobs = store.running_jobs(effective_user_id)
-        if not running_jobs:
-            return []
-        with self._pool.connection() as conn:
-            contexts = {
-                row["job_id"]: self._job_context_to_summary(row)
-                for row in conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    JOIN job_intent USING (job_id)
-                    WHERE job_id = ANY(%s)
-                    ORDER BY job_id
-                    """,
-                    ([job.job.job_id for job in running_jobs],),
-                )
-            }
-        failure_since = failure_since or self._failure_since()
-        jobs = []
-        for running_job in running_jobs:
-            job_id = running_job.job.job_id
-            if job_id not in contexts:
-                raise ValueError(f"job context missing {job_id!r}")
-            job = contexts[job_id]
-            chains = [chain for rank in running_job.ranks for chain in self._rank_to_chains(rank)]
-            job["active_chains"] = chains
-            job["current_ladder"] = chains
-            job["recent_rank_failures"] = [
-                self._rank_failure_summary(rank)
-                for rank in store.failed_ranks_since(job_id, failure_since)
-            ]
-            jobs.append(job)
-        return jobs
+        """Return observed jobs enriched with the tick's SQL context."""
+        return self.snapshot().active_jobs_summary()
 
     def get_waiting_jobs(self) -> list[dict[str, Any]]:
         """Read queued jobs and their intent for Koi's planning view."""
+        if self._tick_snapshot is not None:
+            return self._tick_snapshot.pending_jobs_summary()
         if self._pool is None:
             raise ValueError("database pool is required for waiting-job reads")
         with self._pool.connection() as conn:
@@ -467,7 +439,7 @@ class ResourceMapManager:
     # ------------------------------------------------------------------
 
     def read_resource_map_snapshot(self, tick: int) -> dict[str, Any]:
-        """Read the GlobalResourceMap stored for this exact tick."""
+        """Read this exact tick's GlobalResourceMap encoded with proto field names."""
         if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
             raise ValueError("tick must be a nonnegative integer")
         if self._pool is None:
@@ -481,8 +453,6 @@ class ResourceMapManager:
             ).fetchone()
             if snapshot is None:
                 raise ValueError(f"Resource Map snapshot missing for tick {tick}")
-            if snapshot["stored_at"] is None:
-                raise ValueError(f"snapshot {snapshot['snapshot_id']!r} requires stored_at")
             resource_map = snapshot["resource_map"]
             cluster_maps = resource_map.get("cluster_resource_maps", [])
             vector_clock = resource_map.get("vector_clock", {})
@@ -518,18 +488,131 @@ class ResourceMapManager:
             return snapshot
 
     def snapshot(self) -> ClusterResourceSnapshot:
-        return self.snapshot_cluster_state(tick=None)
+        if self._tick_snapshot is None:
+            raise ValueError("tick snapshot is required; capture it in S0 first")
+        return self._tick_snapshot
 
     def snapshot_cluster_state(self, tick) -> ClusterResourceSnapshot:
-        failure_since = self._failure_since()
-        return ClusterResourceSnapshot(
+        """
+        Freeze one FSM tick into the in-memory planning view used for the rest of the tick.
+        Loads the exact ``resource_map_snapshots`` row for ``tick`` (a validated
+        GlobalResourceMap), then joins every observed job and every queued job with
+        SQL ``jobs`` + ``job_intent``. Observed ranks and chains are attached under
+        each job; cluster-local phases stay observational while ``jobs.status``
+        decides ``active_jobs`` vs ``pending_jobs``.
+        Caches the result on ``self._tick_snapshot`` and returns it unchanged when
+        called again for the same tick. A different tick clears the cache and
+        rebuilds. Raises if ``tick`` is invalid, the snapshot is missing/invalid,
+        or an observed job has no SQL context.
+
+        Args:
+            tick: Nonnegative FSM tick whose Resource Map row must already exist.
+
+        Returns:
+            ClusterResourceSnapshot with per-cluster maps, active/pending jobs, and
+            the raw stored snapshot.
+        """
+        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
+            raise ValueError("tick must be a nonnegative integer")
+        if self._tick_snapshot is not None and self._tick_snapshot.tick == tick:
+            return self._tick_snapshot
+        self._tick_snapshot = None
+        stored = deepcopy(self.read_resource_map_snapshot(tick))
+        cluster_maps = stored["resource_map"].get("cluster_resource_maps", [])
+        observations: dict[str, list[dict[str, Any]]] = {}
+        for cluster_map in cluster_maps:
+            cluster_id = cluster_map["cluster"]["cluster_id"]
+            jobs = cluster_map.get("jobs", [])
+            if not isinstance(jobs, list):
+                raise ValueError(f"cluster {cluster_id!r} jobs must be a list")
+            seen_jobs = set()
+            for observed in jobs:
+                job_id = observed.get("job_id") if isinstance(observed, dict) else None
+                if not isinstance(job_id, str) or not job_id.strip() or job_id in seen_jobs:
+                    raise ValueError(f"cluster {cluster_id!r} has an invalid or duplicate job_id")
+                seen_jobs.add(job_id)
+                observations.setdefault(job_id, []).append(
+                    {
+                        **deepcopy(observed),
+                        "cluster_id": cluster_id,
+                        "collected_at": cluster_map.get("collected_at"),
+                        "logical_counter": cluster_map.get("logical_counter", 0),
+                    }
+                )
+        with self._pool.connection() as conn:
+            contexts = {
+                row["job_id"]: self._job_context_to_summary(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM jobs
+                    JOIN job_intent USING (job_id)
+                    WHERE status = %s OR job_id = ANY(%s)
+                    ORDER BY job_id
+                    """,
+                    ("queued", list(observations)),
+                )
+            }
+        for job_id in observations:
+            if job_id not in contexts:
+                raise ValueError(f"job context missing {job_id!r}")
+        for job_id, job in contexts.items():
+            job["observations"] = observations.get(job_id, [])
+            ranks = []
+            chains = []
+            for observed in job["observations"]:
+                observed_ranks = observed.get("ranks", [])
+                if not isinstance(observed_ranks, list):
+                    raise ValueError(f"job {job_id!r} ranks must be a list")
+                seen_ranks = set()
+                for rank in observed_ranks:
+                    rank_id = rank.get("rank_id") if isinstance(rank, dict) else None
+                    if not isinstance(rank_id, str) or not rank_id.strip() or rank_id in seen_ranks:
+                        raise ValueError(f"job {job_id!r} has an invalid or duplicate rank_id")
+                    seen_ranks.add(rank_id)
+                    ranks.append({**rank, "cluster_id": observed["cluster_id"]})
+                    observed_chains = rank.get("chains", [])
+                    if not isinstance(observed_chains, list):
+                        raise ValueError(f"rank {rank_id!r} chains must be a list")
+                    seen_chains = set()
+                    for chain in observed_chains:
+                        chain_id = chain.get("chain_id") if isinstance(chain, dict) else None
+                        if (
+                            not isinstance(chain_id, str)
+                            or not chain_id.strip()
+                            or chain_id in seen_chains
+                        ):
+                            raise ValueError(
+                                f"rank {rank_id!r} has an invalid or duplicate chain_id"
+                            )
+                        seen_chains.add(chain_id)
+                        chains.append(
+                            {
+                                **chain,
+                                "rank_id": rank_id,
+                                "cluster_id": observed["cluster_id"],
+                                "runtime": rank.get("runtime", {}),
+                                "pod_requirements": rank.get("pod_requirements", []),
+                            }
+                        )
+            job["ranks"] = ranks
+            job["active_chains"] = chains
+            job["current_ladder"] = chains
+        # Cluster-local phases are observations; jobs.status remains authoritative.
+        snapshot = ClusterResourceSnapshot(
             tick=tick,
-            resources=self.resources_summary(),
-            active_jobs=self.get_running_jobs(failure_since=failure_since),
-            pending_jobs=self.get_waiting_jobs(),
+            resources={
+                cluster_map["cluster"]["cluster_id"]: cluster_map for cluster_map in cluster_maps
+            },
+            active_jobs=[job for job in contexts.values() if job["status"] == "running"],
+            pending_jobs=[job for job in contexts.values() if job["status"] == "queued"],
+            resource_map_snapshot=stored,
         )
+        self._tick_snapshot = snapshot
+        return snapshot
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
+        if self._pool is not None:
+            return self.snapshot().resources_summary()
         resource_map = self.get_resource_map(user_id=user_id)
         used_gpus, used_instances, used_pool_gpus = self._used_capacity(
             resource_map, user_id=user_id
@@ -738,6 +821,19 @@ class ResourceMapManager:
         return "reserved"
 
     def dynamic_view(self, user_id: str | None = None) -> dict[str, Any]:
+        if self._pool is not None:
+            snapshot = self.snapshot()
+            stored = snapshot.resource_map_snapshot
+            return {
+                "tick": snapshot.tick,
+                "snapshot_id": stored["snapshot_id"],
+                "stored_at": stored["stored_at"],
+                "resource_map": stored["resource_map"],
+                "resources": snapshot.resources_summary(),
+                "running_jobs": self.get_running_jobs(),
+                "waiting_jobs": self.get_waiting_jobs(),
+                "running_chains": self.get_running_chains(),
+            }
         resource_map = self.get_resource_map(user_id=user_id)
         used_gpus, used_instances, used_pool_gpus = self._used_capacity(
             resource_map, user_id=user_id
@@ -767,6 +863,8 @@ class ResourceMapManager:
     # ------------------------------------------------------------------
 
     def get_resource_map(self, user_id: str | None = None):
+        if self._pool is not None:
+            return self.snapshot().resource_map_snapshot["resource_map"]
         return self._resource_map_store(user_id=user_id).get()
 
     def refresh_resource_map(self, TandemnStore=None):
@@ -1095,6 +1193,9 @@ class _SmokeResourceMapManager(ResourceMapManager):
 
     def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
         return []
+
+    def snapshot_cluster_state(self, tick) -> ClusterResourceSnapshot:
+        return ClusterResourceSnapshot(tick, self.resources_summary(), [], [])
 
 
 def _run_smoke(manager: ResourceMapManager, label: str) -> dict[str, Any]:

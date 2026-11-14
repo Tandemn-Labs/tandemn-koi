@@ -355,7 +355,7 @@ class TickRunner:
     # ------------------------------------------------------------------
 
     def S0(self, ctx: TickContext) -> FSMState:
-        """Freeze the tick's view of the world and reset per-tick caches.
+        """Freeze the exact tick's global map/job context and reset per-tick caches.
 
         The snapshot is the single consistent input every later state
         references. The on_tick_start hook clears agent-tool tick caches

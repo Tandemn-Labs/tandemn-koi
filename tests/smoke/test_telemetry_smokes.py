@@ -273,64 +273,24 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
         rank = next(telemetry.iter_per_rank(telemetry.collect_telemetry(0, 1, snapshot)))
         self.assertEqual(rank.y_observed["throughput_token_per_sec"].tolist(), [30.0])
 
-    def test_running_jobs_requests_failures_since_snapshot_cutoff(self):
-        cutoff = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
-        calls = []
-
-        class JobStore:
-            def running_jobs(self, user_id):
-                job = SimpleNamespace(
-                    job_id="job_1",
-                    model_dump=lambda mode="json": {
-                        "job_id": "job_1",
-                        "user_id": user_id,
-                        "spec_json": {},
-                    },
-                )
-                return [
-                    SimpleNamespace(
-                        job=job,
-                        ranks=[],
-                    )
-                ]
-
-            def failed_ranks_since(self, job_id, since):
-                calls.append((job_id, since))
-                return [
-                    {
-                        "rank_id": "rank_failed",
-                        "plan_id": "plan_1",
-                        "role": "decode",
-                        "status": "failed",
-                        "shape_json": {"count": 8},
-                        "reason_code": "OOM",
-                        "updated_at": "2026-08-23T12:00:00+00:00",
-                    }
-                ]
-
+    def test_running_jobs_use_frozen_inventory_without_store_failure_reads(self):
         pool = MagicMock()
-        conn = pool.connection.return_value.__enter__.return_value
-        conn.execute.return_value.__iter__.return_value = iter(
-            [
+        manager = ResourceMapManager(pool=pool, postgres_client=object())
+        job = {
+            "job_id": "job_1",
+            "job_features": {"model_id": "test/sql-model", "isl_token_avg": 512.0},
+            "ranks": [
                 {
-                    "job_id": "job_1",
-                    "kind": "online",
-                    "status": "running",
-                    "model_id": "test/sql-model",
-                    "isl_token_avg": 512.0,
+                    "rank_id": "rank_failed",
+                    "status": {"phase": "WORKLOAD_PHASE_FAILED", "reason": "OOM"},
                 }
-            ]
-        )
-        manager = ResourceMapManager(user_id="user_1", pool=pool)
-        manager._job_store = lambda: JobStore()
+            ],
+        }
+        manager._tick_snapshot = ClusterResourceSnapshot(5, {}, [job], [])
 
-        jobs = manager.get_running_jobs(failure_since=cutoff)
-
-        self.assertEqual(calls, [("job_1", cutoff)])
-        self.assertEqual(jobs[0]["recent_rank_failures"][0]["reason_code"], "OOM")
-        self.assertEqual(jobs[0]["job_features"]["model_id"], "test/sql-model")
-        self.assertEqual(jobs[0]["job_features"]["isl_token_avg"], 512.0)
-        self.assertEqual(conn.execute.call_args.args[1], (["job_1"],))
+        self.assertEqual(manager.get_running_jobs(), [job])
+        self.assertEqual(manager.get_running_jobs()[0]["ranks"][0]["status"]["reason"], "OOM")
+        pool.connection.assert_not_called()
 
 
 if __name__ == "__main__":

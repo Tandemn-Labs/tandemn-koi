@@ -435,6 +435,16 @@ EXECUTE FUNCTION reject_append_only_mutation();
 
 ## resource_map_snapshots
 
+Each row holds one complete `GlobalResourceMap` for its exact tick; readers do
+not select a newer or older map. `stored_at` is optional metadata, not a read
+requirement.
+
+The external writer must preserve protobuf field names throughout the JSON:
+`preserving_proto_field_name=True` in Python or `UseProtoNames: true` in Go.
+This means `cluster_resource_maps`, `cluster_id`, and `vector_clock`, not their
+lowerCamelCase spellings. Protobuf's string-encoded uint64 counters and omitted
+default fields are supported.
+
 ```sql
 CREATE TABLE resource_map_snapshots (
     tick INTEGER PRIMARY KEY CHECK (tick >= 0),
