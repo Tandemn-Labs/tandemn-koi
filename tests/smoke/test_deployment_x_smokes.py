@@ -2,8 +2,10 @@ import os
 import shutil
 import subprocess
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -1015,6 +1017,190 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
         )
         self.pool = self.enterContext(postgres_pool(database_url))
 
+    @staticmethod
+    def _global_resource_map(clusters):
+        cluster_maps = []
+        for cluster_id, counter, collected_at in clusters:
+            cluster_maps.append(
+                {
+                    "cluster": {"cluster_id": cluster_id, "provider": "aws", "region": "us-east-1"},
+                    "logical_counter": counter,
+                    "collected_at": collected_at.isoformat(),
+                    "capacity_pools": [
+                        {
+                            "id": "workers",
+                            "node_types": [
+                                {
+                                    "id": "h100",
+                                    "accelerator_model": "H100",
+                                    "accelerators_per_node": 8,
+                                    "total_count": 1,
+                                    "eligible_for_tandemn": False,
+                                    "in_use": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "jobs": [{"job_id": "job-1", "ranks": []}],
+                    "topology": {"fabrics": [], "links": []},
+                    "installed_components": [],
+                    "api_resources": [],
+                }
+            )
+        return {
+            "cluster_resource_maps": cluster_maps,
+            "vector_clock": {cluster_id: counter for cluster_id, counter, _ in clusters},
+        }
+
+    def _insert_resource_map_snapshot(self, tick, snapshot_id, stored_at, resource_map):
+        with self.pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO resource_map_snapshots "
+                "(tick, snapshot_id, stored_at, schema_version, resource_map) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    tick,
+                    snapshot_id,
+                    stored_at,
+                    "tandemn.resourcemap.v1alpha1",
+                    Jsonb(resource_map),
+                ),
+            )
+
+    def test_global_resource_map_is_read_for_exact_tick(self):
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        maximum_counter = 2**64 - 1
+        old_map = self._global_resource_map(
+            [("cluster-a", 1, base), ("cluster-b", maximum_counter, base)]
+        )
+        latest_map = self._global_resource_map(
+            [("cluster-c", 9, base), ("cluster-a", "2", base - timedelta(minutes=1))]
+        )
+        self._insert_resource_map_snapshot(4, "global-old", base, old_map)
+        self._insert_resource_map_snapshot(
+            5, "global-latest", base + timedelta(minutes=2), latest_map
+        )
+        manager = ResourceMapManager(pool=self.pool, postgres_client=object())
+
+        snapshot = manager.read_resource_map_snapshot(5)
+
+        self.assertEqual(snapshot["snapshot_id"], "global-latest")
+        self.assertEqual(snapshot["resource_map"], latest_map)
+        self.assertEqual(
+            [
+                entry["cluster"]["cluster_id"]
+                for entry in snapshot["resource_map"]["cluster_resource_maps"]
+            ],
+            ["cluster-c", "cluster-a"],
+        )
+        next_map = self._global_resource_map(
+            [("cluster-b", maximum_counter, base), ("cluster-a", 3, base)]
+        )
+        self._insert_resource_map_snapshot(6, "global-next", base + timedelta(minutes=3), next_map)
+        self.assertEqual(manager.read_resource_map_snapshot(5), snapshot)
+        self.assertEqual(manager.read_resource_map_snapshot(4)["resource_map"], old_map)
+        next_snapshot = manager.read_resource_map_snapshot(6)
+        self.assertEqual(next_snapshot["resource_map"], next_map)
+        self.assertEqual(
+            next_snapshot["resource_map"]["vector_clock"]["cluster-b"], maximum_counter
+        )
+        with self.pool.connection() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT snapshot_id FROM resource_map_snapshots WHERE tick = %s",
+                    (5,),
+                ).fetchall(),
+                [{"snapshot_id": "global-latest"}],
+            )
+
+    def test_empty_global_resource_map_is_not_replaced_by_another_tick(self):
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        self._insert_resource_map_snapshot(5, "global-empty", base, {})
+        manager = ResourceMapManager(pool=self.pool)
+        snapshot = manager.read_resource_map_snapshot(5)
+        self.assertEqual(snapshot["resource_map"], {})
+        self._insert_resource_map_snapshot(
+            6,
+            "global-next",
+            base + timedelta(minutes=1),
+            self._global_resource_map([("cluster-a", 1, base)]),
+        )
+        self.assertEqual(manager.read_resource_map_snapshot(5), snapshot)
+        self.assertEqual(manager.read_resource_map_snapshot(6)["snapshot_id"], "global-next")
+        with self.assertRaisesRegex(ValueError, "missing for tick 7"):
+            manager.read_resource_map_snapshot(7)
+
+    def test_resource_map_snapshots_are_unique_and_append_only(self):
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        self._insert_resource_map_snapshot(
+            5,
+            "global-map",
+            base,
+            self._global_resource_map([("cluster-a", 1, base), ("cluster-b", 1, base)]),
+        )
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            self._insert_resource_map_snapshot(5, "different-map", base, {})
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            self._insert_resource_map_snapshot(6, "global-map", base, {})
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self._insert_resource_map_snapshot(-1, "negative-tick", base, {})
+        for query in (
+            "UPDATE resource_map_snapshots SET resource_map = '{}' WHERE tick = 5",
+            "DELETE FROM resource_map_snapshots WHERE tick = 5",
+            "TRUNCATE resource_map_snapshots",
+        ):
+            with (
+                self.subTest(query=query),
+                self.assertRaisesRegex(psycopg.Error, "append-only"),
+                self.pool.connection() as conn,
+            ):
+                conn.execute(query)
+
+    def test_resource_map_read_rejects_missing_or_invalid_inputs(self):
+        manager = ResourceMapManager(pool=self.pool)
+        for tick in (None, -1, True, 1.5):
+            with self.subTest(tick=tick), self.assertRaisesRegex(ValueError, "nonnegative integer"):
+                manager.read_resource_map_snapshot(tick)
+        with self.assertRaisesRegex(ValueError, "database pool is required"):
+            ResourceMapManager().read_resource_map_snapshot(5)
+        with self.assertRaisesRegex(ValueError, "missing for tick 5"):
+            manager.read_resource_map_snapshot(5)
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        self._insert_resource_map_snapshot(5, "missing-time", None, {})
+        with self.assertRaisesRegex(ValueError, "stored_at"):
+            manager.read_resource_map_snapshot(5)
+        valid_map = self._global_resource_map([("cluster-a", 1, base)])
+        invalid_maps = [
+            {"cluster": {"cluster_id": "cluster-a"}},
+            {"cluster_resource_maps": {}},
+            {"cluster_resource_maps": [{}]},
+            {
+                "cluster_resource_maps": valid_map["cluster_resource_maps"] * 2,
+                "vector_clock": valid_map["vector_clock"],
+            },
+            {"cluster_resource_maps": valid_map["cluster_resource_maps"]},
+            {
+                "cluster_resource_maps": valid_map["cluster_resource_maps"],
+                "vector_clock": {"cluster-a": 2},
+            },
+            {
+                "cluster_resource_maps": valid_map["cluster_resource_maps"],
+                "vector_clock": {"cluster-a": 1, "extra-cluster": 1},
+            },
+            self._global_resource_map([("cluster-a", -1, base)]),
+            self._global_resource_map([("cluster-a", 2**64, base)]),
+            self._global_resource_map([("cluster-a", True, base)]),
+        ]
+        for index, payload in enumerate(invalid_maps):
+            self._insert_resource_map_snapshot(
+                index + 6, f"invalid-{index}", base + timedelta(minutes=index), payload
+            )
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(ValueError, "Invalid GlobalResourceMap"),
+            ):
+                manager.read_resource_map_snapshot(index + 6)
+
     def test_waiting_jobs_are_read_from_jobs_and_intent(self):
         model_id = "test/queued-context"
         with self.pool.connection() as conn:
@@ -1063,6 +1249,69 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
         self.assertEqual(manager.snapshot_cluster_state(5).pending_jobs_summary(), jobs)
         with self.assertRaisesRegex(ValueError, "database pool is required"):
             ResourceMapManager().get_waiting_jobs()
+
+    def test_running_jobs_use_sql_context_without_changing_rank_inventory(self):
+        model_id = "test/running-context"
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO model_architecture (model_id) VALUES (%s)", (model_id,))
+            conn.execute(
+                "INSERT INTO jobs (job_id, kind, status, model_id) VALUES (%s, %s, %s, %s)",
+                ("running-job", "batch", "running", model_id),
+            )
+            conn.execute(
+                "INSERT INTO job_intent (job_id, deadline_hrs, is_session_affinity) "
+                "VALUES (%s, %s, %s)",
+                ("running-job", 2.0, False),
+            )
+        legacy_job = SimpleNamespace(
+            job_id="running-job",
+            model_dump=Mock(side_effect=AssertionError("Legacy job context must not be read")),
+        )
+        inventory = [
+            SimpleNamespace(
+                job=legacy_job,
+                ranks=[
+                    {
+                        "rank_id": "rank-running",
+                        "role": "aggregate",
+                        "status": "running",
+                        "n_replicas": 2,
+                        "shape_json": {"gpu_count": 1, "tp": 1, "pp": 1},
+                    }
+                ],
+            )
+        ]
+        store = SimpleNamespace(
+            running_jobs=Mock(return_value=inventory),
+            failed_ranks_since=Mock(return_value=[]),
+        )
+        manager = ResourceMapManager(user_id="legacy-user", pool=self.pool)
+        manager._job_store = lambda: store
+
+        job = manager.get_running_jobs()[0]
+        self.assertEqual(job["kind"], "batch")
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["job_features"]["model_id"], model_id)
+        self.assertEqual(job["job_features"]["type"], "batch")
+        self.assertEqual(job["job_features"]["deadline_hrs"], 2.0)
+        self.assertFalse(job["job_features"]["is_session_affinity"])
+        self.assertIsNone(job["job_features"]["priority_class"])
+        self.assertNotIn("spec_json", job)
+        self.assertNotIn("user_id", job)
+        self.assertEqual(
+            [chain["chain_id"] for chain in job["active_chains"]],
+            ["rank-running_chain_0", "rank-running_chain_1"],
+        )
+        self.assertEqual(job["current_ladder"], job["active_chains"])
+        chains = manager.get_running_chains()
+        self.assertEqual(len(chains), 2)
+        self.assertTrue(all(chain["job_id"] == "running-job" for chain in chains))
+        self.assertTrue(all("user_id" not in chain for chain in chains))
+        legacy_job.model_dump.assert_not_called()
+
+        legacy_job.job_id = "missing-job"
+        with self.assertRaisesRegex(ValueError, "job context missing"):
+            manager.get_running_jobs()
 
     def test_catalogs_are_read_from_postgres(self):
         # Schema-supported values from the legacy model_catalog logged by

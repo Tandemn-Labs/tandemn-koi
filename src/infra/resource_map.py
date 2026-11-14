@@ -93,7 +93,7 @@ class AllocationUnit:
 
 
 class ResourceMapManager:
-    """Read PostgreSQL catalogs/queued jobs and Store-backed runtime state."""
+    """Read PostgreSQL catalogs/job context and Store-backed runtime inventory."""
 
     def __init__(
         self,
@@ -316,17 +316,43 @@ class ResourceMapManager:
     def get_running_jobs(
         self, user_id: str | None = None, *, failure_since: datetime | None = None
     ) -> list[dict[str, Any]]:
-        """Return running jobs with active chains and recent rank failures."""
+        """Enrich Store-observed ranks with Koi's SQL job and intent context."""
+        if self._pool is None:
+            raise ValueError("database pool is required for running-job context reads")
         effective_user_id = self._effective_user_id(user_id)
-        jobs = self._job_store()
+        store = self._job_store()
+        running_jobs = store.running_jobs(effective_user_id)
+        if not running_jobs:
+            return []
+        with self._pool.connection() as conn:
+            contexts = {
+                row["job_id"]: self._job_context_to_summary(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM jobs
+                    JOIN job_intent USING (job_id)
+                    WHERE job_id = ANY(%s)
+                    ORDER BY job_id
+                    """,
+                    ([job.job.job_id for job in running_jobs],),
+                )
+            }
         failure_since = failure_since or self._failure_since()
-        return [
-            self._running_job_to_summary(
-                running_job,
-                jobs.failed_ranks_since(running_job.job.job_id, failure_since),
-            )
-            for running_job in jobs.running_jobs(effective_user_id)
-        ]
+        jobs = []
+        for running_job in running_jobs:
+            job_id = running_job.job.job_id
+            if job_id not in contexts:
+                raise ValueError(f"job context missing {job_id!r}")
+            job = contexts[job_id]
+            chains = [chain for rank in running_job.ranks for chain in self._rank_to_chains(rank)]
+            job["active_chains"] = chains
+            job["current_ladder"] = chains
+            job["recent_rank_failures"] = [
+                self._rank_failure_summary(rank)
+                for rank in store.failed_ranks_since(job_id, failure_since)
+            ]
+            jobs.append(job)
+        return jobs
 
     def get_waiting_jobs(self) -> list[dict[str, Any]]:
         """Read queued jobs and their intent for Koi's planning view."""
@@ -342,28 +368,28 @@ class ResourceMapManager:
                 """,
                 ("queued",),
             ).fetchall()
-        jobs = []
-        for row in rows:
-            job_id = row.pop("job_id")
-            kind = row.pop("kind")
-            status = row.pop("status")
-            jobs.append(
-                {
-                    "job_id": job_id,
-                    "kind": kind,
-                    "status": status,
-                    "job_features": {"type": kind, **row},
-                }
-            )
-        return jobs
+        return [self._job_context_to_summary(row) for row in rows]
 
     def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
         """Return active chains with owning job context."""
         chains: list[dict[str, Any]] = []
         for job in self.get_running_jobs(user_id=user_id):
             for chain in job.get("active_chains", []):
-                chains.append({"job_id": job["job_id"], "user_id": job["user_id"], **chain})
+                chains.append({"job_id": job["job_id"], **chain})
         return chains
+
+    @staticmethod
+    def _job_context_to_summary(row: dict[str, Any]) -> dict[str, Any]:
+        features = row.copy()
+        job_id = features.pop("job_id")
+        kind = features.pop("kind")
+        status = features.pop("status")
+        return {
+            "job_id": job_id,
+            "kind": kind,
+            "status": status,
+            "job_features": {"type": kind, **features},
+        }
 
     @staticmethod
     def _model_dump(model) -> dict[str, Any]:
@@ -439,6 +465,57 @@ class ResourceMapManager:
     # ------------------------------------------------------------------
     # Koi-facing snapshot API
     # ------------------------------------------------------------------
+
+    def read_resource_map_snapshot(self, tick: int) -> dict[str, Any]:
+        """Read the GlobalResourceMap stored for this exact tick."""
+        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
+            raise ValueError("tick must be a nonnegative integer")
+        if self._pool is None:
+            raise ValueError("database pool is required for Resource Map snapshot reads")
+        with self._pool.connection() as conn:
+            snapshot = conn.execute(
+                """
+                SELECT * FROM resource_map_snapshots WHERE tick = %s
+                """,
+                (tick,),
+            ).fetchone()
+            if snapshot is None:
+                raise ValueError(f"Resource Map snapshot missing for tick {tick}")
+            if snapshot["stored_at"] is None:
+                raise ValueError(f"snapshot {snapshot['snapshot_id']!r} requires stored_at")
+            resource_map = snapshot["resource_map"]
+            cluster_maps = resource_map.get("cluster_resource_maps", [])
+            vector_clock = resource_map.get("vector_clock", {})
+            invalid_map = f"Invalid GlobalResourceMap in snapshot {snapshot['snapshot_id']!r}"
+            if (
+                any(key not in {"cluster_resource_maps", "vector_clock"} for key in resource_map)
+                or not isinstance(cluster_maps, list)
+                or not isinstance(vector_clock, dict)
+            ):
+                raise ValueError(invalid_map)
+            # Pop from a copy to catch duplicate IDs without changing the received clock.
+            remaining_clock = vector_clock.copy()
+            for cluster_map in cluster_maps:
+                cluster = cluster_map.get("cluster") if isinstance(cluster_map, dict) else None
+                cluster_id = cluster.get("cluster_id") if isinstance(cluster, dict) else None
+                if (
+                    not isinstance(cluster_id, str)
+                    or not cluster_id.strip()
+                    or cluster_id not in remaining_clock
+                ):
+                    raise ValueError(invalid_map)
+                counters = (cluster_map.get("logical_counter", 0), remaining_clock.pop(cluster_id))
+                if any(
+                    isinstance(counter, bool)
+                    or not isinstance(counter, (int, str))
+                    or not str(counter).isdecimal()
+                    or int(counter) >= 2**64
+                    for counter in counters
+                ) or int(counters[0]) != int(counters[1]):
+                    raise ValueError(invalid_map)
+            if remaining_clock:
+                raise ValueError(invalid_map)
+            return snapshot
 
     def snapshot(self) -> ClusterResourceSnapshot:
         return self.snapshot_cluster_state(tick=None)
