@@ -311,6 +311,8 @@ def test_prediction_identity_retains_runtime_configuration():
             "pp": 1,
             "engine_name": "vllm",
             "engine_version": "0.16.0",
+            "kv_cache_dtype": "auto",
+            "chunked_prefill_enabled": True,
         },
         "n_replicas": 1,
     }
@@ -318,9 +320,14 @@ def test_prediction_identity_retains_runtime_configuration():
     assert runner._deployment_shape_signature(base) == runner._deployment_shape_signature(
         {**base, "config": {**base["config"], "engine_version": "0.17.0"}}
     )
-    assert runner._prediction_shape_signature(base) != runner._prediction_shape_signature(
-        {**base, "config": {**base["config"], "engine_version": "0.17.0"}}
-    )
+    for field, value in (
+        ("engine_version", "0.17.0"),
+        ("kv_cache_dtype", "fp8"),
+        ("chunked_prefill_enabled", False),
+    ):
+        assert runner._prediction_shape_signature(base) != runner._prediction_shape_signature(
+            {**base, "config": {**base["config"], field: value}}
+        )
 
 
 def test_active_health_requires_repeat_or_critical_signal_for_rehabilitation():

@@ -1,8 +1,19 @@
+import os
+import shutil
+import subprocess
 import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 import numpy as np
+import psycopg
+from db.postgres import postgres_pool
+from psycopg import sql
+from psycopg.types.json import Jsonb
 from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
@@ -284,25 +295,6 @@ class DeploymentXSmokeTests(unittest.TestCase):
 
         self.assertEqual(_gpu(hardware, "RTX-PRO-6000")["name"], "RTX-PRO-6000-BSE")
         self.assertEqual(materialize_launch_config(catalog, "RTX-PRO-6000-BSE")["max_num_seq"], 128)
-
-    def test_hardware_catalog_merges_aws_and_azure_store_rows(self):
-        """Expose Azure instances alongside the default AWS catalog."""
-        catalogs = [
-            SimpleNamespace(catalog=_hardware_catalog()),
-            SimpleNamespace(catalog=_azure_hardware_catalog()),
-        ]
-        store = SimpleNamespace(all=lambda: catalogs)
-
-        with patch("tandemn_system_data.clients.HardwareCatalogStore", return_value=store):
-            catalog = ResourceMapManager(postgres_client=object()).hardware_catalog()
-
-        by_instance = {
-            (region["cloud"], region["region"], instance["instance_type"])
-            for region in catalog["regions"]
-            for instance in region["instance_types"]
-        }
-        self.assertIn(("aws", "us-east-2", "p5.48xlarge"), by_instance)
-        self.assertIn(("azure", "eastus", "Standard_ND96amsr_A100_v4"), by_instance)
 
     def test_composite_ranks_split_workload_by_traffic_share(self):
         snapshot = _snapshot()
@@ -989,6 +981,536 @@ class DeploymentXSmokeTests(unittest.TestCase):
         self.assertEqual(metadata.beta, 1.5)
         self.assertEqual(metadata.q_histogram["Q4"], 0)
         self.assertTrue(ctx.confidence_diagnostics[0]["partial_divergence"])
+
+
+@unittest.skipUnless(
+    os.environ.get("TEST_DATABASE_URL") and shutil.which("dbmate"),
+    "Requires dbmate and TEST_DATABASE_URL pointing to local PostgreSQL",
+)
+class ResourceMapCatalogPostgresTests(unittest.TestCase):
+    def setUp(self):
+        url = os.environ["TEST_DATABASE_URL"]
+        parsed = urlsplit(url)
+        self.assertIn(parsed.hostname, {"localhost", "127.0.0.1", "::1"})
+        name = f"koi_catalog_test_{uuid4().hex}"
+        admin = psycopg.connect(url, autocommit=True)
+        self.addCleanup(admin.close)
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+        self.addCleanup(
+            admin.execute,
+            sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)),
+        )
+        database_url = urlunsplit(parsed._replace(path=f"/{name}"))
+        subprocess.run(
+            [
+                "dbmate",
+                "--migration-lock",
+                "--no-dump-schema",
+                "--migrations-dir",
+                str(Path(__file__).resolve().parents[2] / "db" / "migrations"),
+                "migrate",
+                "--strict",
+            ],
+            env={**os.environ, "DATABASE_URL": database_url},
+            check=True,
+            timeout=60,
+        )
+        self.pool = self.enterContext(postgres_pool(database_url))
+
+    @staticmethod
+    def _global_resource_map(clusters):
+        cluster_maps = []
+        for cluster_id, counter, collected_at in clusters:
+            cluster_maps.append(
+                {
+                    "cluster": {"cluster_id": cluster_id, "provider": "aws", "region": "us-east-1"},
+                    "logical_counter": counter,
+                    "collected_at": collected_at.isoformat(),
+                    "capacity_pools": [
+                        {
+                            "id": "workers",
+                            "node_types": [
+                                {
+                                    "id": "h100",
+                                    "accelerator_model": "H100",
+                                    "accelerators_per_node": 8,
+                                    "total_count": 1,
+                                    "eligible_for_tandemn": False,
+                                    "in_use": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "jobs": [{"job_id": "job-1", "ranks": []}],
+                    "topology": {"fabrics": [], "links": []},
+                    "installed_components": [],
+                    "api_resources": [],
+                }
+            )
+        return {
+            "cluster_resource_maps": cluster_maps,
+            "vector_clock": {cluster_id: counter for cluster_id, counter, _ in clusters},
+        }
+
+    def _insert_resource_map_snapshot(self, tick, snapshot_id, stored_at, resource_map):
+        with self.pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO resource_map_snapshots "
+                "(tick, snapshot_id, stored_at, schema_version, resource_map) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    tick,
+                    snapshot_id,
+                    stored_at,
+                    "tandemn.resourcemap.v1alpha1",
+                    Jsonb(resource_map),
+                ),
+            )
+
+    def test_global_resource_map_is_read_for_exact_tick(self):
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        maximum_counter = 2**64 - 1
+        old_map = self._global_resource_map(
+            [("cluster-a", 1, base), ("cluster-b", maximum_counter, base)]
+        )
+        latest_map = self._global_resource_map(
+            [("cluster-c", 9, base), ("cluster-a", "2", base - timedelta(minutes=1))]
+        )
+        self._insert_resource_map_snapshot(4, "global-old", base, old_map)
+        self._insert_resource_map_snapshot(
+            5, "global-latest", base + timedelta(minutes=2), latest_map
+        )
+        manager = ResourceMapManager(pool=self.pool, postgres_client=object())
+
+        snapshot = manager.read_resource_map_snapshot(5)
+
+        self.assertEqual(snapshot["snapshot_id"], "global-latest")
+        self.assertEqual(snapshot["resource_map"], latest_map)
+        self.assertEqual(
+            [
+                entry["cluster"]["cluster_id"]
+                for entry in snapshot["resource_map"]["cluster_resource_maps"]
+            ],
+            ["cluster-c", "cluster-a"],
+        )
+        next_map = self._global_resource_map(
+            [("cluster-b", maximum_counter, base), ("cluster-a", 3, base)]
+        )
+        self._insert_resource_map_snapshot(6, "global-next", base + timedelta(minutes=3), next_map)
+        self.assertEqual(manager.read_resource_map_snapshot(5), snapshot)
+        self.assertEqual(manager.read_resource_map_snapshot(4)["resource_map"], old_map)
+        next_snapshot = manager.read_resource_map_snapshot(6)
+        self.assertEqual(next_snapshot["resource_map"], next_map)
+        self.assertEqual(
+            next_snapshot["resource_map"]["vector_clock"]["cluster-b"], maximum_counter
+        )
+        with self.pool.connection() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT snapshot_id FROM resource_map_snapshots WHERE tick = %s",
+                    (5,),
+                ).fetchall(),
+                [{"snapshot_id": "global-latest"}],
+            )
+
+    def test_empty_global_resource_map_is_not_replaced_by_another_tick(self):
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        self._insert_resource_map_snapshot(5, "global-empty", base, {})
+        manager = ResourceMapManager(pool=self.pool)
+        snapshot = manager.read_resource_map_snapshot(5)
+        self.assertEqual(snapshot["resource_map"], {})
+        self._insert_resource_map_snapshot(
+            6,
+            "global-next",
+            base + timedelta(minutes=1),
+            self._global_resource_map([("cluster-a", 1, base)]),
+        )
+        self.assertEqual(manager.read_resource_map_snapshot(5), snapshot)
+        self.assertEqual(manager.read_resource_map_snapshot(6)["snapshot_id"], "global-next")
+        with self.assertRaisesRegex(ValueError, "missing for tick 7"):
+            manager.read_resource_map_snapshot(7)
+
+    def test_resource_map_snapshots_are_unique_and_append_only(self):
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        self._insert_resource_map_snapshot(
+            5,
+            "global-map",
+            base,
+            self._global_resource_map([("cluster-a", 1, base), ("cluster-b", 1, base)]),
+        )
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            self._insert_resource_map_snapshot(5, "different-map", base, {})
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            self._insert_resource_map_snapshot(6, "global-map", base, {})
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self._insert_resource_map_snapshot(-1, "negative-tick", base, {})
+        for query in (
+            "UPDATE resource_map_snapshots SET resource_map = '{}' WHERE tick = 5",
+            "DELETE FROM resource_map_snapshots WHERE tick = 5",
+            "TRUNCATE resource_map_snapshots",
+        ):
+            with (
+                self.subTest(query=query),
+                self.assertRaisesRegex(psycopg.Error, "append-only"),
+                self.pool.connection() as conn,
+            ):
+                conn.execute(query)
+
+    def test_resource_map_read_rejects_missing_or_invalid_inputs(self):
+        manager = ResourceMapManager(pool=self.pool)
+        for tick in (None, -1, True, 1.5):
+            with self.subTest(tick=tick), self.assertRaisesRegex(ValueError, "nonnegative integer"):
+                manager.read_resource_map_snapshot(tick)
+        with self.assertRaisesRegex(ValueError, "database pool is required"):
+            ResourceMapManager().read_resource_map_snapshot(5)
+        with self.assertRaisesRegex(ValueError, "missing for tick 5"):
+            manager.read_resource_map_snapshot(5)
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        self._insert_resource_map_snapshot(5, "missing-time", None, {})
+        with self.assertRaisesRegex(ValueError, "stored_at"):
+            manager.read_resource_map_snapshot(5)
+        valid_map = self._global_resource_map([("cluster-a", 1, base)])
+        invalid_maps = [
+            {"cluster": {"cluster_id": "cluster-a"}},
+            {"cluster_resource_maps": {}},
+            {"cluster_resource_maps": [{}]},
+            {
+                "cluster_resource_maps": valid_map["cluster_resource_maps"] * 2,
+                "vector_clock": valid_map["vector_clock"],
+            },
+            {"cluster_resource_maps": valid_map["cluster_resource_maps"]},
+            {
+                "cluster_resource_maps": valid_map["cluster_resource_maps"],
+                "vector_clock": {"cluster-a": 2},
+            },
+            {
+                "cluster_resource_maps": valid_map["cluster_resource_maps"],
+                "vector_clock": {"cluster-a": 1, "extra-cluster": 1},
+            },
+            self._global_resource_map([("cluster-a", -1, base)]),
+            self._global_resource_map([("cluster-a", 2**64, base)]),
+            self._global_resource_map([("cluster-a", True, base)]),
+        ]
+        for index, payload in enumerate(invalid_maps):
+            self._insert_resource_map_snapshot(
+                index + 6, f"invalid-{index}", base + timedelta(minutes=index), payload
+            )
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(ValueError, "Invalid GlobalResourceMap"),
+            ):
+                manager.read_resource_map_snapshot(index + 6)
+
+    def test_waiting_jobs_are_read_from_jobs_and_intent(self):
+        model_id = "test/queued-context"
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO model_architecture (model_id) VALUES (%s)", (model_id,))
+            for job_id, kind, status in (
+                ("queued-b", "batch", "queued"),
+                ("queued-a", "online", "queued"),
+                ("running-job", "online", "running"),
+                ("finished-job", "batch", "finished"),
+            ):
+                conn.execute(
+                    "INSERT INTO jobs (job_id, kind, status, model_id) VALUES (%s, %s, %s, %s)",
+                    (job_id, kind, status, model_id),
+                )
+                conn.execute(
+                    "INSERT INTO job_intent "
+                    "(job_id, target_p99_ttft_ms, deadline_hrs, is_session_affinity) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (
+                        job_id,
+                        600.0 if kind == "online" else None,
+                        0.0 if kind == "online" else 2.0,
+                        False,
+                    ),
+                )
+
+        manager = ResourceMapManager(pool=self.pool, postgres_client=object())
+        jobs = manager.get_waiting_jobs()
+        self.assertEqual([job["job_id"] for job in jobs], ["queued-a", "queued-b"])
+        for job, kind in zip(jobs, ("online", "batch"), strict=True):
+            self.assertEqual(job["kind"], kind)
+            self.assertEqual(job["status"], "queued")
+            features = job["job_features"]
+            self.assertEqual(features["type"], kind)
+            self.assertEqual(features["model_id"], model_id)
+            self.assertEqual(features["target_p99_ttft_ms"], 600.0 if kind == "online" else None)
+            self.assertEqual(features["deadline_hrs"], 0.0 if kind == "online" else 2.0)
+            self.assertFalse(features["is_session_affinity"])
+            self.assertIsNone(features["priority_class"])
+            self.assertNotIn("user_id", job)
+            self.assertNotIn("spec_json", job)
+            self.assertNotIn("recent_rank_failures", job)
+        self.assertEqual(manager.get_submitted_jobs(), jobs)
+        manager.resources_summary = lambda: {}
+        manager.get_running_jobs = lambda **kwargs: []
+        self.assertEqual(manager.snapshot_cluster_state(5).pending_jobs_summary(), jobs)
+        with self.assertRaisesRegex(ValueError, "database pool is required"):
+            ResourceMapManager().get_waiting_jobs()
+
+    def test_running_jobs_use_sql_context_without_changing_rank_inventory(self):
+        model_id = "test/running-context"
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO model_architecture (model_id) VALUES (%s)", (model_id,))
+            conn.execute(
+                "INSERT INTO jobs (job_id, kind, status, model_id) VALUES (%s, %s, %s, %s)",
+                ("running-job", "batch", "running", model_id),
+            )
+            conn.execute(
+                "INSERT INTO job_intent (job_id, deadline_hrs, is_session_affinity) "
+                "VALUES (%s, %s, %s)",
+                ("running-job", 2.0, False),
+            )
+        legacy_job = SimpleNamespace(
+            job_id="running-job",
+            model_dump=Mock(side_effect=AssertionError("Legacy job context must not be read")),
+        )
+        inventory = [
+            SimpleNamespace(
+                job=legacy_job,
+                ranks=[
+                    {
+                        "rank_id": "rank-running",
+                        "role": "aggregate",
+                        "status": "running",
+                        "n_replicas": 2,
+                        "shape_json": {"gpu_count": 1, "tp": 1, "pp": 1},
+                    }
+                ],
+            )
+        ]
+        store = SimpleNamespace(
+            running_jobs=Mock(return_value=inventory),
+            failed_ranks_since=Mock(return_value=[]),
+        )
+        manager = ResourceMapManager(user_id="legacy-user", pool=self.pool)
+        manager._job_store = lambda: store
+
+        job = manager.get_running_jobs()[0]
+        self.assertEqual(job["kind"], "batch")
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["job_features"]["model_id"], model_id)
+        self.assertEqual(job["job_features"]["type"], "batch")
+        self.assertEqual(job["job_features"]["deadline_hrs"], 2.0)
+        self.assertFalse(job["job_features"]["is_session_affinity"])
+        self.assertIsNone(job["job_features"]["priority_class"])
+        self.assertNotIn("spec_json", job)
+        self.assertNotIn("user_id", job)
+        self.assertEqual(
+            [chain["chain_id"] for chain in job["active_chains"]],
+            ["rank-running_chain_0", "rank-running_chain_1"],
+        )
+        self.assertEqual(job["current_ladder"], job["active_chains"])
+        chains = manager.get_running_chains()
+        self.assertEqual(len(chains), 2)
+        self.assertTrue(all(chain["job_id"] == "running-job" for chain in chains))
+        self.assertTrue(all("user_id" not in chain for chain in chains))
+        legacy_job.model_dump.assert_not_called()
+
+        legacy_job.job_id = "missing-job"
+        with self.assertRaisesRegex(ValueError, "job context missing"):
+            manager.get_running_jobs()
+
+    def test_catalogs_are_read_from_postgres(self):
+        # Schema-supported values from the legacy model_catalog logged by
+        # koi-3h-cohere-20260906T051213Z on 2026-09-06, using canonical names. updated_at and
+        # runtime_image are not represented in the current schema.
+        legacy_catalog = {
+            "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+            "engine_name": "vllm",
+            "engine_version": "0.16.0",
+            "model_params_b": 70.553706496,
+            "model_size_gb": 141.107412992,
+            "num_hidden_layers": 80,
+            "hidden_size": 8192,
+            "num_attn_heads": 64,
+            "num_kv_heads": 8,
+            "attn_heads_per_kv_head": 8,
+            "intermediate_size": 28672,
+            "max_pos_embeddings": 131072,
+            "vocab_size": 128256,
+            "is_moe": False,
+            "num_routed_experts": 0,
+            "num_active_experts": 0,
+            "flops_per_param": None,
+            "weight_dtype": "bfloat16",
+            "weight_quantization_method": "none",
+            "weight_quantization_bits": 16,
+            "sliding_window_size": None,
+            "min_chain_warmup_time": 10.0,
+            "max_model_len": 131072,
+            "gpu_mem_util": 0.9,
+            "max_num_seq": [
+                {"gpu_type": "H100", "value": 1024},
+                {"gpu_type": "A100-80GB", "value": 256},
+                {"gpu_type": "RTXPRO6000", "value": 256},
+            ],
+            "max_num_batched_tokens": [
+                {"gpu_type": "H100", "value": 8192},
+                {"gpu_type": "A100-80GB", "value": 2048},
+                {"gpu_type": "RTXPRO6000", "value": 2048},
+            ],
+            "block_size": [
+                {"gpu_type": "H100", "value": 16},
+                {"gpu_type": "A100-80GB", "value": 16},
+                {"gpu_type": "RTXPRO6000", "value": 16},
+            ],
+            "kv_cache_dtype": [
+                {"gpu_type": "H100", "value": "auto"},
+                {"gpu_type": "A100-80GB", "value": "auto"},
+                {"gpu_type": "RTXPRO6000", "value": "auto"},
+            ],
+            "attn_backend": "auto",
+            "activation_quantization_method": "none",
+            "activation_dtype": "bfloat16",
+            "prefix_cache_enabled": True,
+            "chunked_prefill_enabled": True,
+            "lmcache_enabled": False,
+            "spec_decoding_enabled": False,
+            "draft_model_id": "",
+            "spec_decoding_method": "none",
+            "num_speculative_tokens": 0,
+            "spec_acceptance_threshold": 0.0,
+            "cuda_graph_enabled": True,
+            "torch_compile_enabled": True,
+            "preemption_policy": "recompute",
+            "pd_enabled": False,
+            "kv_transfer_method": "default",
+            "chunk_size": 100,
+            "max_chunked_steps_per_request": 2,
+        }
+        with self.pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO hardware_catalog (cloud_name, catalog) VALUES (%s, %s)",
+                ("aws", Jsonb(_hardware_catalog())),
+            )
+            conn.execute(
+                "INSERT INTO hardware_catalog (cloud_name, catalog) VALUES (%s, %s)",
+                ("azure", Jsonb(_azure_hardware_catalog())),
+            )
+            conn.execute(
+                "INSERT INTO model_architecture "
+                "(model_id, model_params_b, model_size_gb, num_hidden_layers, hidden_size, "
+                "num_attn_heads, num_kv_heads, attn_heads_per_kv_head, intermediate_size, "
+                "max_pos_embeddings, vocab_size, is_moe, num_routed_experts, "
+                "num_active_experts, flops_per_param, weight_dtype, "
+                "weight_quantization_method, weight_quantization_bits, sliding_window_size, "
+                "min_chain_warmup_time) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s)",
+                tuple(
+                    legacy_catalog[key]
+                    for key in (
+                        "model_id",
+                        "model_params_b",
+                        "model_size_gb",
+                        "num_hidden_layers",
+                        "hidden_size",
+                        "num_attn_heads",
+                        "num_kv_heads",
+                        "attn_heads_per_kv_head",
+                        "intermediate_size",
+                        "max_pos_embeddings",
+                        "vocab_size",
+                        "is_moe",
+                        "num_routed_experts",
+                        "num_active_experts",
+                        "flops_per_param",
+                        "weight_dtype",
+                        "weight_quantization_method",
+                        "weight_quantization_bits",
+                        "sliding_window_size",
+                        "min_chain_warmup_time",
+                    )
+                ),
+            )
+            conn.execute(
+                "INSERT INTO job_engine_defaults "
+                "(model_id, engine_name, engine_version, max_num_seq, max_num_batched_tokens, "
+                "block_size, kv_cache_dtype, "
+                "gpu_mem_util, max_model_len, attn_backend, activation_quantization_method, "
+                "activation_dtype, prefix_cache_enabled, chunked_prefill_enabled, "
+                "lmcache_enabled, spec_decoding_enabled, draft_model_id, spec_decoding_method, "
+                "num_speculative_tokens, spec_acceptance_threshold, cuda_graph_enabled, "
+                "torch_compile_enabled, preemption_policy, pd_enabled, kv_transfer_method, "
+                "chunk_size, max_chunked_steps_per_request) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    legacy_catalog["model_id"],
+                    legacy_catalog["engine_name"],
+                    legacy_catalog["engine_version"],
+                    Jsonb(legacy_catalog["max_num_seq"]),
+                    Jsonb(legacy_catalog["max_num_batched_tokens"]),
+                    Jsonb(legacy_catalog["block_size"]),
+                    Jsonb(legacy_catalog["kv_cache_dtype"]),
+                    legacy_catalog["gpu_mem_util"],
+                    legacy_catalog["max_model_len"],
+                    legacy_catalog["attn_backend"],
+                    legacy_catalog["activation_quantization_method"],
+                    legacy_catalog["activation_dtype"],
+                    legacy_catalog["prefix_cache_enabled"],
+                    legacy_catalog["chunked_prefill_enabled"],
+                    legacy_catalog["lmcache_enabled"],
+                    legacy_catalog["spec_decoding_enabled"],
+                    legacy_catalog["draft_model_id"],
+                    legacy_catalog["spec_decoding_method"],
+                    legacy_catalog["num_speculative_tokens"],
+                    legacy_catalog["spec_acceptance_threshold"],
+                    legacy_catalog["cuda_graph_enabled"],
+                    legacy_catalog["torch_compile_enabled"],
+                    legacy_catalog["preemption_policy"],
+                    legacy_catalog["pd_enabled"],
+                    legacy_catalog["kv_transfer_method"],
+                    legacy_catalog["chunk_size"],
+                    legacy_catalog["max_chunked_steps_per_request"],
+                ),
+            )
+            conn.execute(
+                "INSERT INTO model_architecture (model_id) VALUES (%s)",
+                ("architecture-without-defaults",),
+            )
+
+        manager = ResourceMapManager(pool=self.pool, postgres_client=object())
+        hardware = manager.hardware_catalog()
+        by_instance = {
+            (region["cloud"], region["region"], instance["instance_type"])
+            for region in hardware["regions"]
+            for instance in region["instance_types"]
+        }
+        self.assertIn(("aws", "us-east-2", "p5.48xlarge"), by_instance)
+        self.assertIn(("azure", "eastus", "Standard_ND96amsr_A100_v4"), by_instance)
+
+        catalog = manager.model_catalog(legacy_catalog["model_id"])
+        for field, expected_value in legacy_catalog.items():
+            with self.subTest(field=field):
+                self.assertEqual(catalog[field], expected_value)
+        for gpu_type, expected in (
+            ("H100", 1024),
+            ("A100-80GB", 256),
+            ("RTXPRO6000", 256),
+        ):
+            config = materialize_launch_config(catalog, gpu_type)
+            legacy_config = materialize_launch_config(legacy_catalog, gpu_type)
+            self.assertEqual(config, legacy_config)
+            self.assertEqual(config["engine_name"], "vllm")
+            self.assertEqual(config["engine_version"], "0.16.0")
+            self.assertEqual(config["max_num_seq"], expected)
+            self.assertEqual(config["kv_cache_dtype"], "auto")
+            self.assertTrue(config["chunked_prefill_enabled"])
+
+        for missing_model_id in (
+            "missing-model",
+            "architecture-without-defaults",
+            "' OR 1=1 --",
+        ):
+            with (
+                self.subTest(model_id=missing_model_id),
+                self.assertRaisesRegex(ValueError, "model catalog missing"),
+            ):
+                manager.model_catalog(missing_model_id)
 
 
 class _Telemetry:

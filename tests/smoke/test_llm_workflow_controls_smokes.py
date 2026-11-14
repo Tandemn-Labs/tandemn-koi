@@ -5,7 +5,7 @@ import os
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.agent.agent import AgentTrace, KoiAgentHarness, RLMRuntime, SpecialistRunner
 from src.agent.tools import agent_tools
@@ -535,10 +535,12 @@ class LLMWorkflowControlsSmokeTests(unittest.TestCase):
                 "configure_partial_online_admission",
                 create=True,
             ) as configure_admission,
-            patch.object(runner, "PostgresClient", side_effect=RuntimeError("stop after wiring")),
+            patch.object(
+                runner, "init_causal_graph", side_effect=RuntimeError("stop after wiring")
+            ),
             self.assertRaisesRegex(RuntimeError, "stop after wiring"),
         ):
-            runner.build_runner(args)
+            runner.build_runner(args, pool=Mock())
         configure_budget.assert_called_once_with(17)
         configure_admission.assert_called_once_with("advisory")
 

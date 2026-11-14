@@ -137,7 +137,6 @@ class ActionType(Enum):
                                       a dead chain - see swap_reason)
     DEFER     waiting  -> waiting    stay queued
     TERMINATE any      -> stopped    give up (budget/policy exhausted)
-    DIAGNOSE  no state change        record a theory only
     """
 
     PLACE = "place"
@@ -160,7 +159,7 @@ LADDER_ACTIONS = frozenset(
 )
 
 # # Active-job churn counted against the swap budget B_t (C4). PLACE/DEFER are
-# # admission, not churn; KEEP/DIAGNOSE/TERMINATE move no running workload.
+# # admission, not churn; KEEP/TERMINATE move no running workload.
 SWAP_BUDGET_ACTIONS = frozenset(
     {
         ActionType.SWAP,
@@ -174,7 +173,6 @@ REQUIRED_JOB_STATE = {
     ActionType.KEEP: "running",
     ActionType.SWAP: "running",
     ActionType.TERMINATE: None,
-    ActionType.DIAGNOSE: None,
 }
 
 # v0 is AGGREGATE-ONLY: one engine serves prefill+decode for a job. Prefill/
@@ -303,6 +301,7 @@ class RankSpec:
     predicted_y: dict | None = None
     predicted_v: dict | None = None
     prediction_lineage: dict | None = None
+    rationale: str | None = None
 
     @classmethod
     def from_dict(cls, raw) -> "RankSpec":
@@ -344,6 +343,7 @@ class RankSpec:
                 predicted_y = inner.pop("predicted_y", None)
                 predicted_v = inner.pop("predicted_v", None)
                 prediction_lineage = inner.pop("prediction_lineage", None)
+                rationale = inner.pop("rationale", None)
                 n_rep_raw = inner.pop("chains", inner.pop("n_replicas", 1))
                 n_rep = _positive_replica_count(n_rep_raw)
                 return cls(
@@ -358,6 +358,7 @@ class RankSpec:
                     predicted_y=predicted_y,
                     predicted_v=predicted_v,
                     prediction_lineage=prediction_lineage,
+                    rationale=rationale,
                 )
 
         role = raw.get("role")
@@ -379,6 +380,7 @@ class RankSpec:
             predicted_y=raw.get("predicted_y"),
             predicted_v=raw.get("predicted_v"),
             prediction_lineage=raw.get("prediction_lineage"),
+            rationale=raw.get("rationale"),
         )
 
     def to_dict(self) -> dict:
@@ -394,6 +396,7 @@ class RankSpec:
             "predicted_y": self.predicted_y,
             "predicted_v": self.predicted_v,
             "prediction_lineage": self.prediction_lineage,
+            "rationale": self.rationale,
         }
 
     def gpus_per_chain(self) -> int:
@@ -463,6 +466,8 @@ class PlanAction:
                 f"job {self.job_id}: service_class must be one of "
                 f"{sorted(ALLOWED_SERVICE_CLASSES)}, got {self.service_class!r}"
             )
+        for rank in self.ladder or []:
+            rank.rationale = self.rationale
 
     @classmethod
     def from_dict(cls, raw, job_id: str | None = None) -> "PlanAction":
@@ -587,17 +592,11 @@ class PlanAction:
 
 @dataclass
 class Plan:
-    """The cluster-wide decision for one tick: one action per job.
-
-    A Plan spans every tenant's jobs, so tenant identity lives on each
-    PlanAction (not on the Plan). operator_id is provenance only - who/what
-    produced the plan - mapping the illustrative "user_id" field.
-    """
+    """The cluster-wide decision for one tick: one action per job."""
 
     tick: int
     actions: list[PlanAction] = field(default_factory=list)
     koi_version: str | None = None
-    # operator_id: str | None = None #TODO - Remove- it is noise
     tick_rationale: str | None = None
 
     def action_for(self, job_id: str) -> PlanAction | None:
@@ -648,6 +647,5 @@ class Plan:
             tick=int(meta.get("tick", tick)),
             actions=actions,
             koi_version=meta.get("koi_version"),
-            operator_id=meta.get("operator_id", meta.get("user_id")),
             tick_rationale=meta.get("tick_rationale"),
         )

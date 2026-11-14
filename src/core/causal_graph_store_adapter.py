@@ -1,4 +1,4 @@
-"""Koi causal-graph adapters for Tandemn Store and seeded JSON tables."""
+"""PostgreSQL persistence and seed parsing for Koi's causal graph."""
 
 from __future__ import annotations
 
@@ -6,21 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from psycopg.types.json import Jsonb
 from src.core.candidate_graph import CandidateGraph
 from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node
-from tandemn_system_data.models import (  # type: ignore[import-untyped]
-    CausalEdge,
-    CausalMechanism,
-    CausalNode,
-)
-from tandemn_system_data.models.causal_graph import (  # type: ignore[import-untyped]
-    EdgeMetadata as StoreEdgeMetadata,
-)
-from tandemn_system_data.models.causal_graph import (
-    MechanismMetadata as StoreMechanismMetadata,
-)
 
 DEFAULT_EDGE_TABLE_PATH = (
     Path(__file__).resolve().parents[1] / "bootstrap" / "edge_confidence_table.json"
@@ -31,17 +21,17 @@ DEFAULT_MECHANISM_TABLE_PATH = (
 DEFAULT_Q_HISTOGRAM = {"Q1": 0, "Q2": 0, "Q3": 0, "Q4": 0}
 
 
-class StoreBackedMechanismRegistry(MechanismRegistry):
+class PostgresMechanismRegistry(MechanismRegistry):
     """MechanismRegistry that persists accepted mechanism mutations."""
 
     def __init__(
         self,
-        store,
+        pool,
         mechanism_table: dict[str, Mechanism] | None = None,
         mechanism_metadata_table: dict[str, MechanismMetadata] | None = None,
     ):
         super().__init__(mechanism_table, mechanism_metadata_table)
-        self._store = store
+        self._pool = pool
 
     def add_mechanism(self, mechanism: Mechanism) -> str:
         existing_ids = set(self.mechanism_table)
@@ -56,18 +46,20 @@ class StoreBackedMechanismRegistry(MechanismRegistry):
         return archived
 
     def persist_mechanism(self, mechanism_id: str) -> None:
-        self._store.put_mechanism(
-            koi_mechanism_to_store(self.mechanism_table[mechanism_id]),
-            koi_mechanism_metadata_to_store(self.mechanism_metadata_table[mechanism_id]),
-        )
+        with self._pool.connection() as conn, conn.transaction():
+            save_mechanism(
+                conn,
+                self.mechanism_table[mechanism_id],
+                self.mechanism_metadata_table[mechanism_id],
+            )
 
 
-class StoreBackedConfidenceService(ConfidenceService):
-    """ConfidenceService that can flush Koi's in-memory Beta state to Store."""
+class PostgresConfidenceService(ConfidenceService):
+    """Flush Koi's in-memory confidence state in one transaction."""
 
-    def __init__(self, candidate_graph, mechanism_registry, store):
+    def __init__(self, candidate_graph, mechanism_registry, pool):
         super().__init__(candidate_graph, mechanism_registry)
-        self._store = store
+        self._pool = pool
 
     def seed_new_mechanism_confidence(
         self,
@@ -76,153 +68,77 @@ class StoreBackedConfidenceService(ConfidenceService):
         beta: float = 1.0,
     ) -> float:
         confidence = super().seed_new_mechanism_confidence(mechanism_id, alpha, beta)
-        self._persist_mechanism(mechanism_id)
+        self.mechanism_registry.persist_mechanism(mechanism_id)
         return confidence
 
     def flush(self) -> None:
-        self._store.sync_edge_metadata(
-            {
-                edge_id: koi_edge_metadata_to_store(metadata)
-                for edge_id, metadata in self.candidate_graph.edge_metadata_table.items()
-            }
+        with self._pool.connection() as conn, conn.transaction():
+            save_edge_metadata(conn, self.candidate_graph.edge_metadata_table)
+            for mechanism_id, mechanism in self.mechanism_registry.mechanism_table.items():
+                save_mechanism(
+                    conn,
+                    mechanism,
+                    self.mechanism_registry.mechanism_metadata_table[mechanism_id],
+                )
+
+
+def save_edge_metadata(conn, metadata_table: dict[str, EdgeMetadata]) -> None:
+    with conn.cursor() as cursor:
+        cursor.executemany(
+            """
+            UPDATE causal_edges SET
+                alpha = %s, beta = %s, visit_count = %s, last_touched_tick = %s,
+                q_histogram = %s, envs_seen = %s, q3_frequency = %s
+            WHERE edge_id = %s
+            """,
+            [
+                (
+                    metadata.alpha,
+                    metadata.beta,
+                    metadata.visit_count,
+                    metadata.last_touched_tick,
+                    Jsonb(_q_histogram(metadata.q_histogram)),
+                    Jsonb(sorted(metadata.envs_seen)),
+                    metadata.q3_frequency,
+                    metadata.edge_id,
+                )
+                for metadata in metadata_table.values()
+            ],
         )
-        self._store.sync_mechanisms(
-            {
-                mechanism_id: koi_mechanism_to_store(mechanism)
-                for mechanism_id, mechanism in self.mechanism_registry.mechanism_table.items()
-            },
-            {
-                mechanism_id: koi_mechanism_metadata_to_store(metadata)
-                for mechanism_id, metadata in self.mechanism_registry.mechanism_metadata_table.items()
-            },
-        )
-
-    def _persist_mechanism(self, mechanism_id: str) -> None:
-        persist = getattr(self.mechanism_registry, "persist_mechanism", None)
-        if callable(persist):
-            persist(mechanism_id)
-            return
-        self._store.put_mechanism(
-            koi_mechanism_to_store(self.mechanism_registry.mechanism_table[mechanism_id]),
-            koi_mechanism_metadata_to_store(
-                self.mechanism_registry.mechanism_metadata_table[mechanism_id]
-            ),
-        )
 
 
-def store_node_to_koi(node: CausalNode) -> Node:
-    return Node(
-        node_id=node.node_id,
-        node_type=node.node_type,
-        description=node.description,
-        unit=node.unit,
-    )
-
-
-def koi_node_to_store(node: Node) -> CausalNode:
-    return CausalNode(
-        node_id=node.node_id,
-        node_type=node.node_type,
-        description=node.description,
-        unit=node.unit,
-    )
-
-
-def store_edge_to_koi(edge: CausalEdge) -> Edge:
-    return Edge(
-        edge_id=edge.edge_id,
-        src=edge.src,
-        dst=edge.dst,
-        src_type=edge.src_type,
-        dst_type=edge.dst_type,
-        status=edge.status,
-    )
-
-
-def koi_edge_to_store(edge: Edge) -> CausalEdge:
-    return CausalEdge(
-        edge_id=edge.edge_id,
-        src=edge.src,
-        dst=edge.dst,
-        src_type=edge.src_type,
-        dst_type=edge.dst_type,
-        status=edge.status,
-    )
-
-
-def store_edge_metadata_to_koi(metadata: StoreEdgeMetadata) -> EdgeMetadata:
-    return EdgeMetadata(
-        edge_id=metadata.edge_id,
-        alpha=metadata.alpha,
-        beta=metadata.beta,
-        visit_count=metadata.visit_count,
-        last_touched_tick=metadata.last_touched_tick,
-        q_histogram=_q_histogram(metadata.q_histogram),
-        envs_seen=set(metadata.envs_seen),
-        q3_frequency=metadata.q3_frequency,
-    )
-
-
-def koi_edge_metadata_to_store(metadata: EdgeMetadata) -> StoreEdgeMetadata:
-    return StoreEdgeMetadata(
-        edge_id=metadata.edge_id,
-        alpha=metadata.alpha,
-        beta=metadata.beta,
-        visit_count=metadata.visit_count,
-        last_touched_tick=metadata.last_touched_tick,
-        q_histogram=_q_histogram(metadata.q_histogram),
-        envs_seen=set(metadata.envs_seen),
-        q3_frequency=metadata.q3_frequency,
-    )
-
-
-def store_mechanism_to_koi(mechanism: CausalMechanism) -> Mechanism:
-    return Mechanism(
-        mechanism_id=mechanism.mechanism_id,
-        name=mechanism.name or None,
-        edge_ids=list(mechanism.edge_ids),
-        scope=dict(mechanism.scope),
-        narrative=mechanism.narrative,
-        status=mechanism.status,
-        archived_reason=mechanism.archived_reason,
-    )
-
-
-def koi_mechanism_to_store(mechanism: Mechanism) -> CausalMechanism:
-    return CausalMechanism(
-        mechanism_id=mechanism.mechanism_id,
-        name=mechanism.name or "",
-        edge_ids=list(mechanism.edge_ids),
-        scope=dict(mechanism.scope),
-        narrative=mechanism.narrative,
-        status=mechanism.status,
-        archived_reason=mechanism.archived_reason,
-    )
-
-
-def store_mechanism_metadata_to_koi(metadata: StoreMechanismMetadata) -> MechanismMetadata:
-    return MechanismMetadata(
-        mechanism_id=metadata.mechanism_id,
-        alpha=metadata.alpha,
-        beta=metadata.beta,
-        visit_count=metadata.visit_count,
-        envs_seen=set(metadata.envs_seen),
-        last_touched_tick=metadata.last_touched_tick,
-        q_histogram=_q_histogram(metadata.q_histogram),
-        inspection_count=metadata.inspection_count,
-    )
-
-
-def koi_mechanism_metadata_to_store(metadata: MechanismMetadata) -> StoreMechanismMetadata:
-    return StoreMechanismMetadata(
-        mechanism_id=metadata.mechanism_id,
-        alpha=metadata.alpha,
-        beta=metadata.beta,
-        visit_count=metadata.visit_count,
-        envs_seen=set(metadata.envs_seen),
-        last_touched_tick=metadata.last_touched_tick,
-        q_histogram=_q_histogram(metadata.q_histogram),
-        inspection_count=metadata.inspection_count,
+def save_mechanism(conn, mechanism: Mechanism, metadata: MechanismMetadata) -> None:
+    assert mechanism.mechanism_id is not None
+    conn.execute(
+        """
+        INSERT INTO causal_mechanisms (
+            mechanism_id, name, edge_ids, scope, narrative, status,
+            alpha, beta, visit_count, last_touched_tick, q_histogram,
+            envs_last_seen, inspection_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (mechanism_id) DO UPDATE SET
+            name = EXCLUDED.name, edge_ids = EXCLUDED.edge_ids,
+            scope = EXCLUDED.scope, narrative = EXCLUDED.narrative,
+            status = EXCLUDED.status, alpha = EXCLUDED.alpha, beta = EXCLUDED.beta,
+            visit_count = EXCLUDED.visit_count, last_touched_tick = EXCLUDED.last_touched_tick,
+            q_histogram = EXCLUDED.q_histogram, envs_last_seen = EXCLUDED.envs_last_seen,
+            inspection_count = EXCLUDED.inspection_count
+        """,
+        (
+            mechanism.mechanism_id,
+            mechanism.name,
+            mechanism.edge_ids,
+            Jsonb(mechanism.scope),
+            mechanism.narrative,
+            mechanism.status,
+            metadata.alpha,
+            metadata.beta,
+            metadata.visit_count,
+            metadata.last_touched_tick,
+            Jsonb(_q_histogram(metadata.q_histogram)),
+            Jsonb(sorted(metadata.envs_seen)),
+            metadata.inspection_count,
+        ),
     )
 
 

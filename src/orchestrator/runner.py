@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from db.postgres import postgres_pool
 from src.agent.agent import KoiAgentHarness
 from src.agent.llm_clients import OpenAICompatClient, RecordingLLMClient
 from src.agent.tools import agent_tools
@@ -222,8 +223,8 @@ def configure_logging(level: str, log_file=None) -> None:
     )
 
 
-def build_runner(args: argparse.Namespace):
-    """Build one Store-backed TickRunner and its key debug handles."""
+def build_runner(args: argparse.Namespace, *, pool):
+    """Build the TickRunner using the runner process's database pool."""
     if not args.user_id:
         raise SystemExit("TANDEMN_USER_ID or --user-id is required")
     base_url, api_key, temperature, max_tokens, token_limit_param = resolve_llm_settings(args)
@@ -238,10 +239,8 @@ def build_runner(args: argparse.Namespace):
     agent_tools.configure_partial_online_admission(args.partial_online_admission)
     os.environ["RUST_LOG"] = str(args.rust_log)
 
+    candidate_graph, mechanism_registry, confidence_service = init_causal_graph(pool)
     client = PostgresClient()
-    candidate_graph, mechanism_registry, confidence_service = init_causal_graph(
-        args.user_id, postgres_client=client
-    )
     evidence_store = EvidenceService(user_id=args.user_id, postgres_client=client)
     dro = DRO()
     regret = RegretCalculator()
@@ -267,6 +266,7 @@ def build_runner(args: argparse.Namespace):
         user_id=args.user_id,
         postgres_client=client,
         rank_failure_history_seconds=failure_window_sec,
+        pool=pool,
     )
     telemetry = StoreTelemetry(
         user_id=args.user_id,
@@ -495,6 +495,9 @@ def main(
 ) -> int:
     """Run Koi ticks through the configured loop."""
     args = parse_args(argv)
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise SystemExit("DATABASE_URL is required")
     debug_logger = DebugLogger(args.log_dir, trace=args.trace, run_id=args.run_id)
     configure_logging(args.log_level, debug_logger.runner_log_path)
     log.info("debug logs: %s", debug_logger.run_dir)
@@ -510,24 +513,25 @@ def main(
 
     previous_sigterm_handler = signal.signal(signal.SIGTERM, request_shutdown)
     try:
-        runner, evidence_store, agent, llm = build_runner_fn(args)
-        if hasattr(runner, "should_stop"):
-            runner.should_stop = should_stop
-        emit_run_manifest(debug_logger, args)
-        if hasattr(runner, "trace"):
-            runner.trace = debug_logger
-        agent_tools.bind_tools(trace_logger=debug_logger)
-        fsm_states.bind_runner(runner)
-        return run_ticks(
-            evidence_store=evidence_store,
-            agent=agent,
-            llm=llm,
-            requested_tick=args.start_tick,
-            ticks=args.ticks,
-            run_tick_fn=run_tick_fn,
-            debug_logger=debug_logger,
-            should_stop=should_stop,
-        )
+        with postgres_pool(database_url) as pool:
+            runner, evidence_store, agent, llm = build_runner_fn(args, pool=pool)
+            if hasattr(runner, "should_stop"):
+                runner.should_stop = should_stop
+            emit_run_manifest(debug_logger, args)
+            if hasattr(runner, "trace"):
+                runner.trace = debug_logger
+            agent_tools.bind_tools(trace_logger=debug_logger)
+            fsm_states.bind_runner(runner)
+            return run_ticks(
+                evidence_store=evidence_store,
+                agent=agent,
+                llm=llm,
+                requested_tick=args.start_tick,
+                ticks=args.ticks,
+                run_tick_fn=run_tick_fn,
+                debug_logger=debug_logger,
+                should_stop=should_stop,
+            )
     except KeyboardInterrupt:
         log.info("shutdown requested")
         return 130

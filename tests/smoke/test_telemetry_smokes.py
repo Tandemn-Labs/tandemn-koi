@@ -1,6 +1,7 @@
 import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from src.core.candidate_graph import CandidateGraph
 from src.core.models import Node
@@ -307,13 +308,29 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
                     }
                 ]
 
-        manager = ResourceMapManager(user_id="user_1")
+        pool = MagicMock()
+        conn = pool.connection.return_value.__enter__.return_value
+        conn.execute.return_value.__iter__.return_value = iter(
+            [
+                {
+                    "job_id": "job_1",
+                    "kind": "online",
+                    "status": "running",
+                    "model_id": "test/sql-model",
+                    "isl_token_avg": 512.0,
+                }
+            ]
+        )
+        manager = ResourceMapManager(user_id="user_1", pool=pool)
         manager._job_store = lambda: JobStore()
 
         jobs = manager.get_running_jobs(failure_since=cutoff)
 
         self.assertEqual(calls, [("job_1", cutoff)])
         self.assertEqual(jobs[0]["recent_rank_failures"][0]["reason_code"], "OOM")
+        self.assertEqual(jobs[0]["job_features"]["model_id"], "test/sql-model")
+        self.assertEqual(jobs[0]["job_features"]["isl_token_avg"], 512.0)
+        self.assertEqual(conn.execute.call_args.args[1], (["job_1"],))
 
 
 if __name__ == "__main__":

@@ -113,6 +113,50 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
         self.assertEqual(explicit.config, {"tp": 1})
         self.assertEqual(shorthand.config, {"tp": 1})
 
+    def test_job_rationale_is_inherited_by_ranks_and_round_trips(self):
+        for rationale in ("Use these GPUs for this job.", "", None):
+            with self.subTest(rationale=rationale):
+                raw = _valid_place()
+                raw["rationale"] = rationale
+                raw["ladder"][0]["rationale"] = "Do not use a separate rank reason."
+                raw["ladder"].append(
+                    {"aggregate": {"env": ENV.split("|"), "tp": 1, "rationale": "Ignored."}}
+                )
+
+                action = PlanAction.from_dict(raw)
+                for rank in action.ladder:
+                    self.assertEqual(rank.rationale, rationale)
+                    self.assertEqual(rank.to_dict()["rationale"], rationale)
+                    self.assertNotIn("rationale", rank.config)
+                    self.assertEqual(RankSpec.from_dict(rank.to_dict()).rationale, rationale)
+                restored = PlanAction.from_dict(action.to_dict())
+                self.assertEqual([rank.rationale for rank in restored.ladder], [rationale] * 2)
+
+    def test_materialization_copies_final_job_rationale(self):
+        actions = []
+        for job_id, rationale in (("job_1", "First job reason."), ("job_2", "Second job reason.")):
+            raw = _valid_place()
+            raw.update(job_id=job_id, rationale="Original reason.")
+            action = PlanAction.from_dict(raw)
+            action.rationale = rationale
+            actions.append(action)
+        plan = Plan(tick=1, actions=actions)
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        harness._current_tick = 1
+
+        with (
+            patch.object(harness, "_materialize_launch_configs"),
+            patch.object(harness, "_validate_ladder"),
+            patch.object(agent_tools._CTX, "validated_budget_book", None),
+        ):
+            result = harness.materialize_plan(plan, None)
+
+        self.assertIs(result, plan)
+        for action in result.actions:
+            for rank in action.ladder:
+                self.assertEqual(rank.rationale, action.rationale)
+                self.assertEqual(rank.to_dict()["rationale"], action.rationale)
+
     def test_catalog_launch_config_is_added_after_parsing(self):
         class ResourceMap:
             def model_catalog(self, model_id):

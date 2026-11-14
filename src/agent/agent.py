@@ -67,8 +67,8 @@ from src.infra.deployment_x import materialize_launch_config
 log = logging.getLogger("koi.agent")
 
 # A specialist optimizes ONE job inside its BudgetSlice, so it may only
-# propose place/keep/swap/defer. Root-only actions remain terminate and
-# diagnose. TODO(v0): restore preempt/resume/retry with lifecycle support.
+# propose place/keep/swap/defer. The root-only action remains terminate.
+# TODO(v0): restore preempt/resume/retry with lifecycle support.
 SPECIALIST_ACTIONS = frozenset(
     {
         ActionType.PLACE.value,
@@ -1120,6 +1120,9 @@ class KoiAgentHarness:
         if not plan.actions and states is None:
             raise PlanMaterializationError("plan has no actions and no job inventory to cover")
 
+        for action in plan.actions:
+            for rank in action.ladder or []:
+                rank.rationale = action.rationale
         return plan
 
     def _materialize_launch_configs(self, plan: Plan, cluster_snapshot) -> None:
@@ -1652,7 +1655,7 @@ class KoiAgentHarness:
             # ---------- THE OBJECTIVE, EXACTLY ----------
             "THE OBJECTIVE, EXACTLY. PLACE contributes sigma_i; SWAP contributes "
             "swap_gain_over_keep = sigma_i - keep_baseline_sigma; keep / defer / "
-            "terminate / diagnose add nothing. Aggregate sigma is the sum of those "
+            "terminate add nothing. Aggregate sigma is the sum of those "
             "action gains MINUS an "
             "unserved-demand penalty for every WAITING job you leave unplaced. So "
             "deferring a serveable job LOWERS aggregate sigma - it is NOT free.\n"
@@ -1900,6 +1903,7 @@ class KoiAgentHarness:
             "   'n_replicas': int,       # rank DP / max endpoint count; do NOT put dp in config\n"
             "   'rank_traffic_share': float,        # optional partial-admission traffic share\n"
             "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
+            "Koi copies the job action's rationale onto every rank; do not write separate rank reasons.\n"
             "v0 is AGGREGATE-ONLY per rank: every rank is one full "
             "prefill+decode engine (role 'aggregate'); do NOT split prefill/"
             "decode or set pd_enabled / prefill_worker_count / "
@@ -1912,7 +1916,6 @@ class KoiAgentHarness:
             "  swap     running->running   (needs ladder; scale/migrate/retune/replace)\n"
             "  defer    waiting->waiting    (no ladder)\n"
             "  terminate any->stopped       (no ladder; give up after budget/policy exhaustion)\n"
-            "  diagnose  no change          (no ladder; record a theory only)\n"
             "Every ladder rank MUST carry a unique rank_id (or let Koi auto-fill one), "
             "MUST carry a 5-element env, and MUST resolve a "
             "mechanism_id, either on the rank or inherited from the action. "

@@ -123,6 +123,17 @@ class EigResourceSmokeTests(unittest.TestCase):
         self.assertEqual(result["label"], "in-memory")
         self.assertEqual(result["active_jobs"], 0)
         self.assertEqual(result["pending_jobs"], 0)
+        self.assertEqual(
+            set(result["dynamic_view_keys"]),
+            {
+                "resource_map_version",
+                "updated_at",
+                "resources",
+                "running_jobs",
+                "waiting_jobs",
+                "running_chains",
+            },
+        )
         self.assertEqual(used["free"], 72)
         self.assertEqual(used["total"], 80)
 
