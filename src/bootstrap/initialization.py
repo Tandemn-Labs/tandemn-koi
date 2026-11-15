@@ -170,14 +170,6 @@ def init_slow_state(config):
     pass
 
 
-def init_resource_map(user_id: str, postgres_client=None):
-    from src.infra.resource_map import ResourceMapManager
-
-    manager = ResourceMapManager(user_id=user_id, postgres_client=postgres_client)
-    manager.get_resource_map()
-    return manager
-
-
 def init_evidence_store(user_id: str, postgres_client=None):
     from src.core.evidence_service import EvidenceService
 
