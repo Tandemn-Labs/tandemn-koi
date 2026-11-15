@@ -196,68 +196,6 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
             list(telemetry.iter_per_rank(bundle))
 
     def test_rank_replicas_and_metric_indexes_share_chain_ids(self):
-        class Model:
-            def __init__(self, **values):
-                self.values = values
-
-            def model_dump(self, mode="json"):
-                return self.values
-
-        running_job = SimpleNamespace(
-            job=Model(
-                job_id="job_1",
-                user_id="user_1",
-                kind="inference",
-                status="running",
-                created_at=None,
-                finished_at=None,
-                finish_reason=None,
-                spec_json={},
-            ),
-            ranks=[
-                Model(
-                    rank_id="rank_0",
-                    plan_id="plan_1",
-                    role="aggregate",
-                    status="running",
-                    shape_json={"mechanism_id": "mech_1"},
-                    n_replicas=2,
-                )
-            ],
-        )
-
-        failed_rank = Model(
-            rank_id="rank_failed",
-            plan_id="plan_0",
-            role="decode",
-            status="failed",
-            shape_json={"count": 8, "gpu_type": "H100"},
-            n_replicas=1,
-            reason_code="OOM",
-            updated_at="2026-08-23T12:00:00+00:00",
-        )
-        job = ResourceMapManager._running_job_to_summary(running_job, [failed_rank])
-        self.assertEqual(
-            [chain["chain_id"] for chain in job["active_chains"]],
-            ["rank_0_chain_0", "rank_0_chain_1"],
-        )
-        self.assertTrue(
-            all(chain["shape_json"]["rank_id"] == "rank_0" for chain in job["active_chains"])
-        )
-        self.assertEqual(
-            job["recent_rank_failures"],
-            [
-                {
-                    "rank_id": "rank_failed",
-                    "plan_id": "plan_0",
-                    "role": "decode",
-                    "shape_json": {"count": 8, "gpu_type": "H100"},
-                    "reason_code": "OOM",
-                    "failed_at": "2026-08-23T12:00:00+00:00",
-                }
-            ],
-        )
-
         telemetry = StoreTelemetry(
             user_id="user_1",
             gpu_metric_store=_Store(
@@ -269,7 +207,7 @@ class StoreTelemetrySmokeTests(unittest.TestCase):
             candidate_graph=_graph(),
             now_fn=lambda: datetime(2026, 1, 1, 0, 5, 0, tzinfo=UTC),
         )
-        snapshot = ClusterResourceSnapshot(1, {}, [job], [])
+        snapshot = _snapshot()
         rank = next(telemetry.iter_per_rank(telemetry.collect_telemetry(0, 1, snapshot)))
         self.assertEqual(rank.y_observed["throughput_token_per_sec"].tolist(), [30.0])
 

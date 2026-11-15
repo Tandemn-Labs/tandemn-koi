@@ -1507,6 +1507,71 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "capture it in S0"):
                 manager.snapshot()
 
+    def test_failed_ranks_are_enriched_from_prior_placements_once_per_tick(self):
+        base = datetime(2026, 11, 13, tzinfo=UTC)
+        resource_map = self._global_resource_map([("cluster-a", 1, base)])
+        failed = {"phase": "WORKLOAD_PHASE_FAILED", "reason": "OOM"}
+        resource_map["cluster_resource_maps"][0]["jobs"] = [
+            {
+                "job_id": "job-1",
+                "ranks": [
+                    {"rank_id": "rank-1", "status": failed},
+                    {"rank_id": "missing-placement", "status": failed},
+                    {"rank_id": "running-rank", "status": {"phase": "WORKLOAD_PHASE_RUNNING"}},
+                ],
+            }
+        ]
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO model_architecture (model_id) VALUES ('test/failures')")
+            for job_id in ("job-1", "job-2"):
+                conn.execute(
+                    "INSERT INTO jobs (job_id, kind, status, model_id) VALUES (%s, 'online', 'queued', 'test/failures')",
+                    (job_id,),
+                )
+                conn.execute("INSERT INTO job_intent (job_id) VALUES (%s)", (job_id,))
+            for plan_id, tick, job_id, rank_id, cluster in (
+                ("old", 2, "job-1", "rank-1", "cluster-a"),
+                ("prior", 4, "job-1", "rank-1", "cluster-a"),
+                ("current", 5, "job-1", "rank-1", "cluster-a"),
+                ("future", 6, "job-1", "rank-1", "cluster-a"),
+                ("other-job", 4, "job-2", "rank-1", "cluster-a"),
+                ("other-cluster", 4, "job-1", "rank-1", "cluster-b"),
+                ("running", 4, "job-1", "running-rank", "cluster-a"),
+            ):
+                conn.execute("INSERT INTO plans (plan_id, tick) VALUES (%s, %s)", (plan_id, tick))
+                conn.execute(
+                    "INSERT INTO plan_actions (plan_id, job_id, action) VALUES (%s, %s, 'place')",
+                    (plan_id, job_id),
+                )
+                conn.execute(
+                    "INSERT INTO placement (plan_id, job_id, rank_id, cluster_id, accelerator_type, tensor_parallelism, pipeline_parallelism) "
+                    "VALUES (%s, %s, %s, %s, 'H100', 4, 2)",
+                    (plan_id, job_id, rank_id, cluster),
+                )
+        self._insert_resource_map_snapshot(5, "failed-map", base, resource_map)
+        manager = ResourceMapManager(pool=self.pool, postgres_client=object())
+        snapshot = manager.snapshot_cluster_state(5)
+        job = snapshot.pending_jobs_summary()[0]
+        rank, missing, running = job["ranks"]
+        self.assertEqual(rank["placement"]["plan_id"], "prior")
+        self.assertEqual(rank["status"], failed)
+        self.assertNotIn("placement", missing)
+        self.assertNotIn("placement", running)
+        self.assertEqual(snapshot.resource_map_snapshot["resource_map"], resource_map)
+        runner = TickRunner.__new__(TickRunner)
+        runner._dead_shapes = {}
+        with patch.object(self.pool, "connection", side_effect=AssertionError("inputs are frozen")):
+            self.assertIs(manager.snapshot_cluster_state(5), snapshot)
+            runner._annotate_dead_shapes(TickContext(tick=5, cluster_snapshot=snapshot))
+        self.assertEqual(
+            [
+                (entry["gpu_type"], entry["tp"], entry["pp"])
+                for entry in job["observed_dead_shapes"]
+            ],
+            [("H100", 4, 2)],
+        )
+        self.assertEqual(job["status"], "queued")
+
     def test_catalogs_are_read_from_postgres(self):
         # Schema-supported values from the legacy model_catalog logged by
         # koi-3h-cohere-20260906T051213Z on 2026-09-06, using canonical names. updated_at and
