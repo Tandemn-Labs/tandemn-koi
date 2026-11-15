@@ -22,7 +22,7 @@ from src.cost import switch_cost as switchcost_module
 from src.cost.dro import DRO
 from src.executor.executor import StorePlanExecutor
 from src.exploration import eig as eig_module
-from src.infra.resource_map import RANK_FAILURE_HISTORY_TICKS, ResourceMapManager
+from src.infra.resource_map import ResourceMapManager
 from src.infra.telemetry import StoreTelemetry
 from src.learning.regret import RegretCalculator
 from src.learning.slow_loop import SlowLoop
@@ -256,16 +256,9 @@ def build_runner(args: argparse.Namespace, *, pool):
         cusum=cusum,
         tracked_v_variables=candidate_graph.v,
     )
-    # The failure lookback must not collapse to zero when ticks are driven
-    # externally with --tick-interval-sec 0 (the simulator does this): a zero
-    # window meant no rank failure ever reached a planning tick.
-    failure_window_sec = RANK_FAILURE_HISTORY_TICKS * max(
-        int(args.tick_interval_sec), int(args.telemetry_window_sec), 60
-    )
     resource_map = ResourceMapManager(
         user_id=args.user_id,
         postgres_client=client,
-        rank_failure_history_seconds=failure_window_sec,
         pool=pool,
     )
     telemetry = StoreTelemetry(
