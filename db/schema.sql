@@ -1,12 +1,11 @@
 \restrict dbmate
 
 -- Dumped from database version 16.14
--- Dumped by pg_dump version 18.6
+-- Dumped by pg_dump version 16.14
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
-SET transaction_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SELECT pg_catalog.set_config('search_path', '', false);
@@ -44,7 +43,8 @@ CREATE TYPE public.job_kind AS ENUM (
 CREATE TYPE public.job_status AS ENUM (
     'running',
     'queued',
-    'finished'
+    'finished',
+    'pending'
 );
 
 
@@ -59,19 +59,6 @@ CREATE TYPE public.token_distribution AS ENUM (
     'LogNormal',
     'Exponential'
 );
-
-
---
--- Name: reject_append_only_mutation(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.reject_append_only_mutation() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    RAISE EXCEPTION 'table % is append-only', TG_TABLE_NAME;
-END;
-$$;
 
 
 SET default_tablespace = '';
@@ -143,47 +130,13 @@ CREATE TABLE public.hardware_catalog (
 
 
 --
--- Name: job_engine_arguments; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.job_engine_arguments (
-    job_id text NOT NULL,
-    rank_id text NOT NULL,
-    max_model_len integer,
-    gpu_mem_util double precision,
-    max_num_seq integer,
-    max_num_batched_tokens integer,
-    block_size integer,
-    kv_cache_dtype text,
-    attn_backend text,
-    activation_quantization_method text,
-    activation_dtype text,
-    prefix_cache_enabled boolean,
-    chunked_prefill_enabled boolean,
-    lmcache_enabled boolean,
-    spec_decoding_enabled boolean,
-    draft_model_id text,
-    spec_decoding_method text,
-    num_speculative_tokens integer,
-    spec_acceptance_threshold double precision,
-    cuda_graph_enabled boolean,
-    torch_compile_enabled boolean,
-    preemption_policy text,
-    pd_enabled boolean,
-    kv_transfer_method text,
-    chunk_size integer,
-    max_chunked_steps_per_request integer,
-    extra_args text[],
-    misc_kubernetes_labels text[]
-);
-
-
---
 -- Name: job_engine_defaults; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.job_engine_defaults (
     model_id text NOT NULL,
+    engine_name text,
+    engine_version text,
     max_model_len integer,
     gpu_mem_util double precision,
     max_num_seq jsonb,
@@ -214,11 +167,14 @@ CREATE TABLE public.job_engine_defaults (
 
 
 --
--- Name: job_intent; Type: TABLE; Schema: public; Owner: -
+-- Name: jobs; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.job_intent (
+CREATE TABLE public.jobs (
     job_id text NOT NULL,
+    kind public.job_kind NOT NULL,
+    status public.job_status NOT NULL,
+    model_id text NOT NULL,
     target_p99_ttft_ms double precision,
     target_p99_tpot_ms double precision,
     deadline_hrs double precision,
@@ -242,30 +198,18 @@ CREATE TABLE public.job_intent (
     priority_class text,
     scheduling_policy text,
     router_policy text,
-    CONSTRAINT job_intent_check CHECK (((isl_token_min >= (0)::double precision) AND (isl_token_min <= isl_token_avg) AND (isl_token_avg <= isl_token_max))),
-    CONSTRAINT job_intent_check1 CHECK (((osl_token_min >= (0)::double precision) AND (osl_token_min <= osl_token_avg) AND (osl_token_avg <= osl_token_max))),
-    CONSTRAINT job_intent_deadline_hrs_check CHECK ((deadline_hrs >= (0)::double precision)),
-    CONSTRAINT job_intent_max_concurrent_streaming_check CHECK ((max_concurrent_streaming > (0)::double precision)),
-    CONSTRAINT job_intent_multi_turn_ratio_check CHECK (((multi_turn_ratio >= (0)::double precision) AND (multi_turn_ratio <= (1)::double precision))),
-    CONSTRAINT job_intent_peak_to_mean_ratio_check CHECK ((peak_to_mean_ratio >= (1)::double precision)),
-    CONSTRAINT job_intent_request_arrival_rate_check CHECK ((request_arrival_rate > (0)::double precision)),
-    CONSTRAINT job_intent_shared_prefix_length_avg_check CHECK ((shared_prefix_length_avg >= (0)::double precision)),
-    CONSTRAINT job_intent_target_p99_tpot_ms_check CHECK ((target_p99_tpot_ms > (0)::double precision)),
-    CONSTRAINT job_intent_target_p99_ttft_ms_check CHECK ((target_p99_ttft_ms > (0)::double precision)),
-    CONSTRAINT job_intent_total_token_budget_check CHECK ((total_token_budget > 0)),
-    CONSTRAINT job_intent_workload_prefix_concentration_check CHECK (((workload_prefix_concentration >= (0)::double precision) AND (workload_prefix_concentration <= (1)::double precision)))
-);
-
-
---
--- Name: jobs; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.jobs (
-    job_id text NOT NULL,
-    kind public.job_kind NOT NULL,
-    status public.job_status NOT NULL,
-    model_id text NOT NULL
+    CONSTRAINT jobs_check CHECK (((isl_token_min >= (0)::double precision) AND (isl_token_min <= isl_token_avg) AND (isl_token_avg <= isl_token_max))),
+    CONSTRAINT jobs_check1 CHECK (((osl_token_min >= (0)::double precision) AND (osl_token_min <= osl_token_avg) AND (osl_token_avg <= osl_token_max))),
+    CONSTRAINT jobs_deadline_hrs_check CHECK ((deadline_hrs >= (0)::double precision)),
+    CONSTRAINT jobs_max_concurrent_streaming_check CHECK ((max_concurrent_streaming > (0)::double precision)),
+    CONSTRAINT jobs_multi_turn_ratio_check CHECK (((multi_turn_ratio >= (0)::double precision) AND (multi_turn_ratio <= (1)::double precision))),
+    CONSTRAINT jobs_peak_to_mean_ratio_check CHECK ((peak_to_mean_ratio >= (1)::double precision)),
+    CONSTRAINT jobs_request_arrival_rate_check CHECK ((request_arrival_rate > (0)::double precision)),
+    CONSTRAINT jobs_shared_prefix_length_avg_check CHECK ((shared_prefix_length_avg >= (0)::double precision)),
+    CONSTRAINT jobs_target_p99_tpot_ms_check CHECK ((target_p99_tpot_ms > (0)::double precision)),
+    CONSTRAINT jobs_target_p99_ttft_ms_check CHECK ((target_p99_ttft_ms > (0)::double precision)),
+    CONSTRAINT jobs_total_token_budget_check CHECK ((total_token_budget > 0)),
+    CONSTRAINT jobs_workload_prefix_concentration_check CHECK (((workload_prefix_concentration >= (0)::double precision) AND (workload_prefix_concentration <= (1)::double precision)))
 );
 
 
@@ -283,17 +227,25 @@ CREATE TABLE public.master_table (
     icp_result_per_edge jsonb DEFAULT '{}'::jsonb NOT NULL,
     x_snapshot jsonb DEFAULT '{}'::jsonb NOT NULL,
     reasoning text NOT NULL,
-    job_status public.job_status NOT NULL,
+    job_status public.job_status DEFAULT 'pending'::public.job_status NOT NULL,
     rank_beta double precision,
     rank_dro double precision,
     v_predicted jsonb DEFAULT '{}'::jsonb NOT NULL,
     y_predicted jsonb DEFAULT '{}'::jsonb NOT NULL,
+    v_observed jsonb,
+    y_observed jsonb,
+    prediction_lineage jsonb DEFAULT '{}'::jsonb NOT NULL,
+    mechanism_id text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT master_table_cusum_per_mechanism_check CHECK ((jsonb_typeof(cusum_per_mechanism) = 'object'::text)),
     CONSTRAINT master_table_icp_result_per_edge_check CHECK ((jsonb_typeof(icp_result_per_edge) = 'object'::text)),
+    CONSTRAINT master_table_prediction_lineage_check CHECK ((jsonb_typeof(prediction_lineage) = 'object'::text)),
     CONSTRAINT master_table_q_label_per_mechanism_check CHECK ((jsonb_typeof(q_label_per_mechanism) = 'object'::text)),
     CONSTRAINT master_table_tick_check CHECK ((tick >= 0)),
+    CONSTRAINT master_table_v_observed_check CHECK ((jsonb_typeof(v_observed) = 'object'::text)),
     CONSTRAINT master_table_v_predicted_check CHECK ((jsonb_typeof(v_predicted) = 'object'::text)),
     CONSTRAINT master_table_x_snapshot_check CHECK ((jsonb_typeof(x_snapshot) = 'object'::text)),
+    CONSTRAINT master_table_y_observed_check CHECK ((jsonb_typeof(y_observed) = 'object'::text)),
     CONSTRAINT master_table_y_predicted_check CHECK ((jsonb_typeof(y_predicted) = 'object'::text))
 );
 
@@ -331,7 +283,6 @@ CREATE TABLE public.model_architecture (
 --
 
 CREATE TABLE public.placement (
-    plan_id text NOT NULL,
     job_id text NOT NULL,
     rank_id text NOT NULL,
     cluster_id text,
@@ -350,7 +301,33 @@ CREATE TABLE public.placement (
     tensor_parallelism integer,
     pipeline_parallelism integer,
     moe_expert_parallelism integer,
-    moe_tensor_parallelism integer
+    moe_tensor_parallelism integer,
+    max_model_len integer,
+    gpu_mem_util double precision,
+    max_num_seq integer,
+    max_num_batched_tokens integer,
+    block_size integer,
+    kv_cache_dtype text,
+    attn_backend text,
+    activation_quantization_method text,
+    activation_dtype text,
+    prefix_cache_enabled boolean,
+    chunked_prefill_enabled boolean,
+    lmcache_enabled boolean,
+    spec_decoding_enabled boolean,
+    draft_model_id text,
+    spec_decoding_method text,
+    num_speculative_tokens integer,
+    spec_acceptance_threshold double precision,
+    cuda_graph_enabled boolean,
+    torch_compile_enabled boolean,
+    preemption_policy text,
+    pd_enabled boolean,
+    kv_transfer_method text,
+    chunk_size integer,
+    max_chunked_steps_per_request integer,
+    extra_args text[],
+    misc_kubernetes_labels text[]
 );
 
 
@@ -363,25 +340,6 @@ CREATE TABLE public.plan_actions (
     job_id text NOT NULL,
     action text,
     rationale text
-);
-
-
---
--- Name: plan_rank_predictions; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.plan_rank_predictions (
-    plan_id text NOT NULL,
-    job_id text NOT NULL,
-    rank_id text NOT NULL,
-    v_predicted jsonb NOT NULL,
-    y_predicted jsonb NOT NULL,
-    prediction_lineage jsonb DEFAULT '{}'::jsonb NOT NULL,
-    mechanism_id text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT plan_rank_predictions_prediction_lineage_check CHECK ((jsonb_typeof(prediction_lineage) = 'object'::text)),
-    CONSTRAINT plan_rank_predictions_v_predicted_check CHECK ((jsonb_typeof(v_predicted) = 'object'::text)),
-    CONSTRAINT plan_rank_predictions_y_predicted_check CHECK ((jsonb_typeof(y_predicted) = 'object'::text))
 );
 
 
@@ -498,27 +456,11 @@ ALTER TABLE ONLY public.hardware_catalog
 
 
 --
--- Name: job_engine_arguments job_engine_arguments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.job_engine_arguments
-    ADD CONSTRAINT job_engine_arguments_pkey PRIMARY KEY (job_id, rank_id);
-
-
---
 -- Name: job_engine_defaults job_engine_defaults_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.job_engine_defaults
     ADD CONSTRAINT job_engine_defaults_pkey PRIMARY KEY (model_id);
-
-
---
--- Name: job_intent job_intent_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.job_intent
-    ADD CONSTRAINT job_intent_pkey PRIMARY KEY (job_id);
 
 
 --
@@ -550,7 +492,7 @@ ALTER TABLE ONLY public.model_architecture
 --
 
 ALTER TABLE ONLY public.placement
-    ADD CONSTRAINT placement_pkey PRIMARY KEY (plan_id, job_id, rank_id);
+    ADD CONSTRAINT placement_pkey PRIMARY KEY (job_id, rank_id);
 
 
 --
@@ -559,14 +501,6 @@ ALTER TABLE ONLY public.placement
 
 ALTER TABLE ONLY public.plan_actions
     ADD CONSTRAINT plan_actions_pkey PRIMARY KEY (plan_id, job_id);
-
-
---
--- Name: plan_rank_predictions plan_rank_predictions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.plan_rank_predictions
-    ADD CONSTRAINT plan_rank_predictions_pkey PRIMARY KEY (plan_id, job_id, rank_id);
 
 
 --
@@ -640,62 +574,6 @@ CREATE INDEX rank_metrics_history_idx ON public.rank_metrics USING btree (job_id
 
 
 --
--- Name: master_table master_table_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER master_table_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.master_table FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
--- Name: placement placement_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER placement_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.placement FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
--- Name: plan_actions plan_actions_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER plan_actions_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.plan_actions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
--- Name: plan_rank_predictions plan_rank_predictions_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER plan_rank_predictions_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.plan_rank_predictions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
--- Name: rank_metrics rank_metrics_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER rank_metrics_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.rank_metrics FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
--- Name: resource_map_snapshots resource_map_snapshots_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER resource_map_snapshots_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.resource_map_snapshots FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
--- Name: slow_state_cluster slow_state_cluster_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER slow_state_cluster_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.slow_state_cluster FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
--- Name: slow_state_job slow_state_job_append_only; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER slow_state_job_append_only BEFORE DELETE OR UPDATE OR TRUNCATE ON public.slow_state_job FOR EACH STATEMENT EXECUTE FUNCTION public.reject_append_only_mutation();
-
-
---
 -- Name: causal_edges causal_edges_dst_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -712,27 +590,11 @@ ALTER TABLE ONLY public.causal_edges
 
 
 --
--- Name: job_engine_arguments job_engine_arguments_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.job_engine_arguments
-    ADD CONSTRAINT job_engine_arguments_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(job_id);
-
-
---
 -- Name: job_engine_defaults job_engine_defaults_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.job_engine_defaults
     ADD CONSTRAINT job_engine_defaults_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.model_architecture(model_id);
-
-
---
--- Name: job_intent job_intent_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.job_intent
-    ADD CONSTRAINT job_intent_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(job_id);
 
 
 --
@@ -752,11 +614,11 @@ ALTER TABLE ONLY public.master_table
 
 
 --
--- Name: placement placement_action_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: master_table master_table_mechanism_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.placement
-    ADD CONSTRAINT placement_action_fk FOREIGN KEY (plan_id, job_id) REFERENCES public.plan_actions(plan_id, job_id);
+ALTER TABLE ONLY public.master_table
+    ADD CONSTRAINT master_table_mechanism_id_fkey FOREIGN KEY (mechanism_id) REFERENCES public.causal_mechanisms(mechanism_id);
 
 
 --
@@ -781,22 +643,6 @@ ALTER TABLE ONLY public.plan_actions
 
 ALTER TABLE ONLY public.plan_actions
     ADD CONSTRAINT plan_actions_plan_id_fkey FOREIGN KEY (plan_id) REFERENCES public.plans(plan_id);
-
-
---
--- Name: plan_rank_predictions plan_rank_predictions_mechanism_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.plan_rank_predictions
-    ADD CONSTRAINT plan_rank_predictions_mechanism_id_fkey FOREIGN KEY (mechanism_id) REFERENCES public.causal_mechanisms(mechanism_id);
-
-
---
--- Name: plan_rank_predictions plan_rank_predictions_plan_id_job_id_rank_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.plan_rank_predictions
-    ADD CONSTRAINT plan_rank_predictions_plan_id_job_id_rank_id_fkey FOREIGN KEY (plan_id, job_id, rank_id) REFERENCES public.placement(plan_id, job_id, rank_id);
 
 
 --
