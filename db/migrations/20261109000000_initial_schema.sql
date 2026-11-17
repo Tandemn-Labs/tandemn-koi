@@ -50,7 +50,7 @@ CREATE TABLE model_architecture (
 );
 
 CREATE TABLE job_engine_defaults (
-    model_id TEXT PRIMARY KEY REFERENCES model_architecture (model_id),
+    model_id TEXT REFERENCES model_architecture (model_id),
     engine_name TEXT,
     engine_version TEXT,
     max_model_len INTEGER,
@@ -78,7 +78,8 @@ CREATE TABLE job_engine_defaults (
     chunk_size INTEGER,
     max_chunked_steps_per_request INTEGER,
     extra_args TEXT[],
-    misc_kubernetes_labels TEXT[]
+    misc_kubernetes_labels TEXT[],
+    PRIMARY KEY (model_id, engine_name)
 );
 
 CREATE TABLE hardware_catalog (
@@ -274,28 +275,18 @@ ALTER TABLE master_table
     FOREIGN KEY (mechanism_id) REFERENCES causal_mechanisms (mechanism_id);
 
 CREATE TABLE plans (
-    plan_id TEXT PRIMARY KEY,
-    tick INTEGER,
+    tick INTEGER PRIMARY KEY CHECK (tick >= 0),
     tick_rationale TEXT,
     created_at TIMESTAMPTZ,
     status TEXT
 );
 
 CREATE TABLE plan_actions (
-    plan_id TEXT REFERENCES plans (plan_id),
+    tick INTEGER REFERENCES plans (tick),
     job_id TEXT REFERENCES jobs (job_id),
     action TEXT,
     rationale TEXT,
-    PRIMARY KEY (plan_id, job_id)
-);
-
-CREATE TABLE resource_map_snapshots (
-    tick INTEGER PRIMARY KEY CHECK (tick >= 0),
-    snapshot_id TEXT NOT NULL UNIQUE,
-    stored_at TIMESTAMPTZ,
-    schema_version TEXT,
-    -- One received GlobalResourceMap, preserving its cluster snapshots and vector clock.
-    resource_map JSONB NOT NULL CHECK (jsonb_typeof(resource_map) = 'object')
+    PRIMARY KEY (tick, job_id)
 );
 
 CREATE TABLE rank_metrics (
@@ -308,11 +299,11 @@ CREATE TABLE rank_metrics (
     collected_at TIMESTAMPTZ,
     v_observed JSONB,
     y_observed JSONB,
-    PRIMARY KEY (tick, job_id, rank_id, cluster_id)
+    PRIMARY KEY (tick, job_id, rank_id)
 );
 
 CREATE INDEX rank_metrics_history_idx
-    ON rank_metrics (job_id, rank_id, cluster_id, tick DESC);
+    ON rank_metrics (job_id, rank_id, tick DESC);
 
 -- migrate:down
 DO $$

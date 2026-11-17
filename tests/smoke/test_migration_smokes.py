@@ -61,34 +61,24 @@ def test_concurrent_and_repeated_migrations(migration_database):
             SELECT count(*) FROM information_schema.tables
             WHERE table_schema = 'public' AND table_name <> 'schema_migrations'
             """
-        ).fetchone() == (15,)
-        assert conn.execute(
-            """
-            SELECT column_name FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'resource_map_snapshots'
-            ORDER BY ordinal_position
-            """
-        ).fetchall() == [
-            ("tick",),
-            ("snapshot_id",),
-            ("stored_at",),
-            ("schema_version",),
-            ("resource_map",),
-        ]
-        assert conn.execute("SELECT to_regclass('public.tick_resource_map')").fetchone() == (None,)
-        assert conn.execute(
-            """
-            SELECT pg_get_constraintdef(oid) FROM pg_constraint
-            WHERE conrelid = 'public.resource_map_snapshots'::regclass AND contype = 'p'
-            """
-        ).fetchone() == ("PRIMARY KEY (tick)",)
-        for table in ("job_intent", "job_engine_arguments", "plan_rank_predictions"):
+        ).fetchone() == (14,)
+        for table in (
+            "job_intent",
+            "job_engine_arguments",
+            "plan_rank_predictions",
+            "resource_map_snapshots",
+            "tick_resource_map",
+        ):
             assert conn.execute("SELECT to_regclass(%s)", (f"public.{table}",)).fetchone() == (
                 None,
             )
         for table, key in (
             ("master_table", "PRIMARY KEY (tick, job_id, rank_id)"),
             ("placement", "PRIMARY KEY (job_id, rank_id)"),
+            ("plans", "PRIMARY KEY (tick)"),
+            ("plan_actions", "PRIMARY KEY (tick, job_id)"),
+            ("rank_metrics", "PRIMARY KEY (tick, job_id, rank_id)"),
+            ("job_engine_defaults", "PRIMARY KEY (model_id, engine_name)"),
         ):
             assert conn.execute(
                 "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
@@ -99,8 +89,7 @@ def test_concurrent_and_repeated_migrations(migration_database):
             conn.execute(
                 """
             SELECT column_name FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name IN ('master_table', 'placement')
-              AND column_name = 'plan_id'
+            WHERE table_schema = 'public' AND column_name = 'plan_id'
             """
             ).fetchall()
             == []
@@ -166,9 +155,43 @@ def test_concurrent_and_repeated_migrations(migration_database):
 
         conn.execute("INSERT INTO model_architecture (model_id) VALUES ('model-1')")
         conn.execute(
+            "INSERT INTO job_engine_defaults (model_id, engine_name, max_num_seq) "
+            "VALUES ('model-1', 'vllm', '64'), ('model-1', 'sglang', '128')"
+        )
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+            conn.execute(
+                "INSERT INTO job_engine_defaults (model_id, engine_name) VALUES ('model-1', 'vllm')"
+            )
+        with pytest.raises(psycopg.errors.NotNullViolation), conn.transaction():
+            conn.execute("INSERT INTO job_engine_defaults (model_id) VALUES ('model-1')")
+        conn.execute(
             "INSERT INTO jobs (job_id, kind, status, model_id, target_p99_ttft_ms) "
             "VALUES ('job-1', 'online', 'queued', 'model-1', 100)"
         )
+        conn.execute("INSERT INTO plans (tick) VALUES (1), (2)")
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+            conn.execute("INSERT INTO plans (tick) VALUES (1)")
+        conn.execute(
+            "INSERT INTO plan_actions (tick, job_id, action) "
+            "VALUES (1, 'job-1', 'place'), (2, 'job-1', 'keep')"
+        )
+        with pytest.raises(psycopg.errors.ForeignKeyViolation), conn.transaction():
+            conn.execute("INSERT INTO plan_actions (tick, job_id) VALUES (3, 'job-1')")
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+            conn.execute("INSERT INTO plan_actions (tick, job_id) VALUES (1, 'job-1')")
+        conn.execute(
+            "INSERT INTO rank_metrics (tick, job_id, rank_id, cluster_id) "
+            "VALUES (1, 'job-1', 'rank-1', 'cluster-a')"
+        )
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+            conn.execute(
+                "INSERT INTO rank_metrics (tick, job_id, rank_id, cluster_id) "
+                "VALUES (1, 'job-1', 'rank-1', 'cluster-b')"
+            )
+        assert conn.execute(
+            "UPDATE rank_metrics SET cluster_id = 'cluster-b' "
+            "WHERE tick = 1 AND job_id = 'job-1' AND rank_id = 'rank-1' RETURNING cluster_id"
+        ).fetchone() == ("cluster-b",)
         with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
             conn.execute("UPDATE jobs SET target_p99_ttft_ms = -1 WHERE job_id = 'job-1'")
         conn.execute("UPDATE jobs SET target_p99_ttft_ms = 200 WHERE job_id = 'job-1'")

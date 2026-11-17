@@ -135,7 +135,7 @@ CREATE TABLE public.hardware_catalog (
 
 CREATE TABLE public.job_engine_defaults (
     model_id text NOT NULL,
-    engine_name text,
+    engine_name text NOT NULL,
     engine_version text,
     max_model_len integer,
     gpu_mem_util double precision,
@@ -336,7 +336,7 @@ CREATE TABLE public.placement (
 --
 
 CREATE TABLE public.plan_actions (
-    plan_id text NOT NULL,
+    tick integer NOT NULL,
     job_id text NOT NULL,
     action text,
     rationale text
@@ -348,11 +348,11 @@ CREATE TABLE public.plan_actions (
 --
 
 CREATE TABLE public.plans (
-    plan_id text NOT NULL,
-    tick integer,
+    tick integer NOT NULL,
     tick_rationale text,
     created_at timestamp with time zone,
-    status text
+    status text,
+    CONSTRAINT plans_tick_check CHECK ((tick >= 0))
 );
 
 
@@ -364,27 +364,12 @@ CREATE TABLE public.rank_metrics (
     tick integer NOT NULL,
     job_id text NOT NULL,
     rank_id text NOT NULL,
-    cluster_id text NOT NULL,
+    cluster_id text,
     window_start timestamp with time zone,
     window_end timestamp with time zone,
     collected_at timestamp with time zone,
     v_observed jsonb,
     y_observed jsonb
-);
-
-
---
--- Name: resource_map_snapshots; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.resource_map_snapshots (
-    tick integer NOT NULL,
-    snapshot_id text NOT NULL,
-    stored_at timestamp with time zone,
-    schema_version text,
-    resource_map jsonb NOT NULL,
-    CONSTRAINT resource_map_snapshots_resource_map_check CHECK ((jsonb_typeof(resource_map) = 'object'::text)),
-    CONSTRAINT resource_map_snapshots_tick_check CHECK ((tick >= 0))
 );
 
 
@@ -460,7 +445,7 @@ ALTER TABLE ONLY public.hardware_catalog
 --
 
 ALTER TABLE ONLY public.job_engine_defaults
-    ADD CONSTRAINT job_engine_defaults_pkey PRIMARY KEY (model_id);
+    ADD CONSTRAINT job_engine_defaults_pkey PRIMARY KEY (model_id, engine_name);
 
 
 --
@@ -500,7 +485,7 @@ ALTER TABLE ONLY public.placement
 --
 
 ALTER TABLE ONLY public.plan_actions
-    ADD CONSTRAINT plan_actions_pkey PRIMARY KEY (plan_id, job_id);
+    ADD CONSTRAINT plan_actions_pkey PRIMARY KEY (tick, job_id);
 
 
 --
@@ -508,7 +493,7 @@ ALTER TABLE ONLY public.plan_actions
 --
 
 ALTER TABLE ONLY public.plans
-    ADD CONSTRAINT plans_pkey PRIMARY KEY (plan_id);
+    ADD CONSTRAINT plans_pkey PRIMARY KEY (tick);
 
 
 --
@@ -516,23 +501,7 @@ ALTER TABLE ONLY public.plans
 --
 
 ALTER TABLE ONLY public.rank_metrics
-    ADD CONSTRAINT rank_metrics_pkey PRIMARY KEY (tick, job_id, rank_id, cluster_id);
-
-
---
--- Name: resource_map_snapshots resource_map_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resource_map_snapshots
-    ADD CONSTRAINT resource_map_snapshots_pkey PRIMARY KEY (tick);
-
-
---
--- Name: resource_map_snapshots resource_map_snapshots_snapshot_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resource_map_snapshots
-    ADD CONSTRAINT resource_map_snapshots_snapshot_id_key UNIQUE (snapshot_id);
+    ADD CONSTRAINT rank_metrics_pkey PRIMARY KEY (tick, job_id, rank_id);
 
 
 --
@@ -570,7 +539,7 @@ CREATE INDEX master_table_rank_history_idx ON public.master_table USING btree (j
 -- Name: rank_metrics_history_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX rank_metrics_history_idx ON public.rank_metrics USING btree (job_id, rank_id, cluster_id, tick DESC);
+CREATE INDEX rank_metrics_history_idx ON public.rank_metrics USING btree (job_id, rank_id, tick DESC);
 
 
 --
@@ -638,11 +607,11 @@ ALTER TABLE ONLY public.plan_actions
 
 
 --
--- Name: plan_actions plan_actions_plan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: plan_actions plan_actions_tick_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.plan_actions
-    ADD CONSTRAINT plan_actions_plan_id_fkey FOREIGN KEY (plan_id) REFERENCES public.plans(plan_id);
+    ADD CONSTRAINT plan_actions_tick_fkey FOREIGN KEY (tick) REFERENCES public.plans(tick);
 
 
 --

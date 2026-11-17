@@ -74,9 +74,11 @@ CREATE TABLE model_architecture (
 
 ## job_engine_defaults
 
+One defaults record per `(model_id, engine_name)`.
+
 ```sql
 CREATE TABLE job_engine_defaults (
-    model_id TEXT PRIMARY KEY REFERENCES model_architecture (model_id),
+    model_id TEXT REFERENCES model_architecture (model_id),
     engine_name TEXT,
     engine_version TEXT,
     max_model_len INTEGER,
@@ -104,7 +106,8 @@ CREATE TABLE job_engine_defaults (
     chunk_size INTEGER,
     max_chunked_steps_per_request INTEGER,
     extra_args TEXT[],
-    misc_kubernetes_labels TEXT[]
+    misc_kubernetes_labels TEXT[],
+    PRIMARY KEY (model_id, engine_name)
 );
 ```
 
@@ -344,10 +347,11 @@ ALTER TABLE master_table
 
 ## plans
 
+Each tick identifies one plan; its job actions reference that tick.
+
 ```sql
 CREATE TABLE plans (
-    plan_id TEXT PRIMARY KEY,
-    tick INTEGER,
+    tick INTEGER PRIMARY KEY CHECK (tick >= 0),
     tick_rationale TEXT,
     created_at TIMESTAMPTZ,
     status TEXT
@@ -358,38 +362,17 @@ CREATE TABLE plans (
 
 ```sql
 CREATE TABLE plan_actions (
-    plan_id TEXT REFERENCES plans (plan_id),
+    tick INTEGER REFERENCES plans (tick),
     job_id TEXT REFERENCES jobs (job_id),
     action TEXT,
     rationale TEXT,
-    PRIMARY KEY (plan_id, job_id)
-);
-```
-
-## resource_map_snapshots
-
-Each row holds one complete `GlobalResourceMap` for its exact tick; readers do
-not select a newer or older map. `stored_at` is optional metadata, not a read
-requirement.
-
-The external writer must preserve protobuf field names throughout the JSON:
-`preserving_proto_field_name=True` in Python or `UseProtoNames: true` in Go.
-This means `cluster_resource_maps`, `cluster_id`, and `vector_clock`, not their
-lowerCamelCase spellings. Protobuf's string-encoded uint64 counters and omitted
-default fields are supported.
-
-```sql
-CREATE TABLE resource_map_snapshots (
-    tick INTEGER PRIMARY KEY CHECK (tick >= 0),
-    snapshot_id TEXT NOT NULL UNIQUE,
-    stored_at TIMESTAMPTZ,
-    schema_version TEXT,
-    -- One received GlobalResourceMap, preserving its cluster snapshots and vector clock.
-    resource_map JSONB NOT NULL CHECK (jsonb_typeof(resource_map) = 'object')
+    PRIMARY KEY (tick, job_id)
 );
 ```
 
 ## rank_metrics
+
+One metrics record per `(tick, job_id, rank_id)`; `cluster_id` is metadata.
 
 ```sql
 CREATE TABLE rank_metrics (
@@ -402,9 +385,9 @@ CREATE TABLE rank_metrics (
     collected_at TIMESTAMPTZ,
     v_observed JSONB,
     y_observed JSONB,
-    PRIMARY KEY (tick, job_id, rank_id, cluster_id)
+    PRIMARY KEY (tick, job_id, rank_id)
 );
 
 CREATE INDEX rank_metrics_history_idx
-    ON rank_metrics (job_id, rank_id, cluster_id, tick DESC);
+    ON rank_metrics (job_id, rank_id, tick DESC);
 ```
