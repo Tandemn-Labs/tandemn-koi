@@ -1,13 +1,18 @@
 # Koi schema reference
 
-Documentation snapshot of the frozen initial application schema, preserving the
-original SQL and comments in table order. The authoritative source is
+Documentation of the initial application schema, preserving SQL and comments
+in table order. The authoritative source is
 [`20261109000000_initial_schema.sql`](migrations/20261109000000_initial_schema.sql).
 [`schema.sql`](schema.sql) is the generated database dump. This document is not
-executed by dbmate; approved future changes belong in new migrations.
+executed by dbmate. During this fresh migration, schema changes are made in the
+initial migration and verified on a fresh database.
 
 Dbmate's `schema_migrations` bookkeeping table is not part of the application
 schema below. Migration directives and the blocked rollback are omitted.
+
+All application tables support updates and deletes, subject to their constraints.
+`jobs` contains job intent supplied to Koi; `placement` contains Koi's current
+per-job/rank intent, including resource targets, parallelism, and engine arguments.
 
 ## Shared types
 
@@ -18,7 +23,8 @@ schema below. Migration directives and the blocked rollback are omitted.
 CREATE TYPE job_status AS ENUM (
     'running',
     'queued',
-    'finished'
+    'finished',
+    'pending'
 );
 
 CREATE TYPE job_kind AS ENUM ('online', 'batch');
@@ -37,19 +43,6 @@ CREATE TYPE arrival_pattern AS ENUM (
     'Bursty',
     'Diurnal'
 );
-```
-
-## Append-only enforcement
-
-```sql
-CREATE FUNCTION reject_append_only_mutation()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    RAISE EXCEPTION 'table % is append-only', TG_TABLE_NAME;
-END;
-$$;
 ```
 
 ## model_architecture
@@ -84,6 +77,8 @@ CREATE TABLE model_architecture (
 ```sql
 CREATE TABLE job_engine_defaults (
     model_id TEXT PRIMARY KEY REFERENCES model_architecture (model_id),
+    engine_name TEXT,
+    engine_version TEXT,
     max_model_len INTEGER,
     gpu_mem_util DOUBLE PRECISION,
     max_num_seq JSONB,
@@ -129,15 +124,7 @@ CREATE TABLE jobs (
     job_id TEXT PRIMARY KEY,
     kind job_kind NOT NULL,
     status job_status NOT NULL,
-    model_id TEXT NOT NULL REFERENCES model_architecture (model_id)
-);
-```
-
-## job_intent
-
-```sql
-CREATE TABLE job_intent (
-    job_id TEXT PRIMARY KEY REFERENCES jobs (job_id),
+    model_id TEXT NOT NULL REFERENCES model_architecture (model_id),
     target_p99_ttft_ms DOUBLE PRECISION CHECK (target_p99_ttft_ms > 0),
     target_p99_tpot_ms DOUBLE PRECISION CHECK (target_p99_tpot_ms > 0),
     deadline_hrs DOUBLE PRECISION CHECK (deadline_hrs >= 0),
@@ -175,12 +162,75 @@ CREATE TABLE job_intent (
 );
 ```
 
-## job_engine_arguments
+## master_table
+
+Rows are keyed by `(tick, job_id, rank_id)`, with no `plan_id`. The prediction
+writer inserts pending rows with SQL NULL observations; the observation writer
+later updates the same row's V/Y observations and status. Evidence readers must
+exclude pending rows, including ranks that never materialize.
+The mechanism foreign key is added after `causal_mechanisms` is defined below.
 
 ```sql
-CREATE TABLE job_engine_arguments (
+CREATE TABLE master_table (
+    tick INTEGER NOT NULL CHECK (tick >= 0),
+    job_id TEXT NOT NULL REFERENCES jobs (job_id),
+    rank_id TEXT NOT NULL,
+    mechanisms TEXT[] NOT NULL DEFAULT '{}',
+    -- debt, probably need removal soon - not needed for now
+    cusum_per_mechanism JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(cusum_per_mechanism) = 'object'),
+    q_label_per_mechanism JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(q_label_per_mechanism) = 'object'),
+    icp_result_per_edge JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(icp_result_per_edge) = 'object'),
+    -- shortcut: snapshot resolved X per evidence row; replace with joins over immutable tick-scoped source revisions when available.
+    x_snapshot JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(x_snapshot) = 'object'),
+    reasoning TEXT NOT NULL,
+    job_status job_status NOT NULL DEFAULT 'pending',
+    rank_beta DOUBLE PRECISION,
+    rank_dro DOUBLE PRECISION,
+    v_predicted JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(v_predicted) = 'object'),
+    y_predicted JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(y_predicted) = 'object'),
+    v_observed JSONB CHECK (jsonb_typeof(v_observed) = 'object'),
+    y_observed JSONB CHECK (jsonb_typeof(y_observed) = 'object'),
+    -- TODO: clarify why prediction_lineage needs persistence and which fields are required.
+    prediction_lineage JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(prediction_lineage) = 'object'),
+    mechanism_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tick, job_id, rank_id)
+);
+
+CREATE INDEX master_table_rank_history_idx
+    ON master_table (job_id, rank_id, tick DESC);
+```
+
+## placement
+
+```sql
+CREATE TABLE placement (
     job_id TEXT REFERENCES jobs (job_id),
     rank_id TEXT,
+    cluster_id TEXT,
+    pool_id TEXT,
+    node_type_id TEXT,
+    role TEXT,
+    max_replicas INTEGER,
+    min_replicas INTEGER,
+    engine_name TEXT,
+    engine_version TEXT,
+    market TEXT,
+    cloud TEXT,
+    region TEXT,
+    zone TEXT,
+    accelerator_type TEXT,
+    tensor_parallelism INTEGER,
+    pipeline_parallelism INTEGER,
+    moe_expert_parallelism INTEGER,
+    moe_tensor_parallelism INTEGER,
     max_model_len INTEGER,
     gpu_mem_util DOUBLE PRECISION,
     max_num_seq INTEGER,
@@ -211,80 +261,6 @@ CREATE TABLE job_engine_arguments (
 );
 ```
 
-## master_table
-
-```sql
-CREATE TABLE master_table (
-    tick INTEGER NOT NULL CHECK (tick >= 0),
-    job_id TEXT NOT NULL REFERENCES jobs (job_id),
-    rank_id TEXT NOT NULL,
-    mechanisms TEXT[] NOT NULL DEFAULT '{}',
-    -- debt, probably need removal soon - not needed for now
-    cusum_per_mechanism JSONB NOT NULL DEFAULT '{}'
-        CHECK (jsonb_typeof(cusum_per_mechanism) = 'object'),
-    q_label_per_mechanism JSONB NOT NULL DEFAULT '{}'
-        CHECK (jsonb_typeof(q_label_per_mechanism) = 'object'),
-    icp_result_per_edge JSONB NOT NULL DEFAULT '{}'
-        CHECK (jsonb_typeof(icp_result_per_edge) = 'object'),
-    -- shortcut: snapshot resolved X per evidence row; replace with joins over immutable tick-scoped source revisions when available.
-    x_snapshot JSONB NOT NULL DEFAULT '{}'
-        CHECK (jsonb_typeof(x_snapshot) = 'object'),
-    reasoning TEXT NOT NULL,
-    job_status job_status NOT NULL,
-    rank_beta DOUBLE PRECISION,
-    rank_dro DOUBLE PRECISION,
-    v_predicted JSONB NOT NULL DEFAULT '{}'
-        CHECK (jsonb_typeof(v_predicted) = 'object'),
-    y_predicted JSONB NOT NULL DEFAULT '{}'
-        CHECK (jsonb_typeof(y_predicted) = 'object'),
-    PRIMARY KEY (tick, job_id, rank_id)
-);
-
-CREATE INDEX master_table_rank_history_idx
-    ON master_table (job_id, rank_id, tick DESC);
-
-CREATE TRIGGER master_table_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON master_table
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
-```
-
-## placement
-
-The foreign key to `plan_actions` is added after that table is defined below,
-matching the original execution order.
-
-```sql
-CREATE TABLE placement (
-    plan_id TEXT,
-    job_id TEXT REFERENCES jobs (job_id),
-    rank_id TEXT,
-    cluster_id TEXT,
-    pool_id TEXT,
-    node_type_id TEXT,
-    role TEXT,
-    max_replicas INTEGER,
-    min_replicas INTEGER,
-    engine_name TEXT,
-    engine_version TEXT,
-    market TEXT,
-    cloud TEXT,
-    region TEXT,
-    zone TEXT,
-    accelerator_type TEXT,
-    tensor_parallelism INTEGER,
-    pipeline_parallelism INTEGER,
-    moe_expert_parallelism INTEGER,
-    moe_tensor_parallelism INTEGER,
-    PRIMARY KEY (plan_id, job_id, rank_id)
-);
-
-CREATE TRIGGER placement_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON placement
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
-```
-
 ## slow_state_job
 
 ```sql
@@ -295,11 +271,6 @@ CREATE TABLE slow_state_job (
     z_star JSONB,
     PRIMARY KEY (tick, job_id)
 );
-
-CREATE TRIGGER slow_state_job_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON slow_state_job
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
 ```
 
 ## slow_state_cluster
@@ -314,11 +285,6 @@ CREATE TABLE slow_state_cluster (
     epsilon_dro DOUBLE PRECISION,
     PRIMARY KEY (tick, cluster_id)
 );
-
-CREATE TRIGGER slow_state_cluster_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON slow_state_cluster
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
 ```
 
 ## causal_nodes
@@ -370,6 +336,10 @@ CREATE TABLE causal_mechanisms (
     envs_last_seen JSONB,
     inspection_count INTEGER
 );
+
+ALTER TABLE master_table
+    ADD CONSTRAINT master_table_mechanism_id_fkey
+    FOREIGN KEY (mechanism_id) REFERENCES causal_mechanisms (mechanism_id);
 ```
 
 ## plans
@@ -394,43 +364,6 @@ CREATE TABLE plan_actions (
     rationale TEXT,
     PRIMARY KEY (plan_id, job_id)
 );
-
-CREATE TRIGGER plan_actions_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON plan_actions
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
-
-ALTER TABLE placement
-    ADD CONSTRAINT placement_action_fk
-    FOREIGN KEY (plan_id, job_id)
-    REFERENCES plan_actions (plan_id, job_id);
-```
-
-## plan_rank_predictions
-
-```sql
-CREATE TABLE plan_rank_predictions (
-    plan_id TEXT NOT NULL,
-    job_id TEXT NOT NULL,
-    rank_id TEXT NOT NULL,
-    v_predicted JSONB NOT NULL
-        CHECK (jsonb_typeof(v_predicted) = 'object'),
-    y_predicted JSONB NOT NULL
-        CHECK (jsonb_typeof(y_predicted) = 'object'),
-    -- TODO: clarify why prediction_lineage needs persistence and which fields are required.
-    prediction_lineage JSONB NOT NULL DEFAULT '{}'
-        CHECK (jsonb_typeof(prediction_lineage) = 'object'),
-    mechanism_id TEXT REFERENCES causal_mechanisms (mechanism_id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (plan_id, job_id, rank_id),
-    FOREIGN KEY (plan_id, job_id, rank_id)
-        REFERENCES placement (plan_id, job_id, rank_id)
-);
-
-CREATE TRIGGER plan_rank_predictions_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON plan_rank_predictions
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
 ```
 
 ## resource_map_snapshots
@@ -454,11 +387,6 @@ CREATE TABLE resource_map_snapshots (
     -- One received GlobalResourceMap, preserving its cluster snapshots and vector clock.
     resource_map JSONB NOT NULL CHECK (jsonb_typeof(resource_map) = 'object')
 );
-
-CREATE TRIGGER resource_map_snapshots_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON resource_map_snapshots
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
 ```
 
 ## rank_metrics
@@ -479,9 +407,4 @@ CREATE TABLE rank_metrics (
 
 CREATE INDEX rank_metrics_history_idx
     ON rank_metrics (job_id, rank_id, cluster_id, tick DESC);
-
-CREATE TRIGGER rank_metrics_append_only
-BEFORE UPDATE OR DELETE OR TRUNCATE ON rank_metrics
-FOR EACH STATEMENT
-EXECUTE FUNCTION reject_append_only_mutation();
 ```
