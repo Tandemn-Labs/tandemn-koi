@@ -133,8 +133,8 @@ class ResourceMapManager:
             raise ValueError("hardware catalog is required for deployment X")
         return catalog
 
-    def model_catalog(self, model_id: str) -> dict[str, Any]:
-        """Read model architecture and engine defaults, raising when absent."""
+    def model_catalog(self, model_id: str, engine_name: str) -> dict[str, Any]:
+        """Read model architecture and the selected engine's defaults, raising when absent."""
         if self._pool is None:
             raise ValueError("database pool is required for catalog reads")
         with self._pool.connection() as conn:
@@ -142,12 +142,12 @@ class ResourceMapManager:
                 """
                 SELECT * FROM model_architecture
                 JOIN job_engine_defaults USING (model_id)
-                WHERE model_id = %s
+                WHERE model_id = %s AND engine_name = %s
                 """,
-                (model_id,),
+                (model_id, engine_name),
             ).fetchone()
         if value is None:
-            raise ValueError(f"model catalog missing {model_id!r}")
+            raise ValueError(f"model catalog missing {model_id!r} with engine {engine_name!r}")
         # ponytail: local catalog-read alias; centralize GPU identity if aliases expand.
         for entries in value.values():
             if not isinstance(entries, list):
@@ -312,7 +312,6 @@ class ResourceMapManager:
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
-                JOIN job_intent USING (job_id)
                 WHERE status = %s
                 ORDER BY job_id
                 """,
@@ -408,8 +407,8 @@ class ResourceMapManager:
         time, and logical counter; the global map contains independently collected
         cluster observations, not an atomic physical-world snapshot.
 
-        Join every observed job and every queued job with SQL ``jobs`` and
-        ``job_intent``. Group observations across clusters under their owning job,
+        Read intent for every observed job and every queued job from SQL ``jobs``.
+        Group observations across clusters under their owning job,
         validate observed job/rank/chain identities, and attach ranks and chains
         with their runtime information and pod requirements. Cluster-local phases
         stay observational: ``jobs.status`` decides ``active_jobs`` (running)
@@ -498,7 +497,6 @@ class ResourceMapManager:
                 for row in conn.execute(
                     """
                     SELECT * FROM jobs
-                    JOIN job_intent USING (job_id)
                     WHERE status = %s OR job_id = ANY(%s)
                     ORDER BY job_id
                     """,
