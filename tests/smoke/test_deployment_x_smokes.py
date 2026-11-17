@@ -1728,6 +1728,12 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
                 ),
             )
             conn.execute(
+                "INSERT INTO job_engine_defaults "
+                "(model_id, engine_name, engine_version, max_num_seq, kv_cache_dtype, "
+                "chunked_prefill_enabled) VALUES (%s, 'sglang', '0.5.0', '512', '\"fp8\"', false)",
+                (legacy_catalog["model_id"],),
+            )
+            conn.execute(
                 "INSERT INTO model_architecture (model_id) VALUES (%s)",
                 ("architecture-without-defaults",),
             )
@@ -1742,7 +1748,7 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
         self.assertIn(("aws", "us-east-2", "p5.48xlarge"), by_instance)
         self.assertIn(("azure", "eastus", "Standard_ND96amsr_A100_v4"), by_instance)
 
-        catalog = manager.model_catalog(legacy_catalog["model_id"])
+        catalog = manager.model_catalog(legacy_catalog["model_id"], "vllm")
         for field, expected_value in legacy_catalog.items():
             with self.subTest(field=field):
                 self.assertEqual(catalog[field], expected_value)
@@ -1760,6 +1766,24 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
             self.assertEqual(config["kv_cache_dtype"], "auto")
             self.assertTrue(config["chunked_prefill_enabled"])
 
+        sglang_catalog = manager.model_catalog(legacy_catalog["model_id"], "sglang")
+        self.assertEqual(sglang_catalog["model_id"], legacy_catalog["model_id"])
+        self.assertEqual(sglang_catalog["model_params_b"], legacy_catalog["model_params_b"])
+        sglang_config = materialize_launch_config(sglang_catalog, "H100")
+        self.assertEqual(sglang_config["engine_name"], "sglang")
+        self.assertEqual(sglang_config["engine_version"], "0.5.0")
+        self.assertEqual(sglang_config["max_num_seq"], 512)
+        self.assertEqual(sglang_config["kv_cache_dtype"], "fp8")
+        self.assertFalse(sglang_config["chunked_prefill_enabled"])
+
+        for missing_engine in ("missing-engine", "' OR 1=1 --"):
+            with (
+                self.subTest(engine_name=missing_engine),
+                self.assertRaisesRegex(ValueError, "model catalog missing") as raised,
+            ):
+                manager.model_catalog(legacy_catalog["model_id"], missing_engine)
+            self.assertIn(repr(missing_engine), str(raised.exception))
+
         for missing_model_id in (
             "missing-model",
             "architecture-without-defaults",
@@ -1769,7 +1793,7 @@ class ResourceMapCatalogPostgresTests(unittest.TestCase):
                 self.subTest(model_id=missing_model_id),
                 self.assertRaisesRegex(ValueError, "model catalog missing"),
             ):
-                manager.model_catalog(missing_model_id)
+                manager.model_catalog(missing_model_id, "vllm")
 
 
 class _Telemetry:
