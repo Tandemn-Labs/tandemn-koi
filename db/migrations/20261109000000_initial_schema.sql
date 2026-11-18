@@ -128,6 +128,22 @@ CREATE TABLE jobs (
     misc_kubernetes_labels TEXT[]
 );
 
+CREATE TABLE causal_mechanisms (
+    mechanism_id TEXT PRIMARY KEY,
+    name TEXT,
+    edge_ids TEXT[],
+    scope JSONB,
+    narrative TEXT,
+    status TEXT,
+    alpha DOUBLE PRECISION,
+    beta DOUBLE PRECISION,
+    visit_count INTEGER,
+    last_touched_tick INTEGER,
+    q_histogram JSONB,
+    envs_last_seen JSONB,
+    inspection_count INTEGER
+);
+
 CREATE TABLE master_table (
     tick INTEGER NOT NULL CHECK (tick >= 0),
     job_id TEXT NOT NULL REFERENCES jobs (job_id),
@@ -156,7 +172,7 @@ CREATE TABLE master_table (
     -- TODO: clarify why prediction_lineage needs persistence and which fields are required.
     prediction_lineage JSONB NOT NULL DEFAULT '{}'
         CHECK (jsonb_typeof(prediction_lineage) = 'object'),
-    mechanism_id TEXT,
+    mechanism_id TEXT REFERENCES causal_mechanisms (mechanism_id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tick, job_id, rank_id)
 );
@@ -253,26 +269,6 @@ CREATE TABLE causal_edges (
     envs_seen JSONB,
     q3_frequency DOUBLE PRECISION
 );
-
-CREATE TABLE causal_mechanisms (
-    mechanism_id TEXT PRIMARY KEY,
-    name TEXT,
-    edge_ids TEXT[],
-    scope JSONB,
-    narrative TEXT,
-    status TEXT,
-    alpha DOUBLE PRECISION,
-    beta DOUBLE PRECISION,
-    visit_count INTEGER,
-    last_touched_tick INTEGER,
-    q_histogram JSONB,
-    envs_last_seen JSONB,
-    inspection_count INTEGER
-);
-
-ALTER TABLE master_table
-    ADD CONSTRAINT master_table_mechanism_id_fkey
-    FOREIGN KEY (mechanism_id) REFERENCES causal_mechanisms (mechanism_id);
 
 CREATE TABLE plans (
     tick INTEGER PRIMARY KEY CHECK (tick >= 0),
