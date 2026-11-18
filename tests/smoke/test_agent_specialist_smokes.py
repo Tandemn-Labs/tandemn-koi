@@ -113,34 +113,54 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
         self.assertEqual(explicit.config, {"tp": 1})
         self.assertEqual(shorthand.config, {"tp": 1})
 
-    def test_job_rationale_is_inherited_by_ranks_and_round_trips(self):
-        for rationale in ("Use these GPUs for this job.", "", None):
-            with self.subTest(rationale=rationale):
-                raw = _valid_place()
-                raw["rationale"] = rationale
-                raw["ladder"][0]["rationale"] = "Do not use a separate rank reason."
-                raw["ladder"].append(
-                    {"aggregate": {"env": ENV.split("|"), "tp": 1, "rationale": "Ignored."}}
-                )
+    def test_plan_action_and_rank_rationales_are_independent_and_round_trip(self):
+        raw = _valid_place()
+        raw["rationale"] = "Action rationale."
+        raw["ladder"][0]["rationale"] = "Rank-specific rationale."
+        raw["ladder"].append({"aggregate": {"env": ENV.split("|"), "tp": 1}})
 
-                action = PlanAction.from_dict(raw)
-                for rank in action.ladder:
-                    self.assertEqual(rank.rationale, rationale)
-                    self.assertEqual(rank.to_dict()["rationale"], rationale)
-                    self.assertNotIn("rationale", rank.config)
-                    self.assertEqual(RankSpec.from_dict(rank.to_dict()).rationale, rationale)
-                restored = PlanAction.from_dict(action.to_dict())
-                self.assertEqual([rank.rationale for rank in restored.ladder], [rationale] * 2)
+        plan = Plan.from_raw(
+            {
+                "tick_rationale": "Plan rationale.",
+                "actions": [raw],
+            },
+            tick=1,
+        )
+        action = plan.actions[0]
 
-    def test_materialization_copies_final_job_rationale(self):
-        actions = []
-        for job_id, rationale in (("job_1", "First job reason."), ("job_2", "Second job reason.")):
-            raw = _valid_place()
-            raw.update(job_id=job_id, rationale="Original reason.")
-            action = PlanAction.from_dict(raw)
-            action.rationale = rationale
-            actions.append(action)
-        plan = Plan(tick=1, actions=actions)
+        self.assertEqual(plan.tick_rationale, "Plan rationale.")
+        self.assertEqual(action.rationale, "Action rationale.")
+        self.assertEqual(
+            [rank.rationale for rank in action.ladder],
+            ["Rank-specific rationale.", None],
+        )
+        self.assertEqual(
+            [rank.to_dict()["rationale"] for rank in action.ladder],
+            ["Rank-specific rationale.", None],
+        )
+        for rank in action.ladder:
+            self.assertNotIn("rationale", rank.config)
+            self.assertEqual(RankSpec.from_dict(rank.to_dict()).rationale, rank.rationale)
+
+        restored = PlanAction.from_dict(action.to_dict())
+        self.assertEqual(restored.rationale, "Action rationale.")
+        self.assertEqual(
+            [rank.rationale for rank in restored.ladder],
+            ["Rank-specific rationale.", None],
+        )
+
+    def test_materialization_does_not_copy_action_rationale_to_ranks(self):
+        raw = _valid_place()
+        raw["rationale"] = "Original action rationale."
+        raw["ladder"][0]["rationale"] = "Rank-specific rationale."
+        raw["ladder"].append({"aggregate": {"env": ENV.split("|"), "tp": 1}})
+        action = PlanAction.from_dict(raw)
+        action.rationale = "Final action rationale."
+        plan = Plan(
+            tick=1,
+            actions=[action],
+            tick_rationale="Plan rationale.",
+        )
         harness = KoiAgentHarness.__new__(KoiAgentHarness)
         harness._current_tick = 1
 
@@ -152,10 +172,12 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
             result = harness.materialize_plan(plan, None)
 
         self.assertIs(result, plan)
-        for action in result.actions:
-            for rank in action.ladder:
-                self.assertEqual(rank.rationale, action.rationale)
-                self.assertEqual(rank.to_dict()["rationale"], action.rationale)
+        self.assertEqual(result.tick_rationale, "Plan rationale.")
+        self.assertEqual(result.actions[0].rationale, "Final action rationale.")
+        self.assertEqual(
+            [rank.rationale for rank in result.actions[0].ladder],
+            ["Rank-specific rationale.", None],
+        )
 
     def test_catalog_launch_config_is_added_after_parsing(self):
         class ResourceMap:
