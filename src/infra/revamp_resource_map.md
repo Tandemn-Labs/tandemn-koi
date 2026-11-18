@@ -2,7 +2,7 @@ The resource map needs to change and it's functions also need to change.
 
 The definition of new resource map can be found here -> https://github.com/Tandemn-Labs/tdcp/blob/master/proto/tandemn/resourcemap/v1alpha1/resource_map.proto. This is the PER CLUSTER resource map. The GLOBAL View of Cluster Resources are present here -> https://github.com/Tandemn-Labs/tdcp/blob/master/proto/tandemn/resourcemap/v1alpha1/global_resource_map.proto. The wordings and schema is not fully fixed but the structure is still very much fixed.
 
-Also REMEMBER - the GLOBAL RESOURCE MAP contains multiple clusters, but they all are GOVERNED By the same agent and agent tools (koi - brain). So, always remember, there is ONE KOI FOR ALL CLUSTERS, and not ONE KOI PER CLUSTER.
+Also REMEMBER - the GLOBAL RESOURCE MAP contains multiple clusters, but they all are GOVERNED By the same agent and agent tools (koi - brain). So, always remember, there is ONE KOI FOR ALL CLUSTERS, and not ONE KOI PER CLUSTER. Ranks and Rank IDs are NOT UNIQUE to each cluster gfiven that rank_id is created by Koi itself.
 
 The whole idea is that the resource map is a tree based structure where there are two views -
 a) Node View: Which shows all the nodes and their occupancy grid
@@ -13,35 +13,44 @@ The design choice is that there is a Resource Map Service (not implemented in re
 The responsibilities of the resource_map.py are these
 a) Get the latest Resource Map from the RM Service
 b) Convert that Proto into native python classes.
-c) Save the Resource Map into Database for observability / History Accounting.
-d) Have Helper Functions that help Koi's Agent/Agent.py or any other downstream user of Resource Map interact with the resource map.
+c) Have Helper Functions that help Koi's Agent/Agent.py or any other downstream user of Resource Map interact with the resource map.
 
-a is straightforward. b might take some time, but c is the main one. Helper functions are to be designed in a way that agent/agent_tools are unchanged and whatever data that they require, it will be processed from the live resource map and provided. Given that it is a migration - most of the code we changed AFTER commit ed86c8cfa03f29a0b802d139277d2265447af0c3 is to be properly checked. We will NOT READ the resource map from the database table and then convert it into JSON and do operations on it like legacy resource map. The whole point of Proto format is that we can convert it into Native Python Classes and operate on them.
+The live planning path operates on the native Proto-derived map. Review changes after commit `ed86c8cfa03f29a0b802d139277d2265447af0c3` carefully.
+
+## PR boundary and agreed contracts
+
+**This PR:** preserve and persist the complete GlobalResourceMap per tick in memory; use one frozen map across all clusters for one Koi; expose resource facts; implement projected capacity, pricing, and plan-target persistence. NodeOccupancy is authoritative for actual occupancy regardless of pod phase. A resource group is identified by `(cluster_id, pool_id, node_type_id)`; identical-looking groups in different clusters remain distinct. Convert directly from the proto assumign that it is validated. Avoid a proto → JSON → dictionary → class pipeline.
+
+
+`get_latest_resource_map()` remains unimplemented. Operator ingestion, the RM Service receiver/RPC, submission transport, metrics writing, and operator execution are outside this PR.
+
+**Next PR:** migrate Agent Tools to consume the per-cluster raw resource records and apply its existing planning policy. Validator C5/C6 exact-group validation and downstream Deployment X adaptation are also downstream work. Telemetry migration and `observed_replica_liveness()` are not part of this PR. Candidate construction that chooses target IDs is downstream; this PR must preserve any supplied IDs through plan copying/serialization and persist them to the placement row. The scope of RPC Call failing remains out of scope for this PR. WHat might happen in the future is that we will preserve the 'observed_at' time for a given cluster snapshot in memory and re-use last tick's resource map, but all that will be WITHIN the scope of the resource map serbice and this PR should NOT WORRY about it. Protobuf validation is also NOT in scope for this PR.
 
 Here are some functions we are planning by the business functionality -
 
 a) Snapshot and Resource Access
-   - read_resource_map_snapshot(tick): read the exact resource map for that tick
    - snapshot_cluster_state(tick): freeze the cluster_state and attach every job's intent and context. (I am not sure if it is needed).
    - resource_group(cluster_id, pool_id, node_type_id): Locate the group Record and View it
-   - resource_summary(): Expose the summary as it was shown in the legacy for the agent and agent tools.
+   - resources_summary(): Return a per-cluster index of the canonical GlobalResourceMap records. Do not flatten or merge clusters into legacy environment keys; one Koi agent governs the whole global map. There are sub-functions within this function for example
+    - get_running_jobs(): Canonical Sources of the Jobs Running should come from the Resource Map. A new resource map leads to editing the job statuses of all the jobs. For example: in the last tick - a job 'job_abc' was 'queued', but the resource map showed it's updated status as 'running', so that job's status in the database should change from 'queued' to 'running'. So the state changes are 'queued' -> 'pending' -> 'running' -> 'finished'.
+    - get_waiting_jobs(): The Canonical Source is our database. Waiting Jobs are Jobs with the 'queued' status. It may or may not be available in the live resource map, so direct it from the Database.
+    - get_submitted_jobs(): It was an alias for the get_waiting_jobs(), it is no longer needed in the future version.
+
 
 b) Resource Facts and Availability
    - node_headroom(...): Physical Headroom each node has from NodeOccupancy
-   - get_avail_capacity(...): capacity available to new proposals, accounting for already running pods and for committed pods/capacity reserved (but even un-used / inactive rn ) for autoscaling.
-   - pool_capacity(...): total capacity for that NodePool
+   - get_avail_capacity(...): expose physical headroom, autoscaling reservations, and pending demand as separate facts; do not debit pod allocations twice or silently prioritize pending demand.
+   - pool_capacity(...): expose total capacity, NodeOccupancy usage, autoscaling reservations, and remaining capacity separately, plus available allocation units = total capacity minus NodeOccupancy usage and autoscaling reservations. Pending demand remains separate for Agent Tools policy.
    - rank_allocation_summary(rank): Describe the rank's footprint
    - rank_capacity_per_replica(rank) / rank_capacity_footprint(rank) — per-replica and total requested footprint.
    - requested_capacity(plan) — describe a proposal’s demands without modifying observed state.
 
 c) Simulation, checking, and pricing
-   - simulate_future_resources(plan) — simulate against a copy of the existing resource map, with the new plan that has changed placements. The plan’s place and swap actions carry ladders; each rank supplies its environment, configuration (including instance type and GPU shape), and replica count. Those fields let the Resource Map calculate the capacity the plan would reserve. The new simulate would look at the environment, and can provide the "projected" remaining capacity by this policy - best effort colocation into existing nodes. If a new rank is created, try to colocate with existing ranks on existing nodes, if not, put it on a new node. Do not have the policy of ONE NODE dedicated per placement. For deletions, it is straightforward. Do not worry about the exact cluster_id, any cluster being selected is ok given that it does not change the downstream cluster_score calculations. At the same time, the exact kubernetes ID for that pod does not need to be a concern.
+   - simulate_future_resources(plan) — project Place/Swap ladders against a copy of the map. Use each rank's environment, instance/GPU configuration, and replica count to project capacity. For each replica, first best-effort pack onto a partially occupied existing node with enough headroom; if none fits, place it on a fresh, already-existing idle node. Do not fail just because co-location failed, dedicate a node when an occupied node fits, or add nodes absent from the map. Project the completed plan: apply removals/releases before additions; Koi does not submit overlapping old/new Swap placements. A matching cluster may be chosen freely where cluster identity does not affect scoring. Simulation need not assign Kubernetes node or pod IDs and must not mutate observed occupancy.
    - check_resource_feasibility(plan) — check the proposal against that structure and existing commitments.
-   - switch_pricing_map() — accelerator-proportional pricing by exact target. This is a bit nuanced
-        - if a job is running on reserved GPUs, the cost per job is only the cost totalled by the number of GPUs it is occupying (both running and reserved for autoscaling). Given that Reserved GPUs are already paid for - amortization does not really make sense.
-        - if a job is running on on-demand / spot GPUs- the cost per job is amortized between the number of jobs running across the same nodes. If two jobs are sharing the same on demand instance, the cost should be amortized between them in a proportional way.
+   - switch_pricing_map() — attribute cost by exact target and occupied accelerators. For reserved capacity, charge each job for the GPUs it occupies, including its autoscaling reservation; do not amortize already-paid capacity. For on-demand/spot nodes shared by jobs, amortize node price among those jobs in proportion to their occupied accelerators.
 
-The goal is to NOT REALLY DISTURB Agent and Agent Tools, and move things around for it in resource_map.py. It is not a HARD AND FAST rule- obviously if something is WRONG In resource map.
+Agent Tools and Validator consume the per-cluster map in the next PR; this PR establishes the native-map and helper contracts without moving allocation priority or selection policy into resource_map.py.
 
 Accounting Problems in the Legacy Resource Map:
 
