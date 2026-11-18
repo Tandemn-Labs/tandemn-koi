@@ -113,6 +113,72 @@ class SpecialistSchemaSmokeTests(unittest.TestCase):
         self.assertEqual(explicit.config, {"tp": 1})
         self.assertEqual(shorthand.config, {"tp": 1})
 
+    def test_plan_action_and_rank_rationales_are_independent_and_round_trip(self):
+        raw = _valid_place()
+        raw["rationale"] = "Action rationale."
+        raw["ladder"][0]["rationale"] = "Rank-specific rationale."
+        raw["ladder"].append({"aggregate": {"env": ENV.split("|"), "tp": 1}})
+
+        plan = Plan.from_raw(
+            {
+                "tick_rationale": "Plan rationale.",
+                "actions": [raw],
+            },
+            tick=1,
+        )
+        action = plan.actions[0]
+
+        self.assertEqual(plan.tick_rationale, "Plan rationale.")
+        self.assertEqual(action.rationale, "Action rationale.")
+        self.assertEqual(
+            [rank.rationale for rank in action.ladder],
+            ["Rank-specific rationale.", None],
+        )
+        self.assertEqual(
+            [rank.to_dict()["rationale"] for rank in action.ladder],
+            ["Rank-specific rationale.", None],
+        )
+        for rank in action.ladder:
+            self.assertNotIn("rationale", rank.config)
+            self.assertEqual(RankSpec.from_dict(rank.to_dict()).rationale, rank.rationale)
+
+        restored = PlanAction.from_dict(action.to_dict())
+        self.assertEqual(restored.rationale, "Action rationale.")
+        self.assertEqual(
+            [rank.rationale for rank in restored.ladder],
+            ["Rank-specific rationale.", None],
+        )
+
+    def test_materialization_does_not_copy_action_rationale_to_ranks(self):
+        raw = _valid_place()
+        raw["rationale"] = "Original action rationale."
+        raw["ladder"][0]["rationale"] = "Rank-specific rationale."
+        raw["ladder"].append({"aggregate": {"env": ENV.split("|"), "tp": 1}})
+        action = PlanAction.from_dict(raw)
+        action.rationale = "Final action rationale."
+        plan = Plan(
+            tick=1,
+            actions=[action],
+            tick_rationale="Plan rationale.",
+        )
+        harness = KoiAgentHarness.__new__(KoiAgentHarness)
+        harness._current_tick = 1
+
+        with (
+            patch.object(harness, "_materialize_launch_configs"),
+            patch.object(harness, "_validate_ladder"),
+            patch.object(agent_tools._CTX, "validated_budget_book", None),
+        ):
+            result = harness.materialize_plan(plan, None)
+
+        self.assertIs(result, plan)
+        self.assertEqual(result.tick_rationale, "Plan rationale.")
+        self.assertEqual(result.actions[0].rationale, "Final action rationale.")
+        self.assertEqual(
+            [rank.rationale for rank in result.actions[0].ladder],
+            ["Rank-specific rationale.", None],
+        )
+
     def test_catalog_launch_config_is_added_after_parsing(self):
         class ResourceMap:
             def model_catalog(self, model_id):

@@ -172,7 +172,7 @@ async def run_service(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Start the service; all command-line arguments belong to the runner."""
+    """Start the service and forward arguments to the runner."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

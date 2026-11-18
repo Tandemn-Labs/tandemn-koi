@@ -4,7 +4,7 @@ import asyncio
 import signal
 import sys
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from src import service
@@ -231,6 +231,21 @@ class ServiceSmokeTests(unittest.IsolatedAsyncioTestCase):
         previous_handler = signal.getsignal(signal.SIGTERM)
         with server.capture_signals():
             self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+
+
+class ServiceStartupTests(unittest.TestCase):
+    def test_starts_service_without_running_database_migrations(self):
+        service_coroutine = object()
+        with (
+            patch.object(
+                service, "run_service", new=Mock(return_value=service_coroutine)
+            ) as run_service,
+            patch.object(service.asyncio, "run", return_value=0) as run,
+        ):
+            self.assertEqual(service.main(["--ticks", "1"]), 0)
+
+        run_service.assert_called_once_with(["--ticks", "1"])
+        run.assert_called_once_with(service_coroutine)
 
 
 if __name__ == "__main__":
