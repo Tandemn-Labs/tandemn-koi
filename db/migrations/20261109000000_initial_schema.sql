@@ -77,8 +77,6 @@ CREATE TABLE job_engine_defaults (
     kv_transfer_method TEXT,
     chunk_size INTEGER,
     max_chunked_steps_per_request INTEGER,
-    extra_args TEXT[],
-    misc_kubernetes_labels TEXT[],
     PRIMARY KEY (model_id, engine_name)
 );
 
@@ -125,7 +123,9 @@ CREATE TABLE jobs (
         osl_token_min >= 0
         AND osl_token_min <= osl_token_avg
         AND osl_token_avg <= osl_token_max
-    )
+    ),
+    extra_args TEXT[],
+    misc_kubernetes_labels TEXT[]
 );
 
 CREATE TABLE master_table (
@@ -289,21 +289,6 @@ CREATE TABLE plan_actions (
     PRIMARY KEY (tick, job_id)
 );
 
-CREATE TABLE rank_metrics (
-    tick INTEGER,
-    job_id TEXT REFERENCES jobs (job_id),
-    rank_id TEXT,
-    cluster_id TEXT,
-    window_start TIMESTAMPTZ,
-    window_end TIMESTAMPTZ,
-    collected_at TIMESTAMPTZ,
-    v_observed JSONB,
-    y_observed JSONB,
-    PRIMARY KEY (tick, job_id, rank_id)
-);
-
-CREATE INDEX rank_metrics_history_idx
-    ON rank_metrics (job_id, rank_id, tick DESC);
 
 -- migrate:down
 DO $$

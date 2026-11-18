@@ -61,11 +61,12 @@ def test_concurrent_and_repeated_migrations(migration_database):
             SELECT count(*) FROM information_schema.tables
             WHERE table_schema = 'public' AND table_name <> 'schema_migrations'
             """
-        ).fetchone() == (14,)
+        ).fetchone() == (13,)
         for table in (
             "job_intent",
             "job_engine_arguments",
             "plan_rank_predictions",
+            "rank_metrics",
             "resource_map_snapshots",
             "tick_resource_map",
         ):
@@ -77,7 +78,6 @@ def test_concurrent_and_repeated_migrations(migration_database):
             ("placement", "PRIMARY KEY (job_id, rank_id)"),
             ("plans", "PRIMARY KEY (tick)"),
             ("plan_actions", "PRIMARY KEY (tick, job_id)"),
-            ("rank_metrics", "PRIMARY KEY (tick, job_id, rank_id)"),
             ("job_engine_defaults", "PRIMARY KEY (model_id, engine_name)"),
         ):
             assert conn.execute(
@@ -138,6 +138,18 @@ def test_concurrent_and_repeated_migrations(migration_database):
             ("placement", "chunked_prefill_enabled", "boolean"),
             ("placement", "kv_cache_dtype", "text"),
         ]
+        assert conn.execute(
+            """
+            SELECT table_name, column_name, data_type FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name IN ('jobs', 'job_engine_defaults')
+              AND column_name IN ('extra_args', 'misc_kubernetes_labels')
+            ORDER BY table_name, column_name
+            """
+        ).fetchall() == [
+            ("jobs", "extra_args", "ARRAY"),
+            ("jobs", "misc_kubernetes_labels", "ARRAY"),
+        ]
         assert (
             conn.execute(
                 """
@@ -165,9 +177,15 @@ def test_concurrent_and_repeated_migrations(migration_database):
         with pytest.raises(psycopg.errors.NotNullViolation), conn.transaction():
             conn.execute("INSERT INTO job_engine_defaults (model_id) VALUES ('model-1')")
         conn.execute(
-            "INSERT INTO jobs (job_id, kind, status, model_id, target_p99_ttft_ms) "
-            "VALUES ('job-1', 'online', 'queued', 'model-1', 100)"
+            "INSERT INTO jobs "
+            "(job_id, kind, status, model_id, target_p99_ttft_ms, extra_args, "
+            "misc_kubernetes_labels) "
+            "VALUES ('job-1', 'online', 'queued', 'model-1', 100, %s, %s)",
+            (["--enable-prefix-caching"], ["team=serving"]),
         )
+        assert conn.execute(
+            "SELECT extra_args, misc_kubernetes_labels FROM jobs WHERE job_id = 'job-1'"
+        ).fetchone() == (["--enable-prefix-caching"], ["team=serving"])
         conn.execute("INSERT INTO plans (tick) VALUES (1), (2)")
         with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
             conn.execute("INSERT INTO plans (tick) VALUES (1)")
@@ -179,19 +197,6 @@ def test_concurrent_and_repeated_migrations(migration_database):
             conn.execute("INSERT INTO plan_actions (tick, job_id) VALUES (3, 'job-1')")
         with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
             conn.execute("INSERT INTO plan_actions (tick, job_id) VALUES (1, 'job-1')")
-        conn.execute(
-            "INSERT INTO rank_metrics (tick, job_id, rank_id, cluster_id) "
-            "VALUES (1, 'job-1', 'rank-1', 'cluster-a')"
-        )
-        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
-            conn.execute(
-                "INSERT INTO rank_metrics (tick, job_id, rank_id, cluster_id) "
-                "VALUES (1, 'job-1', 'rank-1', 'cluster-b')"
-            )
-        assert conn.execute(
-            "UPDATE rank_metrics SET cluster_id = 'cluster-b' "
-            "WHERE tick = 1 AND job_id = 'job-1' AND rank_id = 'rank-1' RETURNING cluster_id"
-        ).fetchone() == ("cluster-b",)
         with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
             conn.execute("UPDATE jobs SET target_p99_ttft_ms = -1 WHERE job_id = 'job-1'")
         conn.execute("UPDATE jobs SET target_p99_ttft_ms = 200 WHERE job_id = 'job-1'")
