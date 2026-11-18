@@ -355,7 +355,7 @@ class TickRunner:
     # ------------------------------------------------------------------
 
     def S0(self, ctx: TickContext) -> FSMState:
-        """Freeze the exact tick's global map/job context and reset per-tick caches.
+        """Freeze the tick's view of the world and reset per-tick caches.
 
         The snapshot is the single consistent input every later state
         references. The on_tick_start hook clears agent-tool tick caches
@@ -1265,15 +1265,18 @@ class TickRunner:
     def _annotate_dead_shapes(self, ctx: TickContext) -> None:
         """Attach observed_dead_shapes to every job descriptor for its model.
 
-        Two sources: ranks S2 saw serve nothing under load this run, and failed
-        ranks in the frozen Resource Map with a deterministic reason. Keyed on
+        Two sources: ranks S2 saw serve nothing under load this run, and rank
+        launch failures the Store reports with a deterministic reason. Keyed on
         (gpu_type, tp, pp) - never replicas - so a dead shape is not retried
         wider.
         """
         snapshot = ctx.cluster_snapshot
         if snapshot is None:
             return
-        descriptors = snapshot.active_jobs_summary() + snapshot.pending_jobs_summary()
+        descriptors: list[dict[str, Any]] = []
+        for accessor in ("active_jobs_summary", "pending_jobs_summary"):
+            if hasattr(snapshot, accessor):
+                descriptors.extend(job for job in (getattr(snapshot, accessor)() or []) if job)
         for job in descriptors:
             model_id = str((job.get("job_features") or {}).get("model_id") or "")
             dead: dict[tuple[str, int, int], dict[str, Any]] = {}
@@ -1285,29 +1288,29 @@ class TickRunner:
                 if ctx.tick >= int(entry.get("retry_after_tick", ctx.tick)):
                     continue
                 dead[(entry["gpu_type"], entry["tp"], entry["pp"])] = dict(entry)
-            for rank in job.get("ranks") or []:
-                status = rank.get("status")
-                if not isinstance(status, dict) or status.get("phase") != "WORKLOAD_PHASE_FAILED":
+            for failure in job.get("recent_rank_failures") or []:
+                if not isinstance(failure, dict):
                     continue
-                reason = str(status.get("reason") or "")
-                if reason not in self._DETERMINISTIC_RANK_FAILURES or not model_id:
+                if str(failure.get("reason_code") or "") not in self._DETERMINISTIC_RANK_FAILURES:
                     continue
-                placement = rank.get("placement") or {}
-                gpu_type = placement.get("accelerator_type")
+                shape = dict(failure.get("shape_json") or {})
+                config = dict(shape.get("config") or shape)
+                gpu_type = env_gpu_type(shape.get("env")) or config.get("gpu_type")
                 if not gpu_type:
                     continue
-                tp = placement.get("tensor_parallelism") or 1
-                pp = placement.get("pipeline_parallelism") or 1
+                try:
+                    tp, pp = int(config.get("tp") or 1), int(config.get("pp") or 1)
+                except (TypeError, ValueError):
+                    continue
                 dead.setdefault(
-                    (gpu_type, tp, pp),
+                    (str(gpu_type), tp, pp),
                     {
                         "model_id": model_id,
-                        "gpu_type": gpu_type,
+                        "gpu_type": str(gpu_type),
                         "tp": tp,
                         "pp": pp,
-                        "reason": reason,
-                        "rank_id": rank.get("rank_id"),
-                        "cluster_id": rank["cluster_id"],
+                        "reason": str(failure.get("reason_code")),
+                        "rank_id": failure.get("rank_id"),
                     },
                 )
             if dead:

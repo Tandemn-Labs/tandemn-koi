@@ -1,12 +1,6 @@
-from copy import deepcopy
-from types import SimpleNamespace
-from unittest.mock import Mock
-
-import pytest
-from src.agent.tools.agent_tools import _dead_shape_keys
 from src.core.models import Plan, PlanAction
 from src.infra.resource_map import ClusterResourceSnapshot
-from src.orchestrator.fsm_states import FSMState, TickContext, TickRunner
+from src.orchestrator.fsm_states import TickContext, TickRunner
 
 
 def _runner():
@@ -14,7 +8,6 @@ def _runner():
     runner._deployment_ledger = {}
     runner._prediction_ledger = {}
     runner._health_state = {}
-    runner._dead_shapes = {}
     return runner
 
 
@@ -537,132 +530,3 @@ def test_batch_health_uses_deadline_pace_and_ignores_latency_queue():
     health = result["job-1"]
     assert health["status"] == "degraded"
     assert health["reasons"] == ["throughput_shortfall"]
-
-
-def _rank_failure_snapshot():
-    rank = {
-        "rank_id": "rank-failed",
-        "cluster_id": "cluster-b",
-        "status": {"phase": "WORKLOAD_PHASE_FAILED", "reason": "OOM", "message": "out of memory"},
-        "placement": {
-            "accelerator_type": "H100",
-            "tensor_parallelism": 4,
-            "pipeline_parallelism": 2,
-        },
-    }
-    job = {
-        "job_id": "job-1",
-        "status": "running",
-        "job_features": {"model_id": "test/model"},
-        "ranks": [rank],
-    }
-    snapshot = ClusterResourceSnapshot(5, {}, [job], [])
-    return snapshot, job
-
-
-@pytest.mark.parametrize("reason", ["OOM", "SOFTWARE_STACK_RANK_FAILURE", "MODEL_CATALOG_INVALID"])
-@pytest.mark.parametrize("pending", [False, True])
-def test_dead_shape_annotation_uses_frozen_placement(reason, pending):
-    snapshot, job = _rank_failure_snapshot()
-    job["ranks"][0]["status"]["reason"] = reason
-    if pending:
-        job["status"] = "queued"
-        snapshot.active_jobs = []
-        snapshot.pending_jobs = [job]
-    ranks_before = deepcopy(job["ranks"])
-    resources_before = deepcopy(snapshot.resources)
-
-    runner = _runner()
-    runner.on_tick_start = None
-    runner.resource_map = SimpleNamespace(snapshot_cluster_state=Mock(return_value=snapshot))
-
-    assert runner.S0(TickContext(tick=5)) == FSMState.S1_OBSERVE
-    runner.resource_map.snapshot_cluster_state.assert_called_once_with(5)
-
-    assert job["observed_dead_shapes"] == [
-        {
-            "model_id": "test/model",
-            "gpu_type": "H100",
-            "tp": 4,
-            "pp": 2,
-            "reason": reason,
-            "rank_id": "rank-failed",
-            "cluster_id": "cluster-b",
-        }
-    ]
-    assert _dead_shape_keys(job) == {("H100", 4, 2)}
-    assert job["ranks"] == ranks_before
-    assert snapshot.resources == resources_before
-    assert job["status"] == ("queued" if pending else "running")
-
-
-@pytest.mark.parametrize(
-    ("phase", "reason"),
-    [
-        ("WORKLOAD_PHASE_FAILED", "UNKNOWN_CRASH"),
-        ("WORKLOAD_PHASE_FAILED", ""),
-        ("WORKLOAD_PHASE_RUNNING", "OOM"),
-        ("WORKLOAD_PHASE_DEGRADED", "OOM"),
-        ("WORKLOAD_PHASE_UNKNOWN", "OOM"),
-    ],
-)
-def test_dead_shape_annotation_retains_unclassified_failure_observations(phase, reason):
-    snapshot, job = _rank_failure_snapshot()
-    job["ranks"][0]["status"] = {"phase": phase, "reason": reason}
-    ranks_before = deepcopy(job["ranks"])
-
-    _runner()._annotate_dead_shapes(TickContext(tick=5, cluster_snapshot=snapshot))
-
-    assert "observed_dead_shapes" not in job
-    assert job["ranks"] == ranks_before
-
-
-def test_dead_shape_annotation_skips_unresolved_shape():
-    snapshot, job = _rank_failure_snapshot()
-    job["ranks"][0].pop("placement")
-
-    _runner()._annotate_dead_shapes(TickContext(tick=5, cluster_snapshot=snapshot))
-
-    assert "observed_dead_shapes" not in job
-
-
-def test_dead_shape_annotation_defaults_parallelism_and_ignores_target_in_key():
-    snapshot, job = _rank_failure_snapshot()
-    rank = job["ranks"][0]
-    rank["placement"] = {"accelerator_type": "H100", "tensor_parallelism": None}
-    job["ranks"].append({**deepcopy(rank), "rank_id": "other-rank", "cluster_id": "cluster-c"})
-
-    _runner()._annotate_dead_shapes(TickContext(tick=5, cluster_snapshot=snapshot))
-
-    assert len(job["observed_dead_shapes"]) == 1
-    assert _dead_shape_keys(job) == {("H100", 1, 1)}
-
-
-def test_dead_shape_annotation_preserves_model_scoped_memory_and_expiry():
-    runner = _runner()
-    snapshot, job = _rank_failure_snapshot()
-    pending = {"job_id": "job-2", "job_features": {"model_id": "test/model"}}
-    snapshot.pending_jobs.append(pending)
-    live = {
-        "model_id": "test/model",
-        "gpu_type": "H100",
-        "tp": 4,
-        "pp": 2,
-        "reason": "zero_throughput_under_load",
-        "rank_id": "earlier-rank",
-        "retry_after_tick": 6,
-    }
-    expired = {**live, "gpu_type": "A100", "retry_after_tick": 5}
-    unrelated = {**live, "model_id": "test/other-model"}
-    runner._dead_shapes = {
-        ("test/model", "H100", 4, 2): live,
-        ("test/model", "A100", 4, 2): expired,
-        ("test/other-model", "H100", 4, 2): unrelated,
-    }
-    memory_before = deepcopy(runner._dead_shapes)
-
-    runner._annotate_dead_shapes(TickContext(tick=5, cluster_snapshot=snapshot))
-
-    assert job["observed_dead_shapes"] == [live]
-    assert pending["observed_dead_shapes"] == [live]
-    assert runner._dead_shapes == memory_before

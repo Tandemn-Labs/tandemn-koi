@@ -2,7 +2,6 @@
 
 import asyncio
 import signal
-import subprocess
 import sys
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -235,41 +234,18 @@ class ServiceSmokeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ServiceStartupTests(unittest.TestCase):
-    def test_migrates_before_starting_services(self):
-        events = []
+    def test_starts_service_without_running_database_migrations(self):
+        service_coroutine = object()
         with (
             patch.object(
-                service.subprocess, "run", side_effect=lambda *a, **kw: events.append("migrate")
-            ) as migrate,
-            patch.object(
-                service,
-                "run_service",
-                new=Mock(side_effect=lambda argv: events.append("service") or "service coroutine"),
+                service, "run_service", new=Mock(return_value=service_coroutine)
             ) as run_service,
-            patch.object(service.asyncio, "run", return_value=0),
+            patch.object(service.asyncio, "run", return_value=0) as run,
         ):
             self.assertEqual(service.main(["--ticks", "1"]), 0)
 
-        self.assertEqual(events, ["migrate", "service"])
         run_service.assert_called_once_with(["--ticks", "1"])
-        command = migrate.call_args.args[0]
-        self.assertIn("--migration-lock", command)
-        self.assertIn("--no-dump-schema", command)
-        self.assertEqual(command[-2:], ["migrate", "--strict"])
-        self.assertEqual(migrate.call_args.kwargs, {"check": True})
-
-    def test_migration_failure_prevents_services_starting(self):
-        for error in (FileNotFoundError("dbmate"), subprocess.CalledProcessError(1, "dbmate")):
-            with (
-                self.subTest(error=error),
-                patch.object(service.subprocess, "run", side_effect=error),
-                patch.object(service, "run_service") as run_service,
-                patch.object(service.asyncio, "run") as run,
-                self.assertLogs("koi.service", level="ERROR"),
-            ):
-                self.assertEqual(service.main([]), 1)
-                run_service.assert_not_called()
-                run.assert_not_called()
+        run.assert_called_once_with(service_coroutine)
 
 
 if __name__ == "__main__":

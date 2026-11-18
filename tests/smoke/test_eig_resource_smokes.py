@@ -1,3 +1,5 @@
+import contextlib
+import io
 import unittest
 from dataclasses import dataclass
 from typing import Any
@@ -9,16 +11,12 @@ from src.core.confidence_service import ConfidenceService
 from src.core.mechanism_registry import MechanismRegistry
 from src.core.models import Edge, EdgeMetadata, Mechanism, MechanismMetadata, Node
 from src.exploration.eig import aggregate_cluster_eig, compute_eig
-from src.infra.resource_map import ClusterResourceSnapshot, ResourceMapManager
-
-
-class _CapacityFixtureManager(ResourceMapManager):
-    """Exercise the legacy capacity helpers with in-memory inputs until B replaces them."""
-
-    def resources_summary(self):
-        resource_map = self.get_resource_map()
-        used = self._used_capacity(resource_map)
-        return self._normalized_scheduling_summary(resource_map, *used)
+from src.infra.resource_map import (
+    ResourceMapManager,
+    _run_smoke,
+    _run_used_capacity_check,
+    _SmokeResourceMapManager,
+)
 
 
 @dataclass
@@ -118,33 +116,15 @@ class EigResourceSmokeTests(unittest.TestCase):
         self.assertGreater(alpha_cluster, 0.0)
 
     def test_resource_map_in_memory_smokes(self):
-        env = "reserved|aws|us-east-2|use2-az3|A100"
-        manager = ResourceMapManager()
-        manager._tick_snapshot = ClusterResourceSnapshot(
-            0,
-            {env: {"free": 72, "total": 80, "gpu_type": "A100"}},
-            [],
-            [],
-        )
-        plan = {
-            "actions": [
-                {
-                    "job_id": "new",
-                    "type": "place",
-                    "ladder": [
-                        {
-                            "role": "aggregate",
-                            "env": env.split("|"),
-                            "config": {"gpu_count": 8},
-                            "n_replicas": 1,
-                        }
-                    ],
-                }
-            ]
-        }
-        self.assertEqual(manager.get_avail_capacity(env, "A100"), 72)
-        self.assertEqual(manager.simulate_future_resources(plan)[env]["free_after"], 64)
-        self.assertEqual(manager.check_resource_feasibility(plan), (True, []))
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = _run_smoke(_SmokeResourceMapManager(), "in-memory")
+            used = _run_used_capacity_check()
+
+        self.assertEqual(result["label"], "in-memory")
+        self.assertEqual(result["active_jobs"], 0)
+        self.assertEqual(result["pending_jobs"], 0)
+        self.assertEqual(used["free"], 72)
+        self.assertEqual(used["total"], 80)
 
     def test_underfilled_cloud_instances_consume_full_instance_capacity(self):
         env = "reserved|aws|us-east-2|use2-az3|A100"
@@ -173,7 +153,7 @@ class EigResourceSmokeTests(unittest.TestCase):
                     }
                 }
 
-        class SmokeManager(_CapacityFixtureManager):
+        class SmokeManager(ResourceMapManager):
             def __init__(self):
                 super().__init__(user_id="underfilled_instance_smoke")
 
@@ -258,7 +238,7 @@ class EigResourceSmokeTests(unittest.TestCase):
                     }
                 }
 
-        class SmokeManager(_CapacityFixtureManager):
+        class SmokeManager(ResourceMapManager):
             def __init__(self):
                 super().__init__(user_id="duplicate_p5_pool_smoke")
 
@@ -407,7 +387,7 @@ class EigResourceSmokeTests(unittest.TestCase):
                     }
                 }
 
-        class SmokeManager(_CapacityFixtureManager):
+        class SmokeManager(ResourceMapManager):
             def __init__(self):
                 super().__init__(user_id="mixed_pool_smoke")
 
@@ -497,7 +477,7 @@ class EigResourceSmokeTests(unittest.TestCase):
                     }
                 }
 
-        class SmokeManager(_CapacityFixtureManager):
+        class SmokeManager(ResourceMapManager):
             def __init__(self):
                 super().__init__(user_id="gpu_pool_smoke")
 

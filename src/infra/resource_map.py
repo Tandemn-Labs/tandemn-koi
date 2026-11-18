@@ -1,26 +1,34 @@
 from __future__ import annotations
 
+import argparse
+import json
 from collections.abc import Sequence
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.core.models import LADDER_ACTIONS, Plan, env_gpu_type
-from tandemn_system_data.clients import PostgresClient  # type: ignore[import-untyped]
+from tandemn_system_data.clients import (  # type: ignore[import-untyped]
+    JobStore,
+    PostgresClient,
+    ResourceMapStore,
+)
 
+ACTIVE_CHAIN_STATUSES = ("launching", "running")
+WAITING_JOB_STATUSES = ("waiting",)
+RANK_FAILURE_HISTORY_TICKS = 3
 DEFAULT_TICK_INTERVAL_SECONDS = 300
 
 
-# TODO: Remove with the legacy telemetry chain-index matching.
-# def chain_id_for_rank(rank_id: str, chain_index: int) -> str:
-#     return f"{rank_id}_chain_{chain_index}"
+def chain_id_for_rank(rank_id: str, chain_index: int) -> str:
+    return f"{rank_id}_chain_{chain_index}"
 
 
 def merge_hardware_catalogs(catalogs: Sequence[object]) -> dict[str, Any]:
-    """Normalize provider catalog JSON into deployment X's region schema."""
+    """Normalize Store provider catalogs into deployment X's region schema."""
     regions = []
-    for catalog in catalogs:
+    for hardware in catalogs:
+        catalog = getattr(hardware, "catalog", None)
         if not isinstance(catalog, dict):
             continue
         source_regions = catalog.get("regions", [])
@@ -52,13 +60,10 @@ def merge_hardware_catalogs(catalogs: Sequence[object]) -> dict[str, Any]:
 
 @dataclass
 class ClusterResourceSnapshot:
-    """Tick inputs; PostgreSQL resources retain the raw per-cluster structure."""
-
     tick: int | None
     resources: dict[str, Any]
     active_jobs: list[dict[str, Any]]
     pending_jobs: list[dict[str, Any]]
-    resource_map_snapshot: dict[str, Any] | None = None
 
     def resources_summary(self) -> dict[str, Any]:
         return self.resources
@@ -89,20 +94,18 @@ class AllocationUnit:
 
 
 class ResourceMapManager:
-    """Read PostgreSQL inputs and retain one planning view per tick."""
+    """Read Koi resource/job state from Tandemn Store public clients."""
 
     def __init__(
         self,
         user_id: str | None = None,
         postgres_client=None,
-        # Inject the runner-owned pool for direct PostgreSQL reads.
-        *,
-        pool=None,
+        rank_failure_history_seconds: int = RANK_FAILURE_HISTORY_TICKS
+        * DEFAULT_TICK_INTERVAL_SECONDS,
     ):
         self.user_id = user_id
         self._postgres_client = postgres_client
-        self._pool = pool
-        self._tick_snapshot: ClusterResourceSnapshot | None = None
+        self._rank_failure_history_seconds = int(rank_failure_history_seconds)
 
     # ------------------------------------------------------------------
     # Tandemn Store access
@@ -119,35 +122,27 @@ class ResourceMapManager:
             raise ValueError("user_id is required for Tandemn Store resource map access")
         return effective
 
+    def _resource_map_store(self, user_id: str | None = None):
+        return ResourceMapStore(self._client(), user_id=self._effective_user_id(user_id))
+
     def hardware_catalog(self) -> dict[str, Any]:
-        """Read provider catalogs in deployment X's region schema."""
-        if self._pool is None:
-            raise ValueError("database pool is required for catalog reads")
-        with self._pool.connection() as conn:
-            catalogs = [
-                row["catalog"]
-                for row in conn.execute("SELECT catalog FROM hardware_catalog ORDER BY cloud_name")
-            ]
+        """Return all Store provider catalogs in deployment X's region schema."""
+        from tandemn_system_data.clients import HardwareCatalogStore
+
+        catalogs = HardwareCatalogStore(self._client()).all()
         catalog = merge_hardware_catalogs(catalogs)
         if not catalog["regions"]:
             raise ValueError("hardware catalog is required for deployment X")
         return catalog
 
-    def model_catalog(self, model_id: str, engine_name: str) -> dict[str, Any]:
-        """Read model architecture and the selected engine's defaults, raising when absent."""
-        if self._pool is None:
-            raise ValueError("database pool is required for catalog reads")
-        with self._pool.connection() as conn:
-            value = conn.execute(
-                """
-                SELECT * FROM model_architecture
-                JOIN job_engine_defaults USING (model_id)
-                WHERE model_id = %s AND engine_name = %s
-                """,
-                (model_id, engine_name),
-            ).fetchone()
-        if value is None:
-            raise ValueError(f"model catalog missing {model_id!r} with engine {engine_name!r}")
+    def model_catalog(self, model_id: str) -> dict[str, Any]:
+        """Return one Store model catalog row, raising when absent."""
+        from tandemn_system_data.clients import ModelCatalogStore
+
+        catalog = ModelCatalogStore(self._client()).get(model_id)
+        if catalog is None:
+            raise ValueError(f"model catalog missing {model_id!r}")
+        value = dict(catalog.model_dump(mode="json"))
         # ponytail: local catalog-read alias; centralize GPU identity if aliases expand.
         for entries in value.values():
             if not isinstance(entries, list):
@@ -160,8 +155,13 @@ class ResourceMapManager:
                         "RTX-PRO-6000-BSE": "RTXPRO6000",
                         "RTX PRO 6000": "RTXPRO6000",
                     }.get(name, name)
-                    # TODO: We need to coalese all aliasing in one dictionary somewhere
         return value
+
+    def _job_store(self):
+        return JobStore(self._client())
+
+    def _failure_since(self) -> datetime:
+        return datetime.now(UTC) - timedelta(seconds=self._rank_failure_history_seconds)
 
     # ------------------------------------------------------------------
     # Live-state reconciliation (Layer 2): reserve LIVE replicas, not the
@@ -294,300 +294,147 @@ class ResourceMapManager:
     # Jobs and chains
     # ------------------------------------------------------------------
 
-    def get_submitted_jobs(self) -> list[dict[str, Any]]:
-        """Return queued jobs waiting for admission."""
-        return self.get_waiting_jobs()
+    def get_submitted_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Return waiting jobs for compatibility with the old submitted name."""
+        return self.get_waiting_jobs(user_id=user_id)
 
-    def get_running_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """Return observed jobs enriched with the tick's SQL context."""
-        return self.snapshot().active_jobs_summary()
+    def get_running_jobs(
+        self, user_id: str | None = None, *, failure_since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Return running jobs with active chains and recent rank failures."""
+        effective_user_id = self._effective_user_id(user_id)
+        jobs = self._job_store()
+        failure_since = failure_since or self._failure_since()
+        return [
+            self._running_job_to_summary(
+                running_job,
+                jobs.failed_ranks_since(running_job.job.job_id, failure_since),
+            )
+            for running_job in jobs.running_jobs(effective_user_id)
+        ]
 
-    def get_waiting_jobs(self) -> list[dict[str, Any]]:
-        """Read queued jobs and their intent for Koi's planning view."""
-        if self._tick_snapshot is not None:
-            return self._tick_snapshot.pending_jobs_summary()
-        if self._pool is None:
-            raise ValueError("database pool is required for waiting-job reads")
-        with self._pool.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM jobs
-                WHERE status = %s
-                ORDER BY job_id
-                """,
-                ("queued",),
-            ).fetchall()
-        return [self._job_context_to_summary(row) for row in rows]
+    def get_waiting_jobs(
+        self, user_id: str | None = None, *, failure_since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Return waiting jobs with failures from prior placement attempts."""
+        effective_user_id = self._effective_user_id(user_id)
+        jobs = self._job_store()
+        failure_since = failure_since or self._failure_since()
+        return [
+            self._job_to_summary(job, jobs.failed_ranks_since(job.job_id, failure_since))
+            for job in jobs.waiting_jobs(effective_user_id)
+        ]
+
+    def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Return paused jobs for future preempt/resume support."""
+        effective_user_id = self._effective_user_id(user_id)
+        return [
+            self._job_to_summary(job) for job in self._job_store().paused_jobs(effective_user_id)
+        ]
 
     def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
         """Return active chains with owning job context."""
         chains: list[dict[str, Any]] = []
         for job in self.get_running_jobs(user_id=user_id):
             for chain in job.get("active_chains", []):
-                chains.append({"job_id": job["job_id"], **chain})
+                chains.append({"job_id": job["job_id"], "user_id": job["user_id"], **chain})
         return chains
 
     @staticmethod
-    def _job_context_to_summary(row: dict[str, Any]) -> dict[str, Any]:
-        features = row.copy()
-        job_id = features.pop("job_id")
-        kind = features.pop("kind")
-        status = features.pop("status")
+    def _model_dump(model) -> dict[str, Any]:
+        dump = getattr(model, "model_dump", None)
+        if callable(dump):
+            return dump(mode="json")
+        return dict(model)
+
+    @classmethod
+    def _job_to_summary(cls, job, recent_rank_failures=()) -> dict[str, Any]:
+        raw = cls._model_dump(job)
+        spec = dict(raw.get("spec_json") or {})
+        job_features = dict(spec.get("job_features") or spec.get("features") or spec)
         return {
-            "job_id": job_id,
-            "kind": kind,
-            "status": status,
-            "job_features": {"type": kind, **features},
+            "job_id": raw.get("job_id"),
+            "user_id": raw.get("user_id"),
+            "kind": raw.get("kind"),
+            "status": raw.get("status"),
+            "created_at": raw.get("created_at"),
+            "finished_at": raw.get("finished_at"),
+            "finish_reason": raw.get("finish_reason"),
+            "job_features": job_features,
+            "spec_json": spec,
+            "input_source": raw.get("input_source") or {},
+            "output_target": raw.get("output_target") or {},
+            "recent_rank_failures": [
+                cls._rank_failure_summary(rank) for rank in recent_rank_failures
+            ],
         }
+
+    @classmethod
+    def _rank_failure_summary(cls, rank) -> dict[str, Any]:
+        """Return rank failure feedback for the next planning tick."""
+        raw = cls._model_dump(rank)
+        return {
+            "rank_id": raw["rank_id"],
+            "plan_id": raw.get("plan_id"),
+            "role": raw.get("role"),
+            "shape_json": dict(raw.get("shape_json") or {}),
+            "reason_code": raw.get("reason_code"),
+            "failed_at": raw.get("updated_at"),
+        }
+
+    @classmethod
+    def _rank_to_chains(cls, rank) -> list[dict[str, Any]]:
+        raw = cls._model_dump(rank)
+        rank_id = str(raw["rank_id"])
+        n_replicas = raw["n_replicas"]
+        shape = dict(raw.get("shape_json") or {})
+        shape["rank_id"] = rank_id
+        return [
+            {
+                "chain_id": chain_id_for_rank(rank_id, chain_index),
+                "chain_index": chain_index,
+                "plan_id": raw.get("plan_id"),
+                "role": raw.get("role"),
+                "chain_status": raw.get("status"),
+                "rank_created_at": raw.get("created_at"),
+                "shape_json": dict(shape),
+                "target_node": shape.get("target_node"),
+            }
+            for chain_index in range(n_replicas)
+        ]
+
+    @classmethod
+    def _running_job_to_summary(cls, running_job, recent_rank_failures=()) -> dict[str, Any]:
+        job = cls._job_to_summary(running_job.job, recent_rank_failures)
+        chains = [chain for rank in running_job.ranks for chain in cls._rank_to_chains(rank)]
+        job["active_chains"] = chains
+        job["current_ladder"] = chains
+        return job
 
     # ------------------------------------------------------------------
     # Koi-facing snapshot API
     # ------------------------------------------------------------------
 
-    def read_resource_map_snapshot(self, tick: int) -> dict[str, Any]:
-        """Read this exact tick's GlobalResourceMap encoded with proto field names."""
-        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
-            raise ValueError("tick must be a nonnegative integer")
-        if self._pool is None:
-            raise ValueError("database pool is required for Resource Map snapshot reads")
-        with self._pool.connection() as conn:
-            snapshot = conn.execute(
-                """
-                SELECT * FROM resource_map_snapshots WHERE tick = %s
-                """,
-                (tick,),
-            ).fetchone()
-            if snapshot is None:
-                raise ValueError(f"Resource Map snapshot missing for tick {tick}")
-            resource_map = snapshot["resource_map"]
-            cluster_maps = resource_map.get("cluster_resource_maps", [])
-            vector_clock = resource_map.get("vector_clock", {})
-            invalid_map = f"Invalid GlobalResourceMap in snapshot {snapshot['snapshot_id']!r}"
-            if (
-                any(key not in {"cluster_resource_maps", "vector_clock"} for key in resource_map)
-                or not isinstance(cluster_maps, list)
-                or not isinstance(vector_clock, dict)
-            ):
-                raise ValueError(invalid_map)
-            # Pop from a copy to catch duplicate IDs without changing the received clock.
-            remaining_clock = vector_clock.copy()
-            for cluster_map in cluster_maps:
-                cluster = cluster_map.get("cluster") if isinstance(cluster_map, dict) else None
-                cluster_id = cluster.get("cluster_id") if isinstance(cluster, dict) else None
-                if (
-                    not isinstance(cluster_id, str)
-                    or not cluster_id.strip()
-                    or cluster_id not in remaining_clock
-                ):
-                    raise ValueError(invalid_map)
-                counters = (cluster_map.get("logical_counter", 0), remaining_clock.pop(cluster_id))
-                if any(
-                    isinstance(counter, bool)
-                    or not isinstance(counter, (int, str))
-                    or not str(counter).isdecimal()
-                    or int(counter) >= 2**64
-                    for counter in counters
-                ) or int(counters[0]) != int(counters[1]):
-                    raise ValueError(invalid_map)
-            if remaining_clock:
-                raise ValueError(invalid_map)
-            return snapshot
-
     def snapshot(self) -> ClusterResourceSnapshot:
-        if self._tick_snapshot is None:
-            raise ValueError("tick snapshot is required; capture it in S0 first")
-        return self._tick_snapshot
+        return self.snapshot_cluster_state(tick=None)
 
     def snapshot_cluster_state(self, tick) -> ClusterResourceSnapshot:
-        """Freeze one FSM tick into the in-memory planning view used for the rest of the tick.
-
-        Load the exact ``resource_map_snapshots`` row for ``tick``, validating
-        its GlobalResourceMap membership and vector clock. Never fall back to
-        another tick's map. Preserve each cluster's resource records, collection
-        time, and logical counter; the global map contains independently collected
-        cluster observations, not an atomic physical-world snapshot.
-
-        Read intent for every observed job and every queued job from SQL ``jobs``.
-        Group observations across clusters under their owning job,
-        validate observed job/rank/chain identities, and attach ranks and chains
-        with their runtime information and pod requirements. Cluster-local phases
-        stay observational: ``jobs.status`` decides ``active_jobs`` (running)
-        versus ``pending_jobs`` (queued).
-
-        Enrich explicitly failed ranks with matching saved placements from earlier
-        plan ticks, supplying configuration for failure annotation. A placement
-        does not establish failure or deployment status. Failure retention follows
-        the received map; this method does not reconstruct a failure-history window.
-
-        Cache the completed view on ``self._tick_snapshot`` and return the same
-        object when called again for the same tick, without rereading its inputs.
-        A different tick clears the cache before rebuilding, so a load or validation
-        failure cannot leave an older tick's view active.
-
-        Args:
-            tick: Nonnegative FSM tick whose complete Resource Map row must
-                already exist in PostgreSQL.
-
-        Returns:
-            ClusterResourceSnapshot containing per-cluster maps, enriched
-            active/pending jobs, and the raw stored snapshot envelope.
-
-        Raises:
-            ValueError: If the tick is invalid, the database pool is missing,
-                the snapshot is missing or fails validation, observed identities
-                are malformed or duplicated within their scope, or an observed
-                job has no SQL job/intent context. Database errors propagate.
-        """
-        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
-            raise ValueError("tick must be a nonnegative integer")
-        if self._tick_snapshot is not None and self._tick_snapshot.tick == tick:
-            return self._tick_snapshot
-        self._tick_snapshot = None
-        stored = deepcopy(self.read_resource_map_snapshot(tick))
-        cluster_maps = stored["resource_map"].get("cluster_resource_maps", [])
-        observations = self._group_job_observations(cluster_maps)
-        contexts = self._read_job_contexts(list(observations))
-        self._attach_observed_work(contexts, observations)
-        self._enrich_failed_rank_placements(contexts, tick)
-        # Cluster-local phases are observations; jobs.status remains authoritative.
-        snapshot = ClusterResourceSnapshot(
+        failure_since = self._failure_since()
+        return ClusterResourceSnapshot(
             tick=tick,
-            resources={
-                cluster_map["cluster"]["cluster_id"]: cluster_map for cluster_map in cluster_maps
-            },
-            active_jobs=[job for job in contexts.values() if job["status"] == "running"],
-            pending_jobs=[job for job in contexts.values() if job["status"] == "queued"],
-            resource_map_snapshot=stored,
+            resources=self.resources_summary(),
+            active_jobs=self.get_running_jobs(failure_since=failure_since),
+            pending_jobs=self.get_waiting_jobs(failure_since=failure_since),
         )
-        self._tick_snapshot = snapshot
-        return snapshot
-
-    @staticmethod
-    def _group_job_observations(
-        cluster_maps: list[dict[str, Any]],
-    ) -> dict[str, list[dict[str, Any]]]:
-        """Group cluster observations by job, retaining source metadata."""
-        observations: dict[str, list[dict[str, Any]]] = {}
-        for cluster_map in cluster_maps:
-            cluster_id = cluster_map["cluster"]["cluster_id"]
-            jobs = cluster_map.get("jobs", [])
-            if not isinstance(jobs, list):
-                raise ValueError(f"cluster {cluster_id!r} jobs must be a list")
-            seen_jobs = set()
-            for observed in jobs:
-                job_id = observed.get("job_id") if isinstance(observed, dict) else None
-                if not isinstance(job_id, str) or not job_id.strip() or job_id in seen_jobs:
-                    raise ValueError(f"cluster {cluster_id!r} has an invalid or duplicate job_id")
-                seen_jobs.add(job_id)
-                observations.setdefault(job_id, []).append(
-                    {
-                        **deepcopy(observed),
-                        "cluster_id": cluster_id,
-                        "collected_at": cluster_map.get("collected_at"),
-                        "logical_counter": cluster_map.get("logical_counter", 0),
-                    }
-                )
-        return observations
-
-    def _read_job_contexts(self, observed_job_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Read queued/observed job intent and require context for every observation."""
-        with self._pool.connection() as conn:
-            contexts = {
-                row["job_id"]: self._job_context_to_summary(row)
-                for row in conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE status = %s OR job_id = ANY(%s)
-                    ORDER BY job_id
-                    """,
-                    ("queued", observed_job_ids),
-                )
-            }
-        for job_id in observed_job_ids:
-            if job_id not in contexts:
-                raise ValueError(f"job context missing {job_id!r}")
-        return contexts
-
-    @staticmethod
-    def _attach_observed_work(
-        contexts: dict[str, dict[str, Any]],
-        observations: dict[str, list[dict[str, Any]]],
-    ) -> None:
-        """Attach validated rank/chain identities and runtime records to each job."""
-        for job_id, job in contexts.items():
-            job["observations"] = observations.get(job_id, [])
-            ranks = []
-            chains = []
-            for observed in job["observations"]:
-                observed_ranks = observed.get("ranks", [])
-                if not isinstance(observed_ranks, list):
-                    raise ValueError(f"job {job_id!r} ranks must be a list")
-                seen_ranks = set()
-                for rank in observed_ranks:
-                    rank_id = rank.get("rank_id") if isinstance(rank, dict) else None
-                    if not isinstance(rank_id, str) or not rank_id.strip() or rank_id in seen_ranks:
-                        raise ValueError(f"job {job_id!r} has an invalid or duplicate rank_id")
-                    seen_ranks.add(rank_id)
-                    ranks.append({**rank, "cluster_id": observed["cluster_id"]})
-                    observed_chains = rank.get("chains", [])
-                    if not isinstance(observed_chains, list):
-                        raise ValueError(f"rank {rank_id!r} chains must be a list")
-                    seen_chains = set()
-                    for chain in observed_chains:
-                        chain_id = chain.get("chain_id") if isinstance(chain, dict) else None
-                        if (
-                            not isinstance(chain_id, str)
-                            or not chain_id.strip()
-                            or chain_id in seen_chains
-                        ):
-                            raise ValueError(
-                                f"rank {rank_id!r} has an invalid or duplicate chain_id"
-                            )
-                        seen_chains.add(chain_id)
-                        chains.append(
-                            {
-                                **chain,
-                                "rank_id": rank_id,
-                                "cluster_id": observed["cluster_id"],
-                                "runtime": rank.get("runtime", {}),
-                                "pod_requirements": rank.get("pod_requirements", []),
-                            }
-                        )
-            job["ranks"] = ranks
-            job["active_chains"] = chains
-            job["current_ladder"] = chains
-
-    def _enrich_failed_rank_placements(
-        self, contexts: dict[str, dict[str, Any]], tick: int
-    ) -> None:
-        """Attach prior saved settings to failures present in this tick's map."""
-        # shortcut: failure retention follows the received map; define a historical lookback separately.
-        failed_ranks = {}
-        for job_id, job in contexts.items():
-            for rank in job["ranks"]:
-                status = rank.get("status")
-                if isinstance(status, dict) and status.get("phase") == "WORKLOAD_PHASE_FAILED":
-                    failed_ranks[(job_id, rank["rank_id"], rank["cluster_id"])] = rank
-        if failed_ranks:
-            with self._pool.connection() as conn:
-                placements = conn.execute(
-                    """
-                    SELECT DISTINCT ON (p.job_id, p.rank_id, p.cluster_id)
-                        p.job_id, p.rank_id, p.cluster_id, p.plan_id,
-                        p.accelerator_type, p.tensor_parallelism, p.pipeline_parallelism
-                    FROM placement AS p JOIN plans USING (plan_id)
-                    WHERE p.rank_id = ANY(%s) AND plans.tick < %s
-                    ORDER BY p.job_id, p.rank_id, p.cluster_id, plans.tick DESC, p.plan_id DESC
-                    """,
-                    ([rank_id for _, rank_id, _ in failed_ranks], tick),
-                ).fetchall()
-            for placement in placements:
-                key = (placement["job_id"], placement["rank_id"], placement["cluster_id"])
-                if key in failed_ranks:
-                    failed_ranks[key]["placement"] = placement
 
     def resources_summary(self, user_id: str | None = None) -> dict[str, Any]:
-        return self.snapshot().resources_summary()
+        resource_map = self.get_resource_map(user_id=user_id)
+        used_gpus, used_instances, used_pool_gpus = self._used_capacity(
+            resource_map, user_id=user_id
+        )
+        return self._normalized_scheduling_summary(
+            resource_map, used_gpus, used_instances, used_pool_gpus
+        )
 
     @classmethod
     def _normalized_scheduling_summary(
@@ -789,17 +636,21 @@ class ResourceMapManager:
         return "reserved"
 
     def dynamic_view(self, user_id: str | None = None) -> dict[str, Any]:
-        snapshot = self.snapshot()
-        stored = snapshot.resource_map_snapshot
+        resource_map = self.get_resource_map(user_id=user_id)
+        used_gpus, used_instances, used_pool_gpus = self._used_capacity(
+            resource_map, user_id=user_id
+        )
+        resources = self._normalized_scheduling_summary(
+            resource_map, used_gpus, used_instances, used_pool_gpus
+        )
         return {
-            "tick": snapshot.tick,
-            "snapshot_id": stored["snapshot_id"],
-            "stored_at": stored["stored_at"],
-            "resource_map": stored["resource_map"],
-            "resources": snapshot.resources_summary(),
-            "running_jobs": self.get_running_jobs(),
-            "waiting_jobs": self.get_waiting_jobs(),
-            "running_chains": self.get_running_chains(),
+            "resource_map_version": resource_map.version,
+            "updated_at": resource_map.updated_at,
+            "resources": resources,
+            "running_jobs": self.get_running_jobs(user_id=user_id),
+            "waiting_jobs": self.get_waiting_jobs(user_id=user_id),
+            "paused_jobs": self.get_paused_jobs(user_id=user_id),
+            "running_chains": self.get_running_chains(user_id=user_id),
         }
 
     def build_keep_all_plan(self, snapshot: ClusterResourceSnapshot) -> dict[str, dict[str, str]]:
@@ -815,9 +666,9 @@ class ResourceMapManager:
     # ------------------------------------------------------------------
 
     def get_resource_map(self, user_id: str | None = None):
-        return self.snapshot().resource_map_snapshot["resource_map"]
+        return self._resource_map_store(user_id=user_id).get()
 
-    def refresh_resource_map(self):
+    def refresh_resource_map(self, TandemnStore=None):
         return self.get_resource_map()
 
     def get_avail_capacity(self, env, gpu_type):
@@ -1070,3 +921,231 @@ class ResourceMapManager:
 
 def _float_or_none(value) -> float | None:
     return None if value is None else float(value)
+
+
+def _smoke_resource_map():
+    from tandemn_system_data.models import (  # type: ignore[import-untyped]
+        Cloud,
+        IntraMachineInterconnect,
+        MachinePool,
+        NetworkFabric,
+        Region,
+        ResourceMap,
+        Zone,
+    )
+
+    pool_fields = getattr(MachinePool, "model_fields", {})
+    pool_values = {
+        "instance_family": "p4d",
+        "gpu_type": "A100",
+        "gpu_memory_gb": 40,
+        "gpus_per_instance": 8,
+        "total_instances": 2,
+        "intra_machine_interconnect": IntraMachineInterconnect(type="nvlink_nvswitch"),
+    }
+    if "price_per_instance_hour" in pool_fields:
+        pool_values["price_per_instance_hour"] = 32.77
+
+    resource_fields = getattr(ResourceMap, "model_fields", {})
+    resource_values = {
+        "clouds": {
+            "aws": Cloud(
+                regions={
+                    "us-east-2": Region(
+                        zones={
+                            "use2-az3": Zone(
+                                network_fabrics={
+                                    "efa-cluster-a": NetworkFabric(
+                                        fabric_type="efa",
+                                        gpu_direct_rdma=True,
+                                        machine_pools={
+                                            "p4d.24xlarge": MachinePool(**pool_values),
+                                        },
+                                    )
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+        }
+    }
+    if "market" in resource_fields:
+        resource_values["market"] = ["reserved"]
+    elif "capacity_type" in resource_fields:
+        resource_values["capacity_type"] = ["reserved"]
+    return ResourceMap(**resource_values)
+
+
+class _SmokeResourceMapManager(ResourceMapManager):
+    def __init__(self):
+        super().__init__(user_id="usr_resource_map_smoke")
+
+    def get_resource_map(self, user_id: str | None = None):
+        return _smoke_resource_map()
+
+    def get_running_jobs(
+        self, user_id: str | None = None, *, failure_since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        return []
+
+    def get_waiting_jobs(
+        self, user_id: str | None = None, *, failure_since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        return []
+
+    def get_paused_jobs(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+    def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+
+def _run_smoke(manager: ResourceMapManager, label: str) -> dict[str, Any]:
+    resources = manager.resources_summary()
+    if not resources:
+        raise RuntimeError(f"{label}: resource map is empty")
+
+    env_key, info = next(iter(sorted(resources.items())))
+    env_parts = env_key.split("|")
+    if len(env_parts) != 5:
+        raise AssertionError(f"{label}: env key must have 5 parts, got {env_key!r}")
+    for required in ("free", "total", "gpu_type", "cloud", "region", "zone", "market"):
+        if required not in info:
+            raise AssertionError(f"{label}: env {env_key!r} missing {required!r}")
+
+    free = int(info["free"])
+    assert manager.get_avail_capacity(env_parts, info["gpu_type"]) == free
+    pool: dict[str, Any] = next(iter(info.get("pools") or []), {})
+    config = {"gpu_count": 1, "gpu_type": info["gpu_type"]}
+    if pool.get("instance_type"):
+        config["instance_type"] = pool["instance_type"]
+
+    plan = {
+        "actions": [
+            {
+                "job_id": "job_resource_map_smoke",
+                "type": "place",
+                "ladder": [
+                    {
+                        "role": "aggregate",
+                        "env": env_parts,
+                        "config": config,
+                        "n_replicas": 1,
+                    }
+                ],
+            }
+        ]
+    }
+    simulated = manager.simulate_future_resources(plan)
+    footprint = manager._requested_gpus_by_env(plan, resources)[env_key]
+    if simulated[env_key]["free_after"] != free - footprint:
+        raise AssertionError(
+            f"{label}: expected free_after={free - footprint}, got {simulated[env_key]}"
+        )
+    ok, violations = manager.check_resource_feasibility(plan)
+    if not ok:
+        raise AssertionError(f"{label}: feasible smoke plan failed: {violations}")
+
+    snapshot = manager.snapshot_cluster_state(tick=0)
+    dynamic = manager.dynamic_view()
+    result = {
+        "label": label,
+        "env_key": env_key,
+        "free": free,
+        "total": int(info["total"]),
+        "active_jobs": len(snapshot.active_jobs_summary()),
+        "pending_jobs": len(snapshot.pending_jobs_summary()),
+        "dynamic_view_keys": sorted(dynamic.keys()),
+    }
+    print(json.dumps(result, indent=2, default=str))
+    return result
+
+
+class _UsedCapacitySmokeManager(ResourceMapManager):
+    """80 total A100 GPUs with one running 8-GPU chain placed via target_node.
+
+    Pins the used-capacity contract: free = total - count = 80 - 8 = 72.
+    The chain carries its env in the first-class ``target_node`` field (not
+    ``shape_json['env']``), exercising the resolution precedence.
+    """
+
+    _ENV = "reserved|aws|us-east-2|use2-az3|A100"
+
+    def __init__(self):
+        super().__init__(user_id="usr_used_capacity_smoke")
+
+    def get_resource_map(self, user_id: str | None = None):
+        from tandemn_system_data.models import (
+            Cloud,
+            MachinePool,
+            NetworkFabric,
+            Region,
+            ResourceMap,
+            Zone,
+        )
+
+        pool = MachinePool(
+            instance_family="p4d",
+            gpu_type="A100",
+            gpus_per_instance=8,
+            total_instances=10,  # 10 * 8 = 80 total GPUs
+        )
+        clouds = {
+            "aws": Cloud(
+                regions={
+                    "us-east-2": Region(
+                        zones={
+                            "use2-az3": Zone(
+                                network_fabrics={
+                                    "efa-cluster-a": NetworkFabric(
+                                        fabric_type="efa",
+                                        machine_pools={"p4d.24xlarge": pool},
+                                    )
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+        }
+        return ResourceMap(market=["reserved"], clouds=clouds)
+
+    def get_running_chains(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        return [
+            {
+                "chain_id": "chain_used_capacity_smoke",
+                "target_node": self._ENV,
+                "shape_json": {"gpu_count": 8, "count": 8},
+            }
+        ]
+
+
+def _run_used_capacity_check() -> dict[str, Any]:
+    manager = _UsedCapacitySmokeManager()
+    resources = manager.resources_summary()
+    env = _UsedCapacitySmokeManager._ENV
+    info = resources[env]
+    if int(info["total"]) != 80:
+        raise AssertionError(f"used-capacity: expected total=80, got {info['total']}")
+    if int(info["free"]) != 72:
+        raise AssertionError(f"used-capacity: expected free=72 (80-8), got {info['free']}")
+    result = {"label": "used-capacity", "env_key": env, "total": 80, "free": int(info["free"])}
+    print(json.dumps(result, indent=2, default=str))
+    return result
+
+
+def _main() -> None:
+    parser = argparse.ArgumentParser(description="Smoke-test Koi ResourceMapManager")
+    parser.add_argument("--user-id", help="Run against Tandemn Store for this user_id")
+    args = parser.parse_args()
+
+    if args.user_id:
+        _run_smoke(ResourceMapManager(user_id=args.user_id), "tandemn-store")
+    else:
+        _run_smoke(_SmokeResourceMapManager(), "in-memory")
+        _run_used_capacity_check()
+
+
+if __name__ == "__main__":
+    _main()
