@@ -466,8 +466,6 @@ class PlanAction:
                 f"job {self.job_id}: service_class must be one of "
                 f"{sorted(ALLOWED_SERVICE_CLASSES)}, got {self.service_class!r}"
             )
-        for rank in self.ladder or []:
-            rank.rationale = self.rationale
 
     @classmethod
     def from_dict(cls, raw, job_id: str | None = None) -> "PlanAction":

@@ -1120,9 +1120,6 @@ class KoiAgentHarness:
         if not plan.actions and states is None:
             raise PlanMaterializationError("plan has no actions and no job inventory to cover")
 
-        for action in plan.actions:
-            for rank in action.ladder or []:
-                rank.rationale = action.rationale
         return plan
 
     def _materialize_launch_configs(self, plan: Plan, cluster_snapshot) -> None:
@@ -1887,7 +1884,7 @@ class KoiAgentHarness:
             "   'mechanism_id': 'M_...',            # committed mechanism for the job\n"
             "   'swap_reason': 'scale_up|scale_down|migrate|replace|retune',  # swap only\n"
             "   'budget_ref': '<BudgetSlice id>',   # required if a BudgetBook was validated\n"
-            "   'rationale': str}\n"
+            "   'rationale': str | None}\n"
             "Rank dict (each entry of ladder):\n"
             "  {'role': 'aggregate',     # v0: AGGREGATE ONLY - one engine does prefill+decode\n"
             "   'rank_id': 'rank_<ULID>', # omit rank_id; Koi generates a Store-compatible ID\n"
@@ -1902,8 +1899,10 @@ class KoiAgentHarness:
             "   # Any such key you set is dropped; the engine/catalog supplies it.\n"
             "   'n_replicas': int,       # rank DP / max endpoint count; do NOT put dp in config\n"
             "   'rank_traffic_share': float,        # optional partial-admission traffic share\n"
-            "   'mechanism_id': 'M_...'}            # defaults to the action's mechanism_id\n"
-            "Koi copies the job action's rationale onto every rank; do not write separate rank reasons.\n"
+            "   'mechanism_id': 'M_...',           # defaults to the action's mechanism_id\n"
+            "   'rationale': str | None}            # optional, specific to this rank\n"
+            "Plan, action, and rank rationales are independent. Koi does not copy "
+            "rationales between them. An omitted rank rationale remains None.\n"
             "v0 is AGGREGATE-ONLY per rank: every rank is one full "
             "prefill+decode engine (role 'aggregate'); do NOT split prefill/"
             "decode or set pd_enabled / prefill_worker_count / "
