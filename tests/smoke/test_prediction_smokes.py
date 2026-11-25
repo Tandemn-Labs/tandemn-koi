@@ -12,6 +12,7 @@ from src.prediction import surrogate as surrogate_module
 from src.prediction.compatibility import GPUProfile
 from src.prediction.profile_search import ModelProfile, SupportedProfile, model_profile_from_values
 from src.prediction.surrogate import (
+    ONLINE_MAX_REQUESTS,
     ONLINE_MIN_REQUESTS,
     SurrogateExecutionError,
     SurrogateMemoryNoFit,
@@ -331,6 +332,27 @@ class PredictionSmokeTests(unittest.TestCase):
         self.assertEqual(controls["replay_concurrency"], 8)
         self.assertEqual(controls["request_count"], 160)
         self.assertNotIn("arrival_interval_ms", controls)
+
+    def test_online_concurrency_mode_caps_request_count(self):
+        predictor = SurrogatePrediction(objective="online")
+
+        def controls_for(concurrency):
+            return predictor._build_simulator_controls(
+                objective="online",
+                job_config={},
+                job_features={
+                    "_traffic_mode": "concurrency",
+                    "max_concurrent_streaming": concurrency,
+                },
+                direct_x_values={},
+            )
+
+        high = controls_for(500)
+        self.assertEqual(high["request_count"], ONLINE_MAX_REQUESTS)
+        self.assertEqual(high["expected_completed_requests"], ONLINE_MAX_REQUESTS)
+
+        very_high = controls_for(ONLINE_MAX_REQUESTS * 2)
+        self.assertEqual(very_high["request_count"], ONLINE_MAX_REQUESTS * 2)
 
     def test_offline_single_worker_kv_router_downgrades_to_round_robin(self):
         predictor = SurrogatePrediction()

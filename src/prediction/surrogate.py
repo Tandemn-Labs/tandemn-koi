@@ -29,6 +29,9 @@ for _logger_name in ("aiconfigurator", "aiconfigurator_core"):
 
 ONLINE_REPLAY_WINDOW_S = 1
 ONLINE_MIN_REQUESTS = 20
+ONLINE_CONCURRENCY_WAVES = 20
+ONLINE_MAX_REQUESTS = 1000
+
 _AIC_FALLBACK_MODES = ("HYBRID", "EMPIRICAL", "SOL")
 _AIC_PROFILE_BACKENDS = (("vllm", "0.22.0"), ("sglang", "0.5.14"))
 _A10G_PROFILE_FALLBACK_SYSTEMS = ("l40s", "a100_sxm", "h100_sxm", "h200_sxm")
@@ -592,12 +595,16 @@ class SurrogatePrediction:
                 if replay_concurrency is None:
                     raise ValueError("Online concurrency replay needs positive max concurrency")
                 replay_concurrency = max(1, math.ceil(replay_concurrency))
+                request_count = min(
+                    replay_concurrency * ONLINE_CONCURRENCY_WAVES, ONLINE_MAX_REQUESTS
+                )
+                request_count = max(request_count, replay_concurrency)
                 return {
-                    "request_count": replay_concurrency * 20,
+                    "request_count": request_count,
                     "replay_concurrency": replay_concurrency,
                     "replay_mode": "offline",
                     "turns_per_session": 1,
-                    "expected_completed_requests": replay_concurrency * 20,
+                    "expected_completed_requests": request_count,
                 }
             if request_arrival_rate is None:
                 raise ValueError("Online simulation needs positive request_arrival_rate")
