@@ -6,7 +6,8 @@ CREATE TYPE job_status AS ENUM (
     'running',
     'queued',
     'finished',
-    'pending'
+    'pending',
+    'failed'
 );
 
 CREATE TYPE job_kind AS ENUM ('online', 'batch');
@@ -161,6 +162,7 @@ CREATE TABLE master_table (
         CHECK (jsonb_typeof(x_snapshot) = 'object'),
     reasoning TEXT NOT NULL,
     job_status job_status NOT NULL DEFAULT 'pending',
+    rank_status TEXT,  -- only one thing thats added,
     rank_beta DOUBLE PRECISION,
     rank_dro DOUBLE PRECISION,
     v_predicted JSONB NOT NULL DEFAULT '{}'
@@ -191,6 +193,7 @@ CREATE TABLE placement (
     min_replicas INTEGER,
     engine_name TEXT,
     engine_version TEXT,
+    inference_framework TEXT,
     market TEXT,
     cloud TEXT,
     region TEXT,
