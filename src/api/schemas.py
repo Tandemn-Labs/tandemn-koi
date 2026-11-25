@@ -1,6 +1,8 @@
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from tandemn_system_data.models.enums import JobKind, JobStatus
 
 
 class RequestModel(BaseModel):
@@ -107,3 +109,25 @@ class JobSpec(RequestModel):
 class JobSubmission(RequestModel):
     kind: Literal["online", "batch"]
     spec: JobSpec
+
+
+class JobPlacement(BaseModel):
+    cloud: str
+    region: str
+
+
+class JobSummary(BaseModel):
+    job_id: str
+    kind: JobKind
+    status: JobStatus
+    owner_user_id: str
+    model_id: str | None
+    priority_class: str | None
+    target_p99_ttft_ms: float | None
+    target_p99_tpot_ms: float | None
+    deadline_hrs: float | None
+    allocated_replicas: int | None
+    placements: list[JobPlacement]
+    created_at: datetime
+    finished_at: datetime | None
+    finish_reason: str | None

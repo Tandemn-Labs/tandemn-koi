@@ -2,11 +2,13 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from src.api.app import app
 from src.api.schemas import JobSubmission
+from tandemn_system_data.models.job import Job, RankAllocation, RunningJob
 
 
 class ApiSmokeTests(unittest.TestCase):
@@ -70,6 +72,125 @@ class ApiSmokeTests(unittest.TestCase):
 
                 self.assertEqual(response.status_code, 501)
                 self.assertEqual(response.json(), {"detail": "Not implemented"})
+
+    def test_list_jobs_returns_scoped_summaries(self):
+        self.enterContext(patch.object(app.state, "user_id", "usr_test"))
+        store = Mock()
+        self.enterContext(patch.object(app.state, "job_store", store))
+        job = Job(
+            user_id="usr_test",
+            kind="online",
+            status="running",
+            spec_json={
+                "model_id": "test-model",
+                "job_intent": {"priority_class": "HIGH", "target_p99_ttft_ms": 125},
+                "job_features": {"target_p99_tpot_ms": "40"},
+                "internal_config": "private",
+            },
+        )
+        store.list_jobs.return_value = [job]
+        ranks = [
+            RankAllocation(
+                rank_id=f"rank_{index}",
+                plan_id=None,
+                role="aggregate",
+                status="running",
+                shape_json={"env": env},
+                n_replicas=replicas,
+            )
+            for index, (env, replicas) in enumerate(
+                [
+                    (["on_demand", "aws", "us-east-1", "a", "H100"], 2),
+                    ("on_demand|aws|us-east-1|b|H100", 1),
+                    (None, 1),
+                ]
+            )
+        ]
+        store.running_jobs.return_value = [RunningJob(job=job, ranks=ranks)]
+
+        response = self.client.get("/jobs", params={"user_id": "other"})
+
+        store.list_jobs.assert_called_once_with("usr_test")
+        store.running_jobs.assert_called_once_with("usr_test")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            [
+                {
+                    "job_id": job.job_id,
+                    "kind": "online",
+                    "status": "running",
+                    "owner_user_id": "usr_test",
+                    "model_id": "test-model",
+                    "priority_class": "HIGH",
+                    "target_p99_ttft_ms": 125,
+                    "target_p99_tpot_ms": 40,
+                    "deadline_hrs": None,
+                    "allocated_replicas": 4,
+                    "placements": [{"cloud": "aws", "region": "us-east-1"}],
+                    "created_at": job.model_dump(mode="json")["created_at"],
+                    "finished_at": None,
+                    "finish_reason": None,
+                }
+            ],
+        )
+
+        store.list_jobs.return_value = []
+        self.assertEqual(self.client.get("/jobs").json(), [])
+
+    def test_list_jobs_reads_legacy_batch_deadline(self):
+        self.enterContext(patch.object(app.state, "user_id", "usr_test"))
+        store = Mock()
+        self.enterContext(patch.object(app.state, "job_store", store))
+        for primary_deadline, expected in ((None, 2), ("", 2), ("invalid", 2), (0, 0), (3, 3)):
+            with self.subTest(primary_deadline=primary_deadline):
+                store.list_jobs.return_value = [
+                    Job(
+                        user_id="usr_test",
+                        kind="batch",
+                        spec_json={
+                            "features": {"deadline_hrs": primary_deadline, "deadline_hours": 2}
+                        },
+                    )
+                ]
+                response = self.client.get("/jobs")
+
+                self.assertEqual(response.status_code, 200)
+                summary = response.json()[0]
+                self.assertEqual(summary["deadline_hrs"], expected)
+                self.assertIsNone(summary["allocated_replicas"])
+                self.assertEqual(summary["placements"], [])
+        store.running_jobs.assert_not_called()
+
+    def test_list_jobs_without_scope_returns_503(self):
+        self.enterContext(patch.object(app.state, "user_id", None))
+        store = Mock()
+        self.enterContext(patch.object(app.state, "job_store", store))
+
+        self.assertEqual(self.client.get("/jobs").status_code, 503)
+        store.list_jobs.assert_not_called()
+
+    def test_get_job_queries_one_id_and_returns_the_database_row(self):
+        pool = MagicMock()
+        self.enterContext(patch.object(app.state, "postgres_pool", pool))
+        conn = pool.connection.return_value.__enter__.return_value
+        row = {"job_id": "job_1", "status": "queued", "deadline_hrs": 0, "priority_class": None}
+        conn.execute.return_value.fetchone.return_value = row
+
+        response = self.client.get("/jobs/job_1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), row)
+        conn.execute.assert_called_once()
+        query, params = conn.execute.call_args.args
+        self.assertTrue(query.strip().endswith("WHERE job_id = %s"))
+        self.assertEqual(params, ("job_1",))
+
+        conn.execute.return_value.fetchone.return_value = None
+        self.assertEqual(self.client.get("/jobs/missing").status_code, 404)
+
+    def test_get_job_without_pool_returns_503(self):
+        self.assertEqual(self.client.get("/jobs/job_1").status_code, 503)
 
     def test_resource_map_returns_501(self):
         response = self.client.get("/resource_map")

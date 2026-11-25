@@ -1,10 +1,11 @@
 """Smoke tests for service supervision without Store or LLM access."""
 
 import asyncio
+import os
 import signal
 import sys
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
 from src import service
@@ -83,6 +84,13 @@ class ServiceSmokeTests(unittest.IsolatedAsyncioTestCase):
             patch.object(service, "_HTTPServer", return_value=self.server)
         )
         self.config = self.enterContext(patch.object(service.uvicorn, "Config"))
+        self.postgres = self.enterContext(patch.object(service, "PostgresClient"))
+        self.job_store = self.enterContext(patch.object(service, "JobStore"))
+        self.enterContext(patch.dict(os.environ, {"DATABASE_URL": "postgresql://test/koi"}))
+        self.pool_context = MagicMock()
+        self.postgres_pool = self.enterContext(
+            patch.object(service, "postgres_pool", return_value=self.pool_context)
+        )
 
     async def asyncTearDown(self):
         self.process.finish(0)
@@ -95,9 +103,15 @@ class ServiceSmokeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.server.started.wait(), timeout=2)
 
     async def test_forwards_arguments_and_inherits_environment_and_output(self):
-        argv = ["--ticks", "0", "--log-dir", "logs/with spaces", "--model", "test-model"]
+        argv = ["--ticks", "0", "--log-dir", "logs/with spaces", "--user-id=usr_cli"]
         await self.start_service(argv)
 
+        self.assertEqual(service.app.state.user_id, "usr_cli")
+        self.postgres.assert_called_once_with()
+        self.job_store.assert_called_once_with(self.postgres.return_value)
+        self.assertIs(service.app.state.job_store, self.job_store.return_value)
+        self.postgres_pool.assert_called_once_with("postgresql://test/koi")
+        self.assertIs(service.app.state.postgres_pool, self.pool_context.__enter__.return_value)
         self.spawn.assert_awaited_once_with(
             sys.executable, "-m", "src.orchestrator.runner", *argv, start_new_session=True
         )
@@ -113,6 +127,10 @@ class ServiceSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(service.app.state.runner, self.process)
         self.process.finish(0)
         self.assertEqual(await asyncio.wait_for(self.task, timeout=2), 0)
+        self.assertIsNone(service.app.state.job_store)
+        self.postgres.return_value.engine.dispose.assert_called_once_with()
+        self.assertIsNone(service.app.state.postgres_pool)
+        self.pool_context.__exit__.assert_called_once()
 
     async def test_http_remains_responsive_while_runner_is_waiting(self):
         await self.start_service()
