@@ -1,14 +1,14 @@
 """Smoke tests for Koi HTTP endpoints and job-submission schemas."""
 
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from src.api.app import app
 from src.api.schemas import JobSubmission
-from tandemn_system_data.models.job import Job, RankAllocation, RunningJob
 
 
 class ApiSmokeTests(unittest.TestCase):
@@ -73,130 +73,240 @@ class ApiSmokeTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 501)
                 self.assertEqual(response.json(), {"detail": "Not implemented"})
 
-    def test_list_jobs_returns_scoped_summaries(self):
-        self.enterContext(patch.object(app.state, "user_id", "usr_test"))
-        store = Mock()
-        self.enterContext(patch.object(app.state, "job_store", store))
-        job = Job(
-            user_id="usr_test",
-            kind="online",
-            status="running",
-            spec_json={
-                "model_id": "test-model",
-                "job_intent": {"priority_class": "HIGH", "target_p99_ttft_ms": 125},
-                "job_features": {"target_p99_tpot_ms": "40"},
-                "internal_config": "private",
-            },
-        )
-        store.list_jobs.return_value = [job]
-        ranks = [
-            RankAllocation(
-                rank_id=f"rank_{index}",
-                plan_id=None,
-                role="aggregate",
-                status="running",
-                shape_json={"env": env},
-                n_replicas=replicas,
-            )
-            for index, (env, replicas) in enumerate(
-                [
-                    (["on_demand", "aws", "us-east-1", "a", "H100"], 2),
-                    ("on_demand|aws|us-east-1|b|H100", 1),
-                    (None, 1),
-                ]
-            )
-        ]
-        store.running_jobs.return_value = [RunningJob(job=job, ranks=ranks)]
-
-        response = self.client.get("/jobs", params={"user_id": "other"})
-
-        store.list_jobs.assert_called_once_with("usr_test")
-        store.running_jobs.assert_called_once_with("usr_test")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json(),
-            [
-                {
-                    "job_id": job.job_id,
-                    "kind": "online",
-                    "status": "running",
-                    "owner_user_id": "usr_test",
-                    "model_id": "test-model",
-                    "priority_class": "HIGH",
-                    "target_p99_ttft_ms": 125,
-                    "target_p99_tpot_ms": 40,
-                    "deadline_hrs": None,
-                    "allocated_replicas": 4,
-                    "placements": [{"cloud": "aws", "region": "us-east-1"}],
-                    "created_at": job.model_dump(mode="json")["created_at"],
-                    "finished_at": None,
-                    "finish_reason": None,
-                }
-            ],
-        )
-
-        store.list_jobs.return_value = []
-        self.assertEqual(self.client.get("/jobs").json(), [])
-
-    def test_list_jobs_reads_legacy_batch_deadline(self):
-        self.enterContext(patch.object(app.state, "user_id", "usr_test"))
-        store = Mock()
-        self.enterContext(patch.object(app.state, "job_store", store))
-        for primary_deadline, expected in ((None, 2), ("", 2), ("invalid", 2), (0, 0), (3, 3)):
-            with self.subTest(primary_deadline=primary_deadline):
-                store.list_jobs.return_value = [
-                    Job(
-                        user_id="usr_test",
-                        kind="batch",
-                        spec_json={
-                            "features": {"deadline_hrs": primary_deadline, "deadline_hours": 2}
-                        },
-                    )
-                ]
-                response = self.client.get("/jobs")
-
-                self.assertEqual(response.status_code, 200)
-                summary = response.json()[0]
-                self.assertEqual(summary["deadline_hrs"], expected)
-                self.assertIsNone(summary["allocated_replicas"])
-                self.assertEqual(summary["placements"], [])
-        store.running_jobs.assert_not_called()
-
-    def test_list_jobs_without_scope_returns_503(self):
-        self.enterContext(patch.object(app.state, "user_id", None))
-        store = Mock()
-        self.enterContext(patch.object(app.state, "job_store", store))
-
-        self.assertEqual(self.client.get("/jobs").status_code, 503)
-        store.list_jobs.assert_not_called()
-
-    def test_get_job_queries_one_id_and_returns_the_database_row(self):
-        pool = MagicMock()
-        self.enterContext(patch.object(app.state, "postgres_pool", pool))
-        conn = pool.connection.return_value.__enter__.return_value
-        row = {"job_id": "job_1", "status": "queued", "deadline_hrs": 0, "priority_class": None}
-        conn.execute.return_value.fetchone.return_value = row
-
-        response = self.client.get("/jobs/job_1")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), row)
-        conn.execute.assert_called_once()
-        query, params = conn.execute.call_args.args
-        self.assertTrue(query.strip().endswith("WHERE job_id = %s"))
-        self.assertEqual(params, ("job_1",))
-
-        conn.execute.return_value.fetchone.return_value = None
-        self.assertEqual(self.client.get("/jobs/missing").status_code, 404)
-
-    def test_get_job_without_pool_returns_503(self):
-        self.assertEqual(self.client.get("/jobs/job_1").status_code, 503)
-
     def test_resource_map_returns_501(self):
         response = self.client.get("/resource_map")
 
         self.assertEqual(response.status_code, 501)
         self.assertEqual(response.json(), {"detail": "Not implemented"})
+
+    def test_jobs_endpoints_return_the_same_database_fields(self):
+        pool = MagicMock()
+        self.enterContext(patch.object(app.state, "postgres_pool", pool))
+        conn = pool.connection.return_value.__enter__.return_value
+        row = {"job_id": "job_1", "status": "queued", "deadline_hrs": 0, "priority_class": None}
+        conn.execute.return_value.fetchall.return_value = [row]
+        conn.execute.return_value.fetchone.return_value = row
+
+        listing = self.client.get("/jobs")
+        detail = self.client.get("/jobs/job_1")
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json(), row)
+        self.assertEqual(listing.json(), [detail.json()])
+        list_call, detail_call = conn.execute.call_args_list
+        list_query = list_call.args[0]
+        detail_query, params = detail_call.args
+        self.assertIn("FROM jobs", list_query)
+        self.assertEqual(
+            list_query.partition(" ORDER BY ")[0],
+            detail_query.removesuffix(" WHERE job_id = %s"),
+        )
+        self.assertEqual(params, ("job_1",))
+
+        conn.execute.return_value.fetchone.return_value = None
+        self.assertEqual(self.client.get("/jobs/missing").status_code, 404)
+
+    def test_job_configuration_returns_stored_values_for_one_rank(self):
+        pool = MagicMock()
+        self.enterContext(patch.object(app.state, "postgres_pool", pool))
+        conn = pool.connection.return_value.__enter__.return_value
+        row = {
+            "job": {"job_id": "job_1", "model_id": "model_1", "deadline_hrs": 0},
+            "model_architecture": {"model_id": "model_1", "num_hidden_layers": 80},
+            "placement": {"job_id": "job_1", "rank_id": "rank_2", "engine_name": "sglang"},
+            "job_engine_defaults": None,
+        }
+        conn.execute.return_value.fetchone.return_value = row
+
+        response = self.client.get("/jobs/job_1/configuration", params={"rank_id": "rank_2"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), row)
+        conn.execute.assert_called_once()
+        query, bindings = conn.execute.call_args.args
+        self.assertIn("WHERE placement.job_id = %s AND placement.rank_id = %s", query)
+        self.assertEqual(bindings, ("job_1", "rank_2"))
+
+        conn.execute.return_value.fetchone.return_value = None
+        response = self.client.get("/jobs/job_1/configuration", params={"rank_id": "missing"})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.client.get("/jobs/job_1/configuration").status_code, 422)
+
+    def test_job_replicas_distinguishes_unplaced_and_missing_jobs(self):
+        pool = MagicMock()
+        self.enterContext(patch.object(app.state, "postgres_pool", pool))
+        conn = pool.connection.return_value.__enter__.return_value
+        conn.execute.return_value.fetchall.return_value = []
+        conn.execute.return_value.fetchone.return_value = {"exists": 1}
+        response = self.client.get("/jobs/job_1/replicas")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [])
+        conn.execute.assert_called_with("SELECT 1 FROM jobs WHERE job_id = %s", ("job_1",))
+
+        conn.execute.return_value.fetchone.return_value = None
+        self.assertEqual(self.client.get("/jobs/missing/replicas").status_code, 404)
+
+    def test_job_plan_reports_unavailable_historical_placements(self):
+        pool = MagicMock()
+        self.enterContext(patch.object(app.state, "postgres_pool", pool))
+        conn = pool.connection.return_value.__enter__.return_value
+        decision = {
+            "job_id": "job_1",
+            "tick": 0,
+            "action": "place",
+            "rationale": "Capacity available",
+            "status": None,
+            "created_at": None,
+            "tick_rationale": None,
+            "placement": None,
+        }
+        conn.execute.return_value.fetchone.return_value = decision
+
+        response = self.client.get("/jobs/job_1/plan/0")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), decision)
+        conn.execute.assert_called_once()
+        query, params = conn.execute.call_args.args
+        self.assertIn("WHERE plan_actions.tick = %s AND plan_actions.job_id = %s", query)
+        self.assertIn("NULL AS placement", query)
+        self.assertNotIn("FROM placement", query)
+        self.assertEqual(params, (0, "job_1"))
+
+        conn.execute.return_value.fetchone.return_value = None
+        self.assertEqual(self.client.get("/jobs/job_1/plan/1").status_code, 404)
+        self.assertEqual(self.client.get("/jobs/job_1/plan/-1").status_code, 422)
+        self.assertEqual(conn.execute.call_count, 2)
+
+    def test_job_replicas_groups_observed_replica_ids_by_rank(self):
+        pool = MagicMock()
+        self.enterContext(patch.object(app.state, "postgres_pool", pool))
+        conn = pool.connection.return_value.__enter__.return_value
+        conn.execute.return_value.fetchall.return_value = [
+            {"rank_id": "rank_1"},
+            {"rank_id": "rank_2"},
+        ]
+        store = MagicMock()
+        self.enterContext(patch.object(app.state, "telemetry_client", store))
+        self.enterContext(patch.object(app.state, "telemetry_user_id", "usr_test"))
+        session = store.session.return_value.__enter__.return_value
+        session.execute.return_value.mappings.return_value = [
+            {"rank_id": "rank_1", "chain_index": 0},
+            {"rank_id": "rank_1", "chain_index": 2},
+        ]
+
+        response = self.client.get("/jobs/job_1/replicas")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            [
+                {
+                    "rank_id": "rank_1",
+                    "replicas": [{"chain_index": 0}, {"chain_index": 2}],
+                },
+                {"rank_id": "rank_2", "replicas": []},
+            ],
+        )
+        conn.execute.assert_called_once()
+        placement_query, placement_bindings = conn.execute.call_args.args
+        self.assertIn(
+            "FROM placement WHERE job_id = %s ORDER BY rank_id", " ".join(placement_query.split())
+        )
+        self.assertEqual(placement_bindings, ("job_1",))
+        session.execute.assert_called_once()
+        query, bindings = session.execute.call_args.args
+        self.assertIn("SELECT DISTINCT gpu_metrics.rank_id, gpu_metrics.chain_index", str(query))
+        self.assertIn("INTERVAL '1 hour'", str(query))
+        self.assertEqual(
+            bindings, {"user_id": "usr_test", "job_id": "job_1", "rank_ids": ["rank_1", "rank_2"]}
+        )
+
+    def test_job_replicas_reports_telemetry_unavailable(self):
+        pool = MagicMock()
+        self.enterContext(patch.object(app.state, "postgres_pool", pool))
+        self.enterContext(patch.object(app.state, "telemetry_client", None))
+        conn = pool.connection.return_value.__enter__.return_value
+        conn.execute.return_value.fetchall.return_value = [{"rank_id": "rank_1"}]
+
+        response = self.client.get("/jobs/job_1/replicas")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"detail": "Telemetry Store is unavailable"})
+
+    def test_jobs_endpoints_without_pool_return_503(self):
+        for path in (
+            "/jobs",
+            "/jobs/job_1",
+            "/jobs/job_1/configuration?rank_id=rank_1",
+            "/jobs/job_1/replicas",
+            "/jobs/job_1/plan/0",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 503)
+
+    def test_job_metrics_queries_one_replica_in_a_time_window(self):
+        store = MagicMock()
+        self.enterContext(patch.object(app.state, "telemetry_client", store))
+        self.enterContext(patch.object(app.state, "telemetry_user_id", "usr_test"))
+        session = store.session.return_value.__enter__.return_value
+        start = "2026-11-25T10:00:00Z"
+        end = "2026-11-25T11:00:00Z"
+        sample = {
+            "job_id": "job_1",
+            "rank_id": "rank_1",
+            "chain_index": 0,
+            "ts": start,
+            "metrics_json": {"p99_ttft_ms": 125, "sm_utilization": 0.65},
+        }
+        session.execute.return_value.mappings.return_value = [sample]
+        params = {"rank_id": "rank_1", "chain_index": 0, "start": start, "end": end}
+
+        response = self.client.get("/jobs/job_1/metrics", params=params)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [sample])
+        statement, bindings = session.execute.call_args.args
+        self.assertIn("jobs.user_id = :user_id", str(statement))
+        self.assertIn("gpu_metrics.job_id = :job_id", str(statement))
+        self.assertIn("gpu_metrics.rank_id = :rank_id", str(statement))
+        self.assertIn("gpu_metrics.chain_index = :chain_index", str(statement))
+        self.assertIn("gpu_metrics.ts >= :start AND gpu_metrics.ts <= :end", str(statement))
+        self.assertEqual(
+            bindings,
+            {
+                **params,
+                "user_id": "usr_test",
+                "job_id": "job_1",
+                "start": datetime.fromisoformat(start),
+                "end": datetime.fromisoformat(end),
+            },
+        )
+
+        session.execute.return_value.mappings.return_value = []
+        self.assertEqual(self.client.get("/jobs/job_1/metrics", params=params).json(), [])
+
+    def test_job_metrics_rejects_invalid_queries_before_reading_store(self):
+        store = MagicMock()
+        self.enterContext(patch.object(app.state, "telemetry_client", store))
+        self.enterContext(patch.object(app.state, "telemetry_user_id", "usr_test"))
+        params = {
+            "rank_id": "rank_1",
+            "chain_index": 0,
+            "start": "2026-11-25T10:00:00Z",
+            "end": "2026-11-25T11:00:00Z",
+        }
+        for invalid in (
+            {"chain_index": -1},
+            {"start": "2026-11-25T10:00:00"},
+            {"end": "2026-11-25T09:00:00Z"},
+        ):
+            with self.subTest(invalid=invalid):
+                response = self.client.get("/jobs/job_1/metrics", params={**params, **invalid})
+                self.assertEqual(response.status_code, 422)
+        store.session.assert_not_called()
 
 
 class EngineConfigSchemaTests(unittest.TestCase):
