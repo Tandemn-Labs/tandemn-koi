@@ -1,0 +1,675 @@
+# Preview from the repository root, then visit http://127.0.0.1:8081.
+# docker run --rm -p 127.0.0.1:8081:8080 \
+#   -e SWAGGER_JSON=/spec/openapi.yaml \
+#   -v "$PWD/src/api/openapi.yaml:/spec/openapi.yaml:ro" \
+#   docker.swagger.io/swaggerapi/swagger-ui
+openapi: 3.1.0
+info:
+  title: Koi Frontend API
+  version: 0.1.0
+  description: >
+    Job, rank, and replica reads for the Tandemn dashboard. Job and placement
+    reads use Koi PostgreSQL. Replica metrics use Tandemn Store and are scoped
+    to the user configured for the Koi service. Examples use synthetic data.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local Koi HTTP service
+tags:
+  - name: Health
+  - name: Jobs
+  - name: Resources
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Check runner liveness
+      description: Checks runner liveness and the service shutdown state.
+      responses:
+        '200':
+          description: The runner is alive.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+              example: {status: ok}
+        '503':
+          description: The runner is absent, exited, or shutting down.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+              example: {status: unhealthy}
+  /jobs:
+    get:
+      operationId: listJobs
+      tags: [Jobs]
+      summary: List jobs
+      description: >
+        Returns up to 500 jobs ordered by job_id. An empty table returns [].
+      responses:
+        '200':
+          description: Job rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 500
+                items: {$ref: '#/components/schemas/Job'}
+              examples:
+                jobs:
+                  value:
+                    - &job
+                      job_id: job-123
+                      kind: online
+                      status: running
+                      model_id: model-70b
+                      target_p99_ttft_ms: 500
+                      target_p99_tpot_ms: 50
+                      deadline_hrs: null
+                      isl_token_avg: 512
+                      isl_token_min: 128
+                      isl_token_max: 2048
+                      isl_distribution_type: LogNormal
+                      osl_token_avg: 256
+                      osl_token_min: 64
+                      osl_token_max: 1024
+                      osl_distribution_type: LogNormal
+                      request_arrival_rate: 30
+                      max_concurrent_streaming: 64
+                      request_arrival_pattern: Poisson
+                      peak_to_mean_ratio: 2
+                      workload_prefix_concentration: 0.35
+                      multi_turn_ratio: 0.2
+                      shared_prefix_length_avg: 128
+                      is_session_affinity: true
+                      total_token_budget: null
+                      priority_class: HIGH
+                      scheduling_policy: fcfs
+                      router_policy: kv_aware
+                empty:
+                  value: []
+        '503': {$ref: '#/components/responses/JobDatabaseUnavailable'}
+  /jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      operationId: getJob
+      tags: [Jobs]
+      summary: Get a job
+      responses:
+        '200':
+          description: One job in the same shape used by the list.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+              example: *job
+        '404': {$ref: '#/components/responses/JobNotFound'}
+        '503': {$ref: '#/components/responses/JobDatabaseUnavailable'}
+  /jobs/{job_id}/ranks:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      operationId: getJobRanks
+      tags: [Jobs]
+      summary: List rank IDs and their observed replica indices
+      description: >
+        A replica is included if it reported telemetry within the past hour.
+        A rank without observations has an empty replicas array. A known job
+        with no placements returns an empty array.
+      responses:
+        '200':
+          description: Ranks ordered by rank_id and replicas by chain_index.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/RankReplicas'}
+              example:
+                - rank_id: rank-2
+                  replicas:
+                    - chain_index: 0
+                    - chain_index: 1
+                - rank_id: rank-3
+                  replicas: []
+        '404': {$ref: '#/components/responses/JobNotFound'}
+        '503':
+          description: The job database or telemetry Store is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              examples:
+                jobs:
+                  value: {detail: Job database is unavailable}
+                telemetry:
+                  value: {detail: Telemetry Store is unavailable}
+  /jobs/{job_id}/configuration:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - $ref: '#/components/parameters/RankId'
+    get:
+      operationId: getJobConfiguration
+      tags: [Jobs]
+      summary: Get one rank's stored configuration
+      description: |
+        Returns the stored job, model architecture, rank placement, and engine
+        defaults rows. Defaults are matched by model_id and engine_name and
+        are returned separately from rank settings. Job-level extra_args and
+        misc_kubernetes_labels are omitted from the job section.
+
+        Example request: `GET /jobs/job-123/configuration?rank_id=rank-2`
+      responses:
+        '200':
+          description: Stored configuration for the selected job and rank.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RankConfiguration'}
+              examples:
+                withDefaults:
+                  summary: Selected fields from a rank with engine defaults
+                  description: The example elides other nullable table columns.
+                  value:
+                    job: *job
+                    model_architecture:
+                      model_id: model-70b
+                      model_params_b: 70
+                      model_size_gb: 140
+                      num_hidden_layers: 80
+                      weight_dtype: bfloat16
+                    placement:
+                      job_id: job-123
+                      rank_id: rank-2
+                      role: aggregate
+                      cluster_id: cluster-west
+                      pool_id: pool-h100
+                      node_type_id: node-type-h100
+                      cloud: aws
+                      region: us-west-2
+                      zone: us-west-2a
+                      market: reserved
+                      accelerator_type: H100
+                      pipeline_parallelism: 1
+                      moe_expert_parallelism: null
+                      moe_tensor_parallelism: null
+                      min_replicas: 1
+                      max_replicas: 4
+                      engine_name: vllm
+                      engine_version: '1.0.3'
+                      inference_framework: dynamo
+                      tensor_parallelism: 2
+                      max_num_seq: 128
+                      prefix_cache_enabled: true
+                    job_engine_defaults:
+                      model_id: model-70b
+                      engine_name: vllm
+                      max_num_seq: 64
+                      prefix_cache_enabled: true
+        '404':
+          description: No placement exists for the requested job and rank.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {detail: Job rank not found}
+        '422': {$ref: '#/components/responses/InvalidParameters'}
+        '503': {$ref: '#/components/responses/JobDatabaseUnavailable'}
+  /jobs/{job_id}/metrics:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - $ref: '#/components/parameters/RankId'
+      - name: chain_index
+        in: query
+        required: true
+        description: Zero-based replica index within the rank.
+        schema: {type: integer, minimum: 0}
+        example: 0
+      - name: start
+        in: query
+        required: true
+        description: Inclusive start timestamp with a timezone.
+        schema: {type: string, format: date-time}
+        example: '2026-11-25T10:00:00Z'
+      - name: end
+        in: query
+        required: true
+        description: Inclusive end timestamp with a timezone, at or after start.
+        schema: {type: string, format: date-time}
+        example: '2026-11-25T11:00:00Z'
+    get:
+      operationId: getJobMetrics
+      tags: [Jobs]
+      summary: Read a replica's metrics over time
+      description: |
+        Returns one reading per exact timestamp for the selected job, rank,
+        and replica. Repeated rows for a GPU at the same timestamp are reduced
+        to its latest row. Numeric GPU and interconnect readings are averaged
+        across reporting GPUs. Each other metric uses its latest non-null
+        reading at that timestamp. No matching samples returns [].
+
+        Example request:
+
+        ```sh
+        curl --get http://127.0.0.1:8080/jobs/job-123/metrics \
+          --data-urlencode 'rank_id=rank-2' \
+          --data-urlencode 'chain_index=0' \
+          --data-urlencode 'start=2026-11-25T10:00:00Z' \
+          --data-urlencode 'end=2026-11-25T11:00:00Z'
+        ```
+      responses:
+        '200':
+          description: Replica readings ordered by timestamp.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/ReplicaMetricSample'}
+              examples:
+                measurements:
+                  value:
+                    - job_id: job-123
+                      rank_id: rank-2
+                      chain_index: 0
+                      ts: '2026-11-25T10:00:10Z'
+                      metrics_json:
+                        p99_ttft_ms: 125
+                        p99_tpot_ms: 24
+                        throughput_token_per_sec: 1250
+                        sm_utilization: 0.5
+                        kv_cache_util: 0.32
+                    - job_id: job-123
+                      rank_id: rank-2
+                      chain_index: 0
+                      ts: '2026-11-25T10:00:20Z'
+                      metrics_json:
+                        p99_ttft_ms: null
+                        throughput_token_per_sec: 1420
+                        sm_utilization: 0.54
+                empty:
+                  value: []
+        '422':
+          description: A parameter is invalid or the time window is reversed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ValidationError'}
+              example: {detail: start must be at or before end}
+        '503':
+          description: The telemetry Store or its user scope is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {detail: Telemetry Store is unavailable}
+  /jobs/{job_id}/plan/{tick}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - name: tick
+        in: path
+        required: true
+        description: The exact planning tick to look up.
+        schema: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        example: 42
+    get:
+      operationId: getJobPlan
+      tags: [Jobs]
+      summary: Get the plan for one job at a tick
+      description: >
+        Returns the job action and rationale recorded for the tick with plan
+        metadata. Historical placement is currently unavailable by tick.
+      responses:
+        '200':
+          description: The job's recorded action and plan metadata.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobPlan'}
+              example:
+                job_id: job-123
+                tick: 42
+                action: place
+                rationale: The west cluster had capacity for the requested job.
+                status: null
+                created_at: '2026-11-25T10:00:00Z'
+                tick_rationale: Use available capacity for queued jobs.
+                placement: null
+        '404':
+          description: No decision exists for the requested job and tick.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {detail: Job plan not found}
+        '422':
+          description: The tick must be a non-negative 32-bit integer.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ValidationError'}
+              example:
+                detail:
+                  - loc: [path, tick]
+                    msg: Input should be greater than or equal to 0
+                    type: greater_than_equal
+        '503': {$ref: '#/components/responses/JobDatabaseUnavailable'}
+  /job:
+    post:
+      operationId: submitJob
+      tags: [Jobs]
+      summary: Submit a job (reserved)
+      description: The current handler returns 501 for any request body.
+      responses:
+        '501': {$ref: '#/components/responses/NotImplemented'}
+  /resource_map:
+    get:
+      operationId: getResourceMap
+      tags: [Resources]
+      summary: Get the resource map (reserved)
+      responses:
+        '501': {$ref: '#/components/responses/NotImplemented'}
+
+components:
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: {type: string}
+      example: job-123
+    RankId:
+      name: rank_id
+      in: query
+      required: true
+      description: Rank ID within the job.
+      schema: {type: string, minLength: 1}
+      example: rank-2
+  responses:
+    JobNotFound:
+      description: The job was not found.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {detail: Job not found}
+    JobDatabaseUnavailable:
+      description: The job database is unavailable.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {detail: Job database is unavailable}
+    InvalidParameters:
+      description: A required parameter is missing or invalid.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ValidationError'}
+          example:
+            detail:
+              - loc: [query, rank_id]
+                msg: Field required
+                type: missing
+    NotImplemented:
+      description: This operation is reserved.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {detail: Not implemented}
+  schemas:
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, enum: [ok, unhealthy]}
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: {type: string}
+    ValidationError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          anyOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+                required: [loc, msg, type]
+                properties:
+                  loc:
+                    type: array
+                    items: {type: [string, integer]}
+                  msg: {type: string}
+                  type: {type: string}
+    Job:
+      type: object
+      required: [
+        job_id, kind, status, model_id, target_p99_ttft_ms, target_p99_tpot_ms,
+        deadline_hrs, isl_token_avg, isl_token_min, isl_token_max,
+        isl_distribution_type,
+        osl_token_avg, osl_token_min, osl_token_max, osl_distribution_type,
+        request_arrival_rate, max_concurrent_streaming, request_arrival_pattern,
+        peak_to_mean_ratio, workload_prefix_concentration, multi_turn_ratio,
+        shared_prefix_length_avg, is_session_affinity, total_token_budget,
+        priority_class, scheduling_policy, router_policy
+      ]
+      properties:
+        job_id: {type: string}
+        kind: {type: string, enum: [online, batch]}
+        status:
+          type: string
+          enum: [running, queued, finished, pending, failed]
+        model_id: {type: string}
+        target_p99_ttft_ms: {type: [number, 'null']}
+        target_p99_tpot_ms: {type: [number, 'null']}
+        deadline_hrs: {type: [number, 'null']}
+        isl_token_avg: {type: [number, 'null']}
+        isl_token_min: {type: [number, 'null']}
+        isl_token_max: {type: [number, 'null']}
+        isl_distribution_type:
+          $ref: '#/components/schemas/TokenDistribution'
+        osl_token_avg: {type: [number, 'null']}
+        osl_token_min: {type: [number, 'null']}
+        osl_token_max: {type: [number, 'null']}
+        osl_distribution_type:
+          $ref: '#/components/schemas/TokenDistribution'
+        request_arrival_rate: {type: [number, 'null']}
+        max_concurrent_streaming: {type: [number, 'null']}
+        request_arrival_pattern:
+          type: [string, 'null']
+          enum: [Poisson, Constant, Bursty, Diurnal, null]
+        peak_to_mean_ratio: {type: [number, 'null']}
+        workload_prefix_concentration: {type: [number, 'null']}
+        multi_turn_ratio: {type: [number, 'null']}
+        shared_prefix_length_avg: {type: [number, 'null']}
+        is_session_affinity: {type: [boolean, 'null']}
+        total_token_budget: {type: [integer, 'null'], format: int64}
+        priority_class: {type: [string, 'null']}
+        scheduling_policy: {type: [string, 'null']}
+        router_policy: {type: [string, 'null']}
+    TokenDistribution:
+      type: [string, 'null']
+      enum: [Constant, Uniform, Normal, LogNormal, Exponential, null]
+    RankPlacement:
+      type: object
+      required: [
+        job_id, rank_id, role, cluster_id, pool_id, node_type_id, cloud, region,
+        zone, market, accelerator_type, tensor_parallelism,
+        pipeline_parallelism, moe_expert_parallelism, moe_tensor_parallelism,
+        min_replicas, max_replicas
+      ]
+      properties:
+        job_id: {type: string}
+        rank_id: {type: string}
+        role: {type: [string, 'null']}
+        cluster_id: {type: [string, 'null']}
+        pool_id: {type: [string, 'null']}
+        node_type_id: {type: [string, 'null']}
+        cloud: {type: [string, 'null']}
+        region: {type: [string, 'null']}
+        zone: {type: [string, 'null']}
+        market: {type: [string, 'null']}
+        accelerator_type: {type: [string, 'null']}
+        tensor_parallelism: {type: [integer, 'null']}
+        pipeline_parallelism: {type: [integer, 'null']}
+        moe_expert_parallelism: {type: [integer, 'null']}
+        moe_tensor_parallelism: {type: [integer, 'null']}
+        min_replicas: {type: [integer, 'null']}
+        max_replicas: {type: [integer, 'null']}
+    JobPlan:
+      type: object
+      required:
+        [job_id, tick, action, rationale, status, created_at, tick_rationale,
+         placement]
+      properties:
+        job_id: {type: string}
+        tick: {type: integer, format: int32, minimum: 0}
+        action: {type: [string, 'null']}
+        rationale: {type: [string, 'null']}
+        status:
+          type: [string, 'null']
+          description: Stored status of the plan for the tick.
+        created_at: {type: [string, 'null'], format: date-time}
+        tick_rationale: {type: [string, 'null']}
+        placement:
+          type: 'null'
+          description: Historical placement is unavailable by tick.
+    RankReplicas:
+      type: object
+      required: [rank_id, replicas]
+      additionalProperties: false
+      properties:
+        rank_id: {type: string}
+        replicas:
+          type: array
+          items:
+            type: object
+            required: [chain_index]
+            additionalProperties: false
+            properties:
+              chain_index: {type: integer, minimum: 0}
+    RankConfiguration:
+      type: object
+      required: [job, model_architecture, placement, job_engine_defaults]
+      properties:
+        job: {$ref: '#/components/schemas/Job'}
+        model_architecture: {$ref: '#/components/schemas/ModelArchitecture'}
+        placement: {$ref: '#/components/schemas/StoredRankPlacement'}
+        job_engine_defaults:
+          description: The matching defaults row, or null without a match.
+          anyOf:
+            - $ref: '#/components/schemas/JobEngineDefaults'
+            - type: 'null'
+    ModelArchitecture:
+      type: object
+      required: [model_id]
+      properties:
+        model_id: {type: string}
+        model_params_b: {type: [number, 'null']}
+        model_size_gb: {type: [number, 'null']}
+        num_hidden_layers: {type: [integer, 'null']}
+        hidden_size: {type: [integer, 'null']}
+        num_attn_heads: {type: [integer, 'null']}
+        num_kv_heads: {type: [integer, 'null']}
+        attn_heads_per_kv_head: {type: [integer, 'null']}
+        intermediate_size: {type: [integer, 'null']}
+        max_pos_embeddings: {type: [integer, 'null']}
+        vocab_size: {type: [integer, 'null']}
+        is_moe: {type: [boolean, 'null']}
+        num_routed_experts: {type: [integer, 'null']}
+        num_active_experts: {type: [integer, 'null']}
+        flops_per_param: {type: [number, 'null']}
+        weight_dtype: {type: [string, 'null']}
+        weight_quantization_method: {type: [string, 'null']}
+        weight_quantization_bits: {type: [integer, 'null']}
+        sliding_window_size: {type: [integer, 'null']}
+        min_chain_warmup_time: {type: [number, 'null']}
+    StoredRankPlacement:
+      allOf:
+        - $ref: '#/components/schemas/RankPlacement'
+        - $ref: '#/components/schemas/EngineSettings'
+        - type: object
+          properties:
+            inference_framework: {type: [string, 'null']}
+            max_num_seq: {type: [integer, 'null']}
+            max_num_batched_tokens: {type: [integer, 'null']}
+            block_size: {type: [integer, 'null']}
+            kv_cache_dtype: {type: [string, 'null']}
+            extra_args:
+              type: [array, 'null']
+              items: {type: [string, 'null']}
+            misc_kubernetes_labels:
+              type: [array, 'null']
+              items: {type: [string, 'null']}
+    JobEngineDefaults:
+      allOf:
+        - $ref: '#/components/schemas/EngineSettings'
+        - type: object
+          required: [model_id, engine_name]
+          properties:
+            model_id: {type: string}
+            engine_name: {type: string}
+            max_num_seq: {description: Stored JSONB value.}
+            max_num_batched_tokens: {description: Stored JSONB value.}
+            block_size: {description: Stored JSONB value.}
+            kv_cache_dtype: {description: Stored JSONB value.}
+    EngineSettings:
+      type: object
+      properties:
+        engine_name: {type: [string, 'null']}
+        engine_version: {type: [string, 'null']}
+        max_model_len: {type: [integer, 'null']}
+        gpu_mem_util: {type: [number, 'null']}
+        attn_backend: {type: [string, 'null']}
+        activation_quantization_method: {type: [string, 'null']}
+        activation_dtype: {type: [string, 'null']}
+        prefix_cache_enabled: {type: [boolean, 'null']}
+        chunked_prefill_enabled: {type: [boolean, 'null']}
+        lmcache_enabled: {type: [boolean, 'null']}
+        spec_decoding_enabled: {type: [boolean, 'null']}
+        draft_model_id: {type: [string, 'null']}
+        spec_decoding_method: {type: [string, 'null']}
+        num_speculative_tokens: {type: [integer, 'null']}
+        spec_acceptance_threshold: {type: [number, 'null']}
+        cuda_graph_enabled: {type: [boolean, 'null']}
+        torch_compile_enabled: {type: [boolean, 'null']}
+        preemption_policy: {type: [string, 'null']}
+        pd_enabled: {type: [boolean, 'null']}
+        kv_transfer_method: {type: [string, 'null']}
+        chunk_size: {type: [integer, 'null']}
+        max_chunked_steps_per_request: {type: [integer, 'null']}
+    ReplicaMetricSample:
+      type: object
+      required: [job_id, rank_id, chain_index, ts, metrics_json]
+      properties:
+        job_id: {type: string}
+        rank_id: {type: string}
+        chain_index: {type: integer, minimum: 0}
+        ts: {type: string, format: date-time}
+        metrics_json:
+          type: object
+          description: Observed Store metric keys from the available samples.
+          properties:
+            gpu_mem_used_fraction: {type: [number, 'null']}
+            vram_headroom_gb: {type: [number, 'null']}
+            sm_utilization: {type: [number, 'null']}
+            mem_bandwidth_utilization: {type: [number, 'null']}
+            pcie_tput_observed: {type: [number, 'null']}
+            nvlink_tput_observed: {type: [number, 'null']}
+            p99_ttft_ms: {type: [number, 'null']}
+            p99_tpot_ms: {type: [number, 'null']}
+            throughput_token_per_sec: {type: [number, 'null']}
+            live_batch_size: {type: [number, 'null']}
+            depth_req_q: {type: [number, 'null']}
+            kv_cache_util: {type: [number, 'null']}
+            kvcache_hit_rate: {type: [number, 'null']}
+            input_length_observed: {type: [number, 'null']}
+            output_length_observed: {type: [number, 'null']}
+            prefill_iteration_counts_per_second: {type: [number, 'null']}
+            decode_itr_counts_per_second: {type: [number, 'null']}
+            batched_reqs_inflight: {type: [number, 'null']}
+            batched_reqs_processed_total: {type: [number, 'null']}
+            batched_chunks_input_pulled_total: {type: [number, 'null']}
+            batched_chunks_output_written_total: {type: [number, 'null']}
+            slo_margin: {type: [number, 'null']}
+            kv_pressure_score: {type: [number, 'null']}
+            cost_per_token: {type: [number, 'null']}
+            activation_mem_pressure: {type: [number, 'null']}
+            pd_inbalance: {type: [number, 'null']}
+            comm_overhead_pct: {type: [number, 'null']}
+            per_tok_comm_bytes: {type: [number, 'null']}
+            pipeline_bubble_fraction: {type: [number, 'null']}
+            expert_inbalance: {type: [number, 'null']}
+            dispatch_overhead_ms: {type: [number, 'null']}
+          additionalProperties: true

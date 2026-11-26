@@ -13,7 +13,7 @@ from contextlib import ExitStack, contextmanager, suppress
 
 import uvicorn
 from db.postgres import postgres_pool
-from tandemn_system_data.clients import JobStore, PostgresClient
+from tandemn_system_data.clients import PostgresClient
 
 from src.api.app import app
 
@@ -105,10 +105,9 @@ async def run_service(argv: list[str]) -> int:
     )
     app.state.runner = None
     app.state.shutting_down = False
-    app.state.user_id = scope.user_id
-    app.state.job_store = None
     app.state.postgres_pool = None
-    store_client = None
+    app.state.telemetry_client = None
+    app.state.telemetry_user_id = scope.user_id
     resources = ExitStack()
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -134,23 +133,19 @@ async def run_service(argv: list[str]) -> int:
         await asyncio.gather(*tasks, return_exceptions=True)
 
         app.state.runner = None
-        app.state.user_id = None
-        app.state.job_store = None
         for sig, handler in previous_handlers.items():
             loop.remove_signal_handler(sig)
             signal.signal(sig, handler)
-        if store_client is not None:
-            store_client.engine.dispose()
 
     try:
         for sig in previous_handlers:
             loop.add_signal_handler(sig, request_shutdown)
-        if scope.user_id:
-            # Tandemn Store is provisioned and populated outside the Koi HTTP service.
-            store_client = PostgresClient()
-            app.state.job_store = JobStore(store_client)
         if database_url := os.getenv("DATABASE_URL"):
             app.state.postgres_pool = resources.enter_context(postgres_pool(database_url))
+        if scope.user_id:
+            telemetry_client = PostgresClient()
+            resources.callback(telemetry_client.engine.dispose)
+            app.state.telemetry_client = telemetry_client
         koi_loop_process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -192,6 +187,8 @@ async def run_service(argv: list[str]) -> int:
                 await cleanup_supervisor()
             finally:
                 app.state.postgres_pool = None
+                app.state.telemetry_client = None
+                app.state.telemetry_user_id = None
                 resources.close()
     return exit_code
 
